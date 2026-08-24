@@ -13,6 +13,7 @@ type ThemeProviderProps = {
 
 type ThemeProviderState = {
   theme: Theme
+  resolvedTheme: ResolvedTheme
   setTheme: (theme: Theme) => void
 }
 
@@ -93,14 +94,6 @@ export function ThemeProvider({
     return defaultTheme
   })
 
-  const setTheme = React.useCallback(
-    (nextTheme: Theme) => {
-      localStorage.setItem(storageKey, nextTheme)
-      setThemeState(nextTheme)
-    },
-    [storageKey]
-  )
-
   const applyTheme = React.useCallback(
     (nextTheme: Theme) => {
       const root = document.documentElement
@@ -118,6 +111,17 @@ export function ThemeProvider({
       }
     },
     [disableTransitionOnChange]
+  )
+
+  const setTheme = React.useCallback(
+    (nextTheme: Theme) => {
+      localStorage.setItem(storageKey, nextTheme)
+      // Apply synchronously so the browser's View Transition API can capture
+      // the new palette in the same frame as the toggle interaction.
+      applyTheme(nextTheme)
+      setThemeState(nextTheme)
+    },
+    [applyTheme, storageKey]
   )
 
   React.useEffect(() => {
@@ -207,6 +211,7 @@ export function ThemeProvider({
   const value = React.useMemo(
     () => ({
       theme,
+      resolvedTheme: theme === "system" ? getSystemTheme() : theme,
       setTheme,
     }),
     [theme, setTheme]
