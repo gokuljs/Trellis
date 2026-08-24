@@ -1,10 +1,8 @@
 import type { KeyboardEvent } from "react"
 import {
   ChevronDown,
-  Mic,
   Plus,
   Send,
-  VolumeX,
 } from "lucide-react"
 
 type ComposerProps = {
@@ -36,8 +34,6 @@ export function Composer({ value, placeholder, onChange, onSubmit }: ComposerPro
         />
         <div className="composer-tools">
           <span className="model-label">GPT-5.5 · Med <ChevronDown size={11} /></span>
-          <button className="composer-tool" aria-label="Voice input"><Mic size={14} /></button>
-          <button className="composer-tool" aria-label="Mute"><VolumeX size={14} /></button>
           <button className={`send-button ${value.trim() ? "ready" : ""}`} aria-label="Send" onClick={onSubmit}>
             {value.trim() ? <Send size={14} /> : <span className="voice-orb">◔</span>}
           </button>
