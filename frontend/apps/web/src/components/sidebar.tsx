@@ -96,20 +96,17 @@ export function Sidebar({ activeView, sessions, onNavigate, onClose }: SidebarPr
   return (
     <aside className="app-sidebar">
       <div className="sidebar-topbar">
+        <span className="sidebar-wordmark" aria-label="Trellis">Trellis</span>
+        <div className="sidebar-topbar-spacer" />
         <button className="icon-button" aria-label="Toggle sidebar" onClick={onClose}>
           <PanelLeft size={14} strokeWidth={1.7} />
         </button>
         <button className="icon-button" aria-label="Switch workspace">
           <ArrowLeftRight size={14} strokeWidth={1.7} />
         </button>
-        <div className="sidebar-topbar-spacer" />
       </div>
 
       <div className="sidebar-scroll">
-        <div className="eyebrow-row">
-          <span>SESSIONS</span>
-        </div>
-
         <PrimaryNavigation activeView={activeView} onNavigate={onNavigate} />
 
         <div className="search-field">
