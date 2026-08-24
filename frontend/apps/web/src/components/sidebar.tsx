@@ -1,10 +1,8 @@
 import {
   ArrowLeftRight,
-  CircleHelp,
   MoreHorizontal,
   PanelLeft,
   Pin,
-  Plus,
   Search,
   SlidersHorizontal,
   VolumeX,
@@ -77,21 +75,6 @@ function SessionList({ sessions, onNavigate }: Pick<SidebarProps, "sessions" | "
   )
 }
 
-function SidebarFooter({ onNewSession }: { onNewSession: () => void }) {
-  return (
-    <div className="sidebar-footer">
-      <div className="footer-actions">
-        <button className="round-status" aria-label="Status"><span>◈</span></button>
-        <button className="footer-icon" aria-label="Add" onClick={onNewSession}><Plus size={13} /></button>
-        <button className="footer-icon" aria-label="Help"><CircleHelp size={14} /></button>
-        <div className="footer-spacer" />
-        <button className="footer-icon" aria-label="More"><MoreHorizontal size={15} /></button>
-        <button className="footer-icon" aria-label="Power"><span className="power-mark">◉</span></button>
-      </div>
-    </div>
-  )
-}
-
 export function Sidebar({ activeView, sessions, onNavigate, onClose }: SidebarProps) {
   return (
     <aside className="app-sidebar">
@@ -126,8 +109,6 @@ export function Sidebar({ activeView, sessions, onNavigate, onClose }: SidebarPr
 
         <SessionList sessions={sessions} onNavigate={onNavigate} />
       </div>
-
-      <SidebarFooter onNewSession={() => onNavigate("New session")} />
     </aside>
   )
 }
