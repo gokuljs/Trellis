@@ -2,10 +2,7 @@ import {
   ArrowLeftRight,
   MoreHorizontal,
   PanelLeft,
-  Pin,
-  Search,
   SlidersHorizontal,
-  VolumeX,
 } from "lucide-react"
 
 import { NAVIGATION_ITEMS } from "@/lib/app-data"
@@ -91,21 +88,6 @@ export function Sidebar({ activeView, sessions, onNavigate, onClose }: SidebarPr
 
       <div className="sidebar-scroll">
         <PrimaryNavigation activeView={activeView} onNavigate={onNavigate} />
-
-        <div className="search-field">
-          <Search size={14} strokeWidth={1.6} />
-          <span>Search sessions...</span>
-        </div>
-
-        <section className="pinned-section">
-          <div className="section-heading">
-            <span><Pin size={11} fill="currentColor" /> PINNED</span>
-          </div>
-          <button className="hint-row">
-            <VolumeX size={13} strokeWidth={1.5} />
-            <span>Shift-click a chat to pin</span>
-          </button>
-        </section>
 
         <SessionList sessions={sessions} onNavigate={onNavigate} />
       </div>
