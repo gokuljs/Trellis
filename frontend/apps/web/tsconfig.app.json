@@ -23,7 +23,7 @@
     "noFallthroughCasesInSwitch": true,
     "paths": {
       "@/*": ["./src/*"],
-      "@workspace/ui/*": ["../../packages/ui/src/*"]
+      "@trellis/ui/*": ["../../packages/ui/src/*"]
     }
   },
   "include": ["src"]

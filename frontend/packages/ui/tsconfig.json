@@ -9,7 +9,7 @@
     "strict": true,
     "noEmit": true,
     "paths": {
-      "@workspace/ui/*": ["./src/*"]
+      "@trellis/ui/*": ["./src/*"]
     }
   },
   "include": ["."],
