@@ -39,7 +39,7 @@ export function Composer({ value, placeholder, onChange, onSubmit }: ComposerPro
           </button>
         </div>
       </div>
-      <div className="composer-footnote">Name can make mistakes. Check important info.</div>
+      <div className="composer-footnote">Trellis can make mistakes. Check important info.</div>
     </div>
   )
 }

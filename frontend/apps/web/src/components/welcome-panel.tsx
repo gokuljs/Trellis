@@ -46,7 +46,7 @@ export function WelcomePanel({ activeView, activeSessionTitle }: WelcomePanelPro
       <div className="utility-panel compact">
         <div className="utility-kicker">SESSION</div>
         <h1>{activeSessionTitle ?? "New session"}</h1>
-        <p>This workspace is ready for the next piece of work.</p>
+        <p>Trellis is ready for the next piece of work.</p>
       </div>
     )
   }
