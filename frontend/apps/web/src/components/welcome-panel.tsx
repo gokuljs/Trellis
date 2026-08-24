@@ -53,8 +53,9 @@ export function WelcomePanel({ activeView, activeSessionTitle }: WelcomePanelPro
 
   return (
     <div className="welcome-panel">
+      <div className="welcome-kicker">A workspace for ideas in motion</div>
       <div className="wordmark" aria-label="Trellis">Trellis</div>
-      <p className="welcome-copy">Drop a file path, a traceback, or a rough idea. I&apos;ll investigate, suggest next steps, and<br className="desktop-break" /> keep things reversible.</p>
+      <p className="welcome-copy">Bring a question, a file, or a rough idea. Trellis helps you find the next clear step.</p>
     </div>
   )
 }
