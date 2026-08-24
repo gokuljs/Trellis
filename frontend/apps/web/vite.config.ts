@@ -17,6 +17,8 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      "@trellis/ui/globals.css": path.resolve(__dirname, "../../packages/ui/src/styles/globals.css"),
+      "@trellis/ui": path.resolve(__dirname, "../../packages/ui/src"),
     },
   },
 })
