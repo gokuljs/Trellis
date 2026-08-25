@@ -1545,7 +1545,7 @@ html.theme-ripple-fallback::before {
   --toast-signal: var(--shell-blue);
 
   min-height: 64px;
-  align-items: flex-start;
+  align-items: center;
   gap: 11px;
   border: 1px solid var(--shell-line);
   border-left: 3px solid var(--toast-signal);
@@ -1599,17 +1599,19 @@ html.theme-ripple-fallback::before {
   --toast-signal: var(--chart-3);
 }
 
-.trellis-toast [data-icon].trellis-toast-icon {
+.trellis-toast[data-sonner-toast][data-styled="true"]
+  [data-icon].trellis-toast-icon {
   display: grid;
-  width: 28px;
-  height: 28px;
-  flex: 0 0 28px;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
   place-items: center;
-  margin: 1px 0 0;
-  border: 1px solid color-mix(in srgb, var(--toast-signal) 38%, transparent);
-  border-radius: 3px;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
   color: var(--toast-signal);
-  background: color-mix(in srgb, var(--toast-signal) 9%, transparent);
+  background: transparent;
+  line-height: 0;
 }
 
 .trellis-toast .trellis-toast-content {

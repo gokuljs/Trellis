@@ -10,6 +10,7 @@ import userEvent from "@testing-library/user-event"
 import { toast } from "sonner"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
+import "@trellis/ui/globals.css"
 import { App } from "@/App"
 import { ThemeProvider } from "@/components/theme-provider"
 
@@ -604,6 +605,13 @@ describe("local-first chat", () => {
         "Profile saved"
       )
     ).toBeInTheDocument()
+    const profileToast = screen
+      .getByText("Profile saved")
+      .closest("[data-sonner-toast]")
+    expect(profileToast).not.toBeNull()
+    expect(getComputedStyle(profileToast!).alignItems).toBe("center")
+    const profileIcon = profileToast!.querySelector("[data-icon]")
+    expect(profileIcon).not.toBeNull()
     expect(screen.queryByText("Saved locally.")).not.toBeInTheDocument()
 
     const keyInput = screen.getByLabelText("OpenAI API key")
