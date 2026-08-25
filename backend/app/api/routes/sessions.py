@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
-from app.api.dependencies import ChatServiceDep, DatabaseDep
+from app.api.dependencies import ChatServiceDep, SessionServiceDep
 from app.domain.models import Message, Session
 
 
@@ -67,24 +67,23 @@ def serialize_message(message: Message) -> MessageResponse:
 
 
 @router.get("")
-async def list_sessions(database: DatabaseDep) -> list[SessionResponse]:
-    return [serialize_session(session) for session in await database.list_sessions()]
+async def list_sessions(service: SessionServiceDep) -> list[SessionResponse]:
+    return [serialize_session(session) for session in await service.list_sessions()]
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-async def create_session(database: DatabaseDep) -> SessionResponse:
-    return serialize_session(await database.create_session())
+async def create_session(service: SessionServiceDep) -> SessionResponse:
+    return serialize_session(await service.create())
 
 
 @router.get("/{session_id}")
-async def get_session(session_id: str, database: DatabaseDep) -> SessionDetailResponse:
-    session = await database.get_session(session_id)
-    if session is None:
+async def get_session(session_id: str, service: SessionServiceDep) -> SessionDetailResponse:
+    detail = await service.get(session_id)
+    if detail is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    messages = await database.list_messages(session_id)
     return SessionDetailResponse(
-        session=serialize_session(session),
-        messages=[serialize_message(message) for message in messages],
+        session=serialize_session(detail.session),
+        messages=[serialize_message(message) for message in detail.messages],
     )
 
 

@@ -1,13 +1,8 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel, SecretStr
 
-from app.api.dependencies import DatabaseDep, SecretStoreDep
-from app.domain.models import ProviderName
-
-PROVIDERS: dict[ProviderName, tuple[str, str]] = {
-    "openai": ("OpenAI", "gpt-5.5"),
-    "anthropic": ("Anthropic", "claude-sonnet-5"),
-}
+from app.api.dependencies import SettingsServiceDep
+from app.domain.models import AppSettings, ProviderName
 
 
 class ProviderStatus(BaseModel):
@@ -34,59 +29,48 @@ class ApiKeyUpdate(BaseModel):
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 
-async def build_settings(database: DatabaseDep, secret_store: SecretStoreDep) -> SettingsResponse:
-    statuses: list[ProviderStatus] = []
-    for provider, (name, model) in PROVIDERS.items():
-        configured, key_hint = await secret_store.status(provider)
-        statuses.append(
-            ProviderStatus(
-                id=provider,
-                name=name,
-                model=model,
-                configured=configured,
-                key_hint=key_hint,
-            )
-        )
+def serialize_settings(settings: AppSettings) -> SettingsResponse:
     return SettingsResponse(
-        selected_provider=await database.get_selected_provider(),
-        providers=statuses,
+        selected_provider=settings.selected_provider,
+        providers=[
+            ProviderStatus(
+                id=provider.id,
+                name=provider.name,
+                model=provider.model,
+                configured=provider.configured,
+                key_hint=provider.key_hint,
+            )
+            for provider in settings.providers
+        ],
     )
 
 
 @router.get("")
-async def get_settings(database: DatabaseDep, secret_store: SecretStoreDep) -> SettingsResponse:
-    return await build_settings(database, secret_store)
+async def get_settings(service: SettingsServiceDep) -> SettingsResponse:
+    return serialize_settings(await service.get())
 
 
 @router.put("/provider")
 async def select_provider(
     payload: ProviderSelection,
-    database: DatabaseDep,
-    secret_store: SecretStoreDep,
+    service: SettingsServiceDep,
 ) -> SettingsResponse:
-    await database.set_selected_provider(payload.provider)
-    return await build_settings(database, secret_store)
+    return serialize_settings(await service.select_provider(payload.provider))
 
 
 @router.put("/providers/{provider}/api-key")
 async def update_api_key(
     provider: ProviderName,
     payload: ApiKeyUpdate,
-    database: DatabaseDep,
-    secret_store: SecretStoreDep,
+    service: SettingsServiceDep,
 ) -> SettingsResponse:
     api_key = payload.api_key.get_secret_value()
-    if not api_key or len(api_key) > 10_000:
-        raise HTTPException(status_code=422, detail="API key must contain 1 to 10,000 characters")
-    await secret_store.set(provider, api_key)
-    return await build_settings(database, secret_store)
+    return serialize_settings(await service.save_api_key(provider, api_key))
 
 
 @router.delete("/providers/{provider}/api-key")
 async def delete_api_key(
     provider: ProviderName,
-    database: DatabaseDep,
-    secret_store: SecretStoreDep,
+    service: SettingsServiceDep,
 ) -> SettingsResponse:
-    await secret_store.delete(provider)
-    return await build_settings(database, secret_store)
+    return serialize_settings(await service.remove_api_key(provider))

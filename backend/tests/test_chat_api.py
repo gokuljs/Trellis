@@ -264,6 +264,27 @@ def test_missing_provider_key_does_not_persist_user_message(tmp_path: Path) -> N
     assert provider.calls == []
 
 
+def test_whitespace_only_message_is_rejected_without_persistence(tmp_path: Path) -> None:
+    provider = RecordingProvider()
+
+    with configured_client(tmp_path, provider) as client:
+        client.put(
+            "/api/settings/providers/openai/api-key",
+            json={"api_key": "sk-local-test"},
+        )
+        session_id = client.post("/api/sessions").json()["id"]
+        response = client.post(
+            f"/api/sessions/{session_id}/turns",
+            json={"turn_id": str(uuid4()), "content": "   \n\t "},
+        )
+        detail = client.get(f"/api/sessions/{session_id}")
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "message_empty"
+    assert detail.json()["messages"] == []
+    assert provider.calls == []
+
+
 @pytest.mark.parametrize(
     ("error_code", "expected_status"),
     [
@@ -338,6 +359,44 @@ def test_second_concurrent_turn_for_same_session_is_rejected(tmp_path: Path) -> 
             second = client.post(
                 f"/api/sessions/{session_id}/turns",
                 json={"turn_id": str(uuid4()), "content": "Second"},
+            )
+            provider.release.set()
+            first = first_future.result(timeout=2)
+
+    assert first.status_code == 201
+    assert second.status_code == 409
+    assert second.json()["error"]["code"] == "turn_in_progress"
+
+
+def test_turn_claim_is_shared_across_application_instances(tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    provider = BlockingProvider()
+    first_app = create_app(
+        Settings(environment="test", data_dir=tmp_path),
+        provider_adapters={"openai": provider},
+    )
+    second_app = create_app(
+        Settings(environment="test", data_dir=tmp_path),
+        provider_adapters={"openai": RecordingProvider()},
+    )
+
+    with TestClient(first_app) as first_client, TestClient(second_app) as second_client:
+        first_client.put(
+            "/api/settings/providers/openai/api-key",
+            json={"api_key": "sk-local-test"},
+        )
+        session_id = first_client.post("/api/sessions").json()["id"]
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            first_future = executor.submit(
+                first_client.post,
+                f"/api/sessions/{session_id}/turns",
+                json={"turn_id": str(uuid4()), "content": "First process"},
+            )
+            assert provider.started.wait(timeout=2)
+            second = second_client.post(
+                f"/api/sessions/{session_id}/turns",
+                json={"turn_id": str(uuid4()), "content": "Second process"},
             )
             provider.release.set()
             first = first_future.result(timeout=2)

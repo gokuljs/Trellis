@@ -1,5 +1,5 @@
 import { Menu } from "lucide-react"
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 
 import { ChatThread } from "@/components/chat-thread"
 import { Composer } from "@/components/composer"
@@ -32,6 +32,19 @@ function moveSessionToTop(sessions: Session[], next: Session) {
   return [next, ...sessions.filter((session) => session.id !== next.id)]
 }
 
+function retryFromTranscript(
+  sessionId: string,
+  messages: Message[]
+): FailedTurn | null {
+  const lastMessage = messages.at(-1)
+  if (!lastMessage || lastMessage.role !== "user") return null
+  return {
+    sessionId,
+    turnId: lastMessage.turn_id,
+    content: lastMessage.content,
+  }
+}
+
 export function AppShell() {
   const [activeView, setActiveView] = useState<WorkspaceView>("New session")
   const [sidebarOpen, setSidebarOpen] = useState(false)
@@ -43,9 +56,13 @@ export function AppShell() {
   const [activeSession, setActiveSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState(true)
+  const [sessionLoading, setSessionLoading] = useState(false)
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [failedTurn, setFailedTurn] = useState<FailedTurn | null>(null)
+  const activeSessionIdRef = useRef<string | null>(null)
+  const sessionLoadSequenceRef = useRef(0)
+  const submissionLockRef = useRef(false)
 
   useEffect(() => {
     let cancelled = false
@@ -66,8 +83,17 @@ export function AppShell() {
         if (restoredSessions[0]) {
           const detail = await api.getSession(restoredSessions[0].id)
           if (cancelled) return
+          const restoredRetry = retryFromTranscript(
+            detail.session.id,
+            detail.messages
+          )
+          activeSessionIdRef.current = detail.session.id
           setActiveSession(detail.session)
           setMessages(detail.messages)
+          setFailedTurn(restoredRetry)
+          if (restoredRetry) {
+            setError("The previous assistant response did not complete.")
+          }
           setActiveView("session")
         }
       } catch (restoreError) {
@@ -84,9 +110,12 @@ export function AppShell() {
   }, [])
 
   const startNewSession = useCallback(() => {
+    sessionLoadSequenceRef.current += 1
+    activeSessionIdRef.current = null
     setComposerValue("")
     setActiveSession(null)
     setMessages([])
+    setSessionLoading(false)
     setFailedTurn(null)
     setError(null)
     setActiveView("New session")
@@ -105,16 +134,41 @@ export function AppShell() {
 
   const selectSession = async (sessionId: string) => {
     if (pending) return
+    const loadSequence = sessionLoadSequenceRef.current + 1
+    sessionLoadSequenceRef.current = loadSequence
+    activeSessionIdRef.current = sessionId
     setSidebarOpen(false)
     setActiveView("session")
+    setActiveSession(
+      sessions.find((session) => session.id === sessionId) ?? null
+    )
+    setMessages([])
+    setSessionLoading(true)
     setError(null)
     setFailedTurn(null)
     try {
       const detail = await api.getSession(sessionId)
+      if (
+        sessionLoadSequenceRef.current !== loadSequence ||
+        activeSessionIdRef.current !== sessionId
+      ) {
+        return
+      }
+      const recoveredRetry = retryFromTranscript(sessionId, detail.messages)
       setActiveSession(detail.session)
       setMessages(detail.messages)
+      setFailedTurn(recoveredRetry)
+      if (recoveredRetry) {
+        setError("The previous assistant response did not complete.")
+      }
     } catch (sessionError) {
-      setError(visibleError(sessionError))
+      if (sessionLoadSequenceRef.current === loadSequence) {
+        setError(visibleError(sessionError))
+      }
+    } finally {
+      if (sessionLoadSequenceRef.current === loadSequence) {
+        setSessionLoading(false)
+      }
     }
   }
 
@@ -127,7 +181,6 @@ export function AppShell() {
   }
 
   const completeTurn = async (turn: FailedTurn, optimistic: boolean) => {
-    setPending(true)
     setError(null)
     if (optimistic) {
       setMessages((current) => [
@@ -150,23 +203,29 @@ export function AppShell() {
         turn.turnId,
         turn.content
       )
-      setActiveSession(result.session)
-      setMessages((current) => [
-        ...current.filter((message) => message.turn_id !== turn.turnId),
-        result.user_message,
-        result.assistant_message,
-      ])
       setSessions((current) => moveSessionToTop(current, result.session))
-      setFailedTurn(null)
-      setComposerValue("")
+      if (activeSessionIdRef.current === turn.sessionId) {
+        setActiveSession(result.session)
+        setMessages((current) => [
+          ...current.filter((message) => message.turn_id !== turn.turnId),
+          result.user_message,
+          result.assistant_message,
+        ])
+        setFailedTurn(null)
+        setComposerValue("")
+      }
     } catch (turnError) {
-      setError(visibleError(turnError))
-      setFailedTurn(turn)
+      if (activeSessionIdRef.current === turn.sessionId) {
+        setError(visibleError(turnError))
+        setFailedTurn(turn)
+      }
       try {
         const detail = await api.getSession(turn.sessionId)
-        setActiveSession(detail.session)
-        setMessages(detail.messages)
         setSessions((current) => moveSessionToTop(current, detail.session))
+        if (activeSessionIdRef.current === turn.sessionId) {
+          setActiveSession(detail.session)
+          setMessages(detail.messages)
+        }
       } catch {
         // Keep the optimistic user message if the local transcript cannot be refreshed.
       }
@@ -174,16 +233,17 @@ export function AppShell() {
         turnError instanceof ApiError &&
         turnError.code === "provider_not_configured"
       ) {
-        setComposerValue(turn.content)
+        if (activeSessionIdRef.current === turn.sessionId) {
+          setComposerValue(turn.content)
+        }
       }
-    } finally {
-      setPending(false)
     }
   }
 
   const submitComposer = async () => {
     const content = composerValue.trim()
-    if (!content || pending) return
+    if (!content || pending || sessionLoading || submissionLockRef.current)
+      return
     const provider = settings?.providers.find(
       (item) => item.id === settings.selected_provider
     )
@@ -196,12 +256,16 @@ export function AppShell() {
       return
     }
 
+    submissionLockRef.current = true
+    setPending(true)
     setComposerValue("")
     try {
       let session = activeSession
       if (!session) {
         const createdSession = await api.createSession()
         session = createdSession
+        sessionLoadSequenceRef.current += 1
+        activeSessionIdRef.current = createdSession.id
         setActiveSession(createdSession)
         setSessions((current) => moveSessionToTop(current, createdSession))
         setActiveView("session")
@@ -217,6 +281,21 @@ export function AppShell() {
     } catch (submitError) {
       setComposerValue(content)
       setError(visibleError(submitError))
+    } finally {
+      submissionLockRef.current = false
+      setPending(false)
+    }
+  }
+
+  const retryFailedTurn = async () => {
+    if (!failedTurn || pending || submissionLockRef.current) return
+    submissionLockRef.current = true
+    setPending(true)
+    try {
+      await completeTurn(failedTurn, false)
+    } finally {
+      submissionLockRef.current = false
+      setPending(false)
     }
   }
 
@@ -282,9 +361,7 @@ export function AppShell() {
               pending={pending}
               error={error}
               canRetry={failedTurn !== null && !pending}
-              onRetry={() => {
-                if (failedTurn) void completeTurn(failedTurn, false)
-              }}
+              onRetry={() => void retryFailedTurn()}
             />
           ) : (
             <div className="welcome-state">
@@ -308,7 +385,7 @@ export function AppShell() {
             }
             onChange={setComposerValue}
             onSubmit={() => void submitComposer()}
-            disabled={pending}
+            disabled={pending || sessionLoading}
             modelLabel={modelLabel}
           />
         ) : null}

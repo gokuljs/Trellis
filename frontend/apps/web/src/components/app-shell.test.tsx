@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   render,
   screen,
@@ -170,8 +171,79 @@ describe("local-first chat", () => {
     )
   })
 
+  it("ignores a stale session response after a newer session is selected", async () => {
+    const olderGate = deferred<void>()
+    let recentLoads = 0
+    const fetchMock = startupFetch((url) => {
+      if (url === "/api/sessions")
+        return response([recentSession, olderSession])
+      if (url === "/api/sessions/session-recent") {
+        recentLoads += 1
+        return response({
+          session: recentSession,
+          messages: [
+            {
+              id: "recent-message",
+              turn_id: "recent-turn",
+              role: "assistant",
+              content: "Current session content",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-08-25T10:00:01Z",
+            },
+          ],
+        })
+      }
+      if (url === "/api/sessions/session-older") {
+        return olderGate.promise.then(() =>
+          response({
+            session: olderSession,
+            messages: [
+              {
+                id: "stale-message",
+                turn_id: "stale-turn",
+                role: "user",
+                content: "Stale session content",
+                provider: null,
+                model: null,
+                created_at: "2026-07-20T10:00:00Z",
+              },
+            ],
+          })
+        )
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    renderApp()
+    expect(
+      await screen.findByText("Current session content")
+    ).toBeInTheDocument()
+    await userEvent.click(screen.getByRole("button", { name: "Earlier notes" }))
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/sessions/session-older",
+        expect.anything()
+      )
+    )
+    await userEvent.click(
+      screen.getByRole("button", { name: "Persisted conversation" })
+    )
+    await waitFor(() => expect(recentLoads).toBe(2))
+
+    await act(async () => {
+      olderGate.resolve()
+      await olderGate.promise
+    })
+
+    expect(screen.getByText("Current session content")).toBeInTheDocument()
+    expect(screen.queryByText("Stale session content")).not.toBeInTheDocument()
+  })
+
   it("keeps a new session local until first send, then persists the turn", async () => {
     const calls: Array<{ url: string; method: string; body?: string }> = []
+    const createGate = deferred<void>()
     const turnGate = deferred<void>()
     const created = {
       ...recentSession,
@@ -184,7 +256,7 @@ describe("local-first chat", () => {
       if (method !== "GET")
         calls.push({ url, method, body: String(init?.body ?? "") })
       if (url === "/api/sessions" && method === "POST")
-        return response(created, 201)
+        return createGate.promise.then(() => response(created, 201))
       if (url === "/api/sessions/session-created/turns" && method === "POST") {
         const submitted = JSON.parse(String(init?.body)) as {
           turn_id: string
@@ -235,6 +307,11 @@ describe("local-first chat", () => {
     )
     await user.click(screen.getByRole("button", { name: "Send" }))
 
+    await waitFor(() => expect(calls).toHaveLength(1))
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeDisabled()
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled()
+
+    createGate.resolve()
     expect(
       await screen.findByLabelText("Assistant response pending")
     ).toBeInTheDocument()
@@ -383,6 +460,74 @@ describe("local-first chat", () => {
 
     expect(await screen.findByText("Recovered response")).toBeInTheDocument()
     expect(attempts).toBe(2)
+  })
+
+  it("reconstructs a same-ID retry from an unmatched persisted user message", async () => {
+    const persistedTurnId = "e49ea024-e340-4c85-a7a6-f8c8459a9811"
+    const fetchMock = startupFetch((url, init) => {
+      const method = init?.method ?? "GET"
+      if (url === "/api/sessions") return response([recentSession])
+      if (url === "/api/sessions/session-recent" && method === "GET") {
+        return response({
+          session: { ...recentSession, message_count: 1 },
+          messages: [
+            {
+              id: "persisted-user",
+              turn_id: persistedTurnId,
+              role: "user",
+              content: "Recover after restart",
+              provider: null,
+              model: null,
+              created_at: "2026-08-25T10:00:00Z",
+            },
+          ],
+        })
+      }
+      if (url === "/api/sessions/session-recent/turns" && method === "POST") {
+        const submitted = JSON.parse(String(init?.body)) as {
+          turn_id: string
+          content: string
+        }
+        expect(submitted).toEqual({
+          turn_id: persistedTurnId,
+          content: "Recover after restart",
+        })
+        return response(
+          {
+            session: recentSession,
+            user_message: {
+              id: "persisted-user",
+              turn_id: submitted.turn_id,
+              role: "user",
+              content: submitted.content,
+              provider: null,
+              model: null,
+              created_at: "2026-08-25T10:00:00Z",
+            },
+            assistant_message: {
+              id: "recovered-assistant",
+              turn_id: submitted.turn_id,
+              role: "assistant",
+              content: "Recovered after restart",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-08-25T10:00:01Z",
+            },
+          },
+          201
+        )
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    renderApp()
+    expect(await screen.findByText("Recover after restart")).toBeInTheDocument()
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }))
+
+    expect(
+      await screen.findByText("Recovered after restart")
+    ).toBeInTheDocument()
   })
 
   it("edits the local profile and treats provider keys as write-only", async () => {

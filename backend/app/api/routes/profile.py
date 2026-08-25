@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from pydantic import BaseModel, EmailStr, Field
 
-from app.api.dependencies import DatabaseDep
+from app.api.dependencies import ProfileServiceDep
 
 
 class ProfileResponse(BaseModel):
@@ -21,8 +21,8 @@ router = APIRouter(prefix="/api/profile", tags=["profile"])
 
 
 @router.get("")
-async def get_profile(database: DatabaseDep) -> ProfileResponse:
-    profile = await database.get_profile()
+async def get_profile(service: ProfileServiceDep) -> ProfileResponse:
+    profile = await service.get()
     return ProfileResponse(
         id=profile.id,
         display_name=profile.display_name,
@@ -33,10 +33,9 @@ async def get_profile(database: DatabaseDep) -> ProfileResponse:
 
 
 @router.put("")
-async def update_profile(payload: ProfileUpdate, database: DatabaseDep) -> ProfileResponse:
-    display_name = payload.display_name.strip() if payload.display_name else None
-    profile = await database.update_profile(
-        display_name=display_name or None,
+async def update_profile(payload: ProfileUpdate, service: ProfileServiceDep) -> ProfileResponse:
+    profile = await service.update(
+        display_name=payload.display_name,
         email=str(payload.email) if payload.email else None,
     )
     return ProfileResponse(

@@ -1,7 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -9,7 +9,15 @@ import aiosqlite
 
 from app.domain.models import Message, ProviderName, Session, UserProfile
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+TURN_CLAIM_TTL = timedelta(minutes=5)
+
+MIGRATION_TABLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+"""
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -60,6 +68,19 @@ CREATE INDEX IF NOT EXISTS idx_messages_session_ordinal
 ON messages(session_id, ordinal);
 """
 
+SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS turn_claims (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL,
+    claimed_at TEXT NOT NULL
+);
+"""
+
+MIGRATIONS = {
+    1: SCHEMA_V1,
+    2: SCHEMA_V2,
+}
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -72,12 +93,29 @@ class Database:
     async def initialize(self) -> None:
         await asyncio.to_thread(self._prepare_parent_directory)
         async with self._connect() as connection:
-            await connection.executescript(SCHEMA_V1)
-            now = utc_now()
-            await connection.execute(
-                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                (SCHEMA_VERSION, now),
+            await connection.executescript(MIGRATION_TABLE_SCHEMA)
+            cursor = await connection.execute(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
             )
+            row = await cursor.fetchone()
+            current_version = 0 if row is None else int(row[0])
+            if current_version > SCHEMA_VERSION:
+                raise RuntimeError(
+                    "This database was created by a newer Trellis version. "
+                    "Update Trellis to open it."
+                )
+            for version in range(current_version + 1, SCHEMA_VERSION + 1):
+                migration = MIGRATIONS[version]
+                await connection.executescript(
+                    f"""
+                    BEGIN IMMEDIATE;
+                    {migration}
+                    INSERT INTO schema_migrations(version, applied_at)
+                    VALUES ({version}, STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'));
+                    COMMIT;
+                    """
+                )
+            now = utc_now()
             await connection.execute(
                 """
                 INSERT INTO users(id, display_name, email, created_at, updated_at)
@@ -222,6 +260,34 @@ class Database:
             )
             rows = await cursor.fetchall()
         return [self._message_from_row(row) for row in rows]
+
+    async def claim_turn(self, session_id: str, turn_id: str) -> bool:
+        claimed_at = utc_now()
+        expires_before = (datetime.now(UTC) - TURN_CLAIM_TTL).isoformat().replace("+00:00", "Z")
+        async with self._connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            await connection.execute(
+                "DELETE FROM turn_claims WHERE claimed_at <= ?",
+                (expires_before,),
+            )
+            try:
+                await connection.execute(
+                    "INSERT INTO turn_claims(session_id, turn_id, claimed_at) VALUES (?, ?, ?)",
+                    (session_id, turn_id, claimed_at),
+                )
+            except aiosqlite.IntegrityError:
+                await connection.commit()
+                return False
+            await connection.commit()
+        return True
+
+    async def release_turn(self, session_id: str, turn_id: str) -> None:
+        async with self._connect() as connection:
+            await connection.execute(
+                "DELETE FROM turn_claims WHERE session_id = ? AND turn_id = ?",
+                (session_id, turn_id),
+            )
+            await connection.commit()
 
     async def add_user_message(self, session_id: str, turn_id: str, content: str) -> Message:
         now = utc_now()

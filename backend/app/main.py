@@ -6,8 +6,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.api import router
-from app.application.chat import ChatService, ProviderAdapter
+from app.application.chat import ChatService
 from app.application.errors import ApplicationError
+from app.application.ports import ProviderAdapter
+from app.application.profile import ProfileService
+from app.application.sessions import SessionService
+from app.application.settings import SettingsService
 from app.core.config import Settings
 from app.domain.models import ProviderName
 from app.infrastructure.database import Database
@@ -25,6 +29,8 @@ ERROR_STATUS = {
     "provider_upstream_failed": 502,
     "turn_conflict": 409,
     "turn_in_progress": 409,
+    "message_empty": 422,
+    "invalid_api_key": 422,
 }
 
 
@@ -41,6 +47,9 @@ def create_app(
         application.state.database = database
         secret_store = SecretStore(resolved_settings.secrets_path)
         application.state.secret_store = secret_store
+        application.state.profile_service = ProfileService(database)
+        application.state.session_service = SessionService(database)
+        application.state.settings_service = SettingsService(database, secret_store)
         timeout = httpx.Timeout(connect=10, read=120, write=30, pool=10)
         async with httpx.AsyncClient(timeout=timeout) as http_client:
             if provider_adapters is None:

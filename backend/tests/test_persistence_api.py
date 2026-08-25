@@ -1,12 +1,16 @@
+import asyncio
 import sqlite3
 import stat
 from contextlib import closing
 from pathlib import Path
 from uuid import UUID
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
+from app.infrastructure.database import Database
+from app.infrastructure.secrets import SecretStore
 from app.main import create_app
 
 
@@ -125,6 +129,25 @@ def test_provider_selection_and_key_removal_are_persistent(tmp_path: Path) -> No
     assert anthropic["key_hint"] is None
 
 
+def test_concurrent_secret_updates_preserve_both_provider_keys(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    first_store = SecretStore(settings.secrets_path)
+    second_store = SecretStore(settings.secrets_path)
+
+    async def update_both() -> tuple[str | None, str | None]:
+        await asyncio.gather(
+            first_store.set("openai", "sk-openai-concurrent"),
+            second_store.set("anthropic", "sk-anthropic-concurrent"),
+        )
+        return await first_store.get("openai"), await second_store.get("anthropic")
+
+    assert asyncio.run(update_both()) == (
+        "sk-openai-concurrent",
+        "sk-anthropic-concurrent",
+    )
+    assert not list(tmp_path.glob(".env.*.tmp"))
+
+
 def test_sessions_are_listed_by_recent_activity_and_survive_restart(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
 
@@ -146,7 +169,7 @@ def test_sessions_are_listed_by_recent_activity_and_survive_restart(tmp_path: Pa
     assert detail.json()["session"]["message_count"] == 0
 
 
-def test_database_records_the_initial_schema_migration(tmp_path: Path) -> None:
+def test_database_records_all_schema_migrations(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
 
     with TestClient(create_app(settings)):
@@ -157,4 +180,41 @@ def test_database_records_the_initial_schema_migration(tmp_path: Path) -> None:
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
 
-    assert versions == [(1,)]
+    assert versions == [(1,), (2,)]
+
+
+def test_database_upgrades_an_existing_v1_schema(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    with TestClient(create_app(settings)):
+        pass
+
+    with closing(sqlite3.connect(settings.database_path)) as connection:
+        connection.execute("DROP TABLE turn_claims")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 2")
+        connection.commit()
+
+    asyncio.run(Database(settings.database_path).initialize())
+
+    with closing(sqlite3.connect(settings.database_path)) as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        claim_table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'turn_claims'"
+        ).fetchone()
+
+    assert versions == [(1,), (2,)]
+    assert claim_table == ("turn_claims",)
+
+
+def test_database_rejects_a_schema_from_a_newer_trellis_version(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    asyncio.run(Database(settings.database_path).initialize())
+    with closing(sqlite3.connect(settings.database_path)) as connection:
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (999, 'future')"
+        )
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="newer Trellis version"):
+        asyncio.run(Database(settings.database_path).initialize())

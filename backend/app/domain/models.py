@@ -42,3 +42,24 @@ class TurnResult:
     session: Session
     user_message: Message
     assistant_message: Message
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderStatus:
+    id: ProviderName
+    name: str
+    model: str
+    configured: bool
+    key_hint: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AppSettings:
+    selected_provider: ProviderName
+    providers: list[ProviderStatus]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionDetail:
+    session: Session
+    messages: list[Message]

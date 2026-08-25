@@ -1,38 +1,21 @@
-import asyncio
 from collections.abc import Mapping, Sequence
-from typing import Protocol
 
 from app.application.errors import ApplicationError
+from app.application.ports import ChatRepository, ProviderAdapter, SecretStorePort
 from app.domain.models import Message, ProviderName, Session, TurnResult
-from app.infrastructure.database import Database
 from app.infrastructure.providers import ProviderError
-from app.infrastructure.secrets import SecretStore
-
-
-class ProviderAdapter(Protocol):
-    name: ProviderName
-    model: str
-
-    async def complete(
-        self,
-        messages: Sequence[Message],
-        api_key: str,
-        user_id: str,
-    ) -> str: ...
 
 
 class ChatService:
     def __init__(
         self,
-        database: Database,
-        secret_store: SecretStore,
+        database: ChatRepository,
+        secret_store: SecretStorePort,
         providers: Mapping[ProviderName, ProviderAdapter],
     ) -> None:
         self._database = database
         self._secret_store = secret_store
         self._providers = providers
-        self._active_sessions: set[str] = set()
-        self._active_sessions_lock = asyncio.Lock()
 
     async def complete_turn(self, session_id: str, turn_id: str, content: str) -> TurnResult:
         session = await self._database.get_session(session_id)
@@ -40,12 +23,18 @@ class ChatService:
             raise ApplicationError("session_not_found", "Session not found")
 
         normalized_content = content.strip()
+        if not normalized_content:
+            raise ApplicationError("message_empty", "Message content cannot be empty")
         existing = await self._database.get_turn_messages(session_id, turn_id)
         completed = self._resolve_existing(existing, normalized_content)
         if completed is not None:
             return TurnResult(session=session, **completed)
 
-        await self._claim_session(session_id)
+        if not await self._database.claim_turn(session_id, turn_id):
+            raise ApplicationError(
+                "turn_in_progress",
+                "Another turn is already in progress for this session.",
+            )
         try:
             existing = await self._database.get_turn_messages(session_id, turn_id)
             completed = self._resolve_existing(existing, normalized_content)
@@ -101,7 +90,7 @@ class ChatService:
                 assistant_message=assistant_message,
             )
         finally:
-            await self._release_session(session_id)
+            await self._database.release_turn(session_id, turn_id)
 
     @staticmethod
     def _resolve_existing(messages: Sequence[Message], content: str) -> dict[str, Message] | None:
@@ -116,19 +105,6 @@ class ChatService:
         if len(messages) == 2:
             return {"user_message": user_message, "assistant_message": messages[1]}
         return None
-
-    async def _claim_session(self, session_id: str) -> None:
-        async with self._active_sessions_lock:
-            if session_id in self._active_sessions:
-                raise ApplicationError(
-                    "turn_in_progress",
-                    "Another turn is already in progress for this session.",
-                )
-            self._active_sessions.add(session_id)
-
-    async def _release_session(self, session_id: str) -> None:
-        async with self._active_sessions_lock:
-            self._active_sessions.discard(session_id)
 
     async def _require_session(self, session_id: str) -> Session:
         session = await self._database.get_session(session_id)
