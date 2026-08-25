@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trellis Runtime"
+  short_description: "Develop Trellis agent runtime safely"
+  default_prompt: "Use $develop-trellis-runtime to design or implement this Trellis runtime change."

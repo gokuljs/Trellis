@@ -3,6 +3,7 @@ import { Menu } from "lucide-react"
 
 import { Composer } from "@/components/composer"
 import { Sidebar } from "@/components/sidebar"
+import { SettingsPage } from "@/components/settings-page"
 import { WelcomePanel } from "@/components/welcome-panel"
 import { WorkspaceTopbar } from "@/components/workspace-topbar"
 import { INITIAL_SESSIONS } from "@/lib/app-data"
@@ -14,12 +15,14 @@ export function AppShell() {
   const [composerValue, setComposerValue] = useState("")
   const [sessions, setSessions] = useState<Session[]>(INITIAL_SESSIONS)
   const [activeSessionTitle, setActiveSessionTitle] = useState<string | null>(null)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
 
   const startNewSession = () => {
     setComposerValue("")
     setActiveSessionTitle(null)
     setActiveView("New session")
     setSidebarOpen(false)
+    setSidebarCollapsed(false)
   }
 
   const handleNavigate = (view: WorkspaceView) => {
@@ -30,6 +33,15 @@ export function AppShell() {
 
     setActiveView(view)
     setSidebarOpen(false)
+  }
+
+  const toggleSidebar = () => {
+    if (window.innerWidth <= 760) {
+      setSidebarOpen(false)
+      return
+    }
+
+    setSidebarCollapsed((collapsed) => !collapsed)
   }
 
   const submitComposer = () => {
@@ -47,33 +59,55 @@ export function AppShell() {
 
   return (
     <main className="app-shell">
-      <button className="mobile-menu" aria-label="Open navigation" onClick={() => setSidebarOpen(true)}>
-        <Menu size={17} />
+      <button
+        className={`mobile-menu ${sidebarCollapsed ? "sidebar-restorer" : ""}`}
+        aria-label="Open navigation"
+        onClick={() => {
+          if (window.innerWidth <= 760) {
+            setSidebarOpen(true)
+          } else {
+            setSidebarCollapsed(false)
+          }
+        }}
+      >
+        <Menu size={17} aria-hidden="true" />
       </button>
 
-      <div className={`sidebar-overlay ${sidebarOpen ? "visible" : ""}`} onClick={() => setSidebarOpen(false)} />
-      <div className={`sidebar-container ${sidebarOpen ? "open" : ""}`}>
+      <button
+        className={`sidebar-overlay ${sidebarOpen ? "visible" : ""}`}
+        type="button"
+        aria-label="Close navigation"
+        onClick={() => setSidebarOpen(false)}
+      />
+      <div className={`sidebar-container ${sidebarOpen ? "open" : ""} ${sidebarCollapsed ? "collapsed" : ""}`}>
         <Sidebar
           activeView={activeView}
           sessions={sessions}
           onNavigate={handleNavigate}
-          onClose={() => setSidebarOpen(false)}
+          sidebarCollapsed={sidebarCollapsed}
+          onToggleSidebar={toggleSidebar}
         />
       </div>
 
       <section className="workspace">
-        <WorkspaceTopbar />
+        <WorkspaceTopbar activeView={activeView} onNavigate={handleNavigate} />
 
-        <div className="workspace-content">
-          <WelcomePanel activeView={activeView} activeSessionTitle={activeSessionTitle} />
+        <div className={`workspace-content ${activeView === "Settings" ? "settings-content" : ""}`}>
+          {activeView === "Settings" ? (
+            <SettingsPage />
+          ) : (
+            <WelcomePanel activeView={activeView} activeSessionTitle={activeSessionTitle} />
+          )}
         </div>
 
-        <Composer
-          value={composerValue}
-          placeholder={activeView === "New session" ? "What are we building?" : "Adjust or continue"}
-          onChange={setComposerValue}
-          onSubmit={submitComposer}
-        />
+        {activeView !== "Settings" ? (
+          <Composer
+            value={composerValue}
+            placeholder={activeView === "New session" ? "What are we building?" : "Adjust or continue"}
+            onChange={setComposerValue}
+            onSubmit={submitComposer}
+          />
+        ) : null}
       </section>
     </main>
   )

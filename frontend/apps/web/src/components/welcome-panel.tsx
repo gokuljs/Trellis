@@ -23,7 +23,7 @@ function CapabilityGrid() {
   return (
     <div className="capability-grid">
       {capabilityItems.map(({ label, icon: Icon }) => (
-        <div key={label}><Icon size={16} /><span>{label}</span></div>
+        <div key={label}><Icon size={16} aria-hidden="true" /><span>{label}</span></div>
       ))}
     </div>
   )
