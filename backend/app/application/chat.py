@@ -3,7 +3,7 @@ from collections.abc import Mapping, Sequence
 from typing import Protocol
 
 from app.application.errors import ApplicationError
-from app.domain.models import Message, ProviderName, TurnResult
+from app.domain.models import Message, ProviderName, Session, TurnResult
 from app.infrastructure.database import Database
 from app.infrastructure.providers import ProviderError
 from app.infrastructure.secrets import SecretStore
@@ -130,7 +130,7 @@ class ChatService:
         async with self._active_sessions_lock:
             self._active_sessions.discard(session_id)
 
-    async def _require_session(self, session_id: str):
+    async def _require_session(self, session_id: str) -> Session:
         session = await self._database.get_session(session_id)
         if session is None:
             raise ApplicationError("session_not_found", "Session not found")

@@ -35,7 +35,7 @@ class SecretStore:
 
     async def delete(self, provider: ProviderName) -> None:
         async with self._lock:
-            if not self.path.exists():
+            if not await asyncio.to_thread(self.path.exists):
                 return
             await asyncio.to_thread(unset_key, self.path, ENV_NAMES[provider])
             await asyncio.to_thread(self.path.chmod, 0o600)

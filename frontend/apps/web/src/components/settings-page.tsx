@@ -1,43 +1,174 @@
-import { Check, Eye, EyeOff, KeyRound, Sparkles } from "lucide-react"
+import { Check, Eye, EyeOff, KeyRound, Sparkles, Trash2 } from "lucide-react"
 import { useState } from "react"
 
-type ModelProvider = "OpenAI" | "Anthropic"
+import { ApiError, api } from "@/lib/api"
+import type { Profile, ProviderId, Settings } from "@/lib/app-types"
 
-const providers: Array<{
-  id: ModelProvider
-  description: string
-  model: string
-}> = [
-  { id: "OpenAI", description: "GPT-5.5 and other OpenAI models", model: "GPT-5.5" },
-  { id: "Anthropic", description: "Claude and other Anthropic models", model: "Claude Sonnet" },
-]
+type SettingsPageProps = {
+  profile: Profile
+  settings: Settings
+  onProfileChange: (profile: Profile) => void
+  onSettingsChange: (settings: Settings) => void
+}
 
-export function SettingsPage() {
-  const [provider, setProvider] = useState<ModelProvider>("OpenAI")
-  const [apiKeys, setApiKeys] = useState<Record<ModelProvider, string>>({ OpenAI: "", Anthropic: "" })
+function errorMessage(error: unknown) {
+  return error instanceof ApiError
+    ? error.message
+    : "Trellis could not save that change."
+}
+
+export function SettingsPage({
+  profile,
+  settings,
+  onProfileChange,
+  onSettingsChange,
+}: SettingsPageProps) {
+  const [displayName, setDisplayName] = useState(profile.display_name ?? "")
+  const [email, setEmail] = useState(profile.email ?? "")
+  const [apiKey, setApiKey] = useState("")
   const [showApiKey, setShowApiKey] = useState(false)
-  const selectedProvider = providers.find((item) => item.id === provider) ?? providers[0]
+  const [saving, setSaving] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const selectedProvider =
+    settings.providers.find((item) => item.id === settings.selected_provider) ??
+    settings.providers[0]
+
+  const runUpdate = async (label: string, update: () => Promise<void>) => {
+    setSaving(label)
+    setError(null)
+    setNotice(null)
+    try {
+      await update()
+      setNotice("Saved locally.")
+    } catch (updateError) {
+      setError(errorMessage(updateError))
+    } finally {
+      setSaving(null)
+    }
+  }
+
+  const selectProvider = (provider: ProviderId) => {
+    setApiKey("")
+    setShowApiKey(false)
+    void runUpdate("provider", async () => {
+      onSettingsChange(await api.selectProvider(provider))
+    })
+  }
+
+  if (!selectedProvider) return null
 
   return (
     <div className="settings-page">
       <h1 className="sr-only">Settings</h1>
       <header className="settings-header">
         <div className="utility-kicker">SETTINGS</div>
-        <p>Choose the model provider you want to work with and add its API key.</p>
+        <p>
+          Set up this local installation. Your profile and sessions stay on this
+          device.
+        </p>
+        {notice ? (
+          <div className="settings-notice" role="status">
+            {notice}
+          </div>
+        ) : null}
+        {error ? (
+          <div className="settings-error" role="alert">
+            {error}
+          </div>
+        ) : null}
       </header>
 
       <div className="settings-sections">
-        <section className="settings-section" aria-labelledby="provider-heading">
+        <section className="settings-section" aria-labelledby="profile-heading">
           <div className="settings-section-copy">
-            <div className="settings-section-label">MODEL PROVIDER</div>
-            <h2 id="provider-heading">Choose your models</h2>
-            <p>Pick the provider that should power your sessions.</p>
+            <div className="settings-section-label">LOCAL PROFILE</div>
+            <h2 id="profile-heading">Your installation</h2>
+            <p>
+              Optional details make the workspace feel familiar. The
+              installation ID identifies this local user.
+            </p>
           </div>
 
-          <div className="provider-options" role="radiogroup" aria-label="Model provider">
-            {providers.map((item) => {
-              const isSelected = item.id === provider
+          <div className="settings-form-grid">
+            <label className="settings-field">
+              <span className="settings-field-label">Display name</span>
+              <span className="settings-input-wrap">
+                <input
+                  aria-label="Display name"
+                  value={displayName}
+                  maxLength={100}
+                  onChange={(event) => setDisplayName(event.target.value)}
+                  placeholder="How should Trellis address you?"
+                />
+              </span>
+            </label>
+            <label className="settings-field">
+              <span className="settings-field-label">Email</span>
+              <span className="settings-input-wrap">
+                <input
+                  aria-label="Email"
+                  type="email"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  placeholder="you@example.com"
+                />
+              </span>
+            </label>
+            <label className="settings-field settings-field-wide">
+              <span className="settings-field-label">Installation ID</span>
+              <span className="settings-input-wrap readonly">
+                <input
+                  aria-label="Installation ID"
+                  value={profile.id}
+                  disabled
+                  readOnly
+                />
+              </span>
+              <span className="settings-field-help">
+                Stable until the Trellis data directory is removed.
+              </span>
+            </label>
+            <button
+              className="settings-save"
+              type="button"
+              disabled={saving !== null}
+              onClick={() => {
+                void runUpdate("profile", async () => {
+                  onProfileChange(
+                    await api.updateProfile({
+                      display_name: displayName.trim() || null,
+                      email: email.trim() || null,
+                    })
+                  )
+                })
+              }}
+            >
+              {saving === "profile" ? "Saving…" : "Save profile"}
+            </button>
+          </div>
+        </section>
 
+        <section
+          className="settings-section"
+          aria-labelledby="provider-heading"
+        >
+          <div className="settings-section-copy">
+            <div className="settings-section-label">MODEL PROVIDER</div>
+            <h2 id="provider-heading">Choose your model</h2>
+            <p>
+              The selected provider powers every new turn. Your choice is stored
+              locally.
+            </p>
+          </div>
+
+          <div
+            className="provider-options"
+            role="radiogroup"
+            aria-label="Model provider"
+          >
+            {settings.providers.map((item) => {
+              const isSelected = item.id === settings.selected_provider
               return (
                 <button
                   className={`provider-option ${isSelected ? "is-selected" : ""}`}
@@ -45,12 +176,19 @@ export function SettingsPage() {
                   type="button"
                   role="radio"
                   aria-checked={isSelected}
-                  onClick={() => setProvider(item.id)}
+                  disabled={saving !== null}
+                  onClick={() => selectProvider(item.id)}
                 >
-                  <span className="provider-icon"><Sparkles size={16} strokeWidth={1.7} aria-hidden="true" /></span>
+                  <span className="provider-icon">
+                    <Sparkles size={16} strokeWidth={1.7} aria-hidden="true" />
+                  </span>
                   <span className="provider-details">
-                    <span className="provider-name">{item.id}</span>
-                    <span className="provider-description">{item.description}</span>
+                    <span className="provider-name">{item.name}</span>
+                    <span className="provider-description">
+                      {item.configured
+                        ? `Key configured ${item.key_hint ?? ""}`
+                        : "API key required"}
+                    </span>
                   </span>
                   <span className="provider-model">{item.model}</span>
                   <span className="provider-check" aria-hidden="true">
@@ -65,35 +203,89 @@ export function SettingsPage() {
         <section className="settings-section" aria-labelledby="api-key-heading">
           <div className="settings-section-copy">
             <div className="settings-section-label">API KEY</div>
-            <h2 id="api-key-heading">Connect {selectedProvider.id}</h2>
-            <p>Use a key from {selectedProvider.id} to enable its models in Trellis.</p>
+            <h2 id="api-key-heading">Connect {selectedProvider.name}</h2>
+            <p>
+              Keys are stored separately from chat history in the private local
+              secrets file.
+            </p>
           </div>
 
-          <label className="settings-field">
-            <span className="settings-field-label">{selectedProvider.id} API key</span>
-            <span className="settings-input-wrap">
-              <KeyRound size={15} strokeWidth={1.7} aria-hidden="true" />
-              <input
-                type={showApiKey ? "text" : "password"}
-                value={apiKeys[selectedProvider.id]}
-                onChange={(event) => setApiKeys((current) => ({ ...current, [selectedProvider.id]: event.target.value }))}
-                placeholder={selectedProvider.id === "OpenAI" ? "sk-…" : "sk-ant-…"}
-                autoComplete="off"
-                name={`${selectedProvider.id.toLowerCase()}-api-key`}
-                spellCheck={false}
-                aria-label={`${selectedProvider.id} API key`}
-              />
+          <div className="settings-key-panel">
+            <label className="settings-field">
+              <span className="settings-field-label">
+                {selectedProvider.name} API key
+              </span>
+              <span className="settings-input-wrap">
+                <KeyRound size={15} strokeWidth={1.7} aria-hidden="true" />
+                <input
+                  type={showApiKey ? "text" : "password"}
+                  value={apiKey}
+                  onChange={(event) => setApiKey(event.target.value)}
+                  placeholder={
+                    selectedProvider.id === "openai" ? "sk-…" : "sk-ant-…"
+                  }
+                  autoComplete="new-password"
+                  name={`${selectedProvider.id}-api-key`}
+                  spellCheck={false}
+                  aria-label={`${selectedProvider.name} API key`}
+                />
+                <button
+                  className="settings-input-action"
+                  type="button"
+                  aria-label={showApiKey ? "Hide API key" : "Show API key"}
+                  onClick={() => setShowApiKey((visible) => !visible)}
+                >
+                  {showApiKey ? (
+                    <EyeOff size={15} aria-hidden="true" />
+                  ) : (
+                    <Eye size={15} aria-hidden="true" />
+                  )}
+                </button>
+              </span>
+              <span className="settings-field-help">
+                {selectedProvider.configured
+                  ? `Configured · ${selectedProvider.key_hint ?? "saved"}`
+                  : "Not configured. The key is write-only and will not be shown again."}
+              </span>
+            </label>
+            <div className="settings-actions">
               <button
-                className="settings-input-action"
+                className="settings-save"
                 type="button"
-                aria-label={showApiKey ? "Hide API key" : "Show API key"}
-                onClick={() => setShowApiKey((visible) => !visible)}
+                disabled={!apiKey.trim() || saving !== null}
+                onClick={() => {
+                  void runUpdate("key", async () => {
+                    onSettingsChange(
+                      await api.saveApiKey(selectedProvider.id, apiKey.trim())
+                    )
+                    setApiKey("")
+                    setShowApiKey(false)
+                  })
+                }}
               >
-                {showApiKey ? <EyeOff size={15} strokeWidth={1.7} aria-hidden="true" /> : <Eye size={15} strokeWidth={1.7} aria-hidden="true" />}
+                {saving === "key"
+                  ? "Saving…"
+                  : `Save ${selectedProvider.name} key`}
               </button>
-            </span>
-            <span className="settings-field-help">Your key is only held in this form for now.</span>
-          </label>
+              {selectedProvider.configured ? (
+                <button
+                  className="settings-remove"
+                  type="button"
+                  disabled={saving !== null}
+                  onClick={() => {
+                    void runUpdate("remove", async () => {
+                      onSettingsChange(
+                        await api.removeApiKey(selectedProvider.id)
+                      )
+                      setApiKey("")
+                    })
+                  }}
+                >
+                  <Trash2 size={13} aria-hidden="true" /> Remove key
+                </button>
+              ) : null}
+            </div>
+          </div>
         </section>
       </div>
     </div>

@@ -1,5 +1,5 @@
-from fastapi import APIRouter
-from pydantic import BaseModel, Field, SecretStr
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, SecretStr
 
 from app.api.dependencies import DatabaseDep, SecretStoreDep
 from app.domain.models import ProviderName
@@ -28,7 +28,7 @@ class ProviderSelection(BaseModel):
 
 
 class ApiKeyUpdate(BaseModel):
-    api_key: SecretStr = Field(min_length=1, max_length=10_000)
+    api_key: SecretStr
 
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -75,7 +75,10 @@ async def update_api_key(
     database: DatabaseDep,
     secret_store: SecretStoreDep,
 ) -> SettingsResponse:
-    await secret_store.set(provider, payload.api_key.get_secret_value())
+    api_key = payload.api_key.get_secret_value()
+    if not api_key or len(api_key) > 10_000:
+        raise HTTPException(status_code=422, detail="API key must contain 1 to 10,000 characters")
+    await secret_store.set(provider, api_key)
     return await build_settings(database, secret_store)
 
 

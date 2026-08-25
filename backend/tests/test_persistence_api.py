@@ -85,6 +85,19 @@ def test_api_keys_are_write_only_and_kept_outside_sqlite(tmp_path: Path) -> None
     assert stat.S_IMODE(settings.secrets_path.stat().st_mode) == 0o600
 
 
+def test_rejected_api_key_is_not_disclosed_in_validation_response(tmp_path: Path) -> None:
+    rejected_secret = "sk-" + ("private" * 2_000)
+
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        response = client.put(
+            "/api/settings/providers/openai/api-key",
+            json={"api_key": rejected_secret},
+        )
+
+    assert response.status_code == 422
+    assert rejected_secret not in response.text
+
+
 def test_provider_selection_and_key_removal_are_persistent(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
 
