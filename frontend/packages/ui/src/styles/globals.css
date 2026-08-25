@@ -52,6 +52,7 @@
 }
 
 :root {
+    color-scheme: light;
     --background: #f4f5f2;
     --foreground: #172033;
     --card: #fcfcfa;
@@ -105,6 +106,7 @@
 }
 
 .dark {
+    color-scheme: dark;
     --background: #050608;
     --foreground: #f4f1ec;
     --card: #0e1117;
@@ -281,6 +283,7 @@ html.theme-ripple-fallback::before {
 
   button {
     font: inherit;
+    -webkit-tap-highlight-color: transparent;
   }
 
   .icon-button,
@@ -296,7 +299,7 @@ html.theme-ripple-fallback::before {
     border: 0;
     color: inherit;
     background: transparent;
-    transition: color 140ms ease, background 140ms ease, opacity 140ms ease;
+    transition: color 140ms ease, background 140ms ease, opacity 140ms ease, transform 140ms cubic-bezier(0.22, 1, 0.36, 1);
   }
 
   .icon-button {
@@ -311,6 +314,42 @@ html.theme-ripple-fallback::before {
   .composer-tool:hover,
   .composer-add:hover {
     color: var(--shell-text-bright);
+  }
+
+  .icon-button:focus-visible,
+  .topbar-icon:focus-visible,
+  .footer-icon:focus-visible,
+  .composer-tool:focus-visible,
+  .composer-add:focus-visible,
+  .send-button:focus-visible,
+  .mobile-menu:focus-visible,
+  .settings-input-action:focus-visible,
+  .provider-option:focus-visible,
+  .nav-item:focus-visible,
+  .session-row:focus-visible {
+    outline: 2px solid var(--shell-blue);
+    outline-offset: 3px;
+  }
+
+  .icon-button,
+  .topbar-icon,
+  .footer-icon,
+  .composer-tool,
+  .composer-add,
+  .send-button,
+  .mobile-menu,
+  .settings-input-action {
+    touch-action: manipulation;
+  }
+
+  .icon-button:active,
+  .topbar-icon:active,
+  .composer-add:active,
+  .send-button:active,
+  .mobile-menu:active,
+  .settings-input-action:active {
+    transform: scale(0.97);
+    transition-duration: 0s;
   }
 
   .topbar-icon.is-active {
@@ -564,17 +603,23 @@ html.theme-ripple-fallback::before {
 
   .theme-toggle {
     color: var(--shell-text-muted);
-    transition: color 180ms ease, transform 180ms ease;
-  }
-
-  .theme-toggle:hover {
-    color: var(--shell-blue);
-    transform: rotate(-12deg) scale(1.08);
+    transition: color 180ms ease;
   }
 
   .theme-toggle:focus-visible {
     outline: 2px solid var(--shell-blue);
     outline-offset: 4px;
+  }
+
+  @media (hover: hover) and (pointer: fine) {
+    .theme-toggle {
+      transition: color 180ms ease, transform 140ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .theme-toggle:hover {
+      color: var(--shell-blue);
+      transform: rotate(-12deg) scale(1.04);
+    }
   }
 
   .theme-chip {
@@ -906,6 +951,11 @@ html.theme-ripple-fallback::before {
     background: var(--shell-input);
   }
 
+  .composer-box:focus-within {
+    border-color: var(--shell-blue);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--shell-blue) 18%, transparent);
+  }
+
   .composer-add {
     width: 22px;
     height: 28px;
@@ -999,19 +1049,32 @@ html.theme-ripple-fallback::before {
       z-index: 50;
       width: min(248px, calc(100vw - 40px));
       transform: translateX(-100%);
-      transition: transform 180ms ease;
+      transition: transform 220ms cubic-bezier(0.25, 1, 0.5, 1);
     }
 
     .sidebar-container.open {
       transform: translateX(0);
     }
 
-    .sidebar-overlay.visible {
+    .sidebar-overlay {
       position: fixed;
       inset: 0;
       z-index: 40;
       display: block;
+      border: 0;
+      padding: 0;
+      visibility: hidden;
+      opacity: 0;
+      pointer-events: none;
       background: rgb(0 0 0 / 45%);
+      transition: opacity 180ms cubic-bezier(0.22, 1, 0.36, 1), visibility 0s linear 180ms;
+    }
+
+    .sidebar-overlay.visible {
+      visibility: visible;
+      opacity: 1;
+      pointer-events: auto;
+      transition-delay: 0s;
     }
 
     .mobile-menu {
@@ -1096,6 +1159,26 @@ html.theme-ripple-fallback::before {
 
     .composer-footnote {
       display: none;
+    }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  @layer components {
+    .sidebar-container,
+    .sidebar-overlay,
+    .theme-toggle {
+      transition-duration: 1ms !important;
+    }
+
+    .theme-toggle:hover,
+    .icon-button:active,
+    .topbar-icon:active,
+    .composer-add:active,
+    .send-button:active,
+    .mobile-menu:active,
+    .settings-input-action:active {
+      transform: none;
     }
   }
 }

@@ -49,10 +49,15 @@ export function AppShell() {
   return (
     <main className="app-shell">
       <button className="mobile-menu" aria-label="Open navigation" onClick={() => setSidebarOpen(true)}>
-        <Menu size={17} />
+        <Menu size={17} aria-hidden="true" />
       </button>
 
-      <div className={`sidebar-overlay ${sidebarOpen ? "visible" : ""}`} onClick={() => setSidebarOpen(false)} />
+      <button
+        className={`sidebar-overlay ${sidebarOpen ? "visible" : ""}`}
+        type="button"
+        aria-label="Close navigation"
+        onClick={() => setSidebarOpen(false)}
+      />
       <div className={`sidebar-container ${sidebarOpen ? "open" : ""}`}>
         <Sidebar
           activeView={activeView}

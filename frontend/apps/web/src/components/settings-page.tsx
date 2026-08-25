@@ -14,12 +14,13 @@ const providers: Array<{
 
 export function SettingsPage() {
   const [provider, setProvider] = useState<ModelProvider>("OpenAI")
-  const [apiKey, setApiKey] = useState("")
+  const [apiKeys, setApiKeys] = useState<Record<ModelProvider, string>>({ OpenAI: "", Anthropic: "" })
   const [showApiKey, setShowApiKey] = useState(false)
   const selectedProvider = providers.find((item) => item.id === provider) ?? providers[0]
 
   return (
     <div className="settings-page">
+      <h1 className="sr-only">Settings</h1>
       <header className="settings-header">
         <div className="utility-kicker">SETTINGS</div>
         <p>Choose the model provider you want to work with and add its API key.</p>
@@ -46,7 +47,7 @@ export function SettingsPage() {
                   aria-checked={isSelected}
                   onClick={() => setProvider(item.id)}
                 >
-                  <span className="provider-icon"><Sparkles size={16} strokeWidth={1.7} /></span>
+                  <span className="provider-icon"><Sparkles size={16} strokeWidth={1.7} aria-hidden="true" /></span>
                   <span className="provider-details">
                     <span className="provider-name">{item.id}</span>
                     <span className="provider-description">{item.description}</span>
@@ -74,10 +75,11 @@ export function SettingsPage() {
               <KeyRound size={15} strokeWidth={1.7} aria-hidden="true" />
               <input
                 type={showApiKey ? "text" : "password"}
-                value={apiKey}
-                onChange={(event) => setApiKey(event.target.value)}
-                placeholder={selectedProvider.id === "OpenAI" ? "sk-..." : "sk-ant-..."}
+                value={apiKeys[selectedProvider.id]}
+                onChange={(event) => setApiKeys((current) => ({ ...current, [selectedProvider.id]: event.target.value }))}
+                placeholder={selectedProvider.id === "OpenAI" ? "sk-…" : "sk-ant-…"}
                 autoComplete="off"
+                name={`${selectedProvider.id.toLowerCase()}-api-key`}
                 spellCheck={false}
                 aria-label={`${selectedProvider.id} API key`}
               />
@@ -87,7 +89,7 @@ export function SettingsPage() {
                 aria-label={showApiKey ? "Hide API key" : "Show API key"}
                 onClick={() => setShowApiKey((visible) => !visible)}
               >
-                {showApiKey ? <EyeOff size={15} strokeWidth={1.7} /> : <Eye size={15} strokeWidth={1.7} />}
+                {showApiKey ? <EyeOff size={15} strokeWidth={1.7} aria-hidden="true" /> : <Eye size={15} strokeWidth={1.7} aria-hidden="true" />}
               </button>
             </span>
             <span className="settings-field-help">Your key is only held in this form for now.</span>

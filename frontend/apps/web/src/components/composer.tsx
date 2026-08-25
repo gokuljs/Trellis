@@ -23,7 +23,7 @@ export function Composer({ value, placeholder, onChange, onSubmit }: ComposerPro
   return (
     <div className="composer-wrap">
       <div className="composer-box">
-        <button className="composer-add" aria-label="Attach"><Plus size={16} strokeWidth={1.6} /></button>
+        <button className="composer-add" aria-label="Attach"><Plus size={16} strokeWidth={1.6} aria-hidden="true" /></button>
         <textarea
           aria-label="Message"
           value={value}
@@ -33,9 +33,9 @@ export function Composer({ value, placeholder, onChange, onSubmit }: ComposerPro
           rows={1}
         />
         <div className="composer-tools">
-          <span className="model-label">GPT-5.5 · Med <ChevronDown size={11} /></span>
+          <span className="model-label">GPT-5.5 · Med <ChevronDown size={11} aria-hidden="true" /></span>
           <button className={`send-button ${value.trim() ? "ready" : ""}`} aria-label="Send" onClick={onSubmit}>
-            {value.trim() ? <Send size={14} /> : <span className="voice-orb">◔</span>}
+            {value.trim() ? <Send size={14} aria-hidden="true" /> : <span className="voice-orb" aria-hidden="true">◔</span>}
           </button>
         </div>
       </div>

@@ -67,15 +67,15 @@ export function WorkspaceTopbar({ activeView, onNavigate }: WorkspaceTopbarProps
     <div className="workspace-topbar">
       <div className="topbar-spacer" />
       <div className="topbar-actions">
-        <button className="topbar-icon" aria-label="Layout"><LayoutGrid size={15} /></button>
-        <button className="topbar-icon" aria-label="Messages"><MessageSquare size={15} /></button>
+        <button className="topbar-icon" aria-label="Layout"><LayoutGrid size={15} aria-hidden="true" /></button>
+        <button className="topbar-icon" aria-label="Messages"><MessageSquare size={15} aria-hidden="true" /></button>
         <button
           className={`topbar-icon ${activeView === "Settings" ? "is-active" : ""}`}
           aria-label="Settings"
           aria-pressed={activeView === "Settings"}
           onClick={() => onNavigate("Settings")}
         >
-          <Settings size={15} />
+          <Settings size={15} aria-hidden="true" />
         </button>
         <button
           className="topbar-icon theme-toggle"
@@ -83,7 +83,7 @@ export function WorkspaceTopbar({ activeView, onNavigate }: WorkspaceTopbarProps
           title={`Switch to ${resolvedTheme === "dark" ? "light" : "dark"} theme`}
           onClick={handleThemeToggle}
         >
-          {resolvedTheme === "dark" ? <Sun size={15} strokeWidth={1.7} /> : <Moon size={15} strokeWidth={1.7} />}
+          {resolvedTheme === "dark" ? <Sun size={15} strokeWidth={1.7} aria-hidden="true" /> : <Moon size={15} strokeWidth={1.7} aria-hidden="true" />}
         </button>
       </div>
     </div>
