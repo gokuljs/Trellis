@@ -1,11 +1,8 @@
 import {
-  ArrowLeftRight,
-  Check,
   MoreHorizontal,
   PanelLeft,
   SlidersHorizontal,
 } from "lucide-react"
-import { useEffect, useRef, useState } from "react"
 
 import { NAVIGATION_ITEMS } from "@/lib/app-data"
 import type { Session, WorkspaceView } from "@/lib/app-types"
@@ -78,33 +75,6 @@ function SessionList({ sessions, onNavigate }: Pick<SidebarProps, "sessions" | "
 }
 
 export function Sidebar({ activeView, sessions, onNavigate, sidebarCollapsed, onToggleSidebar }: SidebarProps) {
-  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false)
-  const workspaceSwitcherRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    if (!workspaceMenuOpen) return undefined
-
-    const handlePointerDown = (event: PointerEvent) => {
-      if (!workspaceSwitcherRef.current?.contains(event.target as Node)) {
-        setWorkspaceMenuOpen(false)
-      }
-    }
-
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setWorkspaceMenuOpen(false)
-      }
-    }
-
-    document.addEventListener("pointerdown", handlePointerDown)
-    document.addEventListener("keydown", handleKeyDown)
-
-    return () => {
-      document.removeEventListener("pointerdown", handlePointerDown)
-      document.removeEventListener("keydown", handleKeyDown)
-    }
-  }, [workspaceMenuOpen])
-
   return (
     <aside className="app-sidebar">
       <div className="sidebar-topbar">
@@ -118,28 +88,6 @@ export function Sidebar({ activeView, sessions, onNavigate, sidebarCollapsed, on
         >
           <PanelLeft size={14} strokeWidth={1.7} aria-hidden="true" />
         </button>
-        <div className="workspace-switcher" ref={workspaceSwitcherRef}>
-          <button
-            className={`icon-button ${workspaceMenuOpen ? "is-active" : ""}`}
-            aria-label="Switch workspace"
-            aria-haspopup="menu"
-            aria-expanded={workspaceMenuOpen}
-            onClick={() => setWorkspaceMenuOpen((open) => !open)}
-          >
-            <ArrowLeftRight size={14} strokeWidth={1.7} aria-hidden="true" />
-          </button>
-          {workspaceMenuOpen ? (
-            <div className="workspace-menu" role="menu" aria-label="Workspaces">
-              <div className="workspace-menu-label">WORKSPACE</div>
-              <button className="workspace-option is-current" role="menuitem" onClick={() => setWorkspaceMenuOpen(false)}>
-                <span className="workspace-option-mark">◆</span>
-                <span className="workspace-option-name">Trellis</span>
-                <Check size={13} strokeWidth={2} aria-hidden="true" />
-              </button>
-              <p className="workspace-menu-note">Trellis is your current workspace.</p>
-            </div>
-          ) : null}
-        </div>
       </div>
 
       <div className="sidebar-scroll">
