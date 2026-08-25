@@ -7,9 +7,10 @@ import {
   within,
 } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
+import { toast } from "sonner"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { AppShell } from "@/components/app-shell"
+import { App } from "@/App"
 import { ThemeProvider } from "@/components/theme-provider"
 
 const profile = {
@@ -66,7 +67,7 @@ function response(body: unknown, status = 200) {
 function renderApp() {
   return render(
     <ThemeProvider defaultTheme="dark">
-      <AppShell />
+      <App />
     </ThemeProvider>
   )
 }
@@ -99,6 +100,7 @@ function startupFetch(
 
 afterEach(() => {
   cleanup()
+  toast.dismiss()
   vi.unstubAllGlobals()
   localStorage.clear()
 })
@@ -597,12 +599,19 @@ describe("local-first chat", () => {
     await waitFor(() =>
       expect(currentProfile.display_name).toBe("Ada Lovelace")
     )
+    expect(
+      within(screen.getByRole("region", { name: "Notifications" })).getByText(
+        "Profile saved"
+      )
+    ).toBeInTheDocument()
+    expect(screen.queryByText("Saved locally.")).not.toBeInTheDocument()
 
     const keyInput = screen.getByLabelText("OpenAI API key")
     await user.type(keyInput, "sk-new-secret-4567")
     await user.click(screen.getByRole("button", { name: "Save OpenAI key" }))
 
     await waitFor(() => expect(keyInput).toHaveValue(""))
+    expect(screen.getByText("OpenAI key saved")).toBeInTheDocument()
     expect(screen.getByText("Configured · ••••4567")).toBeInTheDocument()
     expect(
       screen.queryByDisplayValue("sk-new-secret-4567")
@@ -614,11 +623,46 @@ describe("local-first chat", () => {
         "Not configured. The key is write-only and will not be shown again."
       )
     ).toBeInTheDocument()
+    expect(screen.getByText("OpenAI key removed")).toBeInTheDocument()
 
     const anthropic = screen.getByRole("radio", { name: /Anthropic/ })
     await user.click(anthropic)
     await waitFor(() =>
       expect(anthropic).toHaveAttribute("aria-checked", "true")
     )
+    expect(screen.getByText("Anthropic selected")).toBeInTheDocument()
+  })
+
+  it("shows settings failures in the global notification region", async () => {
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/profile" && init?.method === "PUT") {
+        return response(
+          {
+            error: {
+              code: "profile_update_failed",
+              message: "The profile could not be saved.",
+            },
+          },
+          500
+        )
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    renderApp()
+    await screen.findByText("A workspace for ideas in motion")
+    await userEvent.click(screen.getByRole("button", { name: "Settings" }))
+    await userEvent.click(screen.getByRole("button", { name: "Save profile" }))
+
+    const notifications = screen.getByRole("region", {
+      name: "Notifications",
+    })
+    expect(
+      await within(notifications).findByText("Change not saved")
+    ).toBeInTheDocument()
+    expect(
+      within(notifications).getByText("The profile could not be saved.")
+    ).toBeInTheDocument()
   })
 })

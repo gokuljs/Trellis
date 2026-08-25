@@ -970,21 +970,6 @@ html.theme-ripple-fallback::before {
     gap: 13px;
   }
 
-  .settings-notice,
-  .settings-error {
-    width: max-content;
-    margin-top: 14px;
-    border-left: 2px solid var(--shell-agent);
-    padding: 4px 9px;
-    color: var(--shell-text-muted);
-    font-size: 11px;
-  }
-
-  .settings-error {
-    border-left-color: var(--destructive);
-    color: var(--destructive);
-  }
-
   .welcome-panel {
     width: 100%;
     margin-top: -0.5vh;
@@ -1551,5 +1536,148 @@ html.theme-ripple-fallback::before {
     .settings-input-action:active {
       transform: none;
     }
+  }
+}
+
+/* Sonner injects unlayered base styles at runtime, so toast skinning remains
+   unlayered as well to keep the cascade deterministic. */
+.trellis-toast[data-sonner-toast][data-styled="true"] {
+  --toast-signal: var(--shell-blue);
+
+  min-height: 64px;
+  align-items: flex-start;
+  gap: 11px;
+  border: 1px solid var(--shell-line);
+  border-left: 3px solid var(--toast-signal);
+  border-radius: 5px;
+  padding: 12px 42px 12px 12px;
+  color: var(--shell-text-bright);
+  background: color-mix(in srgb, var(--shell-card) 94%, transparent);
+  box-shadow:
+    0 18px 42px color-mix(in srgb, #000 22%, transparent),
+    0 1px 0 color-mix(in srgb, white 4%, transparent) inset;
+  backdrop-filter: blur(16px);
+  font-family:
+    Inter,
+    ui-sans-serif,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  transition:
+    transform 220ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 160ms cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 180ms ease;
+}
+
+.trellis-toast[data-sonner-toast][data-styled="true"]:focus-visible {
+  outline: 2px solid var(--toast-signal);
+  outline-offset: 2px;
+}
+
+.trellis-toast[data-sonner-toast][data-y-position="top"]:not(
+    [data-mounted="true"]
+  ),
+.trellis-toast[data-sonner-toast][data-y-position="top"][data-removed="true"] {
+  --y: translate3d(0, -6px, 0);
+}
+
+.trellis-toast[data-sonner-toast][data-type="success"] {
+  --toast-signal: var(--shell-agent);
+}
+
+.trellis-toast[data-sonner-toast][data-type="error"] {
+  --toast-signal: var(--destructive);
+}
+
+.trellis-toast[data-sonner-toast][data-type="info"] {
+  --toast-signal: var(--shell-blue);
+}
+
+.trellis-toast[data-sonner-toast][data-type="warning"],
+.trellis-toast[data-sonner-toast][data-type="loading"] {
+  --toast-signal: var(--chart-3);
+}
+
+.trellis-toast [data-icon].trellis-toast-icon {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  place-items: center;
+  margin: 1px 0 0;
+  border: 1px solid color-mix(in srgb, var(--toast-signal) 38%, transparent);
+  border-radius: 3px;
+  color: var(--toast-signal);
+  background: color-mix(in srgb, var(--toast-signal) 9%, transparent);
+}
+
+.trellis-toast .trellis-toast-content {
+  gap: 3px;
+  padding-top: 1px;
+}
+
+.trellis-toast .trellis-toast-title {
+  color: var(--shell-text-strong);
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+}
+
+.trellis-toast[data-sonner-toast][data-styled="true"]
+  .trellis-toast-description {
+  color: var(--shell-text);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.trellis-toast[data-sonner-toast][data-styled="true"]
+  [data-close-button].trellis-toast-close {
+  top: 7px;
+  right: 7px;
+  left: auto;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  color: var(--shell-text-muted);
+  background: transparent;
+  opacity: 0.7;
+  transform: none;
+  transition:
+    color 140ms ease,
+    background-color 140ms ease,
+    opacity 140ms ease;
+}
+
+@media (pointer: coarse) {
+  .trellis-toast[data-sonner-toast][data-styled="true"]
+    [data-close-button].trellis-toast-close {
+    top: 4px;
+    right: 4px;
+    width: 36px;
+    height: 36px;
+  }
+}
+
+.trellis-toast[data-sonner-toast][data-styled="true"]
+  [data-close-button].trellis-toast-close:focus-visible {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--shell-blue) 35%, transparent);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .trellis-toast[data-sonner-toast][data-styled="true"]
+    [data-close-button].trellis-toast-close:hover {
+    color: var(--shell-text-strong);
+    background: var(--shell-hover);
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .trellis-toast[data-sonner-toast],
+  .trellis-toast[data-sonner-toast] > * {
+    transition-duration: 1ms !important;
+    animation-duration: 1ms !important;
   }
 }

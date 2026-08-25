@@ -3,6 +3,7 @@ import { useState } from "react"
 
 import { ApiError, api } from "@/lib/api"
 import type { Profile, ProviderId, Settings } from "@/lib/app-types"
+import { notifications } from "@/lib/notifications"
 
 type SettingsPageProps = {
   profile: Profile
@@ -28,32 +29,49 @@ export function SettingsPage({
   const [apiKey, setApiKey] = useState("")
   const [showApiKey, setShowApiKey] = useState(false)
   const [saving, setSaving] = useState<string | null>(null)
-  const [notice, setNotice] = useState<string | null>(null)
-  const [error, setError] = useState<string | null>(null)
   const selectedProvider =
     settings.providers.find((item) => item.id === settings.selected_provider) ??
     settings.providers[0]
 
-  const runUpdate = async (label: string, update: () => Promise<void>) => {
+  const runUpdate = async (
+    label: string,
+    success: {
+      kind?: "success" | "info"
+      title: string
+      description: string
+    },
+    update: () => Promise<void>
+  ) => {
     setSaving(label)
-    setError(null)
-    setNotice(null)
     try {
       await update()
-      setNotice("Saved locally.")
+      notifications[success.kind ?? "success"](success)
     } catch (updateError) {
-      setError(errorMessage(updateError))
+      notifications.error({
+        title: "Change not saved",
+        description: errorMessage(updateError),
+      })
     } finally {
       setSaving(null)
     }
   }
 
   const selectProvider = (provider: ProviderId) => {
+    const nextProvider = settings.providers.find((item) => item.id === provider)
+    if (!nextProvider) return
     setApiKey("")
     setShowApiKey(false)
-    void runUpdate("provider", async () => {
-      onSettingsChange(await api.selectProvider(provider))
-    })
+    void runUpdate(
+      "provider",
+      {
+        kind: "info",
+        title: `${nextProvider.name} selected`,
+        description: `${nextProvider.model} will power new messages.`,
+      },
+      async () => {
+        onSettingsChange(await api.selectProvider(provider))
+      }
+    )
   }
 
   if (!selectedProvider) return null
@@ -67,16 +85,6 @@ export function SettingsPage({
           Set up this local installation. Your profile and sessions stay on this
           device.
         </p>
-        {notice ? (
-          <div className="settings-notice" role="status">
-            {notice}
-          </div>
-        ) : null}
-        {error ? (
-          <div className="settings-error" role="alert">
-            {error}
-          </div>
-        ) : null}
       </header>
 
       <div className="settings-sections">
@@ -134,14 +142,21 @@ export function SettingsPage({
               type="button"
               disabled={saving !== null}
               onClick={() => {
-                void runUpdate("profile", async () => {
-                  onProfileChange(
-                    await api.updateProfile({
-                      display_name: displayName.trim() || null,
-                      email: email.trim() || null,
-                    })
-                  )
-                })
+                void runUpdate(
+                  "profile",
+                  {
+                    title: "Profile saved",
+                    description: "Your details stay on this device.",
+                  },
+                  async () => {
+                    onProfileChange(
+                      await api.updateProfile({
+                        display_name: displayName.trim() || null,
+                        email: email.trim() || null,
+                      })
+                    )
+                  }
+                )
               }}
             >
               {saving === "profile" ? "Saving…" : "Save profile"}
@@ -254,13 +269,20 @@ export function SettingsPage({
                 type="button"
                 disabled={!apiKey.trim() || saving !== null}
                 onClick={() => {
-                  void runUpdate("key", async () => {
-                    onSettingsChange(
-                      await api.saveApiKey(selectedProvider.id, apiKey.trim())
-                    )
-                    setApiKey("")
-                    setShowApiKey(false)
-                  })
+                  void runUpdate(
+                    "key",
+                    {
+                      title: `${selectedProvider.name} key saved`,
+                      description: "Stored in your private local secrets file.",
+                    },
+                    async () => {
+                      onSettingsChange(
+                        await api.saveApiKey(selectedProvider.id, apiKey.trim())
+                      )
+                      setApiKey("")
+                      setShowApiKey(false)
+                    }
+                  )
                 }}
               >
                 {saving === "key"
@@ -273,12 +295,20 @@ export function SettingsPage({
                   type="button"
                   disabled={saving !== null}
                   onClick={() => {
-                    void runUpdate("remove", async () => {
-                      onSettingsChange(
-                        await api.removeApiKey(selectedProvider.id)
-                      )
-                      setApiKey("")
-                    })
+                    void runUpdate(
+                      "remove",
+                      {
+                        kind: "info",
+                        title: `${selectedProvider.name} key removed`,
+                        description: "New messages will require another key.",
+                      },
+                      async () => {
+                        onSettingsChange(
+                          await api.removeApiKey(selectedProvider.id)
+                        )
+                        setApiKey("")
+                      }
+                    )
                   }}
                 >
                   <Trash2 size={13} aria-hidden="true" /> Remove key
