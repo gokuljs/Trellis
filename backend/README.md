@@ -1,7 +1,9 @@
 # Trellis backend
 
-Minimal FastAPI service with a typed health endpoint. The project targets
-CPython 3.14 and uses uv for reproducible dependency management.
+FastAPI service for Trellis' local-first chat. It stores the installation
+profile, sessions, and complete transcripts in SQLite. Provider keys are kept
+separately in the private app-data `.env` file and are managed through the
+Settings API.
 
 From this directory:
 
@@ -15,3 +17,7 @@ global uv installation. CI installs the same pinned uv version.
 
 The service is available at `http://127.0.0.1:8000`. Interactive API docs are
 served at `/docs`, with the OpenAPI document at `/openapi.json`.
+
+By default, local state is written to `~/.trellis/state.db` and secrets to
+`~/.trellis/.env`. Set `TRELLIS_DATA_DIR` to use another directory. Deleting
+that directory resets the installation ID and all local data.

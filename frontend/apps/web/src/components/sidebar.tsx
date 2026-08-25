@@ -1,8 +1,4 @@
-import {
-  MoreHorizontal,
-  PanelLeft,
-  SlidersHorizontal,
-} from "lucide-react"
+import { PanelLeft, SlidersHorizontal } from "lucide-react"
 
 import { NAVIGATION_ITEMS } from "@/lib/app-data"
 import type { Session, WorkspaceView } from "@/lib/app-types"
@@ -11,6 +7,8 @@ type SidebarProps = {
   activeView: WorkspaceView
   sessions: Session[]
   onNavigate: (view: WorkspaceView) => void
+  activeSessionId: string | null
+  onSelectSession: (sessionId: string) => void
   sidebarCollapsed: boolean
   onToggleSidebar: () => void
 }
@@ -29,56 +27,94 @@ function PrimaryNavigation({ activeView, onNavigate }: PrimaryNavigationProps) {
         >
           <Icon size={15} strokeWidth={1.6} aria-hidden="true" />
           <span>{label}</span>
-          {label === "New session" ? <span className="shortcut-hint">⌘ N</span> : null}
+          {label === "New session" ? (
+            <span className="shortcut-hint">⌘ N</span>
+          ) : null}
         </button>
       ))}
     </nav>
   )
 }
 
-function SessionList({ sessions, onNavigate }: Pick<SidebarProps, "sessions" | "onNavigate">) {
-  const groups = [
-    { month: "", items: sessions.slice(0, 1) },
-    { month: "JULY", items: sessions.slice(1, 5) },
-    { month: "JUNE", items: sessions.slice(5) },
-  ].filter((group) => group.items.length > 0)
+function formatSessionDate(value: string) {
+  const date = new Date(value)
+  const today = new Date()
+  if (date.toDateString() === today.toDateString()) return "today"
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+  }).format(date)
+}
+
+function SessionList({
+  sessions,
+  activeSessionId,
+  onSelectSession,
+}: Pick<SidebarProps, "sessions" | "activeSessionId" | "onSelectSession">) {
+  const groups = Object.entries(
+    sessions.reduce<Record<string, Session[]>>((current, session) => {
+      const month = new Intl.DateTimeFormat(undefined, {
+        month: "long",
+        year: "numeric",
+      })
+        .format(new Date(session.updated_at))
+        .toUpperCase()
+      current[month] = [...(current[month] ?? []), session]
+      return current
+    }, {})
+  )
 
   return (
     <section className="sessions-section">
       <div className="section-heading">
-        <span><span className="section-mark">◆</span> SESSIONS</span>
+        <span>
+          <span className="section-mark">◆</span> SESSIONS
+        </span>
         <SlidersHorizontal size={12} strokeWidth={1.5} />
       </div>
 
-      {groups.map((group) => (
-        <div className="session-group" key={group.month || "recent"}>
-          {group.month ? <div className="month-label">{group.month}</div> : null}
-          {group.items.map((session) => (
-            <button
-              className={`session-row ${session.active ? "selected" : ""}`}
-              key={session.title}
-              aria-current={session.active ? "page" : undefined}
-              onClick={() => onNavigate("session")}
-            >
-              <span className="session-dot">•</span>
-              <span className="session-title">{session.title}</span>
-              <span className="session-date">{session.date}</span>
-              {session.title === "Resume File Location" ? (
-                <MoreHorizontal className="session-more" size={13} strokeWidth={1.8} aria-hidden="true" />
-              ) : null}
-            </button>
-          ))}
+      {groups.map(([month, items]) => (
+        <div className="session-group" key={month}>
+          <div className="month-label">{month}</div>
+          {items.map((session) => {
+            const isSelected = session.id === activeSessionId
+            return (
+              <button
+                className={`session-row ${isSelected ? "selected" : ""}`}
+                key={session.id}
+                aria-label={session.title}
+                aria-current={isSelected ? "page" : undefined}
+                onClick={() => onSelectSession(session.id)}
+              >
+                <span className="session-dot">•</span>
+                <span className="session-title">{session.title}</span>
+                <span className="session-date">
+                  {formatSessionDate(session.updated_at)}
+                </span>
+              </button>
+            )
+          })}
         </div>
       ))}
     </section>
   )
 }
 
-export function Sidebar({ activeView, sessions, onNavigate, sidebarCollapsed, onToggleSidebar }: SidebarProps) {
+export function Sidebar({
+  activeView,
+  sessions,
+  onNavigate,
+  activeSessionId,
+  onSelectSession,
+  sidebarCollapsed,
+  onToggleSidebar,
+}: SidebarProps) {
   return (
     <aside className="app-sidebar">
       <div className="sidebar-topbar">
-        <span className="sidebar-wordmark" aria-label="Trellis">Trellis</span>
+        <span className="sidebar-wordmark" aria-label="Trellis">
+          Trellis
+        </span>
         <div className="sidebar-topbar-spacer" />
         <button
           className="icon-button"
@@ -93,7 +129,11 @@ export function Sidebar({ activeView, sessions, onNavigate, sidebarCollapsed, on
       <div className="sidebar-scroll">
         <PrimaryNavigation activeView={activeView} onNavigate={onNavigate} />
 
-        <SessionList sessions={sessions} onNavigate={onNavigate} />
+        <SessionList
+          sessions={sessions}
+          activeSessionId={activeSessionId}
+          onSelectSession={onSelectSession}
+        />
       </div>
     </aside>
   )
