@@ -8,12 +8,18 @@ import {
 import type { MouseEvent } from "react"
 
 import { useTheme } from "@/components/theme-provider"
+import type { WorkspaceView } from "@/lib/app-types"
 
 type ViewTransitionDocument = Document & {
   startViewTransition?: (callback: () => void) => { finished: Promise<void> }
 }
 
-export function WorkspaceTopbar() {
+type WorkspaceTopbarProps = {
+  activeView: WorkspaceView
+  onNavigate: (view: WorkspaceView) => void
+}
+
+export function WorkspaceTopbar({ activeView, onNavigate }: WorkspaceTopbarProps) {
   const { resolvedTheme, setTheme } = useTheme()
 
   const handleThemeToggle = (event: MouseEvent<HTMLButtonElement>) => {
@@ -63,7 +69,14 @@ export function WorkspaceTopbar() {
       <div className="topbar-actions">
         <button className="topbar-icon" aria-label="Layout"><LayoutGrid size={15} /></button>
         <button className="topbar-icon" aria-label="Messages"><MessageSquare size={15} /></button>
-        <button className="topbar-icon" aria-label="Settings"><Settings size={15} /></button>
+        <button
+          className={`topbar-icon ${activeView === "Settings" ? "is-active" : ""}`}
+          aria-label="Settings"
+          aria-pressed={activeView === "Settings"}
+          onClick={() => onNavigate("Settings")}
+        >
+          <Settings size={15} />
+        </button>
         <button
           className="topbar-icon theme-toggle"
           aria-label={`Switch to ${resolvedTheme === "dark" ? "light" : "dark"} theme`}

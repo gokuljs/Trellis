@@ -3,6 +3,7 @@ import { Menu } from "lucide-react"
 
 import { Composer } from "@/components/composer"
 import { Sidebar } from "@/components/sidebar"
+import { SettingsPage } from "@/components/settings-page"
 import { WelcomePanel } from "@/components/welcome-panel"
 import { WorkspaceTopbar } from "@/components/workspace-topbar"
 import { INITIAL_SESSIONS } from "@/lib/app-data"
@@ -62,18 +63,24 @@ export function AppShell() {
       </div>
 
       <section className="workspace">
-        <WorkspaceTopbar />
+        <WorkspaceTopbar activeView={activeView} onNavigate={handleNavigate} />
 
-        <div className="workspace-content">
-          <WelcomePanel activeView={activeView} activeSessionTitle={activeSessionTitle} />
+        <div className={`workspace-content ${activeView === "Settings" ? "settings-content" : ""}`}>
+          {activeView === "Settings" ? (
+            <SettingsPage />
+          ) : (
+            <WelcomePanel activeView={activeView} activeSessionTitle={activeSessionTitle} />
+          )}
         </div>
 
-        <Composer
-          value={composerValue}
-          placeholder={activeView === "New session" ? "What are we building?" : "Adjust or continue"}
-          onChange={setComposerValue}
-          onSubmit={submitComposer}
-        />
+        {activeView !== "Settings" ? (
+          <Composer
+            value={composerValue}
+            placeholder={activeView === "New session" ? "What are we building?" : "Adjust or continue"}
+            onChange={setComposerValue}
+            onSubmit={submitComposer}
+          />
+        ) : null}
       </section>
     </main>
   )
