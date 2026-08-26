@@ -1,22 +1,10 @@
 import path from "path"
-import tailwindcss from "@tailwindcss/vite"
 import react from "@vitejs/plugin-react"
-import { defineConfig } from "vite"
+import { defineConfig } from "vitest/config"
 
-// https://vite.dev/config/
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
-  server: {
-    port: 3000,
-    strictPort: true,
-    proxy: {
-      "/api": "http://127.0.0.1:8000",
-    },
-  },
-  preview: {
-    port: 3000,
-    strictPort: true,
-  },
+  root: import.meta.dirname,
+  plugins: [react()],
   resolve: {
     alias: {
       "@": path.resolve(import.meta.dirname, "./src"),
@@ -26,5 +14,9 @@ export default defineConfig({
       ),
       "@trellis/ui": path.resolve(import.meta.dirname, "../../packages/ui/src"),
     },
+  },
+  test: {
+    environment: "jsdom",
+    setupFiles: ["./src/test/setup.ts"],
   },
 })
