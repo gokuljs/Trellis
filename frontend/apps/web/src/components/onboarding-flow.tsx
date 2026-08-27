@@ -164,6 +164,10 @@ export function OnboardingFlow({
                   >
                     <span>Get started</span>
                   </h1>
+                  <p className="onboarding-intro-copy">
+                    Set up your profile and connect a model to start using
+                    Trellis.
+                  </p>
                   <button
                     className="onboarding-primary-action"
                     type="button"

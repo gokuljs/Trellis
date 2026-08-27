@@ -1536,13 +1536,23 @@ html.theme-ripple-fallback::before {
     display: block;
   }
 
+  .onboarding-intro-copy {
+    max-width: 280px;
+    margin: 18px 0 0;
+    color: var(--onboarding-muted);
+    font-size: 13px;
+    font-weight: 400;
+    line-height: 1.45;
+    text-align: center;
+  }
+
   .onboarding-page h1:focus {
     outline: 0;
   }
 
   .onboarding-intro .onboarding-primary-action {
     width: auto;
-    margin-top: 34px;
+    margin-top: 24px;
     border-color: var(--onboarding-line);
     color: var(--onboarding-text);
     background: transparent;
