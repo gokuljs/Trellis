@@ -6,6 +6,7 @@ import {
 } from "lucide-react"
 
 import type { WorkspaceView } from "@/lib/app-types"
+import { TrellisMark } from "@/components/trellis-mark"
 
 type WelcomePanelProps = {
   activeView: WorkspaceView
@@ -54,7 +55,10 @@ export function WelcomePanel({ activeView, activeSessionTitle }: WelcomePanelPro
   return (
     <div className="welcome-panel">
       <div className="welcome-kicker">A workspace for ideas in motion</div>
-      <div className="wordmark" aria-label="Trellis">Trellis</div>
+      <div className="wordmark" aria-label="Trellis">
+        <TrellisMark size={22} />
+        <span>Trellis</span>
+      </div>
       <p className="welcome-copy">Bring a question, a file, or a rough idea. Trellis helps you find the next clear step.</p>
     </div>
   )

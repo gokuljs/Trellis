@@ -6,6 +6,7 @@ import {
 
 import { NAVIGATION_ITEMS } from "@/lib/app-data"
 import type { Session, WorkspaceView } from "@/lib/app-types"
+import { TrellisMark } from "@/components/trellis-mark"
 
 type SidebarProps = {
   activeView: WorkspaceView
@@ -78,7 +79,10 @@ export function Sidebar({ activeView, sessions, onNavigate, sidebarCollapsed, on
   return (
     <aside className="app-sidebar">
       <div className="sidebar-topbar">
-        <span className="sidebar-wordmark" aria-label="Trellis">Trellis</span>
+        <span className="sidebar-brand" aria-label="Trellis">
+          <TrellisMark size={15} />
+          <span className="sidebar-wordmark">Trellis</span>
+        </span>
         <div className="sidebar-topbar-spacer" />
         <button
           className="icon-button"
