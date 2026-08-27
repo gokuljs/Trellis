@@ -47,7 +47,7 @@ function renderOnboarding(overrides: Partial<Settings> = {}) {
 
 async function reachModelStep() {
   const user = userEvent.setup()
-  await user.click(screen.getByRole("button", { name: "Get started" }))
+  await user.click(screen.getByRole("button", { name: "Continue" }))
   await user.type(screen.getByRole("textbox", { name: "Name" }), "Ada")
   await user.type(
     screen.getByRole("textbox", { name: "Email" }),
@@ -64,20 +64,21 @@ describe("OnboardingFlow", () => {
     renderOnboarding()
 
     expect(
-      screen.getByRole("heading", { name: /get started/i })
-    ).toHaveAccessibleName("Get started")
+      screen.getByRole("heading", { name: "Workspace setup" })
+    ).toHaveAccessibleName("Workspace setup")
     expect(
-      screen.getByText("Set up your profile and connect a model.")
+      screen.getByText("Create your profile and connect a model.")
     ).toBeInTheDocument()
     expect(screen.getByText("01 / 03")).toBeInTheDocument()
-    expect(screen.getAllByRole("button", { name: "Get started" })).toHaveLength(
-      1
-    )
+    expect(screen.getAllByRole("button", { name: "Continue" })).toHaveLength(1)
+    expect(
+      screen.queryByRole("button", { name: "Get started" })
+    ).not.toBeInTheDocument()
     expect(
       screen.queryByRole("button", { name: "Start onboarding" })
     ).not.toBeInTheDocument()
 
-    await userEvent.click(screen.getByRole("button", { name: "Get started" }))
+    await userEvent.click(screen.getByRole("button", { name: "Continue" }))
 
     expect(
       await screen.findByRole("heading", { name: "Your profile" })
@@ -88,7 +89,7 @@ describe("OnboardingFlow", () => {
   it("blocks profile progression until name and a valid email are present", async () => {
     renderOnboarding()
     const user = userEvent.setup()
-    await user.click(screen.getByRole("button", { name: "Get started" }))
+    await user.click(screen.getByRole("button", { name: "Continue" }))
     await user.click(screen.getByRole("button", { name: "Continue" }))
 
     expect(

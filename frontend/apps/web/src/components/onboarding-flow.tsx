@@ -159,20 +159,20 @@ export function OnboardingFlow({
                   <h1
                     id="onboarding-intro-heading"
                     ref={headingRef}
-                    aria-label="Get started"
+                    aria-label="Workspace setup"
                     tabIndex={-1}
                   >
-                    <span>Get started</span>
+                    <span>Workspace setup</span>
                   </h1>
                   <p className="onboarding-intro-copy">
-                    Set up your profile and connect a model.
+                    Create your profile and connect a model.
                   </p>
                   <button
                     className="onboarding-primary-action"
                     type="button"
                     onClick={() => changeStep("profile", "forward")}
                   >
-                    <span>Get started</span>
+                    <span>Continue</span>
                     <ArrowUpRight size={14} aria-hidden="true" />
                   </button>
                 </section>

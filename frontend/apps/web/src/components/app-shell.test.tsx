@@ -124,7 +124,7 @@ describe("local-first chat", () => {
     renderFirstRunApp()
 
     expect(
-      await screen.findByRole("heading", { name: /get started/i })
+      await screen.findByRole("heading", { name: "Workspace setup" })
     ).toBeInTheDocument()
     expect(
       screen.queryByRole("textbox", { name: "Message" })
@@ -173,7 +173,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderFirstRunApp()
-    await user.click(await screen.findByRole("button", { name: "Get started" }))
+    await user.click(await screen.findByRole("button", { name: "Continue" }))
     await user.clear(screen.getByRole("textbox", { name: "Name" }))
     await user.type(screen.getByRole("textbox", { name: "Name" }), "Ada")
     await user.clear(screen.getByRole("textbox", { name: "Email" }))
@@ -216,7 +216,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderFirstRunApp()
-    await user.click(await screen.findByRole("button", { name: "Get started" }))
+    await user.click(await screen.findByRole("button", { name: "Continue" }))
     await user.click(screen.getByRole("button", { name: "Continue" }))
     await user.click(screen.getByRole("button", { name: "Start Trellis" }))
 

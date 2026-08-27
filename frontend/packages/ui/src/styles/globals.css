@@ -1526,9 +1526,9 @@ html.theme-ripple-fallback::before {
   .onboarding-intro h1 {
     margin: 0;
     color: var(--onboarding-text);
-    font-size: clamp(2.5rem, 3.75vw, 3.5rem);
+    font-size: clamp(2.25rem, 3.25vw, 3rem);
     font-weight: 500;
-    letter-spacing: -0.08em;
+    letter-spacing: -0.07em;
     line-height: 1;
   }
 
