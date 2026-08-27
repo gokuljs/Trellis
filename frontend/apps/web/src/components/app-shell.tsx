@@ -3,6 +3,10 @@ import { useCallback, useEffect, useRef, useState } from "react"
 
 import { ChatThread } from "@/components/chat-thread"
 import { Composer } from "@/components/composer"
+import {
+  OnboardingFlow,
+  type OnboardingValues,
+} from "@/components/onboarding-flow"
 import { SettingsPage } from "@/components/settings-page"
 import { Sidebar } from "@/components/sidebar"
 import { WelcomePanel } from "@/components/welcome-panel"
@@ -21,6 +25,8 @@ type FailedTurn = {
   turnId: string
   content: string
 }
+
+const ONBOARDING_STORAGE_KEY = "trellis:onboarding-complete"
 
 function visibleError(error: unknown) {
   return error instanceof ApiError
@@ -52,6 +58,7 @@ export function AppShell() {
   const [composerValue, setComposerValue] = useState("")
   const [profile, setProfile] = useState<Profile | null>(null)
   const [settings, setSettings] = useState<Settings | null>(null)
+  const [onboardingRequired, setOnboardingRequired] = useState(false)
   const [sessions, setSessions] = useState<Session[]>([])
   const [activeSession, setActiveSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
@@ -64,38 +71,47 @@ export function AppShell() {
   const sessionLoadSequenceRef = useRef(0)
   const submissionLockRef = useRef(false)
 
+  const restoreSessions = useCallback(async (isCancelled = () => false) => {
+    const restoredSessions = await api.listSessions()
+    if (isCancelled()) return
+
+    setSessions(restoredSessions)
+    if (!restoredSessions[0]) return
+
+    const detail = await api.getSession(restoredSessions[0].id)
+    if (isCancelled()) return
+    const restoredRetry = retryFromTranscript(
+      detail.session.id,
+      detail.messages
+    )
+    activeSessionIdRef.current = detail.session.id
+    setActiveSession(detail.session)
+    setMessages(detail.messages)
+    setFailedTurn(restoredRetry)
+    if (restoredRetry) {
+      setError("The previous assistant response did not complete.")
+    }
+    setActiveView("session")
+  }, [])
+
   useEffect(() => {
     let cancelled = false
 
     const restore = async () => {
       try {
-        const [restoredProfile, restoredSettings, restoredSessions] =
-          await Promise.all([
-            api.getProfile(),
-            api.getSettings(),
-            api.listSessions(),
-          ])
+        const [restoredProfile, restoredSettings] = await Promise.all([
+          api.getProfile(),
+          api.getSettings(),
+        ])
         if (cancelled) return
 
         setProfile(restoredProfile)
         setSettings(restoredSettings)
-        setSessions(restoredSessions)
-        if (restoredSessions[0]) {
-          const detail = await api.getSession(restoredSessions[0].id)
-          if (cancelled) return
-          const restoredRetry = retryFromTranscript(
-            detail.session.id,
-            detail.messages
-          )
-          activeSessionIdRef.current = detail.session.id
-          setActiveSession(detail.session)
-          setMessages(detail.messages)
-          setFailedTurn(restoredRetry)
-          if (restoredRetry) {
-            setError("The previous assistant response did not complete.")
-          }
-          setActiveView("session")
+        if (!localStorage.getItem(ONBOARDING_STORAGE_KEY)) {
+          setOnboardingRequired(true)
+          return
         }
+        await restoreSessions(() => cancelled)
       } catch (restoreError) {
         if (!cancelled) setError(visibleError(restoreError))
       } finally {
@@ -107,7 +123,43 @@ export function AppShell() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [restoreSessions])
+
+  const completeOnboarding = async (values: OnboardingValues) => {
+    if (!profile || !settings) {
+      throw new Error("Trellis is still loading your local settings.")
+    }
+
+    const updatedProfile = await api.updateProfile({
+      display_name: values.displayName,
+      email: values.email,
+    })
+    let updatedSettings = settings
+    if (values.provider !== settings.selected_provider) {
+      updatedSettings = await api.selectProvider(values.provider)
+    }
+
+    const selectedProvider = updatedSettings.providers.find(
+      (item) => item.id === values.provider
+    )
+    if (!selectedProvider) {
+      throw new Error("The selected model provider is unavailable.")
+    }
+    if (!selectedProvider.configured) {
+      updatedSettings = await api.saveApiKey(values.provider, values.apiKey)
+    }
+
+    setProfile(updatedProfile)
+    setSettings(updatedSettings)
+    localStorage.setItem(ONBOARDING_STORAGE_KEY, "true")
+    try {
+      await restoreSessions()
+    } catch (restoreError) {
+      localStorage.removeItem(ONBOARDING_STORAGE_KEY)
+      throw restoreError
+    }
+    setOnboardingRequired(false)
+  }
 
   const startNewSession = useCallback(() => {
     sessionLoadSequenceRef.current += 1
@@ -304,6 +356,29 @@ export function AppShell() {
   )
   const modelLabel = selectedProvider?.model ?? "Local chat"
 
+  if (loading) {
+    return (
+      <main
+        className="onboarding-shell onboarding-loading-shell"
+        data-theme="dark"
+      >
+        <div className="workspace-loading" role="status">
+          Opening your local workspace…
+        </div>
+      </main>
+    )
+  }
+
+  if (onboardingRequired && profile && settings) {
+    return (
+      <OnboardingFlow
+        profile={profile}
+        settings={settings}
+        onComplete={completeOnboarding}
+      />
+    )
+  }
+
   return (
     <main className="app-shell">
       <button
@@ -343,11 +418,7 @@ export function AppShell() {
         <div
           className={`workspace-content ${activeView === "Settings" ? "settings-content" : ""} ${activeView === "session" ? "thread-content" : ""}`}
         >
-          {loading ? (
-            <div className="workspace-loading" role="status">
-              Opening your local workspace…
-            </div>
-          ) : activeView === "Settings" && profile && settings ? (
+          {activeView === "Settings" && profile && settings ? (
             <SettingsPage
               profile={profile}
               settings={settings}
@@ -375,7 +446,7 @@ export function AppShell() {
           )}
         </div>
 
-        {!loading && activeView !== "Settings" ? (
+        {activeView !== "Settings" ? (
           <Composer
             value={composerValue}
             placeholder={
