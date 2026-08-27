@@ -117,8 +117,8 @@ float bayer4(vec2 cell) {
 
 void main() {
   vec2 cell = floor(v_uv * vec2(12.0, 64.0));
-  float dot = step(bayer4(cell), 0.42);
-  out_color = vec4(vec3(0.82), dot * 0.55);
+  float pattern = step(bayer4(cell), 0.42);
+  out_color = vec4(vec3(0.82), pattern * 0.55);
 }`
     )
     gl.compileShader(fragmentShader)

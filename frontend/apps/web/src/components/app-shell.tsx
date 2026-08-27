@@ -71,28 +71,31 @@ export function AppShell() {
   const sessionLoadSequenceRef = useRef(0)
   const submissionLockRef = useRef(false)
 
-  const restoreSessions = useCallback(async (isCancelled = () => false) => {
-    const restoredSessions = await api.listSessions()
-    if (isCancelled()) return
+  const restoreSessions = useCallback(
+    async (isCancelled: () => boolean = () => false) => {
+      const restoredSessions = await api.listSessions()
+      if (isCancelled()) return
 
-    setSessions(restoredSessions)
-    if (!restoredSessions[0]) return
+      setSessions(restoredSessions)
+      if (!restoredSessions[0]) return
 
-    const detail = await api.getSession(restoredSessions[0].id)
-    if (isCancelled()) return
-    const restoredRetry = retryFromTranscript(
-      detail.session.id,
-      detail.messages
-    )
-    activeSessionIdRef.current = detail.session.id
-    setActiveSession(detail.session)
-    setMessages(detail.messages)
-    setFailedTurn(restoredRetry)
-    if (restoredRetry) {
-      setError("The previous assistant response did not complete.")
-    }
-    setActiveView("session")
-  }, [])
+      const detail = await api.getSession(restoredSessions[0].id)
+      if (isCancelled()) return
+      const restoredRetry = retryFromTranscript(
+        detail.session.id,
+        detail.messages
+      )
+      activeSessionIdRef.current = detail.session.id
+      setActiveSession(detail.session)
+      setMessages(detail.messages)
+      setFailedTurn(restoredRetry)
+      if (restoredRetry) {
+        setError("The previous assistant response did not complete.")
+      }
+      setActiveView("session")
+    },
+    []
+  )
 
   useEffect(() => {
     let cancelled = false
