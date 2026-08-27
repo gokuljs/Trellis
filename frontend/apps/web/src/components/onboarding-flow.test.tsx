@@ -67,9 +67,7 @@ describe("OnboardingFlow", () => {
       screen.getByRole("heading", { name: /get started/i })
     ).toHaveAccessibleName("Get started")
     expect(
-      screen.getByText(
-        "Set up your profile and connect a model to start using Trellis."
-      )
+      screen.getByText("Set up your profile and connect a model.")
     ).toBeInTheDocument()
     expect(screen.getByText("01 / 03")).toBeInTheDocument()
     expect(screen.getAllByRole("button", { name: "Get started" })).toHaveLength(
