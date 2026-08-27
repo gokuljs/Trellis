@@ -66,6 +66,16 @@ function response(body: unknown, status = 200) {
 }
 
 function renderApp() {
+  localStorage.setItem("trellis:onboarding-complete", "true")
+  return render(
+    <ThemeProvider defaultTheme="dark">
+      <App />
+    </ThemeProvider>
+  )
+}
+
+function renderFirstRunApp() {
+  localStorage.removeItem("trellis:onboarding-complete")
   return render(
     <ThemeProvider defaultTheme="dark">
       <App />
@@ -107,6 +117,118 @@ afterEach(() => {
 })
 
 describe("local-first chat", () => {
+  it("shows onboarding before exposing the workspace on the first visit", async () => {
+    const fetchMock = startupFetch(() => undefined)
+    vi.stubGlobal("fetch", fetchMock)
+
+    renderFirstRunApp()
+
+    expect(
+      await screen.findByRole("heading", { name: "Workspace setup" })
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole("textbox", { name: "Message" })
+    ).not.toBeInTheDocument()
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/sessions",
+      expect.objectContaining({ method: "GET" })
+    )
+  })
+
+  it("submits onboarding setup, marks completion, then restores the workspace", async () => {
+    const calls: string[] = []
+    const fetchMock = startupFetch((url, init) => {
+      const method = init?.method ?? "GET"
+      if (method !== "GET") calls.push(`${method} ${url}`)
+      if (url === "/api/profile" && method === "PUT") {
+        return response({
+          ...profile,
+          display_name: "Ada",
+          email: "ada@example.com",
+        })
+      }
+      if (url === "/api/settings/provider" && method === "PUT") {
+        return response({
+          ...settings,
+          selected_provider: "anthropic",
+        })
+      }
+      if (
+        url === "/api/settings/providers/anthropic/api-key" &&
+        method === "PUT"
+      ) {
+        return response({
+          ...settings,
+          selected_provider: "anthropic",
+          providers: settings.providers.map((provider) =>
+            provider.id === "anthropic"
+              ? { ...provider, configured: true, key_hint: "••••draft" }
+              : provider
+          ),
+        })
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderFirstRunApp()
+    await user.click(await screen.findByRole("button", { name: "Continue" }))
+    await user.clear(screen.getByRole("textbox", { name: "Name" }))
+    await user.type(screen.getByRole("textbox", { name: "Name" }), "Ada")
+    await user.clear(screen.getByRole("textbox", { name: "Email" }))
+    await user.type(
+      screen.getByRole("textbox", { name: "Email" }),
+      "ada@example.com"
+    )
+    await user.click(screen.getByRole("button", { name: "Continue" }))
+    await user.click(screen.getByRole("radio", { name: /Anthropic/ }))
+    await user.type(screen.getByLabelText("Anthropic API key"), "sk-ant-draft")
+    await user.click(screen.getByRole("button", { name: "Start Trellis" }))
+
+    expect(
+      await screen.findByText("A workspace for ideas in motion")
+    ).toBeInTheDocument()
+    expect(localStorage.getItem("trellis:onboarding-complete")).toBe("true")
+    expect(calls).toEqual([
+      "PUT /api/profile",
+      "PUT /api/settings/provider",
+      "PUT /api/settings/providers/anthropic/api-key",
+    ])
+  })
+
+  it("keeps onboarding open and does not mark completion when setup fails", async () => {
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/profile" && init?.method === "PUT") {
+        return response(
+          {
+            error: {
+              code: "profile_update_failed",
+              message: "The profile could not be saved.",
+            },
+          },
+          500
+        )
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderFirstRunApp()
+    await user.click(await screen.findByRole("button", { name: "Continue" }))
+    await user.click(screen.getByRole("button", { name: "Continue" }))
+    await user.click(screen.getByRole("button", { name: "Start Trellis" }))
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The profile could not be saved."
+    )
+    expect(
+      screen.getByRole("heading", { name: "Choose a model" })
+    ).toBeInTheDocument()
+    expect(localStorage.getItem("trellis:onboarding-complete")).toBeNull()
+  })
+
   it("restores the most recent complete transcript and switches sessions by ID", async () => {
     const fetchMock = startupFetch((url) => {
       if (url === "/api/sessions")

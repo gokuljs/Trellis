@@ -1,7 +1,8 @@
-import { PanelLeft, SlidersHorizontal } from "lucide-react"
+import { MoreHorizontal, PanelLeft, SlidersHorizontal } from "lucide-react"
 
 import { NAVIGATION_ITEMS } from "@/lib/app-data"
 import type { Session, WorkspaceView } from "@/lib/app-types"
+import { TrellisMark } from "@/components/trellis-mark"
 
 type SidebarProps = {
   activeView: WorkspaceView
@@ -91,6 +92,14 @@ function SessionList({
                 <span className="session-date">
                   {formatSessionDate(session.updated_at)}
                 </span>
+                {session.title === "Resume File Location" ? (
+                  <MoreHorizontal
+                    className="session-more"
+                    size={13}
+                    strokeWidth={1.8}
+                    aria-hidden="true"
+                  />
+                ) : null}
               </button>
             )
           })}
@@ -112,8 +121,9 @@ export function Sidebar({
   return (
     <aside className="app-sidebar">
       <div className="sidebar-topbar">
-        <span className="sidebar-wordmark" aria-label="Trellis">
-          Trellis
+        <span className="sidebar-brand" aria-label="Trellis">
+          <TrellisMark size={15} />
+          <span className="sidebar-wordmark">Trellis</span>
         </span>
         <div className="sidebar-topbar-spacer" />
         <button
