@@ -1474,13 +1474,13 @@ html.theme-ripple-fallback::before {
     display: flex;
     min-height: 0;
     flex: 1;
-    align-items: center;
-    justify-content: center;
-    padding: clamp(52px, 8vh, 96px) clamp(36px, 5vw, 72px);
+    align-items: flex-start;
+    justify-content: flex-start;
+    padding: clamp(104px, 16vh, 152px) clamp(36px, 5vw, 72px) 72px;
   }
 
   .onboarding-page {
-    width: min(520px, 100%);
+    width: min(440px, 100%);
     animation-duration: 260ms;
     animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
     animation-fill-mode: both;
@@ -1528,10 +1528,10 @@ html.theme-ripple-fallback::before {
     margin: 0;
     flex-direction: column;
     color: var(--onboarding-text);
-    font-size: clamp(4.75rem, 7vw, 7rem);
+    font-size: clamp(3.5rem, 4.8vw, 4.75rem);
     font-weight: 500;
-    letter-spacing: -0.085em;
-    line-height: 0.86;
+    letter-spacing: -0.075em;
+    line-height: 0.88;
   }
 
   .onboarding-intro h1 span {
@@ -1543,8 +1543,8 @@ html.theme-ripple-fallback::before {
   }
 
   .onboarding-intro .onboarding-primary-action {
-    width: 100%;
-    margin-top: 48px;
+    width: auto;
+    margin-top: 34px;
   }
 
   .onboarding-form-page {
@@ -1552,25 +1552,26 @@ html.theme-ripple-fallback::before {
   }
 
   .onboarding-form-page h1 {
-    margin: 0 0 40px;
-    color: var(--onboarding-text);
-    font-size: clamp(3rem, 4.2vw, 4.75rem);
-    font-weight: 500;
-    letter-spacing: -0.075em;
-    line-height: 0.9;
+    margin: 0 0 28px;
+    color: var(--onboarding-muted);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.16em;
+    line-height: 1;
+    text-transform: uppercase;
   }
 
   .onboarding-form {
     display: grid;
     width: 100%;
-    gap: 20px;
+    gap: 16px;
   }
 
   .onboarding-field {
     display: grid;
-    gap: 8px;
+    gap: 7px;
     color: var(--onboarding-muted);
-    font-size: 10px;
+    font-size: 9px;
     font-weight: 600;
     letter-spacing: 0.14em;
     text-transform: uppercase;
@@ -1578,13 +1579,13 @@ html.theme-ripple-fallback::before {
 
   .onboarding-field input,
   .onboarding-key-input {
-    min-height: 52px;
+    min-height: 44px;
     border: 1px solid var(--onboarding-line);
     border-radius: 0;
     color: var(--onboarding-text);
     background: var(--onboarding-panel);
     font: inherit;
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 400;
     letter-spacing: 0;
     text-transform: none;
@@ -1609,18 +1610,18 @@ html.theme-ripple-fallback::before {
 
   .onboarding-provider-options {
     display: grid;
-    gap: 8px;
+    gap: 6px;
   }
 
   .onboarding-provider {
     display: grid;
-    min-height: 70px;
+    min-height: 56px;
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
-    gap: 8px 16px;
+    gap: 4px 12px;
     border: 1px solid var(--onboarding-line);
     border-radius: 0;
-    padding: 14px 15px;
+    padding: 10px 12px;
     color: var(--onboarding-muted);
     background: var(--onboarding-panel);
     text-align: left;
@@ -1632,7 +1633,7 @@ html.theme-ripple-fallback::before {
 
   .onboarding-provider span:first-child {
     color: var(--onboarding-text);
-    font-size: 14px;
+    font-size: 12px;
     font-weight: 600;
   }
 
@@ -1640,13 +1641,13 @@ html.theme-ripple-fallback::before {
     color: var(--onboarding-muted);
     font-family:
       ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    font-size: 11px;
+    font-size: 10px;
   }
 
   .onboarding-provider span:last-child {
     grid-column: 1 / -1;
     color: var(--onboarding-faint);
-    font-size: 10px;
+    font-size: 9px;
   }
 
   .onboarding-provider:hover,
@@ -1680,8 +1681,8 @@ html.theme-ripple-fallback::before {
 
   .onboarding-key-toggle {
     display: inline-flex;
-    width: 40px;
-    min-height: 50px;
+    width: 38px;
+    min-height: 42px;
     align-items: center;
     justify-content: center;
     border: 0;
@@ -1694,23 +1695,24 @@ html.theme-ripple-fallback::before {
   }
 
   .onboarding-actions {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr);
-    gap: 12px;
-    padding-top: 20px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding-top: 14px;
   }
 
   .onboarding-actions .onboarding-primary-action {
-    width: 100%;
+    width: auto;
+    min-width: 112px;
   }
 
   .onboarding-primary-action,
   .onboarding-secondary-action {
-    min-height: 48px;
+    min-height: 40px;
     border: 1px solid var(--onboarding-text);
     border-radius: 0;
-    padding: 0 20px;
-    font-size: 12px;
+    padding: 0 14px;
+    font-size: 11px;
     font-weight: 600;
     letter-spacing: 0.02em;
   }
@@ -1789,11 +1791,11 @@ html.theme-ripple-fallback::before {
     }
 
     .onboarding-stage {
-      padding: 48px 24px 64px;
+      padding: 64px 24px 72px;
     }
 
     .onboarding-page {
-      width: min(560px, 100%);
+      width: min(440px, 100%);
     }
   }
 }
@@ -1988,7 +1990,7 @@ html.theme-ripple-fallback::before {
     }
 
     .onboarding-intro h1 {
-      font-size: clamp(4rem, 18vw, 7rem);
+      font-size: clamp(3.25rem, 14vw, 4rem);
     }
 
     .onboarding-form-page {
@@ -1996,20 +1998,12 @@ html.theme-ripple-fallback::before {
     }
 
     .onboarding-form-page h1 {
-      margin-bottom: 28px;
+      margin-bottom: 24px;
     }
 
     .onboarding-form {
       width: 100%;
       margin-left: 0;
-    }
-
-    .onboarding-provider {
-      grid-template-columns: minmax(0, 1fr);
-    }
-
-    .onboarding-provider span:nth-child(2) {
-      grid-column: 1;
     }
   }
 }
