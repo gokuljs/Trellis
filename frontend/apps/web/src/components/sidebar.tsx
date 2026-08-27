@@ -1,8 +1,4 @@
-import {
-  MoreHorizontal,
-  PanelLeft,
-  SlidersHorizontal,
-} from "lucide-react"
+import { MoreHorizontal, PanelLeft, SlidersHorizontal } from "lucide-react"
 
 import { NAVIGATION_ITEMS } from "@/lib/app-data"
 import type { Session, WorkspaceView } from "@/lib/app-types"
@@ -30,14 +26,19 @@ function PrimaryNavigation({ activeView, onNavigate }: PrimaryNavigationProps) {
         >
           <Icon size={15} strokeWidth={1.6} aria-hidden="true" />
           <span>{label}</span>
-          {label === "New session" ? <span className="shortcut-hint">⌘ N</span> : null}
+          {label === "New session" ? (
+            <span className="shortcut-hint">⌘ N</span>
+          ) : null}
         </button>
       ))}
     </nav>
   )
 }
 
-function SessionList({ sessions, onNavigate }: Pick<SidebarProps, "sessions" | "onNavigate">) {
+function SessionList({
+  sessions,
+  onNavigate,
+}: Pick<SidebarProps, "sessions" | "onNavigate">) {
   const groups = [
     { month: "", items: sessions.slice(0, 1) },
     { month: "JULY", items: sessions.slice(1, 5) },
@@ -47,13 +48,17 @@ function SessionList({ sessions, onNavigate }: Pick<SidebarProps, "sessions" | "
   return (
     <section className="sessions-section">
       <div className="section-heading">
-        <span><span className="section-mark">◆</span> SESSIONS</span>
+        <span>
+          <span className="section-mark">◆</span> SESSIONS
+        </span>
         <SlidersHorizontal size={12} strokeWidth={1.5} />
       </div>
 
       {groups.map((group) => (
         <div className="session-group" key={group.month || "recent"}>
-          {group.month ? <div className="month-label">{group.month}</div> : null}
+          {group.month ? (
+            <div className="month-label">{group.month}</div>
+          ) : null}
           {group.items.map((session) => (
             <button
               className={`session-row ${session.active ? "selected" : ""}`}
@@ -65,7 +70,12 @@ function SessionList({ sessions, onNavigate }: Pick<SidebarProps, "sessions" | "
               <span className="session-title">{session.title}</span>
               <span className="session-date">{session.date}</span>
               {session.title === "Resume File Location" ? (
-                <MoreHorizontal className="session-more" size={13} strokeWidth={1.8} aria-hidden="true" />
+                <MoreHorizontal
+                  className="session-more"
+                  size={13}
+                  strokeWidth={1.8}
+                  aria-hidden="true"
+                />
               ) : null}
             </button>
           ))}
@@ -75,7 +85,13 @@ function SessionList({ sessions, onNavigate }: Pick<SidebarProps, "sessions" | "
   )
 }
 
-export function Sidebar({ activeView, sessions, onNavigate, sidebarCollapsed, onToggleSidebar }: SidebarProps) {
+export function Sidebar({
+  activeView,
+  sessions,
+  onNavigate,
+  sidebarCollapsed,
+  onToggleSidebar,
+}: SidebarProps) {
   return (
     <aside className="app-sidebar">
       <div className="sidebar-topbar">

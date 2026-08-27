@@ -1,9 +1,4 @@
-import {
-  CalendarClock,
-  FileText,
-  GitBranch,
-  Search,
-} from "lucide-react"
+import { CalendarClock, FileText, GitBranch, Search } from "lucide-react"
 
 import type { WorkspaceView } from "@/lib/app-types"
 import { TrellisMark } from "@/components/trellis-mark"
@@ -24,19 +19,28 @@ function CapabilityGrid() {
   return (
     <div className="capability-grid">
       {capabilityItems.map(({ label, icon: Icon }) => (
-        <div key={label}><Icon size={16} aria-hidden="true" /><span>{label}</span></div>
+        <div key={label}>
+          <Icon size={16} aria-hidden="true" />
+          <span>{label}</span>
+        </div>
       ))}
     </div>
   )
 }
 
-export function WelcomePanel({ activeView, activeSessionTitle }: WelcomePanelProps) {
+export function WelcomePanel({
+  activeView,
+  activeSessionTitle,
+}: WelcomePanelProps) {
   if (activeView === "Capabilities") {
     return (
       <div className="utility-panel">
         <div className="utility-kicker">AGENT CAPABILITIES</div>
         <h1>Build with an agent that can follow the thread.</h1>
-        <p>Research, code, inspect files, and keep a working context across every session.</p>
+        <p>
+          Research, code, inspect files, and keep a working context across every
+          session.
+        </p>
         <CapabilityGrid />
       </div>
     )
@@ -59,7 +63,10 @@ export function WelcomePanel({ activeView, activeSessionTitle }: WelcomePanelPro
         <TrellisMark size={22} />
         <span>Trellis</span>
       </div>
-      <p className="welcome-copy">Bring a question, a file, or a rough idea. Trellis helps you find the next clear step.</p>
+      <p className="welcome-copy">
+        Bring a question, a file, or a rough idea. Trellis helps you find the
+        next clear step.
+      </p>
     </div>
   )
 }
