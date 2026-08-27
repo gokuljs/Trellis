@@ -199,6 +199,40 @@ describe("local-first chat", () => {
     ])
   })
 
+  it("keeps onboarding open and does not mark completion when setup fails", async () => {
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/profile" && init?.method === "PUT") {
+        return response(
+          {
+            error: {
+              code: "profile_update_failed",
+              message: "The profile could not be saved.",
+            },
+          },
+          500
+        )
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderFirstRunApp()
+    await user.click(
+      await screen.findByRole("button", { name: "Start onboarding" })
+    )
+    await user.click(screen.getByRole("button", { name: "Continue" }))
+    await user.click(screen.getByRole("button", { name: "Start Trellis" }))
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The profile could not be saved."
+    )
+    expect(
+      screen.getByRole("heading", { name: "Choose a model" })
+    ).toBeInTheDocument()
+    expect(localStorage.getItem("trellis:onboarding-complete")).toBeNull()
+  })
+
   it("restores the most recent complete transcript and switches sessions by ID", async () => {
     const fetchMock = startupFetch((url) => {
       if (url === "/api/sessions")
