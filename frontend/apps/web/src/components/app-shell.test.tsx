@@ -173,9 +173,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderFirstRunApp()
-    await user.click(
-      await screen.findByRole("button", { name: "Start onboarding" })
-    )
+    await user.click(await screen.findByRole("button", { name: "Get started" }))
     await user.clear(screen.getByRole("textbox", { name: "Name" }))
     await user.type(screen.getByRole("textbox", { name: "Name" }), "Ada")
     await user.clear(screen.getByRole("textbox", { name: "Email" }))
@@ -218,9 +216,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderFirstRunApp()
-    await user.click(
-      await screen.findByRole("button", { name: "Start onboarding" })
-    )
+    await user.click(await screen.findByRole("button", { name: "Get started" }))
     await user.click(screen.getByRole("button", { name: "Continue" }))
     await user.click(screen.getByRole("button", { name: "Start Trellis" }))
 

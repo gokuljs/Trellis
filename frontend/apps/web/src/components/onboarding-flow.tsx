@@ -1,4 +1,4 @@
-import { Eye, EyeOff, KeyRound } from "lucide-react"
+import { ArrowUpRight, Eye, EyeOff, KeyRound } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
 
 import { TrellisMark } from "@/components/trellis-mark"
@@ -26,6 +26,11 @@ const STEP_NUMBER: Record<OnboardingStep, number> = {
   model: 3,
 }
 
+const onboardingImageUrl = new URL(
+  "../../../../assets/image-1.jpg",
+  import.meta.url
+).href
+
 function errorMessage(error: unknown) {
   if (error instanceof ApiError) return error.message
   if (error instanceof Error) return error.message
@@ -34,185 +39,6 @@ function errorMessage(error: unknown) {
 
 function isValidEmail(value: string) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())
-}
-
-function DitherField() {
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-
-  useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-
-    if (!("WebGL2RenderingContext" in window)) {
-      canvas.dataset.fallback = "true"
-      return
-    }
-
-    let gl: WebGL2RenderingContext | null = null
-    try {
-      gl = canvas.getContext("webgl2", {
-        alpha: true,
-        antialias: false,
-        depth: false,
-        premultipliedAlpha: true,
-      })
-    } catch {
-      canvas.dataset.fallback = "true"
-    }
-
-    if (!gl) {
-      canvas.dataset.fallback = "true"
-      return
-    }
-
-    const vertexShader = gl.createShader(gl.VERTEX_SHADER)
-    const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER)
-    if (!vertexShader || !fragmentShader) {
-      canvas.dataset.fallback = "true"
-      return
-    }
-
-    gl.shaderSource(
-      vertexShader,
-      `#version 300 es
-in vec2 a_position;
-out vec2 v_uv;
-
-void main() {
-  v_uv = a_position * 0.5 + 0.5;
-  gl_Position = vec4(a_position, 0.0, 1.0);
-}`
-    )
-    gl.compileShader(vertexShader)
-
-    gl.shaderSource(
-      fragmentShader,
-      `#version 300 es
-precision highp float;
-in vec2 v_uv;
-out vec4 out_color;
-
-float bayer4(vec2 cell) {
-  int x = int(mod(cell.x, 4.0));
-  int y = int(mod(cell.y, 4.0));
-  int index = x + y * 4;
-
-  if (index == 0) return 0.0 / 16.0;
-  if (index == 1) return 8.0 / 16.0;
-  if (index == 2) return 2.0 / 16.0;
-  if (index == 3) return 10.0 / 16.0;
-  if (index == 4) return 12.0 / 16.0;
-  if (index == 5) return 4.0 / 16.0;
-  if (index == 6) return 14.0 / 16.0;
-  if (index == 7) return 6.0 / 16.0;
-  if (index == 8) return 3.0 / 16.0;
-  if (index == 9) return 11.0 / 16.0;
-  if (index == 10) return 1.0 / 16.0;
-  if (index == 11) return 9.0 / 16.0;
-  if (index == 12) return 15.0 / 16.0;
-  if (index == 13) return 7.0 / 16.0;
-  if (index == 14) return 13.0 / 16.0;
-  return 5.0 / 16.0;
-}
-
-void main() {
-  float leftFrame = 1.0 - smoothstep(0.006, 0.035, abs(v_uv.x - 0.12));
-  float rightFrame = 1.0 - smoothstep(0.006, 0.035, abs(v_uv.x - 0.88));
-  float topFrame = 1.0 - smoothstep(0.006, 0.035, abs(v_uv.y - 0.12));
-  float bottomFrame = 1.0 - smoothstep(0.006, 0.035, abs(v_uv.y - 0.88));
-  float firstRail = 1.0 - smoothstep(0.008, 0.04, abs(v_uv.x - 0.37));
-  float secondRail = 1.0 - smoothstep(0.008, 0.04, abs(v_uv.x - 0.63));
-  float crossRail = 1.0 - smoothstep(0.008, 0.04, abs(v_uv.y - 0.5));
-  float frame = max(max(leftFrame, rightFrame), max(topFrame, bottomFrame));
-  float rails = max(max(firstRail, secondRail), crossRail);
-  float structure = max(frame * 0.72, rails);
-  float density = clamp(structure * 0.54, 0.0, 0.56);
-  vec2 cell = floor(gl_FragCoord.xy / 4.0);
-  float pixel = step(0.001, density) * step(bayer4(cell), density);
-  out_color = vec4(vec3(0.46), pixel * 0.62);
-}`
-    )
-    gl.compileShader(fragmentShader)
-
-    const program = gl.createProgram()
-    if (!program) {
-      canvas.dataset.fallback = "true"
-      return
-    }
-    gl.attachShader(program, vertexShader)
-    gl.attachShader(program, fragmentShader)
-    gl.linkProgram(program)
-
-    if (
-      !gl.getShaderParameter(vertexShader, gl.COMPILE_STATUS) ||
-      !gl.getShaderParameter(fragmentShader, gl.COMPILE_STATUS) ||
-      !gl.getProgramParameter(program, gl.LINK_STATUS)
-    ) {
-      canvas.dataset.fallback = "true"
-      gl.deleteProgram(program)
-      gl.deleteShader(vertexShader)
-      gl.deleteShader(fragmentShader)
-      return
-    }
-
-    const buffer = gl.createBuffer()
-    const position = gl.getAttribLocation(program, "a_position")
-    if (!buffer || position < 0) {
-      canvas.dataset.fallback = "true"
-      gl.deleteProgram(program)
-      gl.deleteShader(vertexShader)
-      gl.deleteShader(fragmentShader)
-      return
-    }
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
-    gl.bufferData(
-      gl.ARRAY_BUFFER,
-      new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]),
-      gl.STATIC_DRAW
-    )
-    gl.useProgram(program)
-    gl.enableVertexAttribArray(position)
-    gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0)
-    gl.enable(gl.BLEND)
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
-
-    const draw = () => {
-      const rect = canvas.getBoundingClientRect()
-      const pixelRatio = Math.min(window.devicePixelRatio || 1, 2)
-      const width = Math.max(1, Math.round(rect.width * pixelRatio))
-      const height = Math.max(1, Math.round(rect.height * pixelRatio))
-      if (canvas.width !== width || canvas.height !== height) {
-        canvas.width = width
-        canvas.height = height
-      }
-      gl!.viewport(0, 0, width, height)
-      gl!.clearColor(0, 0, 0, 0)
-      gl!.clear(gl!.COLOR_BUFFER_BIT)
-      gl!.drawArrays(gl!.TRIANGLES, 0, 6)
-    }
-
-    draw()
-    const resizeObserver =
-      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(draw)
-    resizeObserver?.observe(canvas)
-
-    return () => {
-      resizeObserver?.disconnect()
-      gl?.deleteBuffer(buffer)
-      gl?.deleteProgram(program)
-      gl?.deleteShader(vertexShader)
-      gl?.deleteShader(fragmentShader)
-    }
-  }, [])
-
-  return (
-    <canvas
-      ref={canvasRef}
-      className="onboarding-dither-field"
-      aria-hidden="true"
-    />
-  )
 }
 
 export function OnboardingFlow({
@@ -309,21 +135,17 @@ export function OnboardingFlow({
   return (
     <main className="onboarding-shell" data-theme="dark">
       <div className="onboarding-frame">
-        <div className="onboarding-visual">
-          <DitherField />
+        <header className="onboarding-topbar">
           <div className="onboarding-brand" aria-label="Trellis">
             <TrellisMark size={18} />
             <span>Trellis</span>
           </div>
-        </div>
+          <div className="onboarding-step" aria-live="polite">
+            {stepLabel}
+          </div>
+        </header>
 
         <section className="onboarding-content">
-          <header className="onboarding-topbar">
-            <div className="onboarding-step" aria-live="polite">
-              {stepLabel}
-            </div>
-          </header>
-
           <div className="onboarding-stage" aria-live="polite">
             <div
               key={step}
@@ -340,15 +162,15 @@ export function OnboardingFlow({
                     aria-label="Get started"
                     tabIndex={-1}
                   >
-                    <span>Get</span>
-                    <span>started</span>
+                    <span>Get started</span>
                   </h1>
                   <button
                     className="onboarding-primary-action"
                     type="button"
                     onClick={() => changeStep("profile", "forward")}
                   >
-                    Start onboarding
+                    <span>Get started</span>
+                    <ArrowUpRight size={14} aria-hidden="true" />
                   </button>
                 </section>
               ) : step === "profile" ? (
@@ -548,6 +370,17 @@ export function OnboardingFlow({
             </div>
           </div>
         </section>
+
+        <div className="onboarding-visual">
+          <img
+            className="onboarding-image"
+            src={onboardingImageUrl}
+            alt=""
+            aria-hidden="true"
+            width={5899}
+            height={3938}
+          />
+        </div>
       </div>
     </main>
   )

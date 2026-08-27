@@ -47,7 +47,7 @@ function renderOnboarding(overrides: Partial<Settings> = {}) {
 
 async function reachModelStep() {
   const user = userEvent.setup()
-  await user.click(screen.getByRole("button", { name: "Start onboarding" }))
+  await user.click(screen.getByRole("button", { name: "Get started" }))
   await user.type(screen.getByRole("textbox", { name: "Name" }), "Ada")
   await user.type(
     screen.getByRole("textbox", { name: "Email" }),
@@ -67,10 +67,14 @@ describe("OnboardingFlow", () => {
       screen.getByRole("heading", { name: /get started/i })
     ).toHaveAccessibleName("Get started")
     expect(screen.getByText("01 / 03")).toBeInTheDocument()
-
-    await userEvent.click(
-      screen.getByRole("button", { name: "Start onboarding" })
+    expect(screen.getAllByRole("button", { name: "Get started" })).toHaveLength(
+      1
     )
+    expect(
+      screen.queryByRole("button", { name: "Start onboarding" })
+    ).not.toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole("button", { name: "Get started" }))
 
     expect(
       await screen.findByRole("heading", { name: "Your profile" })
@@ -81,7 +85,7 @@ describe("OnboardingFlow", () => {
   it("blocks profile progression until name and a valid email are present", async () => {
     renderOnboarding()
     const user = userEvent.setup()
-    await user.click(screen.getByRole("button", { name: "Start onboarding" }))
+    await user.click(screen.getByRole("button", { name: "Get started" }))
     await user.click(screen.getByRole("button", { name: "Continue" }))
 
     expect(
