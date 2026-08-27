@@ -1399,7 +1399,7 @@ html.theme-ripple-fallback::before {
     display: grid;
     width: 100%;
     min-height: 100svh;
-    grid-template-columns: minmax(440px, 0.78fr) minmax(0, 1.22fr);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .onboarding-visual {
@@ -1440,9 +1440,9 @@ html.theme-ripple-fallback::before {
     align-items: center;
     justify-content: space-between;
     inset: 0 0 auto;
-    border-bottom: 1px solid rgb(255 255 255 / 14%);
+    border-bottom: 0;
     color: var(--onboarding-text);
-    background: rgb(0 0 0 / 68%);
+    background: transparent;
     font-size: 12px;
     font-weight: 600;
     letter-spacing: -0.02em;
