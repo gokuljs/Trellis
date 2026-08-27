@@ -145,4 +145,22 @@ describe("OnboardingFlow", () => {
 
     expect(screen.getByLabelText("Anthropic API key")).toHaveValue("")
   })
+
+  it("moves provider selection with arrow keys using one tab stop", async () => {
+    renderOnboarding()
+    const user = await reachModelStep()
+    const openAi = screen.getByRole("radio", { name: /OpenAI/ })
+    const anthropic = screen.getByRole("radio", { name: /Anthropic/ })
+
+    expect(openAi).toHaveAttribute("tabindex", "0")
+    expect(anthropic).toHaveAttribute("tabindex", "-1")
+
+    openAi.focus()
+    await user.keyboard("{ArrowDown}")
+
+    expect(anthropic).toHaveFocus()
+    expect(anthropic).toHaveAttribute("aria-checked", "true")
+    expect(openAi).toHaveAttribute("tabindex", "-1")
+    expect(anthropic).toHaveAttribute("tabindex", "0")
+  })
 })

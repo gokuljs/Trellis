@@ -36,7 +36,7 @@ function isValidEmail(value: string) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())
 }
 
-function DitherEdge() {
+function DitherField() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
 
   useEffect(() => {
@@ -116,9 +116,20 @@ float bayer4(vec2 cell) {
 }
 
 void main() {
-  vec2 cell = floor(v_uv * vec2(12.0, 64.0));
-  float pattern = step(bayer4(cell), 0.42);
-  out_color = vec4(vec3(0.82), pattern * 0.55);
+  float leftFrame = 1.0 - smoothstep(0.006, 0.035, abs(v_uv.x - 0.12));
+  float rightFrame = 1.0 - smoothstep(0.006, 0.035, abs(v_uv.x - 0.88));
+  float topFrame = 1.0 - smoothstep(0.006, 0.035, abs(v_uv.y - 0.12));
+  float bottomFrame = 1.0 - smoothstep(0.006, 0.035, abs(v_uv.y - 0.88));
+  float firstRail = 1.0 - smoothstep(0.008, 0.04, abs(v_uv.x - 0.37));
+  float secondRail = 1.0 - smoothstep(0.008, 0.04, abs(v_uv.x - 0.63));
+  float crossRail = 1.0 - smoothstep(0.008, 0.04, abs(v_uv.y - 0.5));
+  float frame = max(max(leftFrame, rightFrame), max(topFrame, bottomFrame));
+  float rails = max(max(firstRail, secondRail), crossRail);
+  float structure = max(frame * 0.72, rails);
+  float density = clamp(structure * 0.54, 0.0, 0.56);
+  vec2 cell = floor(gl_FragCoord.xy / 4.0);
+  float pixel = step(0.001, density) * step(bayer4(cell), density);
+  out_color = vec4(vec3(0.46), pixel * 0.62);
 }`
     )
     gl.compileShader(fragmentShader)
@@ -198,7 +209,7 @@ void main() {
   return (
     <canvas
       ref={canvasRef}
-      className="onboarding-dither-edge"
+      className="onboarding-dither-field"
       aria-hidden="true"
     />
   )
@@ -221,6 +232,7 @@ export function OnboardingFlow({
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const headingRef = useRef<HTMLHeadingElement>(null)
+  const providerRefs = useRef<Array<HTMLButtonElement | null>>([])
 
   const selectedProvider = settings.providers.find(
     (item) => item.id === provider
@@ -257,6 +269,13 @@ export function OnboardingFlow({
     changeStep("model", "forward")
   }
 
+  const selectProvider = (nextProvider: ProviderId) => {
+    setProvider(nextProvider)
+    setApiKey("")
+    setShowApiKey(false)
+    setError(null)
+  }
+
   const submit = async () => {
     if (!selectedProvider) {
       setError("Choose a model provider.")
@@ -290,209 +309,245 @@ export function OnboardingFlow({
   return (
     <main className="onboarding-shell" data-theme="dark">
       <div className="onboarding-frame">
-        <header className="onboarding-topbar">
+        <div className="onboarding-visual">
+          <DitherField />
           <div className="onboarding-brand" aria-label="Trellis">
             <TrellisMark size={18} />
             <span>Trellis</span>
           </div>
-          <div className="onboarding-step" aria-live="polite">
-            {stepLabel}
-          </div>
-        </header>
-
-        <div className="onboarding-stage" aria-live="polite">
-          <div
-            key={step}
-            className={`onboarding-page onboarding-page-${direction}`}
-          >
-            {step === "intro" ? (
-              <section
-                className="onboarding-intro"
-                aria-labelledby="onboarding-intro-heading"
-              >
-                <DitherEdge />
-                <TrellisMark size={22} />
-                <h1
-                  id="onboarding-intro-heading"
-                  ref={headingRef}
-                  aria-label="Get started"
-                  tabIndex={-1}
-                >
-                  <span>Get</span>
-                  <span>started</span>
-                </h1>
-                <button
-                  className="onboarding-primary-action"
-                  type="button"
-                  onClick={() => changeStep("profile", "forward")}
-                >
-                  Start onboarding
-                </button>
-              </section>
-            ) : step === "profile" ? (
-              <section
-                className="onboarding-form-page"
-                aria-labelledby="onboarding-profile-heading"
-              >
-                <h1
-                  id="onboarding-profile-heading"
-                  ref={headingRef}
-                  tabIndex={-1}
-                >
-                  Your profile
-                </h1>
-                <form
-                  className="onboarding-form"
-                  onSubmit={(event) => {
-                    event.preventDefault()
-                    continueFromProfile()
-                  }}
-                >
-                  <label className="onboarding-field">
-                    <span>Name</span>
-                    <input
-                      aria-label="Name"
-                      value={displayName}
-                      maxLength={100}
-                      autoComplete="name"
-                      onChange={(event) => setDisplayName(event.target.value)}
-                    />
-                  </label>
-                  <label className="onboarding-field">
-                    <span>Email</span>
-                    <input
-                      aria-label="Email"
-                      type="email"
-                      required
-                      value={email}
-                      autoComplete="email"
-                      onChange={(event) => setEmail(event.target.value)}
-                    />
-                  </label>
-                  {error ? (
-                    <div className="onboarding-error" role="alert">
-                      {error}
-                    </div>
-                  ) : null}
-                  <div className="onboarding-actions">
-                    <button
-                      className="onboarding-secondary-action"
-                      type="button"
-                      onClick={() => changeStep("intro", "back")}
-                    >
-                      Back
-                    </button>
-                    <button className="onboarding-primary-action" type="submit">
-                      Continue
-                    </button>
-                  </div>
-                </form>
-              </section>
-            ) : (
-              <section
-                className="onboarding-form-page"
-                aria-labelledby="onboarding-model-heading"
-              >
-                <h1
-                  id="onboarding-model-heading"
-                  ref={headingRef}
-                  tabIndex={-1}
-                >
-                  Choose a model
-                </h1>
-                <form
-                  className="onboarding-form"
-                  onSubmit={(event) => {
-                    event.preventDefault()
-                    void submit()
-                  }}
-                >
-                  <div
-                    className="onboarding-provider-options"
-                    role="radiogroup"
-                    aria-label="Model provider"
-                  >
-                    {settings.providers.map((item) => (
-                      <button
-                        key={item.id}
-                        className={`onboarding-provider ${item.id === provider ? "is-selected" : ""}`}
-                        type="button"
-                        role="radio"
-                        aria-checked={item.id === provider}
-                        onClick={() => {
-                          setProvider(item.id)
-                          setApiKey("")
-                          setShowApiKey(false)
-                          setError(null)
-                        }}
-                      >
-                        <span>{item.name}</span>
-                        <span>{item.model}</span>
-                        <span>
-                          {item.configured ? "Configured" : "API key required"}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-
-                  {selectedProvider && !selectedProvider.configured ? (
-                    <label className="onboarding-field">
-                      <span>{selectedProvider.name} API key</span>
-                      <span className="onboarding-key-input">
-                        <KeyRound size={15} aria-hidden="true" />
-                        <input
-                          aria-label={`${selectedProvider.name} API key`}
-                          type={showApiKey ? "text" : "password"}
-                          value={apiKey}
-                          autoComplete="new-password"
-                          spellCheck={false}
-                          onChange={(event) => setApiKey(event.target.value)}
-                        />
-                        <button
-                          className="onboarding-key-toggle"
-                          type="button"
-                          aria-label={
-                            showApiKey ? "Hide API key" : "Show API key"
-                          }
-                          onClick={() => setShowApiKey((visible) => !visible)}
-                        >
-                          {showApiKey ? (
-                            <EyeOff size={15} aria-hidden="true" />
-                          ) : (
-                            <Eye size={15} aria-hidden="true" />
-                          )}
-                        </button>
-                      </span>
-                    </label>
-                  ) : null}
-
-                  {error ? (
-                    <div className="onboarding-error" role="alert">
-                      {error}
-                    </div>
-                  ) : null}
-                  <div className="onboarding-actions">
-                    <button
-                      className="onboarding-secondary-action"
-                      type="button"
-                      disabled={submitting}
-                      onClick={() => changeStep("profile", "back")}
-                    >
-                      Back
-                    </button>
-                    <button
-                      className="onboarding-primary-action"
-                      type="submit"
-                      disabled={submitting}
-                    >
-                      {submitting ? "Starting…" : "Start Trellis"}
-                    </button>
-                  </div>
-                </form>
-              </section>
-            )}
-          </div>
         </div>
+
+        <section className="onboarding-content">
+          <header className="onboarding-topbar">
+            <div className="onboarding-step" aria-live="polite">
+              {stepLabel}
+            </div>
+          </header>
+
+          <div className="onboarding-stage" aria-live="polite">
+            <div
+              key={step}
+              className={`onboarding-page onboarding-page-${direction}`}
+            >
+              {step === "intro" ? (
+                <section
+                  className="onboarding-intro"
+                  aria-labelledby="onboarding-intro-heading"
+                >
+                  <h1
+                    id="onboarding-intro-heading"
+                    ref={headingRef}
+                    aria-label="Get started"
+                    tabIndex={-1}
+                  >
+                    <span>Get</span>
+                    <span>started</span>
+                  </h1>
+                  <button
+                    className="onboarding-primary-action"
+                    type="button"
+                    onClick={() => changeStep("profile", "forward")}
+                  >
+                    Start onboarding
+                  </button>
+                </section>
+              ) : step === "profile" ? (
+                <section
+                  className="onboarding-form-page"
+                  aria-labelledby="onboarding-profile-heading"
+                >
+                  <h1
+                    id="onboarding-profile-heading"
+                    ref={headingRef}
+                    tabIndex={-1}
+                  >
+                    Your profile
+                  </h1>
+                  <form
+                    className="onboarding-form"
+                    onSubmit={(event) => {
+                      event.preventDefault()
+                      continueFromProfile()
+                    }}
+                  >
+                    <label className="onboarding-field">
+                      <span>Name</span>
+                      <input
+                        aria-label="Name"
+                        value={displayName}
+                        maxLength={100}
+                        autoComplete="name"
+                        onChange={(event) => setDisplayName(event.target.value)}
+                      />
+                    </label>
+                    <label className="onboarding-field">
+                      <span>Email</span>
+                      <input
+                        aria-label="Email"
+                        type="email"
+                        required
+                        value={email}
+                        autoComplete="email"
+                        onChange={(event) => setEmail(event.target.value)}
+                      />
+                    </label>
+                    {error ? (
+                      <div className="onboarding-error" role="alert">
+                        {error}
+                      </div>
+                    ) : null}
+                    <div className="onboarding-actions">
+                      <button
+                        className="onboarding-secondary-action"
+                        type="button"
+                        onClick={() => changeStep("intro", "back")}
+                      >
+                        Back
+                      </button>
+                      <button
+                        className="onboarding-primary-action"
+                        type="submit"
+                      >
+                        Continue
+                      </button>
+                    </div>
+                  </form>
+                </section>
+              ) : (
+                <section
+                  className="onboarding-form-page"
+                  aria-labelledby="onboarding-model-heading"
+                >
+                  <h1
+                    id="onboarding-model-heading"
+                    ref={headingRef}
+                    tabIndex={-1}
+                  >
+                    Choose a model
+                  </h1>
+                  <form
+                    className="onboarding-form"
+                    onSubmit={(event) => {
+                      event.preventDefault()
+                      void submit()
+                    }}
+                  >
+                    <div
+                      className="onboarding-provider-options"
+                      role="radiogroup"
+                      aria-label="Model provider"
+                    >
+                      {settings.providers.map((item, index) => (
+                        <button
+                          key={item.id}
+                          ref={(element) => {
+                            providerRefs.current[index] = element
+                          }}
+                          className={`onboarding-provider ${item.id === provider ? "is-selected" : ""}`}
+                          type="button"
+                          role="radio"
+                          aria-checked={item.id === provider}
+                          tabIndex={item.id === provider ? 0 : -1}
+                          onClick={() => selectProvider(item.id)}
+                          onKeyDown={(event) => {
+                            let nextIndex: number | null = null
+                            if (
+                              event.key === "ArrowDown" ||
+                              event.key === "ArrowRight"
+                            ) {
+                              nextIndex =
+                                (index + 1) % settings.providers.length
+                            } else if (
+                              event.key === "ArrowUp" ||
+                              event.key === "ArrowLeft"
+                            ) {
+                              nextIndex =
+                                (index - 1 + settings.providers.length) %
+                                settings.providers.length
+                            } else if (event.key === "Home") {
+                              nextIndex = 0
+                            } else if (event.key === "End") {
+                              nextIndex = settings.providers.length - 1
+                            }
+
+                            if (nextIndex === null) return
+                            event.preventDefault()
+                            const nextProvider = settings.providers[nextIndex]
+                            if (!nextProvider) return
+                            selectProvider(nextProvider.id)
+                            providerRefs.current[nextIndex]?.focus()
+                          }}
+                        >
+                          <span>{item.name}</span>
+                          <span>{item.model}</span>
+                          <span>
+                            {item.configured
+                              ? "Configured"
+                              : "API key required"}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+
+                    {selectedProvider && !selectedProvider.configured ? (
+                      <label className="onboarding-field">
+                        <span>{selectedProvider.name} API key</span>
+                        <span className="onboarding-key-input">
+                          <KeyRound size={15} aria-hidden="true" />
+                          <input
+                            aria-label={`${selectedProvider.name} API key`}
+                            type={showApiKey ? "text" : "password"}
+                            value={apiKey}
+                            autoComplete="new-password"
+                            spellCheck={false}
+                            onChange={(event) => setApiKey(event.target.value)}
+                          />
+                          <button
+                            className="onboarding-key-toggle"
+                            type="button"
+                            aria-label={
+                              showApiKey ? "Hide API key" : "Show API key"
+                            }
+                            onClick={() => setShowApiKey((visible) => !visible)}
+                          >
+                            {showApiKey ? (
+                              <EyeOff size={15} aria-hidden="true" />
+                            ) : (
+                              <Eye size={15} aria-hidden="true" />
+                            )}
+                          </button>
+                        </span>
+                      </label>
+                    ) : null}
+
+                    {error ? (
+                      <div className="onboarding-error" role="alert">
+                        {error}
+                      </div>
+                    ) : null}
+                    <div className="onboarding-actions">
+                      <button
+                        className="onboarding-secondary-action"
+                        type="button"
+                        disabled={submitting}
+                        onClick={() => changeStep("profile", "back")}
+                      >
+                        Back
+                      </button>
+                      <button
+                        className="onboarding-primary-action"
+                        type="submit"
+                        disabled={submitting}
+                      >
+                        {submitting ? "Starting…" : "Start Trellis"}
+                      </button>
+                    </div>
+                  </form>
+                </section>
+              )}
+            </div>
+          </div>
+        </section>
       </div>
     </main>
   )
