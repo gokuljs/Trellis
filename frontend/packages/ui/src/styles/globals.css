@@ -88,13 +88,13 @@
 
     --shell-bg: #ececea;
     --shell-rail: #f7f7f4;
-    --shell-line: #ced2ce;
+    --shell-line: #7f8781;
     --shell-text: #4e544f;
     --shell-text-strong: #101210;
     --shell-text-bright: #1b1e1b;
-    --shell-text-muted: #707671;
-    --shell-text-faint: #999f99;
-    --shell-text-quiet: #b4bab5;
+    --shell-text-muted: #5f6761;
+    --shell-text-faint: #687169;
+    --shell-text-quiet: #6c746d;
     --shell-accent: #117455;
     --shell-accent-strong: #0b6247;
     --shell-hover: #e2e5e2;
@@ -141,13 +141,13 @@
 
     --shell-bg: #0b0c0c;
     --shell-rail: #101211;
-    --shell-line: #2a2d2b;
+    --shell-line: #59605a;
     --shell-text: #b8bdb8;
     --shell-text-strong: #f0eee8;
     --shell-text-bright: #e5e5df;
     --shell-text-muted: #878d88;
-    --shell-text-faint: #626964;
-    --shell-text-quiet: #4d544f;
+    --shell-text-faint: #7a827b;
+    --shell-text-quiet: #7a827b;
     --shell-accent: #8fe3be;
     --shell-accent-strong: #4fbf92;
     --shell-hover: #191c1b;
@@ -782,7 +782,7 @@ html.theme-ripple-fallback::before {
     justify-content: center;
     border: 1px solid var(--shell-line);
     border-radius: 50%;
-    color: white;
+    color: var(--primary-foreground);
   }
 
   .provider-option.is-selected .provider-check {
@@ -1023,7 +1023,7 @@ html.theme-ripple-fallback::before {
   }
 
   .send-button.ready {
-    color: white;
+    color: var(--primary-foreground);
     background: var(--shell-send-ready);
   }
 
