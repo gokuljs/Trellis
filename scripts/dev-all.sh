@@ -56,7 +56,7 @@ backend_pid=$!
 
 (
   cd -- "$repository_root/frontend"
-  exec bun run dev
+  exec bun run dev -- --ui=stream
 ) &
 frontend_pid=$!
 
