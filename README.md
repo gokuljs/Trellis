@@ -9,11 +9,12 @@ Install dependencies once, then start both services from the repository root:
 ```bash
 uvx --from uv==0.12.5 uv sync --locked --directory backend
 bun install --cwd frontend --frozen-lockfile
-bun run --cwd frontend dev:all
+make dev
 ```
 
 The frontend is served at `http://127.0.0.1:3000` and the backend at
-`http://127.0.0.1:8000`. Press `Ctrl-C` once to stop both services.
+`http://127.0.0.1:8000`. The command uses plain streamed logs so both services
+remain readable in one terminal. Press `Ctrl-C` once to stop both services.
 
 Then open `http://127.0.0.1:3000`, visit Settings, and add an OpenAI or
 Anthropic key. Trellis creates a stable local installation ID automatically and
