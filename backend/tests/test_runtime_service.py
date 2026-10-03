@@ -7,12 +7,13 @@ import pytest
 from app.application.errors import ApplicationError, ProviderError
 from app.application.runs import RunService
 from app.core.config import Settings
-from app.domain.models import ProviderName
+from app.domain.models import ModelDescriptor, ProviderName
 from app.domain.runtime import (
     ModelRequest,
     ModelStreamEvent,
     RunEvent,
     RunEventType,
+    RunSnapshot,
     RunStatus,
 )
 from app.infrastructure.database import Database
@@ -145,6 +146,41 @@ class UnexpectedFailureProvider(RecordingProvider):
             yield ModelStreamEvent(kind="completed")
 
         return generate()
+
+
+class OneShotGetFailureDatabase(Database):
+    fail_next_get_run = False
+
+    async def get_run(self, run_id: str) -> RunSnapshot | None:
+        if self.fail_next_get_run:
+            self.fail_next_get_run = False
+            raise RuntimeError("temporary database read failure")
+        return await super().get_run(run_id)
+
+
+class SlowCreateRunDatabase(Database):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.create_started = asyncio.Event()
+        self.allow_create = asyncio.Event()
+
+    async def create_run(
+        self,
+        session_id: str,
+        turn_id: str,
+        client_request_id: str,
+        content: str,
+        model: ModelDescriptor,
+    ) -> RunSnapshot:
+        self.create_started.set()
+        await self.allow_create.wait()
+        return await super().create_run(
+            session_id,
+            turn_id,
+            client_request_id,
+            content,
+            model,
+        )
 
 
 class PersistBeforePublish:
@@ -427,3 +463,71 @@ def test_unexpected_provider_exception_does_not_expose_secret_in_logs(
     assert persisted is not None and persisted.status is RunStatus.FAILED
     assert persisted.error_code == "runtime_internal_error"
     assert "sk-private-runtime-key" not in caplog.text
+
+
+def test_prestart_repository_failure_is_persisted_without_unhandled_task_error(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = make_settings(tmp_path)
+    database = OneShotGetFailureDatabase(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    provider = RecordingProvider(())
+
+    async def run():
+        await database.initialize()
+        session = await database.create_session()
+        await secret_store.set("openai", "sk-runtime-secret")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+        )
+        database.fail_next_get_run = True
+        created = await service.create_run(session.id, "request-8", "Please answer")
+        await service.wait_for_run(created.id)
+        persisted = await database.get_run(created.id)
+        await service.close()
+        return persisted
+
+    persisted = asyncio.run(run())
+    assert persisted is not None and persisted.status is RunStatus.FAILED
+    assert persisted.error_code == "runtime_internal_error"
+    assert "Traceback" not in caplog.text
+
+
+def test_shutdown_waits_for_run_admission_before_draining_tasks(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = SlowCreateRunDatabase(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    provider = RecordingProvider((ModelStreamEvent(kind="text_delta", text="Will be interrupted"),))
+
+    async def run():
+        await database.initialize()
+        session = await database.create_session()
+        await secret_store.set("openai", "sk-runtime-secret")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+        )
+        admission = asyncio.create_task(
+            service.create_run(session.id, "request-9", "Please answer")
+        )
+        await database.create_started.wait()
+        shutdown = asyncio.create_task(service.close())
+        await asyncio.sleep(0)
+        assert not shutdown.done()
+        database.allow_create.set()
+        created = await admission
+        await shutdown
+        return await database.get_run(created.id)
+
+    persisted = asyncio.run(run())
+    assert persisted is not None and persisted.status is RunStatus.INTERRUPTED

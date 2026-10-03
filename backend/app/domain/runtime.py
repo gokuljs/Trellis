@@ -39,7 +39,9 @@ class ModelCallStatus(StrEnum):
 
 
 _TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
-    RunStatus.QUEUED: frozenset({RunStatus.RUNNING, RunStatus.CANCELLED, RunStatus.INTERRUPTED}),
+    RunStatus.QUEUED: frozenset(
+        {RunStatus.RUNNING, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.INTERRUPTED}
+    ),
     RunStatus.RUNNING: frozenset(
         {
             RunStatus.CANCELLING,
@@ -58,6 +60,7 @@ _TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
 
 _TRANSITION_EVENTS: dict[tuple[RunStatus, RunStatus], RunEventType] = {
     (RunStatus.QUEUED, RunStatus.RUNNING): RunEventType.STARTED,
+    (RunStatus.QUEUED, RunStatus.FAILED): RunEventType.FAILED,
     (RunStatus.QUEUED, RunStatus.CANCELLED): RunEventType.CANCELLED,
     (RunStatus.QUEUED, RunStatus.INTERRUPTED): RunEventType.INTERRUPTED,
     (RunStatus.RUNNING, RunStatus.CANCELLING): RunEventType.CANCELLATION_REQUESTED,

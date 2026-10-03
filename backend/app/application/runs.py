@@ -54,6 +54,7 @@ class RunService:
         self._providers = providers
         self._event_publisher = event_publisher
         self._slots = asyncio.Semaphore(max_concurrent_runs)
+        self._admission_lock = asyncio.Lock()
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._closing = False
 
@@ -65,8 +66,6 @@ class RunService:
         *,
         turn_id: str | None = None,
     ) -> RunSnapshot:
-        if self._closing:
-            raise ApplicationError("runtime_shutting_down", "The runtime is shutting down.")
         session = await self._sessions.get_session(session_id)
         if session is None:
             raise ApplicationError("session_not_found", "Session not found.")
@@ -87,44 +86,60 @@ class RunService:
                 "Add an API key for the selected provider in Settings.",
             )
 
-        try:
-            run = await self._runs.create_run(
-                session.id,
-                turn_id or client_request_id,
-                client_request_id,
-                normalized_content,
-                model,
-            )
-        except ValueError as error:
-            message = str(error)
-            if "active run already exists" in message:
+        async with self._admission_lock:
+            if self._closing:
+                raise ApplicationError("runtime_shutting_down", "The runtime is shutting down.")
+            try:
+                run = await self._runs.create_run(
+                    session.id,
+                    turn_id or client_request_id,
+                    client_request_id,
+                    normalized_content,
+                    model,
+                )
+            except ValueError as error:
+                message = str(error)
+                if "active run already exists" in message:
+                    raise ApplicationError(
+                        "run_in_progress",
+                        "Another run is already in progress for this session.",
+                    ) from None
+                if "conflicts with a previous payload" in message:
+                    raise ApplicationError(
+                        "run_conflict",
+                        "This request ID is already associated with different run input.",
+                    ) from None
+                if "session not found" in message:
+                    raise ApplicationError("session_not_found", "Session not found.") from None
                 raise ApplicationError(
-                    "run_in_progress",
-                    "Another run is already in progress for this session.",
+                    "run_invalid", "The run request could not be accepted."
                 ) from None
-            if "conflicts with a previous payload" in message:
-                raise ApplicationError(
-                    "run_conflict",
-                    "This request ID is already associated with different run input.",
-                ) from None
-            if "session not found" in message:
-                raise ApplicationError("session_not_found", "Session not found.") from None
-            raise ApplicationError(
-                "run_invalid", "The run request could not be accepted."
-            ) from None
 
-        if run.status is RunStatus.QUEUED:
-            self._schedule(run.id)
-        return run
+            if run.status is RunStatus.QUEUED:
+                self._schedule(run.id)
+            return run
 
     async def wait_for_run(self, run_id: str) -> None:
         task = self._tasks.get(run_id)
         if task is not None:
             await task
 
+    async def get_run(self, run_id: str) -> RunSnapshot | None:
+        return await self._runs.get_run(run_id)
+
+    async def list_run_events(
+        self,
+        run_id: str,
+        after_sequence: int,
+        *,
+        limit: int = 500,
+    ) -> list[RunEvent]:
+        return await self._runs.list_run_events(run_id, after_sequence, limit=limit)
+
     async def close(self) -> None:
-        self._closing = True
-        pending = tuple(self._tasks.items())
+        async with self._admission_lock:
+            self._closing = True
+            pending = tuple(self._tasks.items())
         tasks = tuple(task for _run_id, task in pending)
         for task in tasks:
             task.cancel()
@@ -156,6 +171,34 @@ class RunService:
             if run is not None and run.status is RunStatus.QUEUED:
                 await self._interrupt_queued_run(run_id)
             raise
+        except Exception as error:
+            logger.error(
+                "Unexpected failure before run execution completed for %s (error type: %s)",
+                run_id,
+                type(error).__name__,
+            )
+            try:
+                run = await self._runs.get_run(run_id)
+                if run is not None and run.status in {RunStatus.QUEUED, RunStatus.RUNNING}:
+                    event = await self._runs.transition_run_record(
+                        run_id,
+                        RunStatus.FAILED,
+                        RunEventType.FAILED,
+                        {
+                            "code": "runtime_internal_error",
+                            "message": "Trellis could not start this run.",
+                        },
+                        error_code="runtime_internal_error",
+                        error_message="Trellis could not start this run.",
+                        stop_reason="runtime_internal_error",
+                    )
+                    await self._publish(event)
+            except Exception as persist_error:
+                logger.error(
+                    "Could not persist failure for run %s (error type: %s)",
+                    run_id,
+                    type(persist_error).__name__,
+                )
 
     async def _interrupt_queued_run(self, run_id: str) -> None:
         event = await self._runs.transition_run_record(
