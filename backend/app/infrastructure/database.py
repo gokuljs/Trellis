@@ -801,6 +801,128 @@ class Database:
             await connection.commit()
         return RunEvent(run_id, sequence, event_type, 1, data, now)
 
+    async def complete_run(
+        self,
+        run_id: str,
+        content: str,
+    ) -> tuple[Message, tuple[RunEvent, ...]]:
+        normalized_content = content.strip()
+        if not normalized_content:
+            raise ValueError("assistant response cannot be empty")
+
+        now = utc_now()
+        assistant_message_id = str(uuid4())
+        async with self._connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            run_cursor = await connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
+            run = await run_cursor.fetchone()
+            if run is None:
+                await connection.rollback()
+                raise ValueError("run not found")
+            validate_run_event_transition(
+                RunStatus(run["status"]),
+                RunStatus.COMPLETED,
+                RunEventType.COMPLETED,
+            )
+            ordinal_cursor = await connection.execute(
+                "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM messages WHERE session_id = ?",
+                (run["session_id"],),
+            )
+            ordinal_row = await ordinal_cursor.fetchone()
+            if ordinal_row is None:
+                await connection.rollback()
+                raise RuntimeError("could not allocate an assistant message ordinal")
+            ordinal = int(ordinal_row[0])
+            await connection.execute(
+                """INSERT INTO messages(
+                       id, session_id, turn_id, ordinal, role, content, provider, model,
+                       created_at, run_id
+                   ) VALUES (?, ?, ?, ?, 'assistant', ?, ?, ?, ?, ?)""",
+                (
+                    assistant_message_id,
+                    run["session_id"],
+                    run["turn_id"],
+                    ordinal,
+                    normalized_content,
+                    run["provider_id"],
+                    run["model_id"],
+                    now,
+                    run_id,
+                ),
+            )
+            await connection.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (now, run["session_id"]),
+            )
+            first_sequence = int(run["last_event_sequence"]) + 1
+            assistant_data: dict[str, object] = {"message_id": assistant_message_id}
+            completion_data: dict[str, object] = {
+                "message_id": assistant_message_id,
+                "status": RunStatus.COMPLETED.value,
+                "stop_reason": "final_response",
+            }
+            for sequence, event_type, data in (
+                (
+                    first_sequence,
+                    RunEventType.ASSISTANT_COMPLETED,
+                    assistant_data,
+                ),
+                (
+                    first_sequence + 1,
+                    RunEventType.COMPLETED,
+                    completion_data,
+                ),
+            ):
+                await connection.execute(
+                    """INSERT INTO run_events(
+                           run_id, sequence, event_type, event_version, data, created_at
+                       ) VALUES (?, ?, ?, 1, ?, ?)""",
+                    (
+                        run_id,
+                        sequence,
+                        event_type.value,
+                        json.dumps(data, separators=(",", ":")),
+                        now,
+                    ),
+                )
+            await connection.execute(
+                """UPDATE runs SET status = 'completed', finished_at = ?,
+                   stop_reason = 'final_response', last_event_sequence = ? WHERE id = ?""",
+                (now, first_sequence + 1, run_id),
+            )
+            await connection.commit()
+
+        assistant_message = Message(
+            id=assistant_message_id,
+            session_id=run["session_id"],
+            turn_id=run["turn_id"],
+            ordinal=ordinal,
+            role="assistant",
+            content=normalized_content,
+            provider=run["provider_id"],
+            model=run["model_id"],
+            created_at=now,
+        )
+        events = (
+            RunEvent(
+                run_id,
+                first_sequence,
+                RunEventType.ASSISTANT_COMPLETED,
+                1,
+                assistant_data,
+                now,
+            ),
+            RunEvent(
+                run_id,
+                first_sequence + 1,
+                RunEventType.COMPLETED,
+                1,
+                completion_data,
+                now,
+            ),
+        )
+        return assistant_message, events
+
     async def create_model_call(
         self,
         run_id: str,

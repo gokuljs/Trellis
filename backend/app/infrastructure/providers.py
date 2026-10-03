@@ -4,15 +4,9 @@ from typing import Any
 
 import httpx
 
+from app.application.errors import ProviderError
 from app.domain.models import Message, ProviderName
 from app.domain.runtime import ModelRequest, ModelStreamEvent
-
-
-class ProviderError(Exception):
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
 
 
 class OpenAIProvider:

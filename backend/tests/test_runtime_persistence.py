@@ -296,6 +296,61 @@ def test_non_lifecycle_events_cannot_be_appended_after_terminal_status(tmp_path:
     assert len(asyncio.run(database.list_run_events(run_id))) == 3
 
 
+def test_run_completion_atomically_persists_assistant_message_and_terminal_events(
+    tmp_path: Path,
+) -> None:
+    database = Database(make_settings(tmp_path).database_path)
+
+    async def complete() -> str:
+        await database.initialize()
+        session = await database.create_session()
+        run = await database.create_run(
+            session.id,
+            "turn-1",
+            "request-1",
+            "hello",
+            (await database.list_models())[0],
+        )
+        await database.transition_run_record(
+            run.id,
+            RunStatus.RUNNING,
+            RunEventType.STARTED,
+            {"status": "running"},
+        )
+        assistant_message, completion_events = await database.complete_run(
+            run.id,
+            "Hello from the model",
+        )
+        assert assistant_message.role == "assistant"
+        assert assistant_message.content == "Hello from the model"
+        assert [event.event_type for event in completion_events] == [
+            RunEventType.ASSISTANT_COMPLETED,
+            RunEventType.COMPLETED,
+        ]
+        return run.id
+
+    run_id = asyncio.run(complete())
+    persisted = asyncio.run(database.get_run(run_id))
+    events = asyncio.run(database.list_run_events(run_id))
+    with closing(sqlite3.connect(database.path)) as connection:
+        message_run = connection.execute(
+            "SELECT run_id FROM messages WHERE turn_id = ? AND role = 'assistant'",
+            ("turn-1",),
+        ).fetchone()
+
+    assert persisted is not None
+    assert persisted.status is RunStatus.COMPLETED
+    assert persisted.last_event_sequence == 4
+    assert message_run == (run_id,)
+    assert [event.sequence for event in events] == [1, 2, 3, 4]
+    assert [event.event_type for event in events] == [
+        RunEventType.QUEUED,
+        RunEventType.STARTED,
+        RunEventType.ASSISTANT_COMPLETED,
+        RunEventType.COMPLETED,
+    ]
+
+
 def test_model_call_snapshots_and_usage_survive_database_restart(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     database = Database(settings.database_path)
@@ -314,6 +369,13 @@ def test_model_call_snapshots_and_usage_survive_database_restart(tmp_path: Path)
         assert call.status is ModelCallStatus.PENDING
         streaming = await database.update_model_call(call.id, ModelCallStatus.STREAMING)
         assert streaming.finished_at is None
+        usage = await database.update_model_call(
+            call.id,
+            ModelCallStatus.STREAMING,
+            input_tokens=5,
+            cached_tokens=2,
+        )
+        assert (usage.input_tokens, usage.cached_tokens) == (5, 2)
         await database.update_model_call(
             call.id,
             ModelCallStatus.COMPLETED,

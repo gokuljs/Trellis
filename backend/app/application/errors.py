@@ -3,3 +3,7 @@ class ApplicationError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class ProviderError(ApplicationError):
+    """A sanitized failure reported by a provider adapter."""

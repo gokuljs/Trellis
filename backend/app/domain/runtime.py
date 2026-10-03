@@ -126,6 +126,7 @@ def transition_model_call(
             ModelCallStatus.TIMED_OUT,
         },
         ModelCallStatus.STREAMING: {
+            ModelCallStatus.STREAMING,
             ModelCallStatus.COMPLETED,
             ModelCallStatus.FAILED,
             ModelCallStatus.CANCELLED,

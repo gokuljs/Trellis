@@ -1,9 +1,8 @@
 from collections.abc import Mapping, Sequence
 
-from app.application.errors import ApplicationError
+from app.application.errors import ApplicationError, ProviderError
 from app.application.ports import ChatRepository, ProviderAdapter, SecretStorePort
 from app.domain.models import Message, ProviderName, Session, TurnResult
-from app.infrastructure.providers import ProviderError
 
 
 class ChatService:

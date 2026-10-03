@@ -103,6 +103,12 @@ class RunRepository(Protocol):
         stop_reason: str | None = None,
     ) -> RunEvent: ...
 
+    async def complete_run(
+        self,
+        run_id: str,
+        content: str,
+    ) -> tuple[Message, tuple[RunEvent, ...]]: ...
+
     async def create_model_call(
         self,
         run_id: str,
@@ -179,3 +185,7 @@ class StreamingProviderAdapter(ProviderAdapter, Protocol):
         api_key: str,
         user_id: str,
     ) -> AsyncGenerator[ModelStreamEvent]: ...
+
+
+class RunEventPublisher(Protocol):
+    async def publish(self, event: RunEvent) -> None: ...
