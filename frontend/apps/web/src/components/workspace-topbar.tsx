@@ -1,10 +1,4 @@
-import {
-  LayoutGrid,
-  MessageSquare,
-  Moon,
-  Settings,
-  Sun,
-} from "lucide-react"
+import { LayoutGrid, MessageSquare, Moon, Settings, Sun } from "lucide-react"
 import type { MouseEvent } from "react"
 
 import { useTheme } from "@/components/theme-provider"
@@ -19,7 +13,10 @@ type WorkspaceTopbarProps = {
   onNavigate: (view: WorkspaceView) => void
 }
 
-export function WorkspaceTopbar({ activeView, onNavigate }: WorkspaceTopbarProps) {
+export function WorkspaceTopbar({
+  activeView,
+  onNavigate,
+}: WorkspaceTopbarProps) {
   const { resolvedTheme, setTheme } = useTheme()
 
   const handleThemeToggle = (event: MouseEvent<HTMLButtonElement>) => {
@@ -30,7 +27,7 @@ export function WorkspaceTopbar({ activeView, onNavigate }: WorkspaceTopbarProps
     const rippleY = buttonBounds.top + buttonBounds.height / 2
     const rippleRadius = Math.hypot(
       Math.max(rippleX, window.innerWidth - rippleX),
-      Math.max(rippleY, window.innerHeight - rippleY),
+      Math.max(rippleY, window.innerHeight - rippleY)
     )
 
     root.style.setProperty("--theme-ripple-x", `${rippleX}px`)
@@ -67,8 +64,12 @@ export function WorkspaceTopbar({ activeView, onNavigate }: WorkspaceTopbarProps
     <div className="workspace-topbar">
       <div className="topbar-spacer" />
       <div className="topbar-actions">
-        <button className="topbar-icon" aria-label="Layout"><LayoutGrid size={15} aria-hidden="true" /></button>
-        <button className="topbar-icon" aria-label="Messages"><MessageSquare size={15} aria-hidden="true" /></button>
+        <button className="topbar-icon" aria-label="Layout">
+          <LayoutGrid size={15} aria-hidden="true" />
+        </button>
+        <button className="topbar-icon" aria-label="Messages">
+          <MessageSquare size={15} aria-hidden="true" />
+        </button>
         <button
           className={`topbar-icon ${activeView === "Settings" ? "is-active" : ""}`}
           aria-label="Settings"
@@ -83,7 +84,11 @@ export function WorkspaceTopbar({ activeView, onNavigate }: WorkspaceTopbarProps
           title={`Switch to ${resolvedTheme === "dark" ? "light" : "dark"} theme`}
           onClick={handleThemeToggle}
         >
-          {resolvedTheme === "dark" ? <Sun size={15} strokeWidth={1.7} aria-hidden="true" /> : <Moon size={15} strokeWidth={1.7} aria-hidden="true" />}
+          {resolvedTheme === "dark" ? (
+            <Sun size={15} strokeWidth={1.7} aria-hidden="true" />
+          ) : (
+            <Moon size={15} strokeWidth={1.7} aria-hidden="true" />
+          )}
         </button>
       </div>
     </div>

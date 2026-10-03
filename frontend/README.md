@@ -19,6 +19,8 @@ Requires Node.js 20.19 or newer and Bun 1.2.4.
 Verification:
 
 ```bash
+bun run format
+bun run format:check
 bun run test
 bun run lint
 bun run typecheck
