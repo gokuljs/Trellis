@@ -136,6 +136,38 @@ class RunService:
     ) -> list[RunEvent]:
         return await self._runs.list_run_events(run_id, after_sequence, limit=limit)
 
+    async def cancel_run(self, run_id: str) -> RunSnapshot:
+        try:
+            run, event = await self._runs.request_run_cancellation(run_id)
+        except ValueError as error:
+            if str(error) == "run not found":
+                raise ApplicationError("run_not_found", "Run not found.") from None
+            raise
+        if event is not None:
+            await self._publish(event)
+        if event is not None and run.status in {
+            RunStatus.CANCELLING,
+            RunStatus.CANCELLED,
+        }:
+            task = self._tasks.get(run_id)
+            if task is not None and not task.done():
+                task.cancel()
+            elif run.status is RunStatus.CANCELLING:
+                calls = await self._runs.list_model_calls(run_id)
+                active_call = next(
+                    (
+                        call
+                        for call in reversed(calls)
+                        if call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}
+                    ),
+                    None,
+                )
+                await self._mark_cancelled(run_id, active_call)
+                persisted = await self._runs.get_run(run_id)
+                if persisted is not None:
+                    run = persisted
+        return run
+
     async def close(self) -> None:
         async with self._admission_lock:
             self._closing = True
@@ -385,7 +417,10 @@ class RunService:
             for event in completion_events:
                 await self._publish(event)
         except asyncio.CancelledError:
-            if started:
+            current = await self._runs.get_run(run_id)
+            if current is not None and current.status is RunStatus.CANCELLING:
+                await self._mark_cancelled(run_id, call)
+            elif started:
                 await self._mark_interrupted(run_id, call)
             raise
         except ProviderError as error:
@@ -488,5 +523,17 @@ class RunService:
             error_code="runtime_shutdown",
             error_message="The run was interrupted during shutdown.",
             stop_reason="runtime_shutdown",
+        )
+        await self._publish(event)
+
+    async def _mark_cancelled(self, run_id: str, call: ModelCallRecord | None) -> None:
+        if call is not None and call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
+            await self._runs.update_model_call(call.id, ModelCallStatus.CANCELLED)
+        event = await self._runs.transition_run_record(
+            run_id,
+            RunStatus.CANCELLED,
+            RunEventType.CANCELLED,
+            {"code": "user_cancelled", "message": "The run was cancelled."},
+            stop_reason="user_cancelled",
         )
         await self._publish(event)

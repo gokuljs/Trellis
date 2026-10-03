@@ -337,6 +337,62 @@ class Database:
             )
             await connection.commit()
 
+    async def recover_active_runs(self) -> tuple[RunEvent, ...]:
+        """Persist terminal events for runs left active by a previous process."""
+        now = utc_now()
+        message = "The run was interrupted when the local service restarted."
+        event_data: dict[str, object] = {"code": "runtime_restart", "message": message}
+        serialized_data = json.dumps(event_data, separators=(",", ":"))
+        recovered: list[RunEvent] = []
+        async with self._connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                """SELECT id, status, last_event_sequence FROM runs
+                   WHERE status IN ('queued', 'running', 'cancelling')
+                   ORDER BY created_at, id"""
+            )
+            rows = await cursor.fetchall()
+            for row in rows:
+                run_id = row["id"]
+                current_status = RunStatus(row["status"])
+                validate_run_event_transition(
+                    current_status,
+                    RunStatus.INTERRUPTED,
+                    RunEventType.INTERRUPTED,
+                )
+                sequence = row["last_event_sequence"] + 1
+                await connection.execute(
+                    """UPDATE runs SET status = 'interrupted', recovery_count = recovery_count + 1,
+                       stop_reason = 'runtime_restart', error_code = 'runtime_restart',
+                       error_message = ?, last_event_sequence = ?, finished_at = ?
+                       WHERE id = ? AND status IN ('queued', 'running', 'cancelling')""",
+                    (message, sequence, now, run_id),
+                )
+                await connection.execute(
+                    """UPDATE model_calls SET status = 'cancelled',
+                       error_code = 'runtime_restart', error_message = ?, finished_at = ?
+                       WHERE run_id = ? AND status IN ('pending', 'streaming')""",
+                    (message, now, run_id),
+                )
+                await connection.execute(
+                    """INSERT INTO run_events(
+                           run_id, sequence, event_type, event_version, data, created_at
+                       ) VALUES (?, ?, ?, 1, ?, ?)""",
+                    (run_id, sequence, RunEventType.INTERRUPTED.value, serialized_data, now),
+                )
+                recovered.append(
+                    RunEvent(
+                        run_id,
+                        sequence,
+                        RunEventType.INTERRUPTED,
+                        1,
+                        event_data,
+                        now,
+                    )
+                )
+            await connection.commit()
+        return tuple(recovered)
+
     async def get_profile(self) -> UserProfile:
         async with self._connect() as connection:
             cursor = await connection.execute(
@@ -548,13 +604,8 @@ class Database:
                 raise ValueError("session not found")
 
             existing_cursor = await connection.execute(
-                """SELECT * FROM runs
-                   WHERE session_id = ? AND (
-                       client_request_id = ? OR (turn_id = ? AND retry_of IS NULL)
-                   )
-                   ORDER BY CASE WHEN client_request_id = ? THEN 0 ELSE 1 END
-                   LIMIT 1""",
-                (session_id, client_request_id, turn_id, client_request_id),
+                "SELECT * FROM runs WHERE session_id = ? AND client_request_id = ?",
+                (session_id, client_request_id),
             )
             existing = await existing_cursor.fetchone()
             if existing is not None:
@@ -575,6 +626,33 @@ class Database:
                     raise ValueError("run request conflicts with a previous payload")
                 await connection.commit()
                 return self._run_from_row(existing)
+
+            prior_cursor = await connection.execute(
+                """SELECT * FROM runs WHERE session_id = ? AND turn_id = ?
+                   ORDER BY rowid DESC LIMIT 1""",
+                (session_id, turn_id),
+            )
+            prior_run = await prior_cursor.fetchone()
+            retry_of: str | None = None
+            if prior_run is not None:
+                message_cursor = await connection.execute(
+                    "SELECT content FROM messages WHERE id = ?",
+                    (prior_run["input_message_id"],),
+                )
+                input_message = await message_cursor.fetchone()
+                if input_message is None or input_message["content"] != normalized_content:
+                    await connection.rollback()
+                    raise ValueError("run request conflicts with a previous payload")
+                prior_status = RunStatus(prior_run["status"])
+                if prior_status in {
+                    RunStatus.QUEUED,
+                    RunStatus.RUNNING,
+                    RunStatus.CANCELLING,
+                    RunStatus.COMPLETED,
+                }:
+                    await connection.commit()
+                    return self._run_from_row(prior_run)
+                retry_of = prior_run["id"]
 
             active_cursor = await connection.execute(
                 """SELECT id FROM runs WHERE session_id = ?
@@ -629,17 +707,18 @@ class Database:
 
             await connection.execute(
                 """INSERT INTO runs(
-                       id, session_id, turn_id, input_message_id, client_request_id,
-                       retry_of, status, provider_id, model_id, adapter_kind,
-                       upstream_model_id, max_model_calls, max_tool_calls, deadline_at,
+                   id, session_id, turn_id, input_message_id, client_request_id,
+                   retry_of, status, provider_id, model_id, adapter_kind,
+                   upstream_model_id, max_model_calls, max_tool_calls, deadline_at,
                        last_event_sequence, created_at
-                   ) VALUES (?, ?, ?, ?, ?, NULL, 'queued', ?, ?, ?, ?, 1, 0, ?, 1, ?)""",
+                   ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, 1, 0, ?, 1, ?)""",
                 (
                     run_id,
                     session_id,
                     turn_id,
                     input_message_id,
                     client_request_id,
+                    retry_of,
                     model.provider_id,
                     model.id,
                     model.adapter_kind,
@@ -922,6 +1001,79 @@ class Database:
             ),
         )
         return assistant_message, events
+
+    async def request_run_cancellation(
+        self,
+        run_id: str,
+    ) -> tuple[RunSnapshot, RunEvent | None]:
+        now = utc_now()
+        async with self._connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
+            row = await cursor.fetchone()
+            if row is None:
+                await connection.rollback()
+                raise ValueError("run not found")
+
+            current_status = RunStatus(row["status"])
+            if current_status in {
+                RunStatus.CANCELLING,
+                RunStatus.COMPLETED,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+                RunStatus.INTERRUPTED,
+            }:
+                await connection.commit()
+                return self._run_from_row(row), None
+
+            data: dict[str, object]
+            if current_status is RunStatus.QUEUED:
+                next_status = RunStatus.CANCELLED
+                event_type = RunEventType.CANCELLED
+                data = {
+                    "status": next_status.value,
+                    "code": "user_cancelled",
+                    "message": "The run was cancelled.",
+                }
+                finished_at = now
+                stop_reason = "user_cancelled"
+            else:
+                next_status = RunStatus.CANCELLING
+                event_type = RunEventType.CANCELLATION_REQUESTED
+                data = {"status": next_status.value}
+                finished_at = None
+                stop_reason = None
+
+            validate_run_event_transition(current_status, next_status, event_type)
+            sequence = int(row["last_event_sequence"]) + 1
+            await connection.execute(
+                """UPDATE runs SET status = ?, cancel_requested_at = COALESCE(
+                       cancel_requested_at, ?), finished_at = ?,
+                       stop_reason = COALESCE(?, stop_reason), last_event_sequence = ?
+                   WHERE id = ?""",
+                (next_status.value, now, finished_at, stop_reason, sequence, run_id),
+            )
+            await connection.execute(
+                """INSERT INTO run_events(
+                       run_id, sequence, event_type, event_version, data, created_at
+                   ) VALUES (?, ?, ?, 1, ?, ?)""",
+                (
+                    run_id,
+                    sequence,
+                    event_type.value,
+                    json.dumps(data, separators=(",", ":")),
+                    now,
+                ),
+            )
+            updated_cursor = await connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
+            updated_row = await updated_cursor.fetchone()
+            await connection.commit()
+
+        if updated_row is None:
+            raise RuntimeError("cancelled run could not be loaded")
+        snapshot = self._run_from_row(updated_row)
+        event = RunEvent(run_id, sequence, event_type, 1, data, now)
+        return snapshot, event
 
     async def create_model_call(
         self,

@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
+from app.domain.runtime import RunEventType, RunStatus
 from app.infrastructure.database import SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, Database
 from app.infrastructure.secrets import SecretStore
 from app.main import create_app
@@ -35,6 +36,33 @@ def test_installation_profile_id_survives_application_restart(tmp_path: Path) ->
     assert restarted_profile["id"] == first_profile["id"]
     assert first_profile["display_name"] is None
     assert first_profile["email"] is None
+
+
+def test_application_startup_marks_a_persisted_active_run_interrupted(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+
+    async def create_run() -> str:
+        await database.initialize()
+        session = await database.create_session()
+        run = await database.create_run(
+            session.id,
+            "restart-turn",
+            "restart-request",
+            "Resume after restart",
+            (await database.list_models())[0],
+        )
+        return run.id
+
+    run_id = asyncio.run(create_run())
+    with TestClient(create_app(settings)):
+        run = asyncio.run(database.get_run(run_id))
+        events = asyncio.run(database.list_run_events(run_id))
+
+    assert run is not None
+    assert run.status is RunStatus.INTERRUPTED
+    assert run.recovery_count == 1
+    assert events[-1].event_type is RunEventType.INTERRUPTED
 
 
 def test_separate_data_directories_receive_distinct_installation_ids(tmp_path: Path) -> None:

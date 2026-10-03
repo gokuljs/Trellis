@@ -432,6 +432,140 @@ def test_shutdown_marks_running_and_semaphore_queued_runs_interrupted(tmp_path: 
     assert second is not None and second.status is RunStatus.INTERRUPTED
 
 
+def test_user_cancellation_transitions_running_run_and_cancels_model_call(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    provider = BlockingProvider()
+
+    async def run():
+        await database.initialize()
+        session = await database.create_session()
+        await secret_store.set("openai", "sk-runtime-secret")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+        )
+        created = await service.create_run(session.id, "request-10", "Stop this")
+        await provider.started.wait()
+        cancellation = await service.cancel_run(created.id)
+        task = service._tasks[created.id]
+        repeated_cancellation = await service.cancel_run(created.id)
+        cancellation_requests = task.cancelling()
+        result = await asyncio.gather(task, return_exceptions=True)
+        persisted = await database.get_run(created.id)
+        events = await database.list_run_events(created.id)
+        calls = await database.list_model_calls(created.id)
+        await service.close()
+        return (
+            cancellation,
+            repeated_cancellation,
+            cancellation_requests,
+            result,
+            persisted,
+            events,
+            calls,
+        )
+
+    cancellation, repeated_cancellation, cancellation_requests, result, persisted, events, calls = (
+        asyncio.run(run())
+    )
+    assert cancellation.status is RunStatus.CANCELLING
+    assert repeated_cancellation.status is RunStatus.CANCELLING
+    assert cancellation_requests == 1
+    assert result and isinstance(result[0], asyncio.CancelledError)
+    assert persisted is not None and persisted.status is RunStatus.CANCELLED
+    assert [event.event_type for event in events][-2:] == [
+        RunEventType.CANCELLATION_REQUESTED,
+        RunEventType.CANCELLED,
+    ]
+    assert calls[0].status.value == "cancelled"
+
+
+def test_user_can_cancel_a_run_waiting_for_a_concurrency_slot(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    provider = BlockingProvider()
+
+    async def run():
+        await database.initialize()
+        first_session = await database.create_session()
+        second_session = await database.create_session()
+        await secret_store.set("openai", "sk-runtime-secret")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+            max_concurrent_runs=1,
+        )
+        first = await service.create_run(first_session.id, "request-11", "Keep running")
+        await provider.started.wait()
+        second = await service.create_run(second_session.id, "request-12", "Cancel queued")
+        cancelled = await service.cancel_run(second.id)
+        await asyncio.gather(service._tasks[second.id], return_exceptions=True)
+        await service.close()
+        return cancelled, await database.get_run(second.id), await database.get_run(first.id)
+
+    cancelled, persisted, first = asyncio.run(run())
+    assert cancelled.status is RunStatus.CANCELLED
+    assert persisted is not None and persisted.status is RunStatus.CANCELLED
+    assert first is not None and first.status is RunStatus.INTERRUPTED
+
+
+def test_cancelling_orphaned_running_run_reaches_terminal_state(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+
+    async def run():
+        await database.initialize()
+        session = await database.create_session()
+        model = (await database.list_models())[0]
+        created = await database.create_run(
+            session.id,
+            "orphaned-turn",
+            "orphaned-request",
+            "Stop after restart",
+            model,
+        )
+        await database.transition_run_record(
+            created.id,
+            RunStatus.RUNNING,
+            RunEventType.STARTED,
+            {"status": "running"},
+        )
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {},
+        )
+
+        cancelled = await service.cancel_run(created.id)
+        persisted = await database.get_run(created.id)
+        events = await database.list_run_events(created.id)
+        await service.close()
+        return cancelled, persisted, events
+
+    cancelled, persisted, events = asyncio.run(run())
+    assert cancelled.status is RunStatus.CANCELLED
+    assert persisted is not None and persisted.status is RunStatus.CANCELLED
+    assert [event.event_type for event in events][-2:] == [
+        RunEventType.CANCELLATION_REQUESTED,
+        RunEventType.CANCELLED,
+    ]
+
+
 def test_unexpected_provider_exception_does_not_expose_secret_in_logs(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

@@ -59,6 +59,45 @@ def test_run_creation_is_idempotent_and_rejects_changed_input(tmp_path: Path) ->
         asyncio.run(conflicting_input())
 
 
+def test_failed_run_can_be_retried_with_a_new_request_id_and_same_user_message(
+    tmp_path: Path,
+) -> None:
+    database = Database(make_settings(tmp_path).database_path)
+
+    async def create_retry() -> tuple[RunSnapshot, RunSnapshot, int]:
+        await database.initialize()
+        session = await database.create_session()
+        model = (await database.list_models())[0]
+        first = await database.create_run(
+            session.id,
+            "turn-retry",
+            "request-attempt-1",
+            "retry this",
+            model,
+        )
+        await database.transition_run_record(
+            first.id,
+            RunStatus.FAILED,
+            RunEventType.FAILED,
+            {"code": "provider_timeout"},
+        )
+        retry = await database.create_run(
+            session.id,
+            "turn-retry",
+            "request-attempt-2",
+            "retry this",
+            model,
+        )
+        messages = await database.list_messages(session.id)
+        return first, retry, len(messages)
+
+    first, retry, message_count = asyncio.run(create_retry())
+    assert retry.id != first.id
+    assert retry.retry_of == first.id
+    assert retry.status is RunStatus.QUEUED
+    assert message_count == 1
+
+
 def test_first_run_updates_the_session_title(tmp_path: Path) -> None:
     database = Database(make_settings(tmp_path).database_path)
 
@@ -153,6 +192,60 @@ def test_run_events_are_sequenced_and_replay_after_restart(tmp_path: Path) -> No
         RunEventType.MODEL_USAGE,
     ]
     assert events[0].data == {"text": "hello"}
+
+
+def test_restart_recovery_interrupts_orphaned_runs_once(tmp_path: Path) -> None:
+    database = Database(make_settings(tmp_path).database_path)
+
+    async def recover():
+        await database.initialize()
+        model = (await database.list_models())[0]
+        queued_session = await database.create_session()
+        running_session = await database.create_session()
+        cancelling_session = await database.create_session()
+        queued = await database.create_run(
+            queued_session.id, "queued-turn", "queued-request", "queued", model
+        )
+        running = await database.create_run(
+            running_session.id, "running-turn", "running-request", "running", model
+        )
+        await database.transition_run_record(
+            running.id,
+            RunStatus.RUNNING,
+            RunEventType.STARTED,
+            {"status": "running"},
+        )
+        call = await database.create_model_call(running.id, 1, model, {"messages": []})
+        await database.update_model_call(call.id, ModelCallStatus.STREAMING)
+        cancelling = await database.create_run(
+            cancelling_session.id,
+            "cancelling-turn",
+            "cancelling-request",
+            "cancelling",
+            model,
+        )
+        await database.transition_run_record(
+            cancelling.id,
+            RunStatus.RUNNING,
+            RunEventType.STARTED,
+            {"status": "running"},
+        )
+        await database.request_run_cancellation(cancelling.id)
+
+        recovered = await database.recover_active_runs()
+        repeated = await database.recover_active_runs()
+        runs = [await database.get_run(run_id) for run_id in (queued.id, running.id, cancelling.id)]
+        calls = await database.list_model_calls(running.id)
+        return recovered, repeated, runs, calls
+
+    recovered, repeated, runs, calls = asyncio.run(recover())
+    assert len(recovered) == 3
+    assert repeated == ()
+    assert all(run is not None and run.status is RunStatus.INTERRUPTED for run in runs)
+    assert all(run is not None and run.recovery_count == 1 for run in runs)
+    assert calls[0].status is ModelCallStatus.CANCELLED
+    assert [event.event_type for event in recovered] == [RunEventType.INTERRUPTED] * 3
+    assert all(event.data["code"] == "runtime_restart" for event in recovered)
 
 
 def test_run_transitions_atomically_update_snapshot_and_event_log(tmp_path: Path) -> None:
@@ -348,6 +441,96 @@ def test_run_completion_atomically_persists_assistant_message_and_terminal_event
         RunEventType.STARTED,
         RunEventType.ASSISTANT_COMPLETED,
         RunEventType.COMPLETED,
+    ]
+
+
+def test_cancelling_queued_run_is_atomic_and_idempotent(tmp_path: Path) -> None:
+    database = Database(make_settings(tmp_path).database_path)
+
+    async def cancel():
+        await database.initialize()
+        session = await database.create_session()
+        run = await database.create_run(
+            session.id,
+            "turn-cancel-queued",
+            "request-cancel-queued",
+            "hello",
+            (await database.list_models())[0],
+        )
+        cancelled, event = await database.request_run_cancellation(run.id)
+        repeated, repeated_event = await database.request_run_cancellation(run.id)
+        return cancelled, event, repeated, repeated_event
+
+    cancelled, event, repeated, repeated_event = asyncio.run(cancel())
+    assert cancelled.status is RunStatus.CANCELLED
+    assert cancelled.cancel_requested_at is not None
+    assert cancelled.finished_at is not None
+    assert event is not None and event.event_type is RunEventType.CANCELLED
+    assert event.sequence == 2
+    assert repeated == cancelled
+    assert repeated_event is None
+    assert (
+        asyncio.run(Database(make_settings(tmp_path).database_path).list_run_events(cancelled.id))[
+            -1
+        ]
+        == event
+    )
+
+
+def test_cancelling_running_run_records_request_before_terminal_event(tmp_path: Path) -> None:
+    database = Database(make_settings(tmp_path).database_path)
+
+    async def cancel():
+        await database.initialize()
+        session = await database.create_session()
+        run = await database.create_run(
+            session.id,
+            "turn-cancel-running",
+            "request-cancel-running",
+            "hello",
+            (await database.list_models())[0],
+        )
+        await database.transition_run_record(
+            run.id,
+            RunStatus.RUNNING,
+            RunEventType.STARTED,
+            {"status": "running"},
+        )
+        cancelling, request_event = await database.request_run_cancellation(run.id)
+        repeated, repeated_event = await database.request_run_cancellation(run.id)
+        cancelled_event = await database.transition_run_record(
+            run.id,
+            RunStatus.CANCELLED,
+            RunEventType.CANCELLED,
+            {"status": "cancelled"},
+            stop_reason="user_cancelled",
+        )
+        cancelled = await database.get_run(run.id)
+        events = await database.list_run_events(run.id)
+        return (
+            cancelling,
+            request_event,
+            repeated,
+            repeated_event,
+            cancelled_event,
+            cancelled,
+            events,
+        )
+
+    cancelling, request_event, repeated, repeated_event, cancelled_event, cancelled, events = (
+        asyncio.run(cancel())
+    )
+    assert cancelling.status is RunStatus.CANCELLING
+    assert cancelling.cancel_requested_at is not None
+    assert request_event is not None
+    assert request_event.event_type is RunEventType.CANCELLATION_REQUESTED
+    assert request_event.sequence == 3
+    assert repeated == cancelling and repeated_event is None
+    assert cancelled_event.sequence == 4
+    assert cancelled is not None and cancelled.status is RunStatus.CANCELLED
+    assert [event.event_type for event in events][-2:] == [
+        RunEventType.CANCELLATION_REQUESTED,
+        RunEventType.CANCELLED,
     ]
 
 

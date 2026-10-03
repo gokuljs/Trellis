@@ -54,6 +54,7 @@ def create_app(
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         database = Database(resolved_settings.database_path)
         await database.initialize()
+        await database.recover_active_runs()
         application.state.database = database
         secret_store = SecretStore(resolved_settings.secrets_path)
         application.state.secret_store = secret_store

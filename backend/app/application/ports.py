@@ -109,6 +109,11 @@ class RunRepository(Protocol):
         content: str,
     ) -> tuple[Message, tuple[RunEvent, ...]]: ...
 
+    async def request_run_cancellation(
+        self,
+        run_id: str,
+    ) -> tuple[RunSnapshot, RunEvent | None]: ...
+
     async def create_model_call(
         self,
         run_id: str,
