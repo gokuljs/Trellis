@@ -171,7 +171,7 @@
   --shell-disabled-surface: #171717;
   --shell-disabled-text: #888888;
   --shell-danger-hover: #321819;
-  --shell-user-message: #1f1f1f;
+  --shell-user-message: #111111;
   --shell-user-message-text: #f5f5f5;
   --shell-card: #111111;
   --shell-input: #0a0a0a;
@@ -1202,8 +1202,14 @@ html.theme-ripple-fallback::before {
 
   .thread-message {
     display: flex;
+    width: 100%;
+    min-width: 0;
     justify-content: flex-start;
     padding: 0 0 10px;
+  }
+
+  .thread-message.user {
+    justify-content: flex-end;
   }
 
   .thread-message-copy {
@@ -1213,8 +1219,7 @@ html.theme-ripple-fallback::before {
 
   .thread-message.user .thread-message-copy {
     width: fit-content;
-    max-width: min(82%, 640px);
-    margin-left: auto;
+    max-width: min(72%, 760px);
     border: 1px solid
       color-mix(in srgb, var(--shell-user-message) 82%, var(--shell-line));
     border-radius: 18px;
@@ -2259,7 +2264,7 @@ html.theme-ripple-fallback::before {
     }
 
     .thread-message.user .thread-message-copy {
-      max-width: min(92%, 640px);
+      max-width: min(92%, 760px);
     }
 
     .provider-option {
