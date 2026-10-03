@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from app.api import router
 from app.application.chat import ChatService
 from app.application.errors import ApplicationError
+from app.application.onboarding import OnboardingService
 from app.application.ports import ProviderAdapter
 from app.application.profile import ProfileService
 from app.application.sessions import SessionService
@@ -32,6 +33,9 @@ ERROR_STATUS = {
     "turn_in_progress": 409,
     "message_empty": 422,
     "invalid_api_key": 422,
+    "invalid_profile": 422,
+    "onboarding_step_out_of_order": 409,
+    "onboarding_already_complete": 409,
 }
 
 
@@ -51,6 +55,11 @@ def create_app(
         application.state.profile_service = ProfileService(database)
         application.state.session_service = SessionService(database)
         application.state.settings_service = SettingsService(database, secret_store)
+        application.state.onboarding_service = OnboardingService(
+            database,
+            database,
+            secret_store,
+        )
         timeout = httpx.Timeout(connect=10, read=120, write=30, pool=10)
         async with httpx.AsyncClient(timeout=timeout) as http_client:
             if provider_adapters is None:

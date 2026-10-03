@@ -6,6 +6,7 @@ from typing import Literal
 ProviderName = str
 ModelId = str
 MessageRole = Literal["user", "assistant"]
+OnboardingStep = Literal["intro", "profile", "model", "complete"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +16,12 @@ class UserProfile:
     email: str | None
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class OnboardingProgress:
+    current_step: OnboardingStep
+    completed: bool
 
 
 @dataclass(frozen=True, slots=True)

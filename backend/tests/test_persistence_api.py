@@ -156,6 +156,80 @@ def test_model_selection_rejects_an_unregistered_model_id(tmp_path: Path) -> Non
     assert response.json()["error"]["code"] == "model_not_available"
 
 
+def test_onboarding_progress_and_answers_are_saved_after_each_step(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+
+    with TestClient(create_app(settings)) as client:
+        initial = client.get("/api/onboarding")
+        intro = client.put("/api/onboarding/steps/intro")
+        profile = client.put(
+            "/api/onboarding/steps/profile",
+            json={"display_name": "Ada", "email": "ada@example.com"},
+        )
+        repeated_intro = client.put("/api/onboarding/steps/intro")
+
+    with TestClient(create_app(settings)) as restarted_client:
+        resumed = restarted_client.get("/api/onboarding")
+        restored_profile = restarted_client.get("/api/profile")
+        model = next(
+            item
+            for item in restarted_client.get("/api/settings").json()["models"]
+            if item["provider_id"] == "openai"
+        )
+        completed = restarted_client.put(
+            "/api/onboarding/steps/model",
+            json={"model_id": model["id"], "api_key": "sk-onboarding-secret"},
+        )
+        final_state = restarted_client.get("/api/onboarding")
+
+    assert initial.json() == {"current_step": "intro", "completed": False}
+    assert intro.json() == {"current_step": "profile", "completed": False}
+    assert profile.json() == {"current_step": "model", "completed": False}
+    assert repeated_intro.json() == {"current_step": "model", "completed": False}
+    assert resumed.json() == {"current_step": "model", "completed": False}
+    assert restored_profile.json()["display_name"] == "Ada"
+    assert completed.status_code == 200
+    assert final_state.json() == {"current_step": "complete", "completed": True}
+    assert b"sk-onboarding-secret" not in settings.database_path.read_bytes()
+
+
+def test_onboarding_model_step_requires_credentials_without_advancing(tmp_path: Path) -> None:
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        client.put("/api/onboarding/steps/intro")
+        client.put(
+            "/api/onboarding/steps/profile",
+            json={"display_name": "Ada", "email": "ada@example.com"},
+        )
+        model = client.get("/api/settings").json()["models"][0]
+        response = client.put(
+            "/api/onboarding/steps/model",
+            json={"model_id": model["id"], "api_key": None},
+        )
+        state = client.get("/api/onboarding")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "provider_not_configured"
+    assert state.json() == {"current_step": "model", "completed": False}
+
+
+def test_existing_installations_with_a_profile_are_backfilled_as_complete(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    asyncio.run(database.initialize())
+    with closing(sqlite3.connect(settings.database_path)) as connection:
+        connection.execute("UPDATE users SET display_name = 'Ada', email = 'ada@example.com'")
+        connection.execute("DROP TABLE onboarding_progress")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 4")
+        connection.commit()
+
+    asyncio.run(database.initialize())
+
+    with TestClient(create_app(settings)) as client:
+        state = client.get("/api/onboarding")
+
+    assert state.json() == {"current_step": "complete", "completed": True}
+
+
 def test_concurrent_secret_updates_preserve_both_provider_keys(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     first_store = SecretStore(settings.secrets_path)
@@ -207,7 +281,7 @@ def test_database_records_all_schema_migrations(tmp_path: Path) -> None:
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
 
-    assert versions == [(1,), (2,), (3,)]
+    assert versions == [(1,), (2,), (3,), (4,)]
 
 
 def test_database_upgrades_an_existing_v1_schema(tmp_path: Path) -> None:
@@ -230,7 +304,7 @@ def test_database_upgrades_an_existing_v1_schema(tmp_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'turn_claims'"
         ).fetchone()
 
-    assert versions == [(1,), (2,), (3,)]
+    assert versions == [(1,), (2,), (3,), (4,)]
     assert claim_table == ("turn_claims",)
 
 

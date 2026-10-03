@@ -1,7 +1,15 @@
 from collections.abc import Sequence
 from typing import Protocol
 
-from app.domain.models import Message, ModelDescriptor, ModelId, ProviderName, Session, UserProfile
+from app.domain.models import (
+    Message,
+    ModelDescriptor,
+    ModelId,
+    OnboardingProgress,
+    ProviderName,
+    Session,
+    UserProfile,
+)
 
 
 class ProfileRepository(Protocol):
@@ -20,6 +28,18 @@ class SettingsRepository(Protocol):
     async def list_models(self) -> list[ModelDescriptor]: ...
 
     async def set_selected_model(self, model_id: ModelId) -> bool: ...
+
+
+class OnboardingRepository(Protocol):
+    async def get_onboarding_progress(self) -> OnboardingProgress: ...
+
+    async def advance_onboarding_intro(self) -> OnboardingProgress: ...
+
+    async def save_onboarding_profile(
+        self, display_name: str, email: str
+    ) -> tuple[UserProfile, OnboardingProgress]: ...
+
+    async def complete_onboarding(self, model_id: ModelId) -> bool: ...
 
 
 class SessionRepository(Protocol):

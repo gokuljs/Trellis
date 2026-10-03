@@ -3,13 +3,23 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 import aiosqlite
 
-from app.domain.models import Message, ModelDescriptor, ModelId, ProviderName, Session, UserProfile
+from app.domain.models import (
+    Message,
+    ModelDescriptor,
+    ModelId,
+    OnboardingProgress,
+    OnboardingStep,
+    ProviderName,
+    Session,
+    UserProfile,
+)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 TURN_CLAIM_TTL = timedelta(minutes=5)
 
 MIGRATION_TABLE_SCHEMA = """
@@ -145,10 +155,24 @@ CREATE INDEX IF NOT EXISTS idx_messages_session_ordinal
 ON messages(session_id, ordinal);
 """
 
+SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS onboarding_progress (
+    user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    flow_version INTEGER NOT NULL,
+    current_step TEXT NOT NULL CHECK (
+        current_step IN ('intro', 'profile', 'model', 'complete')
+    ),
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
 MIGRATIONS = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
     3: SCHEMA_V3,
+    4: SCHEMA_V4,
 }
 
 
@@ -202,6 +226,21 @@ class Database:
                 """,
                 (now,),
             )
+            await connection.execute(
+                """
+                INSERT OR IGNORE INTO onboarding_progress(
+                    user_id, flow_version, current_step, completed_at, created_at, updated_at
+                )
+                SELECT id, 1,
+                       CASE WHEN display_name IS NOT NULL AND email IS NOT NULL
+                            THEN 'complete' ELSE 'intro' END,
+                       CASE WHEN display_name IS NOT NULL AND email IS NOT NULL
+                            THEN ? ELSE NULL END,
+                       ?, ?
+                FROM users
+                """,
+                (now, now, now),
+            )
             await connection.commit()
 
     async def get_profile(self) -> UserProfile:
@@ -229,6 +268,86 @@ class Database:
             )
             await connection.commit()
         return await self.get_profile()
+
+    async def get_onboarding_progress(self) -> OnboardingProgress:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                "SELECT current_step FROM onboarding_progress LIMIT 1"
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError("Trellis onboarding has not been initialized")
+        return OnboardingProgress(
+            current_step=cast(OnboardingStep, row["current_step"]),
+            completed=row["current_step"] == "complete",
+        )
+
+    async def advance_onboarding_intro(self) -> OnboardingProgress:
+        now = utc_now()
+        async with self._connect() as connection:
+            await connection.execute(
+                """UPDATE onboarding_progress SET current_step = 'profile', updated_at = ?
+                   WHERE current_step = 'intro'""",
+                (now,),
+            )
+            await connection.commit()
+        return await self.get_onboarding_progress()
+
+    async def save_onboarding_profile(
+        self, display_name: str, email: str
+    ) -> tuple[UserProfile, OnboardingProgress]:
+        now = utc_now()
+        async with self._connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            await connection.execute(
+                "UPDATE users SET display_name = ?, email = ?, updated_at = ?",
+                (display_name, email, now),
+            )
+            await connection.execute(
+                """UPDATE onboarding_progress
+                   SET current_step = CASE WHEN current_step = 'profile'
+                                           THEN 'model' ELSE current_step END,
+                       updated_at = ?""",
+                (now,),
+            )
+            await connection.commit()
+        return await self.get_profile(), await self.get_onboarding_progress()
+
+    async def complete_onboarding(self, model_id: ModelId) -> bool:
+        now = utc_now()
+        async with self._connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            model_cursor = await connection.execute(
+                "SELECT provider_id FROM models WHERE id = ? AND enabled = 1", (model_id,)
+            )
+            model = await model_cursor.fetchone()
+            progress_cursor = await connection.execute(
+                "SELECT user_id, current_step FROM onboarding_progress LIMIT 1"
+            )
+            progress = await progress_cursor.fetchone()
+            if (
+                model is None
+                or progress is None
+                or progress["current_step"]
+                not in {
+                    "model",
+                    "complete",
+                }
+            ):
+                await connection.rollback()
+                return False
+            await connection.execute(
+                """UPDATE app_settings SET selected_provider = ?, selected_model_id = ?,
+                   updated_at = ? WHERE id = 1""",
+                (model["provider_id"], model_id, now),
+            )
+            await connection.execute(
+                """UPDATE onboarding_progress SET current_step = 'complete', completed_at = ?,
+                   updated_at = ? WHERE user_id = ?""",
+                (now, now, progress["user_id"]),
+            )
+            await connection.commit()
+        return True
 
     async def get_selected_provider(self) -> ProviderName:
         async with self._connect() as connection:
