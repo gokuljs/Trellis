@@ -159,13 +159,21 @@ class ModelStreamEvent:
     text: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    cached_tokens: int | None = None
     finish_reason: str | None = None
+    provider_response_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind == "text_delta" and self.text is None:
             raise ValueError("text_delta events require text")
         if self.kind == "usage":
-            for token_count in (self.input_tokens, self.output_tokens):
+            for token_count in (
+                self.input_tokens,
+                self.output_tokens,
+                self.reasoning_tokens,
+                self.cached_tokens,
+            ):
                 if token_count is not None and token_count < 0:
                     raise ValueError("token counts cannot be negative")
 

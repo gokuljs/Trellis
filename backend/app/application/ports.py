@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import AsyncGenerator, Sequence
 from typing import Protocol
 
 from app.domain.models import (
@@ -13,6 +13,8 @@ from app.domain.models import (
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
+    ModelRequest,
+    ModelStreamEvent,
     RunEvent,
     RunEventType,
     RunSnapshot,
@@ -168,3 +170,12 @@ class ProviderAdapter(Protocol):
         api_key: str,
         user_id: str,
     ) -> str: ...
+
+
+class StreamingProviderAdapter(ProviderAdapter, Protocol):
+    def stream(
+        self,
+        request: ModelRequest,
+        api_key: str,
+        user_id: str,
+    ) -> AsyncGenerator[ModelStreamEvent]: ...
