@@ -71,6 +71,82 @@ class FailingProvider(RecordingProvider):
         return generate()
 
 
+class TimedOutProvider(RecordingProvider):
+    def stream(
+        self,
+        request: ModelRequest,
+        api_key: str,
+        user_id: str,
+    ) -> AsyncGenerator[ModelStreamEvent]:
+        self.request = request
+        self.api_key = api_key
+        self.user_id = user_id
+
+        async def generate() -> AsyncGenerator[ModelStreamEvent]:
+            raise ProviderError("provider_timeout", "Safe timeout")
+            yield ModelStreamEvent(kind="completed")
+
+        return generate()
+
+
+class BlockingProvider(RecordingProvider):
+    def __init__(self) -> None:
+        super().__init__(())
+        self.started = asyncio.Event()
+
+    def stream(
+        self,
+        request: ModelRequest,
+        api_key: str,
+        user_id: str,
+    ) -> AsyncGenerator[ModelStreamEvent]:
+        self.request = request
+        self.api_key = api_key
+        self.user_id = user_id
+
+        async def generate() -> AsyncGenerator[ModelStreamEvent]:
+            self.started.set()
+            await asyncio.Event().wait()
+            yield ModelStreamEvent(kind="completed")
+
+        return generate()
+
+
+class IncompleteProvider(RecordingProvider):
+    def stream(
+        self,
+        request: ModelRequest,
+        api_key: str,
+        user_id: str,
+    ) -> AsyncGenerator[ModelStreamEvent]:
+        self.request = request
+        self.api_key = api_key
+        self.user_id = user_id
+
+        async def generate() -> AsyncGenerator[ModelStreamEvent]:
+            yield ModelStreamEvent(kind="text_delta", text="truncated")
+
+        return generate()
+
+
+class UnexpectedFailureProvider(RecordingProvider):
+    def stream(
+        self,
+        request: ModelRequest,
+        api_key: str,
+        user_id: str,
+    ) -> AsyncGenerator[ModelStreamEvent]:
+        self.request = request
+        self.api_key = api_key
+        self.user_id = user_id
+
+        async def generate() -> AsyncGenerator[ModelStreamEvent]:
+            raise RuntimeError(f"unexpected provider failure: {api_key}")
+            yield ModelStreamEvent(kind="completed")
+
+        return generate()
+
+
 class PersistBeforePublish:
     def __init__(self, database: Database) -> None:
         self.database = database
@@ -240,3 +316,114 @@ def test_run_service_requires_selected_streaming_adapter_before_persisting(
         return len(messages), len(runs)
 
     assert asyncio.run(run()) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected_call_status", "expected_error"),
+    [
+        (TimedOutProvider(()), "timed_out", "provider_timeout"),
+        (IncompleteProvider(()), "failed", "provider_invalid_response"),
+    ],
+)
+def test_run_service_records_timeout_and_rejects_truncated_streams(
+    tmp_path: Path,
+    provider: RecordingProvider,
+    expected_call_status: str,
+    expected_error: str,
+) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+
+    async def run():
+        await database.initialize()
+        session = await database.create_session()
+        await secret_store.set("openai", "sk-runtime-secret")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+        )
+        created = await service.create_run(session.id, "request-4", "Please answer")
+        await service.wait_for_run(created.id)
+        result = (
+            await database.get_run(created.id),
+            await database.list_model_calls(created.id),
+            await database.list_messages(session.id),
+        )
+        await service.close()
+        return result
+
+    persisted, calls, messages = asyncio.run(run())
+    assert persisted is not None
+    assert persisted.status is RunStatus.FAILED
+    assert persisted.error_code == expected_error
+    assert calls[0].status.value == expected_call_status
+    assert [message.role for message in messages] == ["user"]
+
+
+def test_shutdown_marks_running_and_semaphore_queued_runs_interrupted(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    provider = BlockingProvider()
+
+    async def run():
+        await database.initialize()
+        first_session = await database.create_session()
+        second_session = await database.create_session()
+        await secret_store.set("openai", "sk-runtime-secret")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+            max_concurrent_runs=1,
+        )
+        first = await service.create_run(first_session.id, "request-5", "First")
+        await provider.started.wait()
+        second = await service.create_run(second_session.id, "request-6", "Second")
+        await service.close()
+        return await database.get_run(first.id), await database.get_run(second.id)
+
+    first, second = asyncio.run(run())
+    assert first is not None and first.status is RunStatus.INTERRUPTED
+    assert second is not None and second.status is RunStatus.INTERRUPTED
+
+
+def test_unexpected_provider_exception_does_not_expose_secret_in_logs(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    provider = UnexpectedFailureProvider(())
+
+    async def run():
+        await database.initialize()
+        session = await database.create_session()
+        await secret_store.set("openai", "sk-private-runtime-key")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+        )
+        created = await service.create_run(session.id, "request-7", "Please answer")
+        await service.wait_for_run(created.id)
+        persisted = await database.get_run(created.id)
+        await service.close()
+        return persisted
+
+    persisted = asyncio.run(run())
+    assert persisted is not None and persisted.status is RunStatus.FAILED
+    assert persisted.error_code == "runtime_internal_error"
+    assert "sk-private-runtime-key" not in caplog.text

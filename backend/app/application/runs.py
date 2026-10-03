@@ -124,11 +124,16 @@ class RunService:
 
     async def close(self) -> None:
         self._closing = True
-        tasks = tuple(self._tasks.values())
+        pending = tuple(self._tasks.items())
+        tasks = tuple(task for _run_id, task in pending)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        for run_id, _task in pending:
+            run = await self._runs.get_run(run_id)
+            if run is not None and run.status is RunStatus.QUEUED:
+                await self._interrupt_queued_run(run_id)
 
     def _schedule(self, run_id: str) -> None:
         existing = self._tasks.get(run_id)
@@ -143,8 +148,29 @@ class RunService:
             del self._tasks[run_id]
 
     async def _run_with_limit(self, run_id: str) -> None:
-        async with self._slots:
-            await self._execute(run_id)
+        try:
+            async with self._slots:
+                await self._execute(run_id)
+        except asyncio.CancelledError:
+            run = await self._runs.get_run(run_id)
+            if run is not None and run.status is RunStatus.QUEUED:
+                await self._interrupt_queued_run(run_id)
+            raise
+
+    async def _interrupt_queued_run(self, run_id: str) -> None:
+        event = await self._runs.transition_run_record(
+            run_id,
+            RunStatus.INTERRUPTED,
+            RunEventType.INTERRUPTED,
+            {
+                "code": "runtime_shutdown",
+                "message": "The run was interrupted during shutdown.",
+            },
+            error_code="runtime_shutdown",
+            error_message="The run was interrupted during shutdown.",
+            stop_reason="runtime_shutdown",
+        )
+        await self._publish(event)
 
     async def _execute(self, run_id: str) -> None:
         run = await self._runs.get_run(run_id)
@@ -212,6 +238,7 @@ class RunService:
             }
             provider_response_id: str | None = None
             finish_reason: str | None = None
+            received_completion = False
             deadline = datetime.fromisoformat(run.deadline_at.replace("Z", "+00:00"))
             timeout_seconds = (deadline - datetime.now(UTC)).total_seconds()
             if timeout_seconds <= 0:
@@ -272,6 +299,7 @@ class RunService:
                                 },
                             )
                         elif event.kind == "completed":
+                            received_completion = True
                             provider_response_id = (
                                 event.provider_response_id or provider_response_id
                             )
@@ -279,6 +307,11 @@ class RunService:
             except TimeoutError:
                 raise ProviderError("provider_timeout", "The run deadline was reached.") from None
 
+            if not received_completion:
+                raise ProviderError(
+                    "provider_invalid_response",
+                    "The provider stream ended before completion.",
+                )
             assistant_content = "".join(output_parts).strip()
             if not assistant_content:
                 raise ProviderError(
@@ -318,8 +351,12 @@ class RunService:
         except ApplicationError as error:
             if started:
                 await self._fail(run_id, call, error.code, error.message)
-        except Exception:
-            logger.exception("Unexpected failure while executing run %s", run_id)
+        except Exception as error:
+            logger.error(
+                "Unexpected failure while executing run %s (error type: %s)",
+                run_id,
+                type(error).__name__,
+            )
             if started:
                 await self._fail(
                     run_id,
@@ -375,9 +412,14 @@ class RunService:
         error_message: str,
     ) -> None:
         if call is not None and call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
+            call_status = (
+                ModelCallStatus.TIMED_OUT
+                if error_code == "provider_timeout"
+                else ModelCallStatus.FAILED
+            )
             await self._runs.update_model_call(
                 call.id,
-                ModelCallStatus.FAILED,
+                call_status,
                 error_code=error_code,
                 error_message=error_message,
             )
