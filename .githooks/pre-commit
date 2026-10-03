@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+frontend_staged=false
+python_staged=false
+
+while IFS= read -r -d '' staged_path; do
+  case "$staged_path" in
+    frontend/*.js|frontend/*.jsx|frontend/*.ts|frontend/*.tsx|frontend/*.css|frontend/*.html|frontend/*.json|frontend/*.md|frontend/*.yml|frontend/*.yaml)
+      frontend_staged=true
+      ;;
+    backend/*.py)
+      python_staged=true
+      ;;
+  esac
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+if [[ "$frontend_staged" == false && "$python_staged" == false ]]; then
+  exit 0
+fi
+
+staged_formatter="$repo_root/frontend/node_modules/.bin/git-format-staged"
+if [[ ! -x "$staged_formatter" ]]; then
+  printf '%s\n' \
+    'pre-commit: git-format-staged is unavailable; run bun install --cwd frontend --frozen-lockfile.' \
+    >&2
+  exit 1
+fi
+
+if [[ "$frontend_staged" == true ]]; then
+  if [[ ! -x "$repo_root/frontend/node_modules/.bin/prettier" ]]; then
+    printf '%s\n' \
+      'pre-commit: Prettier is unavailable; run bun install --cwd frontend --frozen-lockfile.' \
+      >&2
+    exit 1
+  fi
+
+  if ! "$staged_formatter" \
+    --formatter 'cd frontend && node_modules/.bin/prettier --stdin-filepath ../{}' \
+    'frontend/*.js' \
+    'frontend/*.jsx' \
+    'frontend/*.ts' \
+    'frontend/*.tsx' \
+    'frontend/*.css' \
+    'frontend/*.html' \
+    'frontend/*.json' \
+    'frontend/*.md' \
+    'frontend/*.yml' \
+    'frontend/*.yaml'; then
+    printf '%s\n' 'pre-commit: Prettier formatting failed; fix the staged frontend files and retry.' >&2
+    exit 1
+  fi
+fi
+
+if [[ "$python_staged" == true ]]; then
+  if [[ ! -x "$repo_root/backend/.venv/bin/ruff" ]]; then
+    printf '%s\n' \
+      'pre-commit: Ruff is unavailable; run uvx --from uv==0.12.5 uv sync --locked --directory backend.' \
+      >&2
+    exit 1
+  fi
+
+  if ! "$staged_formatter" \
+    --formatter 'backend/.venv/bin/ruff format - --stdin-filename {}' \
+    'backend/*.py'; then
+    printf '%s\n' 'pre-commit: Ruff formatting failed; fix the staged Python files and retry.' >&2
+    exit 1
+  fi
+fi
