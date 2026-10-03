@@ -968,6 +968,17 @@ html.theme-ripple-fallback::before {
     background: var(--shell-blue);
   }
 
+  .dark .settings-save {
+    color: var(--primary-foreground);
+  }
+
+  .dark .settings-save:disabled {
+    border-color: var(--shell-line);
+    color: var(--shell-text-muted);
+    background: var(--shell-hover);
+    opacity: 1;
+  }
+
   .settings-remove {
     color: var(--destructive);
   }
