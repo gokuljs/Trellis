@@ -10,6 +10,14 @@ from app.domain.models import (
     Session,
     UserProfile,
 )
+from app.domain.runtime import (
+    ModelCallRecord,
+    ModelCallStatus,
+    RunEvent,
+    RunEventType,
+    RunSnapshot,
+    RunStatus,
+)
 
 
 class ProfileRepository(Protocol):
@@ -50,6 +58,75 @@ class SessionRepository(Protocol):
     async def get_session(self, session_id: str) -> Session | None: ...
 
     async def list_messages(self, session_id: str) -> list[Message]: ...
+
+
+class RunRepository(Protocol):
+    async def create_run(
+        self,
+        session_id: str,
+        turn_id: str,
+        client_request_id: str,
+        content: str,
+        model: ModelDescriptor,
+    ) -> RunSnapshot: ...
+
+    async def get_run(self, run_id: str) -> RunSnapshot | None: ...
+
+    async def append_run_event(
+        self,
+        run_id: str,
+        event_type: RunEventType,
+        data: dict[str, object],
+        *,
+        event_version: int = 1,
+    ) -> RunEvent: ...
+
+    async def list_run_events(
+        self,
+        run_id: str,
+        after_sequence: int = 0,
+        *,
+        limit: int = 500,
+    ) -> list[RunEvent]: ...
+
+    async def transition_run_record(
+        self,
+        run_id: str,
+        next_status: RunStatus,
+        event_type: RunEventType,
+        data: dict[str, object],
+        *,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        stop_reason: str | None = None,
+    ) -> RunEvent: ...
+
+    async def create_model_call(
+        self,
+        run_id: str,
+        step_index: int,
+        model: ModelDescriptor,
+        request_snapshot: dict[str, object],
+    ) -> ModelCallRecord: ...
+
+    async def update_model_call(
+        self,
+        call_id: str,
+        next_status: ModelCallStatus,
+        *,
+        response_snapshot: dict[str, object] | None = None,
+        provider_response_id: str | None = None,
+        finish_reason: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        reasoning_tokens: int | None = None,
+        cached_tokens: int | None = None,
+        estimated_cost: float | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> ModelCallRecord: ...
+
+    async def list_model_calls(self, run_id: str) -> list[ModelCallRecord]: ...
 
 
 class ChatRepository(ProfileRepository, SettingsRepository, SessionRepository, Protocol):

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -18,8 +19,20 @@ from app.domain.models import (
     Session,
     UserProfile,
 )
+from app.domain.runtime import (
+    ModelCallRecord,
+    ModelCallStatus,
+    RunEvent,
+    RunEventType,
+    RunSnapshot,
+    RunStatus,
+    is_lifecycle_event,
+    is_terminal_run_status,
+    transition_model_call,
+    validate_run_event_transition,
+)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 TURN_CLAIM_TTL = timedelta(minutes=5)
 
 MIGRATION_TABLE_SCHEMA = """
@@ -168,11 +181,92 @@ CREATE TABLE IF NOT EXISTS onboarding_progress (
 );
 """
 
+SCHEMA_V5 = """
+CREATE TABLE IF NOT EXISTS runs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL,
+    input_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    client_request_id TEXT NOT NULL,
+    retry_of TEXT REFERENCES runs(id),
+    status TEXT NOT NULL CHECK (
+        status IN (
+            'queued', 'running', 'cancelling', 'completed', 'failed', 'cancelled', 'interrupted'
+        )
+    ),
+    provider_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    adapter_kind TEXT NOT NULL,
+    upstream_model_id TEXT NOT NULL,
+    max_model_calls INTEGER NOT NULL,
+    max_tool_calls INTEGER NOT NULL,
+    deadline_at TEXT NOT NULL,
+    cancel_requested_at TEXT,
+    lease_token TEXT,
+    lease_expires_at TEXT,
+    recovery_count INTEGER NOT NULL DEFAULT 0,
+    stop_reason TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    last_event_sequence INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    UNIQUE(session_id, client_request_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_original_per_turn
+ON runs(session_id, turn_id) WHERE retry_of IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_active_per_session
+ON runs(session_id) WHERE status IN ('queued', 'running', 'cancelling');
+CREATE INDEX IF NOT EXISTS idx_runs_status_created
+ON runs(status, created_at);
+
+ALTER TABLE messages ADD COLUMN run_id TEXT REFERENCES runs(id) ON DELETE SET NULL;
+
+CREATE TABLE IF NOT EXISTS model_calls (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    step_index INTEGER NOT NULL,
+    provider_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    adapter_kind TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('pending', 'streaming', 'completed', 'failed', 'cancelled', 'timed_out')
+    ),
+    request_snapshot TEXT NOT NULL,
+    response_snapshot TEXT,
+    provider_response_id TEXT,
+    finish_reason TEXT,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    reasoning_tokens INTEGER,
+    cached_tokens INTEGER,
+    estimated_cost REAL,
+    error_code TEXT,
+    error_message TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE(run_id, step_index)
+);
+
+CREATE TABLE IF NOT EXISTS run_events (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    event_version INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(run_id, sequence)
+);
+"""
+
 MIGRATIONS = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
     3: SCHEMA_V3,
     4: SCHEMA_V4,
+    5: SCHEMA_V5,
 }
 
 
@@ -427,6 +521,409 @@ class Database:
             await connection.commit()
         return True
 
+    async def create_run(
+        self,
+        session_id: str,
+        turn_id: str,
+        client_request_id: str,
+        content: str,
+        model: ModelDescriptor,
+    ) -> RunSnapshot:
+        normalized_content = content.strip()
+        if not normalized_content:
+            raise ValueError("run input cannot be empty")
+        if not client_request_id or len(client_request_id) > 200:
+            raise ValueError("client request ID must contain 1 to 200 characters")
+
+        now = utc_now()
+        deadline = (datetime.now(UTC) + timedelta(seconds=180)).isoformat().replace("+00:00", "Z")
+        run_id = str(uuid4())
+        async with self._connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            session_cursor = await connection.execute(
+                "SELECT id FROM sessions WHERE id = ?", (session_id,)
+            )
+            if await session_cursor.fetchone() is None:
+                await connection.rollback()
+                raise ValueError("session not found")
+
+            existing_cursor = await connection.execute(
+                """SELECT * FROM runs
+                   WHERE session_id = ? AND (
+                       client_request_id = ? OR (turn_id = ? AND retry_of IS NULL)
+                   )
+                   ORDER BY CASE WHEN client_request_id = ? THEN 0 ELSE 1 END
+                   LIMIT 1""",
+                (session_id, client_request_id, turn_id, client_request_id),
+            )
+            existing = await existing_cursor.fetchone()
+            if existing is not None:
+                message_cursor = await connection.execute(
+                    "SELECT content FROM messages WHERE id = ?", (existing["input_message_id"],)
+                )
+                input_message = await message_cursor.fetchone()
+                if (
+                    existing["turn_id"] != turn_id
+                    or input_message is None
+                    or input_message["content"] != normalized_content
+                    or existing["provider_id"] != model.provider_id
+                    or existing["model_id"] != model.id
+                    or existing["adapter_kind"] != model.adapter_kind
+                    or existing["upstream_model_id"] != model.upstream_model_id
+                ):
+                    await connection.rollback()
+                    raise ValueError("run request conflicts with a previous payload")
+                await connection.commit()
+                return self._run_from_row(existing)
+
+            active_cursor = await connection.execute(
+                """SELECT id FROM runs WHERE session_id = ?
+                   AND status IN ('queued', 'running', 'cancelling') LIMIT 1""",
+                (session_id,),
+            )
+            if await active_cursor.fetchone() is not None:
+                await connection.rollback()
+                raise ValueError("active run already exists for this session")
+
+            user_cursor = await connection.execute(
+                """SELECT id, content FROM messages
+                   WHERE session_id = ? AND turn_id = ? AND role = 'user'""",
+                (session_id, turn_id),
+            )
+            existing_user = await user_cursor.fetchone()
+            if existing_user is not None:
+                if existing_user["content"] != normalized_content:
+                    await connection.rollback()
+                    raise ValueError("run request conflicts with a previous payload")
+                input_message_id = existing_user["id"]
+            else:
+                ordinal_cursor = await connection.execute(
+                    "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM messages WHERE session_id = ?",
+                    (session_id,),
+                )
+                ordinal_row = await ordinal_cursor.fetchone()
+                if ordinal_row is None:
+                    await connection.rollback()
+                    raise RuntimeError("could not allocate a message ordinal")
+                input_message_id = str(uuid4())
+                await connection.execute(
+                    """INSERT INTO messages(
+                           id, session_id, turn_id, ordinal, role, content, created_at
+                       ) VALUES (?, ?, ?, ?, 'user', ?, ?)""",
+                    (
+                        input_message_id,
+                        session_id,
+                        turn_id,
+                        ordinal_row[0],
+                        normalized_content,
+                        now,
+                    ),
+                )
+                title = " ".join(normalized_content.split())[:80] or "New session"
+                await connection.execute(
+                    """UPDATE sessions
+                       SET title = CASE WHEN ? = 1 THEN ? ELSE title END, updated_at = ?
+                       WHERE id = ?""",
+                    (ordinal_row[0], title, now, session_id),
+                )
+
+            await connection.execute(
+                """INSERT INTO runs(
+                       id, session_id, turn_id, input_message_id, client_request_id,
+                       retry_of, status, provider_id, model_id, adapter_kind,
+                       upstream_model_id, max_model_calls, max_tool_calls, deadline_at,
+                       last_event_sequence, created_at
+                   ) VALUES (?, ?, ?, ?, ?, NULL, 'queued', ?, ?, ?, ?, 1, 0, ?, 1, ?)""",
+                (
+                    run_id,
+                    session_id,
+                    turn_id,
+                    input_message_id,
+                    client_request_id,
+                    model.provider_id,
+                    model.id,
+                    model.adapter_kind,
+                    model.upstream_model_id,
+                    deadline,
+                    now,
+                ),
+            )
+            event_data = json.dumps(
+                {"session_id": session_id, "turn_id": turn_id, "status": "queued"},
+                separators=(",", ":"),
+            )
+            await connection.execute(
+                """INSERT INTO run_events(
+                       run_id, sequence, event_type, event_version, data, created_at
+                   )
+                   VALUES (?, 1, ?, 1, ?, ?)""",
+                (run_id, RunEventType.QUEUED.value, event_data, now),
+            )
+            await connection.execute(
+                "UPDATE messages SET run_id = ? WHERE id = ?", (run_id, input_message_id)
+            )
+            run_cursor = await connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
+            run_row = await run_cursor.fetchone()
+            await connection.commit()
+        if run_row is None:
+            raise RuntimeError("created run could not be loaded")
+        return self._run_from_row(run_row)
+
+    async def get_run(self, run_id: str) -> RunSnapshot | None:
+        async with self._connect() as connection:
+            cursor = await connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
+            row = await cursor.fetchone()
+        return None if row is None else self._run_from_row(row)
+
+    async def append_run_event(
+        self,
+        run_id: str,
+        event_type: RunEventType,
+        data: dict[str, object],
+        *,
+        event_version: int = 1,
+    ) -> RunEvent:
+        now = utc_now()
+        async with self._connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                "SELECT status, last_event_sequence FROM runs WHERE id = ?", (run_id,)
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                await connection.rollback()
+                raise ValueError("run not found")
+            if is_lifecycle_event(event_type):
+                await connection.rollback()
+                raise ValueError("run lifecycle events must use transition_run_record")
+            if is_terminal_run_status(RunStatus(row["status"])):
+                await connection.rollback()
+                raise ValueError("cannot append an event to a terminal run")
+            sequence = int(row["last_event_sequence"]) + 1
+            serialized = json.dumps(data, separators=(",", ":"))
+            await connection.execute(
+                """INSERT INTO run_events(
+                       run_id, sequence, event_type, event_version, data, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (run_id, sequence, event_type.value, event_version, serialized, now),
+            )
+            await connection.execute(
+                "UPDATE runs SET last_event_sequence = ? WHERE id = ?", (sequence, run_id)
+            )
+            await connection.commit()
+        return RunEvent(run_id, sequence, event_type, event_version, data, now)
+
+    async def list_run_events(
+        self,
+        run_id: str,
+        after_sequence: int = 0,
+        *,
+        limit: int = 500,
+    ) -> list[RunEvent]:
+        if after_sequence < 0 or not 1 <= limit <= 500:
+            raise ValueError("event cursor and limit are outside the supported range")
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                """SELECT run_id, sequence, event_type, event_version, data, created_at
+                   FROM run_events WHERE run_id = ? AND sequence > ?
+                   ORDER BY sequence LIMIT ?""",
+                (run_id, after_sequence, limit),
+            )
+            rows = await cursor.fetchall()
+        return [
+            RunEvent(
+                run_id=row["run_id"],
+                sequence=row["sequence"],
+                event_type=RunEventType(row["event_type"]),
+                event_version=row["event_version"],
+                data=cast(dict[str, object], json.loads(row["data"])),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    async def transition_run_record(
+        self,
+        run_id: str,
+        next_status: RunStatus,
+        event_type: RunEventType,
+        data: dict[str, object],
+        *,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        stop_reason: str | None = None,
+    ) -> RunEvent:
+        now = utc_now()
+        async with self._connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
+            row = await cursor.fetchone()
+            if row is None:
+                await connection.rollback()
+                raise ValueError("run not found")
+            current_status = RunStatus(row["status"])
+            validate_run_event_transition(current_status, next_status, event_type)
+            sequence = int(row["last_event_sequence"]) + 1
+            started_at = row["started_at"] or (now if next_status is RunStatus.RUNNING else None)
+            finished_at = (
+                now
+                if next_status
+                in {
+                    RunStatus.COMPLETED,
+                    RunStatus.FAILED,
+                    RunStatus.CANCELLED,
+                    RunStatus.INTERRUPTED,
+                }
+                else None
+            )
+            serialized = json.dumps(data, separators=(",", ":"))
+            await connection.execute(
+                """UPDATE runs SET status = ?, started_at = ?, finished_at = ?,
+                   error_code = ?, error_message = ?, stop_reason = ?, last_event_sequence = ?
+                   WHERE id = ?""",
+                (
+                    next_status.value,
+                    started_at,
+                    finished_at,
+                    error_code,
+                    error_message,
+                    stop_reason,
+                    sequence,
+                    run_id,
+                ),
+            )
+            await connection.execute(
+                """INSERT INTO run_events(
+                       run_id, sequence, event_type, event_version, data, created_at
+                   ) VALUES (?, ?, ?, 1, ?, ?)""",
+                (run_id, sequence, event_type.value, serialized, now),
+            )
+            await connection.commit()
+        return RunEvent(run_id, sequence, event_type, 1, data, now)
+
+    async def create_model_call(
+        self,
+        run_id: str,
+        step_index: int,
+        model: ModelDescriptor,
+        request_snapshot: dict[str, object],
+    ) -> ModelCallRecord:
+        if step_index < 1:
+            raise ValueError("model call step index must be positive")
+        call_id = str(uuid4())
+        now = utc_now()
+        async with self._connect() as connection:
+            cursor = await connection.execute("SELECT id FROM runs WHERE id = ?", (run_id,))
+            if await cursor.fetchone() is None:
+                raise ValueError("run not found")
+            await connection.execute(
+                """INSERT INTO model_calls(
+                       id, run_id, step_index, provider_id, model_id, adapter_kind,
+                       status, request_snapshot, started_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                (
+                    call_id,
+                    run_id,
+                    step_index,
+                    model.provider_id,
+                    model.id,
+                    model.adapter_kind,
+                    json.dumps(request_snapshot, separators=(",", ":")),
+                    now,
+                ),
+            )
+            await connection.commit()
+            call_cursor = await connection.execute(
+                "SELECT * FROM model_calls WHERE id = ?", (call_id,)
+            )
+            row = await call_cursor.fetchone()
+        if row is None:
+            raise RuntimeError("created model call could not be loaded")
+        return self._model_call_from_row(row)
+
+    async def update_model_call(
+        self,
+        call_id: str,
+        next_status: ModelCallStatus,
+        *,
+        response_snapshot: dict[str, object] | None = None,
+        provider_response_id: str | None = None,
+        finish_reason: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        reasoning_tokens: int | None = None,
+        cached_tokens: int | None = None,
+        estimated_cost: float | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> ModelCallRecord:
+        now = utc_now()
+        async with self._connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                "SELECT status FROM model_calls WHERE id = ?", (call_id,)
+            )
+            current = await cursor.fetchone()
+            if current is None:
+                await connection.rollback()
+                raise ValueError("model call not found")
+            try:
+                transition_model_call(ModelCallStatus(current["status"]), next_status)
+            except ValueError:
+                await connection.rollback()
+                raise
+            serialized = (
+                None
+                if response_snapshot is None
+                else json.dumps(response_snapshot, separators=(",", ":"))
+            )
+            finished_at = None if next_status is ModelCallStatus.STREAMING else now
+            await connection.execute(
+                """UPDATE model_calls SET status = ?,
+                   response_snapshot = COALESCE(?, response_snapshot),
+                   provider_response_id = COALESCE(?, provider_response_id),
+                   finish_reason = COALESCE(?, finish_reason),
+                   input_tokens = COALESCE(?, input_tokens),
+                   output_tokens = COALESCE(?, output_tokens),
+                   reasoning_tokens = COALESCE(?, reasoning_tokens),
+                   cached_tokens = COALESCE(?, cached_tokens),
+                   estimated_cost = COALESCE(?, estimated_cost),
+                   error_code = COALESCE(?, error_code),
+                   error_message = COALESCE(?, error_message), finished_at = ?
+                   WHERE id = ?""",
+                (
+                    next_status.value,
+                    serialized,
+                    provider_response_id,
+                    finish_reason,
+                    input_tokens,
+                    output_tokens,
+                    reasoning_tokens,
+                    cached_tokens,
+                    estimated_cost,
+                    error_code,
+                    error_message,
+                    finished_at,
+                    call_id,
+                ),
+            )
+            updated_cursor = await connection.execute(
+                "SELECT * FROM model_calls WHERE id = ?", (call_id,)
+            )
+            row = await updated_cursor.fetchone()
+            await connection.commit()
+        if row is None:
+            raise RuntimeError("updated model call could not be loaded")
+        return self._model_call_from_row(row)
+
+    async def list_model_calls(self, run_id: str) -> list[ModelCallRecord]:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                "SELECT * FROM model_calls WHERE run_id = ? ORDER BY step_index", (run_id,)
+            )
+            rows = await cursor.fetchall()
+        return [self._model_call_from_row(row) for row in rows]
+
     async def create_session(self) -> Session:
         profile = await self.get_profile()
         session_id = str(uuid4())
@@ -609,6 +1106,65 @@ class Database:
             await connection.commit()
         messages = await self.get_turn_messages(session_id, turn_id)
         return messages[-1]
+
+    @staticmethod
+    def _model_call_from_row(row: aiosqlite.Row) -> ModelCallRecord:
+        response_snapshot = row["response_snapshot"]
+        return ModelCallRecord(
+            id=row["id"],
+            run_id=row["run_id"],
+            step_index=row["step_index"],
+            provider_id=row["provider_id"],
+            model_id=row["model_id"],
+            adapter_kind=row["adapter_kind"],
+            status=ModelCallStatus(row["status"]),
+            request_snapshot=cast(dict[str, object], json.loads(row["request_snapshot"])),
+            response_snapshot=(
+                None
+                if response_snapshot is None
+                else cast(dict[str, object], json.loads(response_snapshot))
+            ),
+            provider_response_id=row["provider_response_id"],
+            finish_reason=row["finish_reason"],
+            input_tokens=row["input_tokens"],
+            output_tokens=row["output_tokens"],
+            reasoning_tokens=row["reasoning_tokens"],
+            cached_tokens=row["cached_tokens"],
+            estimated_cost=row["estimated_cost"],
+            error_code=row["error_code"],
+            error_message=row["error_message"],
+            started_at=row["started_at"],
+            finished_at=row["finished_at"],
+        )
+
+    @staticmethod
+    def _run_from_row(row: aiosqlite.Row) -> RunSnapshot:
+        return RunSnapshot(
+            id=row["id"],
+            session_id=row["session_id"],
+            turn_id=row["turn_id"],
+            status=RunStatus(row["status"]),
+            provider_id=row["provider_id"],
+            model_id=row["model_id"],
+            adapter_kind=row["adapter_kind"],
+            upstream_model_id=row["upstream_model_id"],
+            input_message_id=row["input_message_id"],
+            retry_of=row["retry_of"],
+            client_request_id=row["client_request_id"],
+            max_model_calls=row["max_model_calls"],
+            max_tool_calls=row["max_tool_calls"],
+            deadline_at=row["deadline_at"],
+            cancel_requested_at=row["cancel_requested_at"],
+            lease_expires_at=row["lease_expires_at"],
+            recovery_count=row["recovery_count"],
+            stop_reason=row["stop_reason"],
+            last_event_sequence=row["last_event_sequence"],
+            error_code=row["error_code"],
+            error_message=row["error_message"],
+            created_at=row["created_at"],
+            started_at=row["started_at"],
+            finished_at=row["finished_at"],
+        )
 
     @staticmethod
     def _session_from_row(row: aiosqlite.Row) -> Session:

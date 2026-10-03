@@ -29,6 +29,15 @@ class RunEventType(StrEnum):
     INTERRUPTED = "run.interrupted"
 
 
+class ModelCallStatus(StrEnum):
+    PENDING = "pending"
+    STREAMING = "streaming"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
+
+
 _TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.QUEUED: frozenset({RunStatus.RUNNING, RunStatus.CANCELLED, RunStatus.INTERRUPTED}),
     RunStatus.RUNNING: frozenset(
@@ -47,10 +56,84 @@ _TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.INTERRUPTED: frozenset(),
 }
 
+_TRANSITION_EVENTS: dict[tuple[RunStatus, RunStatus], RunEventType] = {
+    (RunStatus.QUEUED, RunStatus.RUNNING): RunEventType.STARTED,
+    (RunStatus.QUEUED, RunStatus.CANCELLED): RunEventType.CANCELLED,
+    (RunStatus.QUEUED, RunStatus.INTERRUPTED): RunEventType.INTERRUPTED,
+    (RunStatus.RUNNING, RunStatus.CANCELLING): RunEventType.CANCELLATION_REQUESTED,
+    (RunStatus.RUNNING, RunStatus.COMPLETED): RunEventType.COMPLETED,
+    (RunStatus.RUNNING, RunStatus.FAILED): RunEventType.FAILED,
+    (RunStatus.RUNNING, RunStatus.CANCELLED): RunEventType.CANCELLED,
+    (RunStatus.RUNNING, RunStatus.INTERRUPTED): RunEventType.INTERRUPTED,
+    (RunStatus.CANCELLING, RunStatus.CANCELLED): RunEventType.CANCELLED,
+    (RunStatus.CANCELLING, RunStatus.FAILED): RunEventType.FAILED,
+    (RunStatus.CANCELLING, RunStatus.INTERRUPTED): RunEventType.INTERRUPTED,
+}
+_LIFECYCLE_EVENT_TYPES = frozenset(
+    {
+        RunEventType.QUEUED,
+        RunEventType.STARTED,
+        RunEventType.CANCELLATION_REQUESTED,
+        RunEventType.COMPLETED,
+        RunEventType.FAILED,
+        RunEventType.CANCELLED,
+        RunEventType.INTERRUPTED,
+    }
+)
+_TERMINAL_RUN_STATUSES = frozenset(
+    {
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.INTERRUPTED,
+    }
+)
+
 
 def transition_run(current: RunStatus, next_status: RunStatus) -> RunStatus:
     if next_status not in _TRANSITIONS[current]:
         raise ValueError(f"invalid run transition: {current.value} -> {next_status.value}")
+    return next_status
+
+
+def validate_run_event_transition(
+    current: RunStatus,
+    next_status: RunStatus,
+    event_type: RunEventType,
+) -> None:
+    transition_run(current, next_status)
+    if _TRANSITION_EVENTS[(current, next_status)] is not event_type:
+        raise ValueError("run event does not match status transition")
+
+
+def is_lifecycle_event(event_type: RunEventType) -> bool:
+    return event_type in _LIFECYCLE_EVENT_TYPES
+
+
+def is_terminal_run_status(status: RunStatus) -> bool:
+    return status in _TERMINAL_RUN_STATUSES
+
+
+def transition_model_call(
+    current: ModelCallStatus, next_status: ModelCallStatus
+) -> ModelCallStatus:
+    valid_transitions = {
+        ModelCallStatus.PENDING: {
+            ModelCallStatus.STREAMING,
+            ModelCallStatus.COMPLETED,
+            ModelCallStatus.FAILED,
+            ModelCallStatus.CANCELLED,
+            ModelCallStatus.TIMED_OUT,
+        },
+        ModelCallStatus.STREAMING: {
+            ModelCallStatus.COMPLETED,
+            ModelCallStatus.FAILED,
+            ModelCallStatus.CANCELLED,
+            ModelCallStatus.TIMED_OUT,
+        },
+    }
+    if next_status not in valid_transitions.get(current, set()):
+        raise ValueError(f"invalid model call transition: {current.value} -> {next_status.value}")
     return next_status
 
 
@@ -110,9 +193,40 @@ class RunSnapshot:
     input_message_id: str
     retry_of: str | None
     client_request_id: str
+    max_model_calls: int
+    max_tool_calls: int
+    deadline_at: str
+    cancel_requested_at: str | None
+    lease_expires_at: str | None
+    recovery_count: int
+    stop_reason: str | None
     last_event_sequence: int
     error_code: str | None
     error_message: str | None
     created_at: str
     started_at: str | None
+    finished_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCallRecord:
+    id: str
+    run_id: str
+    step_index: int
+    provider_id: str
+    model_id: str
+    adapter_kind: str
+    status: ModelCallStatus
+    request_snapshot: dict[str, object]
+    response_snapshot: dict[str, object] | None
+    provider_response_id: str | None
+    finish_reason: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    reasoning_tokens: int | None
+    cached_tokens: int | None
+    estimated_cost: float | None
+    error_code: str | None
+    error_message: str | None
+    started_at: str
     finished_at: str | None

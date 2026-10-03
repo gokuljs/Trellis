@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
-from app.infrastructure.database import Database
+from app.infrastructure.database import SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, Database
 from app.infrastructure.secrets import SecretStore
 from app.main import create_app
 
@@ -214,15 +214,25 @@ def test_onboarding_model_step_requires_credentials_without_advancing(tmp_path: 
 
 def test_existing_installations_with_a_profile_are_backfilled_as_complete(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    asyncio.run(database.initialize())
     with closing(sqlite3.connect(settings.database_path)) as connection:
-        connection.execute("UPDATE users SET display_name = 'Ada', email = 'ada@example.com'")
-        connection.execute("DROP TABLE onboarding_progress")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 4")
+        connection.executescript(SCHEMA_V1)
+        connection.executescript(SCHEMA_V2)
+        connection.executescript(SCHEMA_V3)
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            [(1, "v1"), (2, "v2"), (3, "v3")],
+        )
+        connection.execute(
+            """INSERT INTO users(id, display_name, email, created_at, updated_at)
+               VALUES ('existing-installation', 'Ada', 'ada@example.com', 'v3', 'v3')"""
+        )
+        connection.execute(
+            """INSERT INTO app_settings(id, selected_provider, selected_model_id, updated_at)
+               VALUES (1, 'openai', 'openai:gpt-5.5', 'v3')"""
+        )
         connection.commit()
 
-    asyncio.run(database.initialize())
+    asyncio.run(Database(settings.database_path).initialize())
 
     with TestClient(create_app(settings)) as client:
         state = client.get("/api/onboarding")
@@ -281,17 +291,14 @@ def test_database_records_all_schema_migrations(tmp_path: Path) -> None:
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,)]
 
 
 def test_database_upgrades_an_existing_v1_schema(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    with TestClient(create_app(settings)):
-        pass
-
     with closing(sqlite3.connect(settings.database_path)) as connection:
-        connection.execute("DROP TABLE turn_claims")
-        connection.execute("DELETE FROM schema_migrations WHERE version >= 2")
+        connection.executescript(SCHEMA_V1)
+        connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (1, 'v1')")
         connection.commit()
 
     asyncio.run(Database(settings.database_path).initialize())
@@ -304,7 +311,7 @@ def test_database_upgrades_an_existing_v1_schema(tmp_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'turn_claims'"
         ).fetchone()
 
-    assert versions == [(1,), (2,), (3,), (4,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,)]
     assert claim_table == ("turn_claims",)
 
 
