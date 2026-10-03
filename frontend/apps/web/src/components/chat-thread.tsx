@@ -1,4 +1,6 @@
 import { Bot, RotateCcw, Square, UserRound } from "lucide-react"
+import Markdown, { type Components } from "react-markdown"
+import remarkGfm from "remark-gfm"
 
 import type { Message, Session } from "@/lib/app-types"
 
@@ -13,6 +15,53 @@ type ChatThreadProps = {
   cancellationPending: boolean
   onRetry: () => void
   onCancel: () => void
+}
+
+function safeImageSource(source: string | undefined) {
+  if (!source) return undefined
+
+  try {
+    const imageUrl = new URL(source)
+    if (imageUrl.protocol === "http:" || imageUrl.protocol === "https:") {
+      return imageUrl.href
+    }
+  } catch {
+    return undefined
+  }
+
+  return undefined
+}
+
+const markdownComponents: Components = {
+  img({ src, alt }) {
+    const safeSource = safeImageSource(src)
+    if (!safeSource) return null
+
+    return (
+      <img src={safeSource} alt={alt ?? ""} loading="lazy" decoding="async" />
+    )
+  },
+  table({ children }) {
+    return (
+      <div className="thread-markdown-table-scroll">
+        <table>{children}</table>
+      </div>
+    )
+  },
+}
+
+function MessageMarkdown({ content }: { content: string }) {
+  return (
+    <div className="thread-markdown">
+      <Markdown
+        remarkPlugins={[remarkGfm]}
+        skipHtml
+        components={markdownComponents}
+      >
+        {content}
+      </Markdown>
+    </div>
+  )
 }
 
 export function ChatThread({
@@ -53,7 +102,7 @@ export function ChatThread({
                 <span>{message.role === "assistant" ? "Trellis" : "You"}</span>
                 {message.model ? <span>{message.model}</span> : null}
               </div>
-              <p>{message.content}</p>
+              <MessageMarkdown content={message.content} />
             </div>
           </article>
         ))}
@@ -70,7 +119,7 @@ export function ChatThread({
               <div className="thread-message-meta">
                 <span>Trellis</span>
               </div>
-              <p>{streamingText}</p>
+              <MessageMarkdown content={streamingText} />
             </div>
           </article>
         ) : pending ? (
