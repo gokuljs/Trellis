@@ -49,19 +49,29 @@ def _error_response(
     return {"jsonrpc": "2.0", "id": request_id, "error": error}
 
 
-def _parse_request(
-    raw: str,
-) -> tuple[str, dict[str, object], str | int | None, bool]:
+def _decode_requests(raw: str) -> tuple[list[object], bool]:
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
         raise RpcFault(-32700, "Parse error") from None
+    if isinstance(payload, list):
+        if not payload or len(payload) > 32:
+            raise RpcFault(-32600, "Invalid Request")
+        return payload, True
+    return [payload], False
+
+
+def _parse_request(
+    payload: object,
+) -> tuple[str, dict[str, object], str | int | None, bool]:
     if not isinstance(payload, dict):
         raise RpcFault(-32600, "Invalid Request")
 
     has_id = "id" in payload
     request_id = payload.get("id")
-    if has_id and (isinstance(request_id, bool) or not isinstance(request_id, (str, int))):
+    if has_id and (
+        isinstance(request_id, bool) or not isinstance(request_id, (str, int, type(None)))
+    ):
         raise RpcFault(-32600, "Invalid Request")
     if payload.get("jsonrpc") != "2.0" or not isinstance(payload.get("method"), str):
         raise RpcFault(-32600, "Invalid Request")
@@ -106,7 +116,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
     send_lock = asyncio.Lock()
     active_subscriptions: dict[str, tuple[RuntimeEventSubscription, asyncio.Task[None]]] = {}
 
-    async def send(payload: dict[str, object]) -> None:
+    async def send(payload: object) -> None:
         async with send_lock:
             await websocket.send_json(payload)
 
@@ -116,6 +126,24 @@ async def runtime_websocket(websocket: WebSocket) -> None:
         subscription: RuntimeEventSubscription,
     ) -> None:
         sequence = after_sequence
+
+        async def emit_event(event: RunEvent) -> bool:
+            nonlocal sequence
+            if event.sequence <= sequence:
+                return False
+            if event.sequence != sequence + 1:
+                await send(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "run.replay_required",
+                        "params": {"runId": run_id, "afterSequence": sequence},
+                    }
+                )
+                return True
+            await send(_event_notification(event))
+            sequence = event.sequence
+            return event.event_type in _TERMINAL_EVENTS
+
         try:
             run = await service.get_run(run_id)
             if run is None:
@@ -123,11 +151,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             while True:
                 batch = await service.list_run_events(run_id, sequence)
                 for event in batch:
-                    if event.sequence <= sequence:
-                        continue
-                    await send(_event_notification(event))
-                    sequence = event.sequence
-                    if event.event_type in _TERMINAL_EVENTS:
+                    if await emit_event(event):
                         return
                 if len(batch) < 500:
                     break
@@ -135,7 +159,19 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             if is_terminal_run_status(run.status):
                 return
             while True:
-                event = await subscription.receive()
+                try:
+                    event = await asyncio.wait_for(subscription.receive(), timeout=0.5)
+                except TimeoutError:
+                    # Durable events are authoritative. Polling closes the rare gap where
+                    # persistence succeeds but in-process fanout is interrupted.
+                    batch = await service.list_run_events(run_id, sequence)
+                    for persisted_event in batch:
+                        if await emit_event(persisted_event):
+                            return
+                    current_run = await service.get_run(run_id)
+                    if current_run is None or is_terminal_run_status(current_run.status):
+                        return
+                    continue
                 if event is None:
                     await send(
                         {
@@ -145,11 +181,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                         }
                     )
                     return
-                if event.sequence <= sequence:
-                    continue
-                await send(_event_notification(event))
-                sequence = event.sequence
-                if event.event_type in _TERMINAL_EVENTS:
+                if await emit_event(event):
                     return
         except asyncio.CancelledError:
             raise
@@ -181,6 +213,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
         active_subscriptions[run_id] = (subscription, task)
 
     async def dispatch(method: str, params: dict[str, object]) -> dict[str, object]:
+        result: dict[str, object]
         if method == "run.start":
             session_id = _required_string(params, "sessionId", maximum=200)
             client_request_id = _required_string(params, "clientRequestId", maximum=200)
@@ -195,7 +228,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                 turn_id=turn_id,
             )
             await subscribe(run.id, 0)
-            result: dict[str, object] = {
+            result = {
                 "runId": run.id,
                 "status": run.status.value,
                 "lastSequence": run.last_event_sequence,
@@ -212,6 +245,29 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             run = await service.get_run(run_id)
             if run is None:
                 raise ApplicationError("run_not_found", "Run not found.")
+            if after_sequence > run.last_event_sequence:
+                raise RpcFault(-32602, "Invalid params: afterSequence exceeds the run cursor")
+            await subscribe(run.id, after_sequence)
+            result = {
+                "runId": run.id,
+                "status": run.status.value,
+                "lastSequence": run.last_event_sequence,
+            }
+        elif method == "run.cancel":
+            run_id = _required_string(params, "runId", maximum=200)
+            after_sequence = params.get("afterSequence", 0)
+            if (
+                isinstance(after_sequence, bool)
+                or not isinstance(after_sequence, int)
+                or after_sequence < 0
+            ):
+                raise RpcFault(-32602, "Invalid params: afterSequence")
+            existing_run = await service.get_run(run_id)
+            if existing_run is None:
+                raise ApplicationError("run_not_found", "Run not found.")
+            if after_sequence > existing_run.last_event_sequence:
+                raise RpcFault(-32602, "Invalid params: afterSequence exceeds the run cursor")
+            run = await service.cancel_run(run_id)
             await subscribe(run.id, after_sequence)
             result = {
                 "runId": run.id,
@@ -226,33 +282,46 @@ async def runtime_websocket(websocket: WebSocket) -> None:
     try:
         while True:
             raw = await websocket.receive_text()
-            request_id: str | int | None = None
-            has_id = True
             try:
-                method, params, request_id, has_id = _parse_request(raw)
-                result = await dispatch(method, params)
-                if has_id:
-                    await send({"jsonrpc": "2.0", "id": request_id, "result": result})
+                requests, is_batch = _decode_requests(raw)
             except RpcFault as error:
-                if has_id:
-                    await send(_error_response(request_id, error.code, error.message, error.data))
-            except ApplicationError as error:
-                if has_id:
-                    await send(
-                        _error_response(
-                            request_id,
-                            -32000,
-                            error.message,
-                            {"code": error.code},
+                await send(_error_response(None, error.code, error.message, error.data))
+                continue
+
+            responses: list[dict[str, object]] = []
+            for request in requests:
+                request_id: str | int | None = None
+                has_id = True
+                try:
+                    method, params, request_id, has_id = _parse_request(request)
+                    result = await dispatch(method, params)
+                    if has_id:
+                        responses.append({"jsonrpc": "2.0", "id": request_id, "result": result})
+                except RpcFault as error:
+                    if has_id:
+                        responses.append(
+                            _error_response(request_id, error.code, error.message, error.data)
                         )
+                except ApplicationError as error:
+                    if has_id:
+                        responses.append(
+                            _error_response(
+                                request_id,
+                                -32000,
+                                error.message,
+                                {"code": error.code},
+                            )
+                        )
+                except Exception as error:
+                    logger.error(
+                        "Runtime JSON-RPC request failed (error type: %s)",
+                        type(error).__name__,
                     )
-            except Exception as error:
-                logger.error(
-                    "Runtime JSON-RPC request failed (error type: %s)",
-                    type(error).__name__,
-                )
-                if has_id:
-                    await send(_error_response(request_id, -32603, "Internal error"))
+                    if has_id:
+                        responses.append(_error_response(request_id, -32603, "Internal error"))
+
+            if responses:
+                await send(responses if is_batch else responses[0])
     except WebSocketDisconnect:
         pass
     finally:
