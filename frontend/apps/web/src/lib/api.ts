@@ -5,7 +5,6 @@ import type {
   Session,
   SessionDetail,
   Settings,
-  TurnResult,
 } from "@/lib/app-types"
 
 type ErrorPayload = {
@@ -101,9 +100,4 @@ export const api = {
   createSession: () => request<Session>("/api/sessions", { method: "POST" }),
   getSession: (sessionId: string) =>
     request<SessionDetail>(`/api/sessions/${sessionId}`),
-  completeTurn: (sessionId: string, turnId: string, content: string) =>
-    request<TurnResult>(`/api/sessions/${sessionId}/turns`, {
-      method: "POST",
-      body: JSON.stringify({ turn_id: turnId, content }),
-    }),
 }

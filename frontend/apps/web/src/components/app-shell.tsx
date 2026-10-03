@@ -12,6 +12,7 @@ import { Sidebar } from "@/components/sidebar"
 import { WelcomePanel } from "@/components/welcome-panel"
 import { WorkspaceTopbar } from "@/components/workspace-topbar"
 import { ApiError, api } from "@/lib/api"
+import { RuntimeError, cancelRun, streamRun } from "@/lib/runtime-client"
 import type {
   Message,
   OnboardingStep,
@@ -28,7 +29,7 @@ type FailedTurn = {
 }
 
 function visibleError(error: unknown) {
-  return error instanceof ApiError
+  return error instanceof ApiError || error instanceof RuntimeError
     ? error.message
     : "Trellis could not reach the local service."
 }
@@ -65,11 +66,18 @@ export function AppShell() {
   const [loading, setLoading] = useState(true)
   const [sessionLoading, setSessionLoading] = useState(false)
   const [pending, setPending] = useState(false)
+  const [streamingText, setStreamingText] = useState<string | null>(null)
+  const [activeRunId, setActiveRunId] = useState<string | null>(null)
+  const [cancellingRun, setCancellingRun] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [failedTurn, setFailedTurn] = useState<FailedTurn | null>(null)
   const activeSessionIdRef = useRef<string | null>(null)
   const sessionLoadSequenceRef = useRef(0)
   const submissionLockRef = useRef(false)
+  const activeRunRef = useRef<{ runId: string; lastSequence: number } | null>(
+    null
+  )
+  const cancelRequestRef = useRef(false)
 
   const restoreSessions = useCallback(
     async (isCancelled: () => boolean = () => false) => {
@@ -177,6 +185,11 @@ export function AppShell() {
     setComposerValue("")
     setActiveSession(null)
     setMessages([])
+    setStreamingText(null)
+    setActiveRunId(null)
+    setCancellingRun(false)
+    cancelRequestRef.current = false
+    activeRunRef.current = null
     setSessionLoading(false)
     setFailedTurn(null)
     setError(null)
@@ -205,6 +218,11 @@ export function AppShell() {
       sessions.find((session) => session.id === sessionId) ?? null
     )
     setMessages([])
+    setStreamingText(null)
+    setActiveRunId(null)
+    setCancellingRun(false)
+    cancelRequestRef.current = false
+    activeRunRef.current = null
     setSessionLoading(true)
     setError(null)
     setFailedTurn(null)
@@ -244,6 +262,11 @@ export function AppShell() {
 
   const completeTurn = async (turn: FailedTurn, optimistic: boolean) => {
     setError(null)
+    setStreamingText(null)
+    setActiveRunId(null)
+    setCancellingRun(false)
+    cancelRequestRef.current = false
+    activeRunRef.current = null
     if (optimistic) {
       setMessages((current) => [
         ...current,
@@ -260,23 +283,50 @@ export function AppShell() {
     }
 
     try {
-      const result = await api.completeTurn(
-        turn.sessionId,
-        turn.turnId,
-        turn.content
+      await streamRun(
+        {
+          sessionId: turn.sessionId,
+          turnId: turn.turnId,
+          clientRequestId: crypto.randomUUID(),
+          content: turn.content,
+        },
+        {
+          onRunId: (runId) => {
+            activeRunRef.current = { runId, lastSequence: 0 }
+            setActiveRunId(runId)
+          },
+          onEvent: (event) => {
+            if (activeRunRef.current?.runId === event.runId) {
+              activeRunRef.current.lastSequence = event.sequence
+            }
+            if (
+              event.eventType === "assistant.delta" &&
+              typeof event.data.text === "string"
+            ) {
+              setStreamingText((current) => (current ?? "") + event.data.text)
+            }
+          },
+        }
       )
-      setSessions((current) => moveSessionToTop(current, result.session))
+      const detail = await api.getSession(turn.sessionId)
+      setSessions((current) => moveSessionToTop(current, detail.session))
       if (activeSessionIdRef.current === turn.sessionId) {
-        setActiveSession(result.session)
-        setMessages((current) => [
-          ...current.filter((message) => message.turn_id !== turn.turnId),
-          result.user_message,
-          result.assistant_message,
-        ])
+        setActiveSession(detail.session)
+        setMessages(detail.messages)
         setFailedTurn(null)
         setComposerValue("")
       }
+      setStreamingText(null)
+      setActiveRunId(null)
+      setCancellingRun(false)
+      cancelRequestRef.current = false
+      activeRunRef.current = null
     } catch (turnError) {
+      setStreamingText(null)
+      setActiveRunId(null)
+      setCancellingRun(false)
+      cancelRequestRef.current = false
+      activeRunRef.current = null
       if (activeSessionIdRef.current === turn.sessionId) {
         setError(visibleError(turnError))
         setFailedTurn(turn)
@@ -292,13 +342,27 @@ export function AppShell() {
         // Keep the optimistic user message if the local transcript cannot be refreshed.
       }
       if (
-        turnError instanceof ApiError &&
+        (turnError instanceof ApiError || turnError instanceof RuntimeError) &&
         turnError.code === "provider_not_configured"
       ) {
         if (activeSessionIdRef.current === turn.sessionId) {
           setComposerValue(turn.content)
         }
       }
+    }
+  }
+
+  const cancelActiveRun = async () => {
+    const activeRun = activeRunRef.current
+    if (!activeRun || cancelRequestRef.current) return
+    cancelRequestRef.current = true
+    setCancellingRun(true)
+    try {
+      await cancelRun(activeRun.runId, activeRun.lastSequence)
+    } catch (cancelError) {
+      cancelRequestRef.current = false
+      setCancellingRun(false)
+      if (activeSessionIdRef.current) setError(visibleError(cancelError))
     }
   }
 
@@ -447,9 +511,13 @@ export function AppShell() {
               session={activeSession}
               messages={messages}
               pending={pending}
+              streamingText={streamingText}
               error={error}
               canRetry={failedTurn !== null && !pending}
+              canCancel={pending && activeRunId !== null}
+              cancellationPending={cancellingRun}
               onRetry={() => void retryFailedTurn()}
+              onCancel={() => void cancelActiveRun()}
             />
           ) : (
             <div className="welcome-state">

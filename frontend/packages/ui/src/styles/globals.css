@@ -1238,6 +1238,26 @@ html.theme-ripple-fallback::before {
     padding: 0 9px;
   }
 
+  .cancel-run-button {
+    display: inline-flex;
+    min-height: 30px;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    margin-left: auto;
+    border: 1px solid var(--shell-line);
+    border-radius: 0;
+    padding: 0 10px;
+    color: var(--shell-text-muted);
+    background: transparent;
+    font-size: 10px;
+  }
+
+  .cancel-run-button:hover {
+    color: var(--destructive);
+    border-color: color-mix(in srgb, var(--destructive) 55%, var(--shell-line));
+  }
+
   .welcome-error {
     width: min(520px, 100%);
     margin: 28px auto 0;

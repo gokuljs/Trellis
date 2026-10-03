@@ -73,6 +73,16 @@ const settings = {
 
 let onboardingState = { current_step: "complete", completed: true }
 
+type TestMessage = {
+  id: string
+  turn_id: string
+  role: "user" | "assistant"
+  content: string
+  provider: string | null
+  model: string | null
+  created_at: string
+}
+
 const recentSession = {
   id: "session-recent",
   title: "Persisted conversation",
@@ -120,6 +130,83 @@ function deferred<T>() {
     resolve = promiseResolve
   })
   return { promise, resolve }
+}
+
+class TestWebSocket {
+  static instances: TestWebSocket[] = []
+  static onSend: (
+    socket: TestWebSocket,
+    payload: Record<string, unknown>
+  ) => void = () => {}
+  static OPEN = 1
+  static CONNECTING = 0
+  readyState = TestWebSocket.CONNECTING
+  onopen: (() => void) | null = null
+  onmessage: ((event: { data: string }) => void) | null = null
+  onerror: (() => void) | null = null
+  onclose: (() => void) | null = null
+  readonly url: string
+
+  constructor(url: string) {
+    this.url = url
+    TestWebSocket.instances.push(this)
+    queueMicrotask(() => {
+      this.readyState = TestWebSocket.OPEN
+      this.onopen?.()
+    })
+  }
+
+  send(data: string) {
+    TestWebSocket.onSend(this, JSON.parse(data) as Record<string, unknown>)
+  }
+
+  close() {
+    this.readyState = 3
+    this.onclose?.()
+  }
+
+  reply(payload: unknown) {
+    this.onmessage?.({ data: JSON.stringify(payload) })
+  }
+}
+
+function installRuntimeServer(
+  onSend: (socket: TestWebSocket, payload: Record<string, unknown>) => void
+) {
+  TestWebSocket.instances = []
+  TestWebSocket.onSend = onSend
+  vi.stubGlobal("WebSocket", TestWebSocket)
+}
+
+function runtimeEvent(
+  socket: TestWebSocket,
+  runId: string,
+  sequence: number,
+  eventType: string,
+  data: Record<string, unknown>
+) {
+  socket.reply({
+    jsonrpc: "2.0",
+    method: "run.event",
+    params: { runId, sequence, eventType, eventVersion: 1, data },
+  })
+}
+
+function completeRuntimeRun(
+  socket: TestWebSocket,
+  request: Record<string, unknown>,
+  runId: string,
+  answer: string
+) {
+  socket.reply({
+    jsonrpc: "2.0",
+    id: request.id,
+    result: { runId, status: "running", lastSequence: 1 },
+  })
+  runtimeEvent(socket, runId, 1, "run.queued", { status: "queued" })
+  runtimeEvent(socket, runId, 2, "assistant.delta", { text: answer })
+  runtimeEvent(socket, runId, 3, "assistant.completed", { content: answer })
+  runtimeEvent(socket, runId, 4, "run.completed", { status: "completed" })
 }
 
 function startupFetch(
@@ -404,6 +491,7 @@ describe("local-first chat", () => {
 
   it("keeps a new session local until first send, then persists the turn", async () => {
     const calls: Array<{ url: string; method: string; body?: string }> = []
+    const runtimeRequests: Record<string, unknown>[] = []
     const createGate = deferred<void>()
     const turnGate = deferred<void>()
     const created = {
@@ -412,46 +500,70 @@ describe("local-first chat", () => {
       title: "New session",
       message_count: 0,
     }
+    const completedSession = {
+      ...created,
+      title: "Plan the migration",
+      message_count: 2,
+    }
+    installRuntimeServer((socket, request) => {
+      runtimeRequests.push(request)
+      if (request.method === "run.start") {
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: { runId: "run-created", status: "running", lastSequence: 1 },
+        })
+        runtimeEvent(socket, "run-created", 1, "run.queued", {
+          status: "queued",
+        })
+        runtimeEvent(socket, "run-created", 2, "assistant.delta", {
+          text: "Here is",
+        })
+        void turnGate.promise.then(() => {
+          runtimeEvent(socket, "run-created", 3, "assistant.delta", {
+            text: " the plan.",
+          })
+          runtimeEvent(socket, "run-created", 4, "assistant.completed", {
+            content: "Here is the plan.",
+          })
+          runtimeEvent(socket, "run-created", 5, "run.completed", {
+            status: "completed",
+          })
+        })
+      }
+    })
     const fetchMock = startupFetch((url, init) => {
       const method = init?.method ?? "GET"
       if (method !== "GET")
         calls.push({ url, method, body: String(init?.body ?? "") })
       if (url === "/api/sessions" && method === "POST")
         return createGate.promise.then(() => response(created, 201))
-      if (url === "/api/sessions/session-created/turns" && method === "POST") {
-        const submitted = JSON.parse(String(init?.body)) as {
-          turn_id: string
-          content: string
-        }
-        const turnResponse = response(
-          {
-            session: {
-              ...created,
-              title: "Plan the migration",
-              message_count: 2,
-            },
-            user_message: {
+      if (url === "/api/sessions/session-created" && method === "GET") {
+        const request = runtimeRequests[0]
+        const params = request?.params as Record<string, unknown> | undefined
+        return response({
+          session: completedSession,
+          messages: [
+            {
               id: "message-user",
-              turn_id: submitted.turn_id,
+              turn_id: params?.turnId,
               role: "user",
-              content: submitted.content,
+              content: params?.content,
               provider: null,
               model: null,
               created_at: "2026-08-25T10:00:00Z",
             },
-            assistant_message: {
+            {
               id: "message-assistant",
-              turn_id: submitted.turn_id,
+              turn_id: params?.turnId,
               role: "assistant",
               content: "Here is the plan.",
               provider: "openai",
               model: "gpt-5.5",
               created_at: "2026-08-25T10:00:01Z",
             },
-          },
-          201
-        )
-        return turnGate.promise.then(() => turnResponse)
+          ],
+        })
       }
       return undefined
     })
@@ -474,8 +586,8 @@ describe("local-first chat", () => {
 
     createGate.resolve()
     expect(
-      await screen.findByLabelText("Assistant response pending")
-    ).toBeInTheDocument()
+      await screen.findByLabelText("Assistant response streaming")
+    ).toHaveTextContent("Here is")
     expect(screen.getByRole("textbox", { name: "Message" })).toBeDisabled()
     expect(screen.getByRole("button", { name: "Send" })).toBeDisabled()
 
@@ -483,11 +595,107 @@ describe("local-first chat", () => {
     expect(await screen.findByText("Here is the plan.")).toBeInTheDocument()
     expect(calls.map(({ url, method }) => `${method} ${url}`)).toEqual([
       "POST /api/sessions",
-      "POST /api/sessions/session-created/turns",
     ])
-    expect(JSON.parse(calls[1].body ?? "{}")).toMatchObject({
-      content: "Plan the migration",
+    expect(runtimeRequests[0]).toMatchObject({
+      method: "run.start",
+      params: {
+        sessionId: "session-created",
+        content: "Plan the migration",
+      },
     })
+  })
+
+  it("sends a JSON-RPC cancellation when Stop generating is clicked", async () => {
+    const created = {
+      ...recentSession,
+      id: "session-cancel",
+      title: "New session",
+      message_count: 0,
+    }
+    let streamingSocket: TestWebSocket | null = null
+    let submittedTurnId = ""
+    installRuntimeServer((socket, request) => {
+      if (request.method === "run.start") {
+        streamingSocket = socket
+        const params = request.params as Record<string, unknown>
+        submittedTurnId = String(params.turnId)
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-to-cancel",
+            status: "running",
+            lastSequence: 1,
+          },
+        })
+        runtimeEvent(socket, "run-to-cancel", 1, "run.queued", {
+          status: "queued",
+        })
+        runtimeEvent(socket, "run-to-cancel", 2, "assistant.delta", {
+          text: "Working on it",
+        })
+      } else if (request.method === "run.cancel") {
+        expect(request.params).toMatchObject({
+          runId: "run-to-cancel",
+          afterSequence: 2,
+        })
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-to-cancel",
+            status: "cancelling",
+            lastSequence: 3,
+          },
+        })
+        if (streamingSocket) {
+          runtimeEvent(streamingSocket, "run-to-cancel", 3, "run.cancelled", {
+            code: "user_cancelled",
+            message: "The run was cancelled.",
+          })
+        }
+      }
+    })
+    const fetchMock = startupFetch((url, init) => {
+      const method = init?.method ?? "GET"
+      if (url === "/api/sessions" && method === "POST")
+        return response(created, 201)
+      if (url === "/api/sessions/session-cancel" && method === "GET") {
+        return response({
+          session: { ...created, message_count: 1 },
+          messages: [
+            {
+              id: "cancelled-user",
+              turn_id: submittedTurnId,
+              role: "user",
+              content: "Stop this run",
+              provider: null,
+              model: null,
+              created_at: "2026-08-25T10:00:00Z",
+            },
+          ],
+        })
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByText("A workspace for ideas in motion")
+    await user.type(
+      screen.getByRole("textbox", { name: "Message" }),
+      "Stop this run"
+    )
+    await user.click(screen.getByRole("button", { name: "Send" }))
+    await screen.findByText("Working on it")
+    await user.click(screen.getByRole("button", { name: "Stop generating" }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("The run was cancelled.")
+    expect(
+      within(alert).getByRole("button", { name: "Retry" })
+    ).toBeInTheDocument()
   })
 
   it("does not create an empty session when the selected provider has no key", async () => {
@@ -530,74 +738,72 @@ describe("local-first chat", () => {
   it("shows a sanitized provider error and retries with the same turn ID", async () => {
     let attempts = 0
     let persistedTurnId = ""
+    const requestIds: unknown[] = []
     const created = {
       ...recentSession,
       id: "session-failed",
       title: "New session",
       message_count: 0,
     }
+    installRuntimeServer((socket, request) => {
+      if (request.method !== "run.start") return
+      attempts += 1
+      const params = request.params as Record<string, unknown>
+      requestIds.push(params.clientRequestId)
+      if (!persistedTurnId) persistedTurnId = String(params.turnId)
+      expect(params.turnId).toBe(persistedTurnId)
+      expect(params.content).toBe("Retry this")
+      if (attempts === 1) {
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: { runId: "run-failed", status: "running", lastSequence: 1 },
+        })
+        runtimeEvent(socket, "run-failed", 1, "run.queued", {
+          status: "queued",
+        })
+        runtimeEvent(socket, "run-failed", 2, "run.failed", {
+          code: "provider_timeout",
+          message: "The provider timed out.",
+        })
+      } else {
+        completeRuntimeRun(socket, request, "run-retried", "Recovered response")
+      }
+    })
     const fetchMock = startupFetch((url, init) => {
       const method = init?.method ?? "GET"
       if (url === "/api/sessions" && method === "POST")
         return response(created, 201)
-      if (url === "/api/sessions/session-failed/turns" && method === "POST") {
-        attempts += 1
-        const submitted = JSON.parse(String(init?.body)) as {
-          turn_id: string
-          content: string
-        }
-        if (!persistedTurnId) persistedTurnId = submitted.turn_id
-        expect(submitted.turn_id).toBe(persistedTurnId)
-        if (attempts === 1) {
-          return response(
-            {
-              error: {
-                code: "provider_timeout",
-                message: "The provider timed out.",
-              },
-            },
-            504
-          )
-        }
-        return response(
-          {
-            session: { ...created, title: "Retry this", message_count: 2 },
-            user_message: {
-              id: "message-user",
-              turn_id: submitted.turn_id,
-              role: "user",
-              content: submitted.content,
-              provider: null,
-              model: null,
-              created_at: "2026-08-25T10:00:00Z",
-            },
-            assistant_message: {
-              id: "message-assistant",
-              turn_id: submitted.turn_id,
-              role: "assistant",
-              content: "Recovered response",
-              provider: "openai",
-              model: "gpt-5.5",
-              created_at: "2026-08-25T10:00:01Z",
-            },
-          },
-          201
-        )
-      }
       if (url === "/api/sessions/session-failed") {
+        const messages: TestMessage[] = [
+          {
+            id: "message-user",
+            turn_id: persistedTurnId,
+            role: "user",
+            content: "Retry this",
+            provider: null,
+            model: null,
+            created_at: "2026-08-25T10:00:00Z",
+          },
+        ]
+        if (attempts > 1) {
+          messages.push({
+            id: "message-assistant",
+            turn_id: persistedTurnId,
+            role: "assistant",
+            content: "Recovered response",
+            provider: "openai",
+            model: "gpt-5.5",
+            created_at: "2026-08-25T10:00:01Z",
+          })
+        }
         return response({
-          session: { ...created, title: "Retry this", message_count: 1 },
-          messages: [
-            {
-              id: "message-user",
-              turn_id: persistedTurnId,
-              role: "user",
-              content: "Retry this",
-              provider: null,
-              model: null,
-              created_at: "2026-08-25T10:00:00Z",
-            },
-          ],
+          session: {
+            ...created,
+            title: "Retry this",
+            message_count: messages.length,
+          },
+          messages,
         })
       }
       return undefined
@@ -621,62 +827,57 @@ describe("local-first chat", () => {
 
     expect(await screen.findByText("Recovered response")).toBeInTheDocument()
     expect(attempts).toBe(2)
+    expect(requestIds[0]).not.toBe(requestIds[1])
   })
 
   it("reconstructs a same-ID retry from an unmatched persisted user message", async () => {
     const persistedTurnId = "e49ea024-e340-4c85-a7a6-f8c8459a9811"
+    let detailLoads = 0
+    installRuntimeServer((socket, request) => {
+      if (request.method !== "run.start") return
+      expect(request.params).toMatchObject({
+        sessionId: "session-recent",
+        turnId: persistedTurnId,
+        content: "Recover after restart",
+      })
+      completeRuntimeRun(
+        socket,
+        request,
+        "run-recovered",
+        "Recovered after restart"
+      )
+    })
     const fetchMock = startupFetch((url, init) => {
       const method = init?.method ?? "GET"
       if (url === "/api/sessions") return response([recentSession])
       if (url === "/api/sessions/session-recent" && method === "GET") {
-        return response({
-          session: { ...recentSession, message_count: 1 },
-          messages: [
-            {
-              id: "persisted-user",
-              turn_id: persistedTurnId,
-              role: "user",
-              content: "Recover after restart",
-              provider: null,
-              model: null,
-              created_at: "2026-08-25T10:00:00Z",
-            },
-          ],
-        })
-      }
-      if (url === "/api/sessions/session-recent/turns" && method === "POST") {
-        const submitted = JSON.parse(String(init?.body)) as {
-          turn_id: string
-          content: string
-        }
-        expect(submitted).toEqual({
-          turn_id: persistedTurnId,
-          content: "Recover after restart",
-        })
-        return response(
+        detailLoads += 1
+        const messages: TestMessage[] = [
           {
-            session: recentSession,
-            user_message: {
-              id: "persisted-user",
-              turn_id: submitted.turn_id,
-              role: "user",
-              content: submitted.content,
-              provider: null,
-              model: null,
-              created_at: "2026-08-25T10:00:00Z",
-            },
-            assistant_message: {
-              id: "recovered-assistant",
-              turn_id: submitted.turn_id,
-              role: "assistant",
-              content: "Recovered after restart",
-              provider: "openai",
-              model: "gpt-5.5",
-              created_at: "2026-08-25T10:00:01Z",
-            },
+            id: "persisted-user",
+            turn_id: persistedTurnId,
+            role: "user",
+            content: "Recover after restart",
+            provider: null,
+            model: null,
+            created_at: "2026-08-25T10:00:00Z",
           },
-          201
-        )
+        ]
+        if (detailLoads > 1) {
+          messages.push({
+            id: "recovered-assistant",
+            turn_id: persistedTurnId,
+            role: "assistant",
+            content: "Recovered after restart",
+            provider: "openai",
+            model: "gpt-5.5",
+            created_at: "2026-08-25T10:00:01Z",
+          })
+        }
+        return response({
+          session: { ...recentSession, message_count: messages.length },
+          messages,
+        })
       }
       return undefined
     })

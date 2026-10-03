@@ -1,4 +1,4 @@
-import { Bot, RotateCcw, UserRound } from "lucide-react"
+import { Bot, RotateCcw, Square, UserRound } from "lucide-react"
 
 import type { Message, Session } from "@/lib/app-types"
 
@@ -6,18 +6,26 @@ type ChatThreadProps = {
   session: Session
   messages: Message[]
   pending: boolean
+  streamingText: string | null
   error: string | null
   canRetry: boolean
+  canCancel: boolean
+  cancellationPending: boolean
   onRetry: () => void
+  onCancel: () => void
 }
 
 export function ChatThread({
   session,
   messages,
   pending,
+  streamingText,
   error,
   canRetry,
+  canCancel,
+  cancellationPending,
   onRetry,
+  onCancel,
 }: ChatThreadProps) {
   return (
     <div className="chat-thread" aria-live="polite">
@@ -50,7 +58,22 @@ export function ChatThread({
           </article>
         ))}
 
-        {pending ? (
+        {pending && streamingText !== null ? (
+          <article
+            className="thread-message assistant pending"
+            aria-label="Assistant response streaming"
+          >
+            <span className="thread-node" aria-hidden="true">
+              <Bot size={14} />
+            </span>
+            <div className="thread-message-copy">
+              <div className="thread-message-meta">
+                <span>Trellis</span>
+              </div>
+              <p>{streamingText}</p>
+            </div>
+          </article>
+        ) : pending ? (
           <article
             className="thread-message assistant pending"
             aria-label="Assistant response pending"
@@ -81,6 +104,17 @@ export function ChatThread({
             </button>
           ) : null}
         </div>
+      ) : null}
+      {canCancel ? (
+        <button
+          type="button"
+          onClick={onCancel}
+          className="cancel-run-button"
+          disabled={cancellationPending}
+        >
+          <Square size={13} aria-hidden="true" />
+          {cancellationPending ? "Stopping…" : "Stop generating"}
+        </button>
       ) : null}
     </div>
   )
