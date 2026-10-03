@@ -1,7 +1,9 @@
 import asyncio
 import json
 import os
+import re
 import tempfile
+from hashlib import sha256
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -17,6 +19,15 @@ ENV_NAMES: dict[ProviderName, str] = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
 }
+PROVIDER_ENV_PATTERN = re.compile(r"TRELLIS_PROVIDER_[A-F0-9]{24}_API_KEY")
+
+
+def env_name_for(provider: ProviderName) -> str:
+    known_name = ENV_NAMES.get(provider)
+    if known_name is not None:
+        return known_name
+    digest = sha256(provider.encode("utf-8")).hexdigest()[:24].upper()
+    return f"TRELLIS_PROVIDER_{digest}_API_KEY"
 
 
 class SecretStore:
@@ -26,7 +37,7 @@ class SecretStore:
 
     async def get(self, provider: ProviderName) -> str | None:
         values = await asyncio.to_thread(dotenv_values, self.path)
-        value = values.get(ENV_NAMES[provider])
+        value = values.get(env_name_for(provider))
         return value if isinstance(value, str) and value else None
 
     async def set(self, provider: ProviderName, value: str) -> None:
@@ -60,10 +71,12 @@ class SecretStore:
             current = dotenv_values(self.path)
             secrets = {
                 name: stored
-                for name in ENV_NAMES.values()
-                if isinstance((stored := current.get(name)), str) and stored
+                for name, stored in current.items()
+                if isinstance(stored, str)
+                and stored
+                and (name in ENV_NAMES.values() or PROVIDER_ENV_PATTERN.fullmatch(name))
             }
-            env_name = ENV_NAMES[provider]
+            env_name = env_name_for(provider)
             if value is None:
                 secrets.pop(env_name, None)
             else:
@@ -87,9 +100,8 @@ class SecretStore:
             ) as temporary:
                 temporary_path = Path(temporary.name)
                 os.fchmod(temporary.fileno(), 0o600)
-                for name in ENV_NAMES.values():
-                    if name in secrets:
-                        temporary.write(f"{name}={json.dumps(secrets[name])}\n")
+                for name, value in sorted(secrets.items()):
+                    temporary.write(f"{name}={json.dumps(value)}\n")
                 temporary.flush()
                 os.fsync(temporary.fileno())
             os.replace(temporary_path, self.path)

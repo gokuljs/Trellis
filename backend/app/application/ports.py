@@ -1,7 +1,7 @@
 from collections.abc import Sequence
 from typing import Protocol
 
-from app.domain.models import Message, ProviderName, Session, UserProfile
+from app.domain.models import Message, ModelDescriptor, ModelId, ProviderName, Session, UserProfile
 
 
 class ProfileRepository(Protocol):
@@ -14,6 +14,12 @@ class SettingsRepository(Protocol):
     async def get_selected_provider(self) -> ProviderName: ...
 
     async def set_selected_provider(self, provider: ProviderName) -> ProviderName: ...
+
+    async def get_selected_model_id(self) -> ModelId: ...
+
+    async def list_models(self) -> list[ModelDescriptor]: ...
+
+    async def set_selected_model(self, model_id: ModelId) -> bool: ...
 
 
 class SessionRepository(Protocol):

@@ -7,9 +7,9 @@ from uuid import uuid4
 
 import aiosqlite
 
-from app.domain.models import Message, ProviderName, Session, UserProfile
+from app.domain.models import Message, ModelDescriptor, ModelId, ProviderName, Session, UserProfile
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 TURN_CLAIM_TTL = timedelta(minutes=5)
 
 MIGRATION_TABLE_SCHEMA = """
@@ -76,9 +76,79 @@ CREATE TABLE IF NOT EXISTS turn_claims (
 );
 """
 
+SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS models (
+    id TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL,
+    provider_name TEXT NOT NULL,
+    adapter_kind TEXT NOT NULL,
+    upstream_model_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    requires_api_key INTEGER NOT NULL CHECK (requires_api_key IN (0, 1)),
+    supports_streaming INTEGER NOT NULL CHECK (supports_streaming IN (0, 1)),
+    supports_tools INTEGER NOT NULL CHECK (supports_tools IN (0, 1)),
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO models(
+    id, provider_id, provider_name, adapter_kind, upstream_model_id, name,
+    requires_api_key, supports_streaming, supports_tools, enabled, created_at, updated_at
+) VALUES
+    ('openai:gpt-5.5', 'openai', 'OpenAI', 'openai', 'gpt-5.5', 'GPT-5.5', 1, 1, 0, 1,
+     STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'), STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    ('anthropic:claude-sonnet-5', 'anthropic', 'Anthropic', 'anthropic',
+     'claude-sonnet-5', 'Claude Sonnet 5', 1, 1, 0, 1,
+     STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'), STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'));
+
+DROP TABLE IF EXISTS app_settings_v3;
+CREATE TABLE app_settings_v3 (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    selected_provider TEXT NOT NULL,
+    selected_model_id TEXT NOT NULL REFERENCES models(id),
+    updated_at TEXT NOT NULL
+);
+INSERT INTO app_settings_v3(id, selected_provider, selected_model_id, updated_at)
+SELECT id, selected_provider,
+       CASE selected_provider
+           WHEN 'anthropic' THEN 'anthropic:claude-sonnet-5'
+           ELSE 'openai:gpt-5.5'
+       END,
+       updated_at
+FROM app_settings;
+DROP TABLE app_settings;
+ALTER TABLE app_settings_v3 RENAME TO app_settings;
+
+DROP TABLE IF EXISTS messages_v3;
+CREATE TABLE messages_v3 (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    provider TEXT,
+    model TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, ordinal),
+    UNIQUE(session_id, turn_id, role)
+);
+INSERT INTO messages_v3(
+    id, session_id, turn_id, ordinal, role, content, provider, model, created_at
+)
+SELECT id, session_id, turn_id, ordinal, role, content, provider, model, created_at
+FROM messages;
+DROP TABLE messages;
+ALTER TABLE messages_v3 RENAME TO messages;
+CREATE INDEX IF NOT EXISTS idx_messages_session_ordinal
+ON messages(session_id, ordinal);
+"""
+
 MIGRATIONS = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
+    3: SCHEMA_V3,
 }
 
 
@@ -126,8 +196,9 @@ class Database:
             )
             await connection.execute(
                 """
-                INSERT OR IGNORE INTO app_settings(id, selected_provider, updated_at)
-                VALUES (1, 'openai', ?)
+                INSERT OR IGNORE INTO app_settings(
+                    id, selected_provider, selected_model_id, updated_at
+                ) VALUES (1, 'openai', 'openai:gpt-5.5', ?)
                 """,
                 (now,),
             )
@@ -171,12 +242,71 @@ class Database:
 
     async def set_selected_provider(self, provider: ProviderName) -> ProviderName:
         async with self._connect() as connection:
+            cursor = await connection.execute(
+                """SELECT id FROM models WHERE provider_id = ? AND enabled = 1
+                   ORDER BY rowid LIMIT 1""",
+                (provider,),
+            )
+            model = await cursor.fetchone()
+            if model is None:
+                return provider
             await connection.execute(
-                "UPDATE app_settings SET selected_provider = ?, updated_at = ? WHERE id = 1",
-                (provider, utc_now()),
+                """UPDATE app_settings SET selected_provider = ?, selected_model_id = ?,
+                   updated_at = ? WHERE id = 1""",
+                (provider, model["id"], utc_now()),
             )
             await connection.commit()
         return provider
+
+    async def get_selected_model_id(self) -> ModelId:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                "SELECT selected_model_id FROM app_settings WHERE id = 1"
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError("Trellis settings have not been initialized")
+        return row["selected_model_id"]
+
+    async def list_models(self) -> list[ModelDescriptor]:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                """SELECT id, provider_id, provider_name, adapter_kind, upstream_model_id,
+                          name, requires_api_key, supports_streaming, supports_tools, enabled
+                   FROM models WHERE enabled = 1 ORDER BY rowid"""
+            )
+            rows = await cursor.fetchall()
+        return [
+            ModelDescriptor(
+                id=row["id"],
+                provider_id=row["provider_id"],
+                provider_name=row["provider_name"],
+                adapter_kind=row["adapter_kind"],
+                upstream_model_id=row["upstream_model_id"],
+                name=row["name"],
+                requires_api_key=bool(row["requires_api_key"]),
+                supports_streaming=bool(row["supports_streaming"]),
+                supports_tools=bool(row["supports_tools"]),
+                enabled=bool(row["enabled"]),
+            )
+            for row in rows
+        ]
+
+    async def set_selected_model(self, model_id: ModelId) -> bool:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                "SELECT provider_id FROM models WHERE id = ? AND enabled = 1", (model_id,)
+            )
+            model = await cursor.fetchone()
+            if model is None:
+                return False
+            await connection.execute(
+                """UPDATE app_settings SET selected_provider = ?, selected_model_id = ?,
+                   updated_at = ? WHERE id = 1""",
+                (model["provider_id"], model_id, utc_now()),
+            )
+            await connection.commit()
+        return True
 
     async def create_session(self) -> Session:
         profile = await self.get_profile()

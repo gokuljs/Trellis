@@ -129,6 +129,33 @@ def test_provider_selection_and_key_removal_are_persistent(tmp_path: Path) -> No
     assert anthropic["key_hint"] is None
 
 
+def test_model_catalog_uses_opaque_ids_and_selection_survives_restart(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+
+    with TestClient(create_app(settings)) as client:
+        initial = client.get("/api/settings")
+        catalog = initial.json()["models"]
+        assert {model["provider_id"] for model in catalog} == {"openai", "anthropic"}
+        selected_model = next(model for model in catalog if model["provider_id"] == "anthropic")
+        response = client.put("/api/settings/model", json={"model_id": selected_model["id"]})
+
+    with TestClient(create_app(settings)) as restarted_client:
+        restored = restarted_client.get("/api/settings").json()
+
+    assert response.status_code == 200
+    assert response.json()["selected_model_id"] == selected_model["id"]
+    assert restored["selected_model_id"] == selected_model["id"]
+    assert restored["selected_provider"] == "anthropic"
+
+
+def test_model_selection_rejects_an_unregistered_model_id(tmp_path: Path) -> None:
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        response = client.put("/api/settings/model", json={"model_id": "deepseek:chat"})
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "model_not_available"
+
+
 def test_concurrent_secret_updates_preserve_both_provider_keys(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     first_store = SecretStore(settings.secrets_path)
@@ -180,7 +207,7 @@ def test_database_records_all_schema_migrations(tmp_path: Path) -> None:
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
 
-    assert versions == [(1,), (2,)]
+    assert versions == [(1,), (2,), (3,)]
 
 
 def test_database_upgrades_an_existing_v1_schema(tmp_path: Path) -> None:
@@ -190,7 +217,7 @@ def test_database_upgrades_an_existing_v1_schema(tmp_path: Path) -> None:
 
     with closing(sqlite3.connect(settings.database_path)) as connection:
         connection.execute("DROP TABLE turn_claims")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 2")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 2")
         connection.commit()
 
     asyncio.run(Database(settings.database_path).initialize())
@@ -203,7 +230,7 @@ def test_database_upgrades_an_existing_v1_schema(tmp_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'turn_claims'"
         ).fetchone()
 
-    assert versions == [(1,), (2,)]
+    assert versions == [(1,), (2,), (3,)]
     assert claim_table == ("turn_claims",)
 
 

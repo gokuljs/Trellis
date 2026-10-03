@@ -2,7 +2,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel, SecretStr
 
 from app.api.dependencies import SettingsServiceDep
-from app.domain.models import AppSettings, ProviderName
+from app.domain.models import AppSettings, ModelId, ProviderName
 
 
 class ProviderStatus(BaseModel):
@@ -13,13 +13,33 @@ class ProviderStatus(BaseModel):
     key_hint: str | None
 
 
+class ModelOption(BaseModel):
+    id: ModelId
+    provider_id: ProviderName
+    provider_name: str
+    adapter_kind: str
+    upstream_model_id: str
+    name: str
+    requires_api_key: bool
+    supports_streaming: bool
+    supports_tools: bool
+    configured: bool
+    key_hint: str | None
+
+
 class SettingsResponse(BaseModel):
     selected_provider: ProviderName
     providers: list[ProviderStatus]
+    selected_model_id: ModelId
+    models: list[ModelOption]
 
 
 class ProviderSelection(BaseModel):
     provider: ProviderName
+
+
+class ModelSelection(BaseModel):
+    model_id: ModelId
 
 
 class ApiKeyUpdate(BaseModel):
@@ -42,6 +62,23 @@ def serialize_settings(settings: AppSettings) -> SettingsResponse:
             )
             for provider in settings.providers
         ],
+        selected_model_id=settings.selected_model_id,
+        models=[
+            ModelOption(
+                id=model.id,
+                provider_id=model.provider_id,
+                provider_name=model.provider_name,
+                adapter_kind=model.adapter_kind,
+                upstream_model_id=model.upstream_model_id,
+                name=model.name,
+                requires_api_key=model.requires_api_key,
+                supports_streaming=model.supports_streaming,
+                supports_tools=model.supports_tools,
+                configured=model.configured,
+                key_hint=model.key_hint,
+            )
+            for model in settings.models
+        ],
     )
 
 
@@ -58,9 +95,17 @@ async def select_provider(
     return serialize_settings(await service.select_provider(payload.provider))
 
 
+@router.put("/model")
+async def select_model(
+    payload: ModelSelection,
+    service: SettingsServiceDep,
+) -> SettingsResponse:
+    return serialize_settings(await service.select_model(payload.model_id))
+
+
 @router.put("/providers/{provider}/api-key")
 async def update_api_key(
-    provider: ProviderName,
+    provider: str,
     payload: ApiKeyUpdate,
     service: SettingsServiceDep,
 ) -> SettingsResponse:
@@ -70,7 +115,7 @@ async def update_api_key(
 
 @router.delete("/providers/{provider}/api-key")
 async def delete_api_key(
-    provider: ProviderName,
+    provider: str,
     service: SettingsServiceDep,
 ) -> SettingsResponse:
     return serialize_settings(await service.remove_api_key(provider))

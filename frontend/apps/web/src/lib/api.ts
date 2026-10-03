@@ -69,6 +69,11 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ provider }),
     }),
+  selectModel: (modelId: string) =>
+    request<Settings>("/api/settings/model", {
+      method: "PUT",
+      body: JSON.stringify({ model_id: modelId }),
+    }),
   saveApiKey: (provider: ProviderId, apiKey: string) =>
     request<Settings>(`/api/settings/providers/${provider}/api-key`, {
       method: "PUT",

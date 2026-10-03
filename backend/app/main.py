@@ -19,6 +19,7 @@ from app.infrastructure.providers import AnthropicProvider, OpenAIProvider
 from app.infrastructure.secrets import SecretStore
 
 ERROR_STATUS = {
+    "model_not_available": 404,
     "session_not_found": 404,
     "provider_not_configured": 409,
     "provider_not_available": 503,

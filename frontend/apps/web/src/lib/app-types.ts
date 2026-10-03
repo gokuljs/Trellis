@@ -2,7 +2,8 @@ import type { LucideIcon } from "lucide-react"
 
 export type WorkspaceView =
   "New session" | "Capabilities" | "Settings" | "session"
-export type ProviderId = "openai" | "anthropic"
+export type ProviderId = string
+export type ModelId = string
 export type MessageRole = "user" | "assistant"
 
 export type NavigationItem = {
@@ -34,9 +35,25 @@ export type ProviderStatus = {
   key_hint: string | null
 }
 
+export type ModelStatus = {
+  id: ModelId
+  provider_id: ProviderId
+  provider_name: string
+  adapter_kind: string
+  upstream_model_id: string
+  name: string
+  requires_api_key: boolean
+  supports_streaming: boolean
+  supports_tools: boolean
+  configured: boolean
+  key_hint: string | null
+}
+
 export type Settings = {
   selected_provider: ProviderId
   providers: ProviderStatus[]
+  selected_model_id?: ModelId
+  models?: ModelStatus[]
 }
 
 export type Message = {

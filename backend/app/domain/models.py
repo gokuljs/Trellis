@@ -1,7 +1,10 @@
 from dataclasses import dataclass
 from typing import Literal
 
-ProviderName = Literal["openai", "anthropic"]
+# Provider and model identifiers are owned by Trellis' catalog and are deliberately
+# open-ended so adding a provider does not require changing the domain types.
+ProviderName = str
+ModelId = str
 MessageRole = Literal["user", "assistant"]
 
 
@@ -54,9 +57,40 @@ class ProviderStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelDescriptor:
+    id: ModelId
+    provider_id: ProviderName
+    provider_name: str
+    adapter_kind: str
+    upstream_model_id: str
+    name: str
+    requires_api_key: bool
+    supports_streaming: bool
+    supports_tools: bool
+    enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ModelStatus:
+    id: ModelId
+    provider_id: ProviderName
+    provider_name: str
+    adapter_kind: str
+    upstream_model_id: str
+    name: str
+    requires_api_key: bool
+    supports_streaming: bool
+    supports_tools: bool
+    configured: bool
+    key_hint: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class AppSettings:
     selected_provider: ProviderName
     providers: list[ProviderStatus]
+    selected_model_id: ModelId
+    models: list[ModelStatus]
 
 
 @dataclass(frozen=True, slots=True)
