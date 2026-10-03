@@ -2,7 +2,7 @@ import { Check, Eye, EyeOff, KeyRound, Sparkles, Trash2 } from "lucide-react"
 import { useState } from "react"
 
 import { ApiError, api } from "@/lib/api"
-import type { Profile, ProviderId, Settings } from "@/lib/app-types"
+import type { ModelStatus, Profile, Settings } from "@/lib/app-types"
 import { notifications } from "@/lib/notifications"
 
 type SettingsPageProps = {
@@ -29,9 +29,31 @@ export function SettingsPage({
   const [apiKey, setApiKey] = useState("")
   const [showApiKey, setShowApiKey] = useState(false)
   const [saving, setSaving] = useState<string | null>(null)
-  const selectedProvider =
-    settings.providers.find((item) => item.id === settings.selected_provider) ??
-    settings.providers[0]
+  const models: ModelStatus[] =
+    settings.models ??
+    settings.providers.map((provider) => ({
+      id: provider.id,
+      provider_id: provider.id,
+      provider_name: provider.name,
+      adapter_kind: provider.id,
+      upstream_model_id: provider.model,
+      name: provider.model,
+      requires_api_key: true,
+      supports_streaming: true,
+      supports_tools: false,
+      configured: provider.configured,
+      key_hint: provider.key_hint,
+    }))
+  const selectedModelId =
+    settings.selected_model_id ?? settings.selected_provider
+  const selectedModel = models.find((model) => model.id === selectedModelId)
+  const selectedProviderStatus = settings.providers.find(
+    (provider) => provider.id === selectedModel?.provider_id
+  )
+  const credentialConfigured =
+    selectedProviderStatus?.configured ?? selectedModel?.configured ?? false
+  const credentialHint =
+    selectedProviderStatus?.key_hint ?? selectedModel?.key_hint
 
   const runUpdate = async (
     label: string,
@@ -56,25 +78,25 @@ export function SettingsPage({
     }
   }
 
-  const selectProvider = (provider: ProviderId) => {
-    const nextProvider = settings.providers.find((item) => item.id === provider)
-    if (!nextProvider) return
+  const selectModel = (modelId: string) => {
+    const nextModel = models.find((item) => item.id === modelId)
+    if (!nextModel) return
     setApiKey("")
     setShowApiKey(false)
     void runUpdate(
-      "provider",
+      "model",
       {
         kind: "info",
-        title: `${nextProvider.name} selected`,
-        description: `${nextProvider.model} will power new messages.`,
+        title: `${nextModel.name} selected`,
+        description: `${nextModel.provider_name} will power new messages.`,
       },
       async () => {
-        onSettingsChange(await api.selectProvider(provider))
+        onSettingsChange(await api.selectModel(modelId))
       }
     )
   }
 
-  if (!selectedProvider) return null
+  if (!selectedModel) return null
 
   return (
     <div className="settings-page">
@@ -169,21 +191,21 @@ export function SettingsPage({
           aria-labelledby="provider-heading"
         >
           <div className="settings-section-copy">
-            <div className="settings-section-label">MODEL PROVIDER</div>
+            <div className="settings-section-label">MODEL</div>
             <h2 id="provider-heading">Choose your model</h2>
             <p>
-              The selected provider powers every new turn. Your choice is stored
-              locally.
+              Choose which available model powers new turns. Your choice is
+              stored locally.
             </p>
           </div>
 
           <div
             className="provider-options"
             role="radiogroup"
-            aria-label="Model provider"
+            aria-label="Available models"
           >
-            {settings.providers.map((item) => {
-              const isSelected = item.id === settings.selected_provider
+            {models.map((item) => {
+              const isSelected = item.id === selectedModelId
               return (
                 <button
                   className={`provider-option ${isSelected ? "is-selected" : ""}`}
@@ -192,20 +214,22 @@ export function SettingsPage({
                   role="radio"
                   aria-checked={isSelected}
                   disabled={saving !== null}
-                  onClick={() => selectProvider(item.id)}
+                  onClick={() => selectModel(item.id)}
                 >
                   <span className="provider-icon">
                     <Sparkles size={16} strokeWidth={1.7} aria-hidden="true" />
                   </span>
                   <span className="provider-details">
-                    <span className="provider-name">{item.name}</span>
+                    <span className="provider-name">{item.provider_name}</span>
                     <span className="provider-description">
                       {item.configured
                         ? `Key configured ${item.key_hint ?? ""}`
-                        : "API key required"}
+                        : item.requires_api_key
+                          ? "API key required"
+                          : "Ready to use"}
                     </span>
                   </span>
-                  <span className="provider-model">{item.model}</span>
+                  <span className="provider-model">{item.name}</span>
                   <span className="provider-check" aria-hidden="true">
                     {isSelected ? <Check size={14} strokeWidth={2} /> : null}
                   </span>
@@ -215,108 +239,117 @@ export function SettingsPage({
           </div>
         </section>
 
-        <section className="settings-section" aria-labelledby="api-key-heading">
-          <div className="settings-section-copy">
-            <div className="settings-section-label">API KEY</div>
-            <h2 id="api-key-heading">Connect {selectedProvider.name}</h2>
-            <p>
-              Keys are stored separately from chat history in the private local
-              secrets file.
-            </p>
-          </div>
+        {selectedModel.requires_api_key ? (
+          <section
+            className="settings-section"
+            aria-labelledby="api-key-heading"
+          >
+            <div className="settings-section-copy">
+              <div className="settings-section-label">API KEY</div>
+              <h2 id="api-key-heading">
+                Connect {selectedModel.provider_name}
+              </h2>
+              <p>
+                Keys are stored separately from chat history in the private
+                local secrets file.
+              </p>
+            </div>
 
-          <div className="settings-key-panel">
-            <label className="settings-field">
-              <span className="settings-field-label">
-                {selectedProvider.name} API key
-              </span>
-              <span className="settings-input-wrap">
-                <KeyRound size={15} strokeWidth={1.7} aria-hidden="true" />
-                <input
-                  type={showApiKey ? "text" : "password"}
-                  value={apiKey}
-                  onChange={(event) => setApiKey(event.target.value)}
-                  placeholder={
-                    selectedProvider.id === "openai" ? "sk-…" : "sk-ant-…"
-                  }
-                  autoComplete="new-password"
-                  name={`${selectedProvider.id}-api-key`}
-                  spellCheck={false}
-                  aria-label={`${selectedProvider.name} API key`}
-                />
+            <div className="settings-key-panel">
+              <label className="settings-field">
+                <span className="settings-field-label">
+                  {selectedModel.provider_name} API key
+                </span>
+                <span className="settings-input-wrap">
+                  <KeyRound size={15} strokeWidth={1.7} aria-hidden="true" />
+                  <input
+                    type={showApiKey ? "text" : "password"}
+                    value={apiKey}
+                    onChange={(event) => setApiKey(event.target.value)}
+                    placeholder="Enter API key"
+                    autoComplete="new-password"
+                    name={`${selectedModel.provider_id}-api-key`}
+                    spellCheck={false}
+                    aria-label={`${selectedModel.provider_name} API key`}
+                  />
+                  <button
+                    className="settings-input-action"
+                    type="button"
+                    aria-label={showApiKey ? "Hide API key" : "Show API key"}
+                    onClick={() => setShowApiKey((visible) => !visible)}
+                  >
+                    {showApiKey ? (
+                      <EyeOff size={15} aria-hidden="true" />
+                    ) : (
+                      <Eye size={15} aria-hidden="true" />
+                    )}
+                  </button>
+                </span>
+                <span className="settings-field-help">
+                  {credentialConfigured
+                    ? `Configured · ${credentialHint ?? "saved"}`
+                    : "Not configured. The key is write-only and will not be shown again."}
+                </span>
+              </label>
+              <div className="settings-actions">
                 <button
-                  className="settings-input-action"
+                  className="settings-save"
                   type="button"
-                  aria-label={showApiKey ? "Hide API key" : "Show API key"}
-                  onClick={() => setShowApiKey((visible) => !visible)}
-                >
-                  {showApiKey ? (
-                    <EyeOff size={15} aria-hidden="true" />
-                  ) : (
-                    <Eye size={15} aria-hidden="true" />
-                  )}
-                </button>
-              </span>
-              <span className="settings-field-help">
-                {selectedProvider.configured
-                  ? `Configured · ${selectedProvider.key_hint ?? "saved"}`
-                  : "Not configured. The key is write-only and will not be shown again."}
-              </span>
-            </label>
-            <div className="settings-actions">
-              <button
-                className="settings-save"
-                type="button"
-                disabled={!apiKey.trim() || saving !== null}
-                onClick={() => {
-                  void runUpdate(
-                    "key",
-                    {
-                      title: `${selectedProvider.name} key saved`,
-                      description: "Stored in your private local secrets file.",
-                    },
-                    async () => {
-                      onSettingsChange(
-                        await api.saveApiKey(selectedProvider.id, apiKey.trim())
-                      )
-                      setApiKey("")
-                      setShowApiKey(false)
-                    }
-                  )
-                }}
-              >
-                {saving === "key"
-                  ? "Saving…"
-                  : `Save ${selectedProvider.name} key`}
-              </button>
-              {selectedProvider.configured ? (
-                <button
-                  className="settings-remove"
-                  type="button"
-                  disabled={saving !== null}
+                  disabled={!apiKey.trim() || saving !== null}
                   onClick={() => {
                     void runUpdate(
-                      "remove",
+                      "key",
                       {
-                        kind: "info",
-                        title: `${selectedProvider.name} key removed`,
-                        description: "New messages will require another key.",
+                        title: `${selectedModel.provider_name} key saved`,
+                        description:
+                          "Stored in your private local secrets file.",
                       },
                       async () => {
                         onSettingsChange(
-                          await api.removeApiKey(selectedProvider.id)
+                          await api.saveApiKey(
+                            selectedModel.provider_id,
+                            apiKey.trim()
+                          )
                         )
                         setApiKey("")
+                        setShowApiKey(false)
                       }
                     )
                   }}
                 >
-                  <Trash2 size={13} aria-hidden="true" /> Remove key
+                  {saving === "key"
+                    ? "Saving…"
+                    : `Save ${selectedModel.provider_name} key`}
                 </button>
-              ) : null}
+                {credentialConfigured ? (
+                  <button
+                    className="settings-remove"
+                    type="button"
+                    disabled={saving !== null}
+                    onClick={() => {
+                      void runUpdate(
+                        "remove",
+                        {
+                          kind: "info",
+                          title: `${selectedModel.provider_name} key removed`,
+                          description: "New messages will require another key.",
+                        },
+                        async () => {
+                          onSettingsChange(
+                            await api.removeApiKey(selectedModel.provider_id)
+                          )
+                          setApiKey("")
+                        }
+                      )
+                    }}
+                  >
+                    <Trash2 size={13} aria-hidden="true" /> Remove key
+                  </button>
+                ) : null}
+              </div>
             </div>
-          </div>
-        </section>
+          </section>
+        ) : null}
       </div>
     </div>
   )

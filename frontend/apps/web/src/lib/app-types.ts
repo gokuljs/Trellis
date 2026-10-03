@@ -4,6 +4,12 @@ export type WorkspaceView =
   "New session" | "Capabilities" | "Settings" | "session"
 export type ProviderId = string
 export type ModelId = string
+export type OnboardingStep = "intro" | "profile" | "model"
+
+export type OnboardingState = {
+  current_step: OnboardingStep | "complete"
+  completed: boolean
+}
 export type MessageRole = "user" | "assistant"
 
 export type NavigationItem = {

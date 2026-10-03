@@ -3,22 +3,27 @@ import { useEffect, useRef, useState } from "react"
 
 import { TrellisMark } from "@/components/trellis-mark"
 import { ApiError } from "@/lib/api"
-import type { Profile, ProviderId, Settings } from "@/lib/app-types"
+import type {
+  ModelId,
+  ModelStatus,
+  OnboardingStep,
+  Profile,
+  Settings,
+} from "@/lib/app-types"
 
 export type OnboardingValues = {
-  displayName: string
-  email: string
-  provider: ProviderId
+  modelId: ModelId
   apiKey: string
 }
 
 type OnboardingFlowProps = {
   profile: Profile
   settings: Settings
+  initialStep: OnboardingStep
+  onAdvanceIntro: () => Promise<void>
+  onSaveProfile: (displayName: string, email: string) => Promise<void>
   onComplete: (values: OnboardingValues) => Promise<void>
 }
-
-type OnboardingStep = "intro" | "profile" | "model"
 
 const STEP_NUMBER: Record<OnboardingStep, number> = {
   intro: 1,
@@ -44,25 +49,41 @@ function isValidEmail(value: string) {
 export function OnboardingFlow({
   profile,
   settings,
+  initialStep,
+  onAdvanceIntro,
+  onSaveProfile,
   onComplete,
 }: OnboardingFlowProps) {
-  const [step, setStep] = useState<OnboardingStep>("intro")
+  const [step, setStep] = useState<OnboardingStep>(initialStep)
   const [direction, setDirection] = useState<"forward" | "back">("forward")
   const [displayName, setDisplayName] = useState(profile.display_name ?? "")
   const [email, setEmail] = useState(profile.email ?? "")
-  const [provider, setProvider] = useState<ProviderId>(
-    settings.selected_provider
+  const modelOptions: ModelStatus[] =
+    settings.models ??
+    settings.providers.map((provider) => ({
+      id: provider.id,
+      provider_id: provider.id,
+      provider_name: provider.name,
+      adapter_kind: provider.id,
+      upstream_model_id: provider.model,
+      name: provider.model,
+      requires_api_key: true,
+      supports_streaming: true,
+      supports_tools: false,
+      configured: provider.configured,
+      key_hint: provider.key_hint,
+    }))
+  const [modelId, setModelId] = useState<ModelId>(
+    settings.selected_model_id ?? modelOptions[0]?.id ?? ""
   )
   const [apiKey, setApiKey] = useState("")
   const [showApiKey, setShowApiKey] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const headingRef = useRef<HTMLHeadingElement>(null)
-  const providerRefs = useRef<Array<HTMLButtonElement | null>>([])
+  const modelRefs = useRef<Array<HTMLButtonElement | null>>([])
 
-  const selectedProvider = settings.providers.find(
-    (item) => item.id === provider
-  )
+  const selectedModel = modelOptions.find((item) => item.id === modelId)
 
   useEffect(() => {
     headingRef.current?.focus()
@@ -77,7 +98,20 @@ export function OnboardingFlow({
     setStep(nextStep)
   }
 
-  const continueFromProfile = () => {
+  const advanceIntro = async () => {
+    setSubmitting(true)
+    setError(null)
+    try {
+      await onAdvanceIntro()
+      changeStep("profile", "forward")
+    } catch (submitError) {
+      setError(errorMessage(submitError))
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const continueFromProfile = async () => {
     const trimmedName = displayName.trim()
     const trimmedEmail = email.trim()
     if (!trimmedName) {
@@ -92,24 +126,37 @@ export function OnboardingFlow({
       setError("Enter a valid email address.")
       return
     }
-    changeStep("model", "forward")
+    setSubmitting(true)
+    setError(null)
+    try {
+      await onSaveProfile(trimmedName, trimmedEmail)
+      changeStep("model", "forward")
+    } catch (submitError) {
+      setError(errorMessage(submitError))
+    } finally {
+      setSubmitting(false)
+    }
   }
 
-  const selectProvider = (nextProvider: ProviderId) => {
-    setProvider(nextProvider)
+  const selectModel = (nextModel: ModelId) => {
+    setModelId(nextModel)
     setApiKey("")
     setShowApiKey(false)
     setError(null)
   }
 
   const submit = async () => {
-    if (!selectedProvider) {
-      setError("Choose a model provider.")
+    if (!selectedModel) {
+      setError("Choose a model.")
       return
     }
     const trimmedKey = apiKey.trim()
-    if (!selectedProvider.configured && !trimmedKey) {
-      setError(`Add an API key for ${selectedProvider.name}.`)
+    if (
+      selectedModel.requires_api_key &&
+      !selectedModel.configured &&
+      !trimmedKey
+    ) {
+      setError(`Add an API key for ${selectedModel.provider_name}.`)
       return
     }
 
@@ -117,10 +164,8 @@ export function OnboardingFlow({
     setSubmitting(true)
     try {
       await onComplete({
-        displayName: displayName.trim(),
-        email: email.trim(),
-        provider,
-        apiKey: selectedProvider.configured ? "" : trimmedKey,
+        modelId: selectedModel.id,
+        apiKey: selectedModel.configured ? "" : trimmedKey,
       })
     } catch (submitError) {
       setError(errorMessage(submitError))
@@ -170,9 +215,10 @@ export function OnboardingFlow({
                   <button
                     className="onboarding-primary-action"
                     type="button"
-                    onClick={() => changeStep("profile", "forward")}
+                    disabled={submitting}
+                    onClick={() => void advanceIntro()}
                   >
-                    <span>Continue</span>
+                    <span>{submitting ? "Saving…" : "Continue"}</span>
                     <ArrowUpRight size={14} aria-hidden="true" />
                   </button>
                 </section>
@@ -192,7 +238,7 @@ export function OnboardingFlow({
                     className="onboarding-form"
                     onSubmit={(event) => {
                       event.preventDefault()
-                      continueFromProfile()
+                      void continueFromProfile()
                     }}
                   >
                     <label className="onboarding-field">
@@ -225,6 +271,7 @@ export function OnboardingFlow({
                       <button
                         className="onboarding-secondary-action"
                         type="button"
+                        disabled={submitting}
                         onClick={() => changeStep("intro", "back")}
                       >
                         Back
@@ -232,8 +279,9 @@ export function OnboardingFlow({
                       <button
                         className="onboarding-primary-action"
                         type="submit"
+                        disabled={submitting}
                       >
-                        Continue
+                        {submitting ? "Saving…" : "Continue"}
                       </button>
                     </div>
                   </form>
@@ -260,67 +308,70 @@ export function OnboardingFlow({
                     <div
                       className="onboarding-provider-options"
                       role="radiogroup"
-                      aria-label="Model provider"
+                      aria-label="Available models"
                     >
-                      {settings.providers.map((item, index) => (
+                      {modelOptions.map((item, index) => (
                         <button
                           key={item.id}
                           ref={(element) => {
-                            providerRefs.current[index] = element
+                            modelRefs.current[index] = element
                           }}
-                          className={`onboarding-provider ${item.id === provider ? "is-selected" : ""}`}
+                          className={`onboarding-provider ${item.id === modelId ? "is-selected" : ""}`}
                           type="button"
                           role="radio"
-                          aria-checked={item.id === provider}
-                          tabIndex={item.id === provider ? 0 : -1}
-                          onClick={() => selectProvider(item.id)}
+                          aria-checked={item.id === modelId}
+                          tabIndex={item.id === modelId ? 0 : -1}
+                          onClick={() => selectModel(item.id)}
                           onKeyDown={(event) => {
                             let nextIndex: number | null = null
                             if (
                               event.key === "ArrowDown" ||
                               event.key === "ArrowRight"
                             ) {
-                              nextIndex =
-                                (index + 1) % settings.providers.length
+                              nextIndex = (index + 1) % modelOptions.length
                             } else if (
                               event.key === "ArrowUp" ||
                               event.key === "ArrowLeft"
                             ) {
                               nextIndex =
-                                (index - 1 + settings.providers.length) %
-                                settings.providers.length
+                                (index - 1 + modelOptions.length) %
+                                modelOptions.length
                             } else if (event.key === "Home") {
                               nextIndex = 0
                             } else if (event.key === "End") {
-                              nextIndex = settings.providers.length - 1
+                              nextIndex = modelOptions.length - 1
                             }
 
                             if (nextIndex === null) return
                             event.preventDefault()
-                            const nextProvider = settings.providers[nextIndex]
-                            if (!nextProvider) return
-                            selectProvider(nextProvider.id)
-                            providerRefs.current[nextIndex]?.focus()
+                            const nextModel = modelOptions[nextIndex]
+                            if (!nextModel) return
+                            selectModel(nextModel.id)
+                            modelRefs.current[nextIndex]?.focus()
                           }}
                         >
+                          <span>{item.provider_name}</span>
                           <span>{item.name}</span>
-                          <span>{item.model}</span>
                           <span>
                             {item.configured
                               ? "Configured"
-                              : "API key required"}
+                              : item.requires_api_key
+                                ? "API key required"
+                                : "Ready to use"}
                           </span>
                         </button>
                       ))}
                     </div>
 
-                    {selectedProvider && !selectedProvider.configured ? (
+                    {selectedModel &&
+                    selectedModel.requires_api_key &&
+                    !selectedModel.configured ? (
                       <label className="onboarding-field">
-                        <span>{selectedProvider.name} API key</span>
+                        <span>{selectedModel.provider_name} API key</span>
                         <span className="onboarding-key-input">
                           <KeyRound size={15} aria-hidden="true" />
                           <input
-                            aria-label={`${selectedProvider.name} API key`}
+                            aria-label={`${selectedModel.provider_name} API key`}
                             type={showApiKey ? "text" : "password"}
                             value={apiKey}
                             autoComplete="new-password"

@@ -1,5 +1,6 @@
 import type {
   Profile,
+  OnboardingState,
   ProviderId,
   Session,
   SessionDetail,
@@ -64,6 +65,19 @@ export const api = {
       body: JSON.stringify(profile),
     }),
   getSettings: () => request<Settings>("/api/settings"),
+  getOnboarding: () => request<OnboardingState>("/api/onboarding"),
+  completeOnboardingIntro: () =>
+    request<OnboardingState>("/api/onboarding/steps/intro", { method: "PUT" }),
+  saveOnboardingProfile: (profile: Pick<Profile, "display_name" | "email">) =>
+    request<OnboardingState>("/api/onboarding/steps/profile", {
+      method: "PUT",
+      body: JSON.stringify(profile),
+    }),
+  saveOnboardingModel: (modelId: string, apiKey: string) =>
+    request<OnboardingState>("/api/onboarding/steps/model", {
+      method: "PUT",
+      body: JSON.stringify({ model_id: modelId, api_key: apiKey || null }),
+    }),
   selectProvider: (provider: ProviderId) =>
     request<Settings>("/api/settings/provider", {
       method: "PUT",

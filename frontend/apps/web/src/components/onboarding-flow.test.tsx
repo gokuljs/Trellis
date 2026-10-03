@@ -15,6 +15,7 @@ const profile: Profile = {
 
 const settings: Settings = {
   selected_provider: "openai",
+  selected_model_id: "openai:gpt-5.5",
   providers: [
     {
       id: "openai",
@@ -31,18 +32,54 @@ const settings: Settings = {
       key_hint: null,
     },
   ],
+  models: [
+    {
+      id: "openai:gpt-5.5",
+      provider_id: "openai",
+      provider_name: "OpenAI",
+      adapter_kind: "openai",
+      upstream_model_id: "gpt-5.5",
+      name: "GPT-5.5",
+      requires_api_key: true,
+      supports_streaming: true,
+      supports_tools: false,
+      configured: true,
+      key_hint: "••••7890",
+    },
+    {
+      id: "anthropic:claude-sonnet-5",
+      provider_id: "anthropic",
+      provider_name: "Anthropic",
+      adapter_kind: "anthropic",
+      upstream_model_id: "claude-sonnet-5",
+      name: "Claude Sonnet 5",
+      requires_api_key: true,
+      supports_streaming: true,
+      supports_tools: false,
+      configured: false,
+      key_hint: null,
+    },
+  ],
 }
 
-function renderOnboarding(overrides: Partial<Settings> = {}) {
+function renderOnboarding(
+  overrides: Partial<Settings> = {},
+  initialStep: "intro" | "profile" | "model" = "intro"
+) {
+  const onAdvanceIntro = vi.fn().mockResolvedValue(undefined)
+  const onSaveProfile = vi.fn().mockResolvedValue(undefined)
   const onComplete = vi.fn().mockResolvedValue(undefined)
   render(
     <OnboardingFlow
       profile={profile}
       settings={{ ...settings, ...overrides }}
+      initialStep={initialStep}
+      onAdvanceIntro={onAdvanceIntro}
+      onSaveProfile={onSaveProfile}
       onComplete={onComplete}
     />
   )
-  return { onComplete }
+  return { onAdvanceIntro, onSaveProfile, onComplete }
 }
 
 async function reachModelStep() {
@@ -109,9 +146,10 @@ describe("OnboardingFlow", () => {
     ).toBeInTheDocument()
   })
 
-  it("requires an API key for an unconfigured provider", async () => {
+  it("requires an API key for an unconfigured model provider", async () => {
     const { onComplete } = renderOnboarding({
       selected_provider: "anthropic",
+      selected_model_id: "anthropic:claude-sonnet-5",
     })
     const user = await reachModelStep()
 
@@ -132,9 +170,7 @@ describe("OnboardingFlow", () => {
 
     await waitFor(() =>
       expect(onComplete).toHaveBeenCalledWith({
-        displayName: "Ada",
-        email: "ada@example.com",
-        provider: "openai",
+        modelId: "openai:gpt-5.5",
         apiKey: "",
       })
     )
@@ -170,5 +206,14 @@ describe("OnboardingFlow", () => {
     expect(anthropic).toHaveAttribute("aria-checked", "true")
     expect(openAi).toHaveAttribute("tabindex", "-1")
     expect(anthropic).toHaveAttribute("tabindex", "0")
+  })
+
+  it("resumes at the server-provided profile step", async () => {
+    renderOnboarding({}, "profile")
+
+    expect(
+      await screen.findByRole("heading", { name: "Your profile" })
+    ).toBeInTheDocument()
+    expect(screen.getByText("02 / 03")).toBeInTheDocument()
   })
 })

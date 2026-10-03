@@ -24,6 +24,7 @@ const profile = {
 
 const settings = {
   selected_provider: "openai",
+  selected_model_id: "openai:gpt-5.5",
   providers: [
     {
       id: "openai",
@@ -40,7 +41,37 @@ const settings = {
       key_hint: null,
     },
   ],
+  models: [
+    {
+      id: "openai:gpt-5.5",
+      provider_id: "openai",
+      provider_name: "OpenAI",
+      adapter_kind: "openai",
+      upstream_model_id: "gpt-5.5",
+      name: "GPT-5.5",
+      requires_api_key: true,
+      supports_streaming: true,
+      supports_tools: false,
+      configured: true,
+      key_hint: "••••7890",
+    },
+    {
+      id: "anthropic:claude-sonnet-5",
+      provider_id: "anthropic",
+      provider_name: "Anthropic",
+      adapter_kind: "anthropic",
+      upstream_model_id: "claude-sonnet-5",
+      name: "Claude Sonnet 5",
+      requires_api_key: true,
+      supports_streaming: true,
+      supports_tools: false,
+      configured: false,
+      key_hint: null,
+    },
+  ],
 }
+
+let onboardingState = { current_step: "complete", completed: true }
 
 const recentSession = {
   id: "session-recent",
@@ -66,7 +97,7 @@ function response(body: unknown, status = 200) {
 }
 
 function renderApp() {
-  localStorage.setItem("trellis:onboarding-complete", "true")
+  onboardingState = { current_step: "complete", completed: true }
   return render(
     <ThemeProvider defaultTheme="dark">
       <App />
@@ -75,7 +106,7 @@ function renderApp() {
 }
 
 function renderFirstRunApp() {
-  localStorage.removeItem("trellis:onboarding-complete")
+  onboardingState = { current_step: "intro", completed: false }
   return render(
     <ThemeProvider defaultTheme="dark">
       <App />
@@ -104,6 +135,8 @@ function startupFetch(
     if (override) return override
     if (url === "/api/profile" && method === "GET") return response(profile)
     if (url === "/api/settings" && method === "GET") return response(settings)
+    if (url === "/api/onboarding" && method === "GET")
+      return response(onboardingState)
     if (url === "/api/sessions" && method === "GET") return response([])
     throw new Error(`Unhandled request: ${method} ${url}`)
   })
@@ -114,6 +147,7 @@ afterEach(() => {
   toast.dismiss()
   vi.unstubAllGlobals()
   localStorage.clear()
+  onboardingState = { current_step: "complete", completed: true }
 })
 
 describe("local-first chat", () => {
@@ -135,37 +169,38 @@ describe("local-first chat", () => {
     )
   })
 
-  it("submits onboarding setup, marks completion, then restores the workspace", async () => {
+  it("saves onboarding steps on the server, then restores the workspace", async () => {
     const calls: string[] = []
+    let currentSettings = settings
     const fetchMock = startupFetch((url, init) => {
       const method = init?.method ?? "GET"
       if (method !== "GET") calls.push(`${method} ${url}`)
-      if (url === "/api/profile" && method === "PUT") {
-        return response({
-          ...profile,
-          display_name: "Ada",
-          email: "ada@example.com",
+      if (url === "/api/settings" && method === "GET")
+        return response(currentSettings)
+      if (url === "/api/onboarding/steps/intro" && method === "PUT")
+        return response({ current_step: "profile", completed: false })
+      if (url === "/api/onboarding/steps/profile" && method === "PUT")
+        return response({ current_step: "model", completed: false })
+      if (url === "/api/onboarding/steps/model" && method === "PUT") {
+        const submitted = JSON.parse(String(init?.body)) as {
+          model_id: string
+          api_key: string
+        }
+        expect(submitted).toEqual({
+          model_id: "anthropic:claude-sonnet-5",
+          api_key: "sk-ant-draft",
         })
-      }
-      if (url === "/api/settings/provider" && method === "PUT") {
-        return response({
+        currentSettings = {
           ...settings,
           selected_provider: "anthropic",
-        })
-      }
-      if (
-        url === "/api/settings/providers/anthropic/api-key" &&
-        method === "PUT"
-      ) {
-        return response({
-          ...settings,
-          selected_provider: "anthropic",
-          providers: settings.providers.map((provider) =>
-            provider.id === "anthropic"
-              ? { ...provider, configured: true, key_hint: "••••draft" }
-              : provider
+          selected_model_id: submitted.model_id,
+          models: settings.models.map((model) =>
+            model.id === submitted.model_id
+              ? { ...model, configured: true, key_hint: "••••draft" }
+              : model
           ),
-        })
+        }
+        return response({ current_step: "complete", completed: true })
       }
       return undefined
     })
@@ -189,17 +224,20 @@ describe("local-first chat", () => {
     expect(
       await screen.findByText("A workspace for ideas in motion")
     ).toBeInTheDocument()
-    expect(localStorage.getItem("trellis:onboarding-complete")).toBe("true")
     expect(calls).toEqual([
-      "PUT /api/profile",
-      "PUT /api/settings/provider",
-      "PUT /api/settings/providers/anthropic/api-key",
+      "PUT /api/onboarding/steps/intro",
+      "PUT /api/onboarding/steps/profile",
+      "PUT /api/onboarding/steps/model",
     ])
+    expect(currentSettings.selected_model_id).toBe("anthropic:claude-sonnet-5")
   })
 
   it("keeps onboarding open and does not mark completion when setup fails", async () => {
     const fetchMock = startupFetch((url, init) => {
-      if (url === "/api/profile" && init?.method === "PUT") {
+      if (url === "/api/onboarding/steps/intro" && init?.method === "PUT") {
+        return response({ current_step: "profile", completed: false })
+      }
+      if (url === "/api/onboarding/steps/profile" && init?.method === "PUT") {
         return response(
           {
             error: {
@@ -218,15 +256,13 @@ describe("local-first chat", () => {
     renderFirstRunApp()
     await user.click(await screen.findByRole("button", { name: "Continue" }))
     await user.click(screen.getByRole("button", { name: "Continue" }))
-    await user.click(screen.getByRole("button", { name: "Start Trellis" }))
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "The profile could not be saved."
     )
     expect(
-      screen.getByRole("heading", { name: "Choose a model" })
+      screen.getByRole("heading", { name: "Your profile" })
     ).toBeInTheDocument()
-    expect(localStorage.getItem("trellis:onboarding-complete")).toBeNull()
   })
 
   it("restores the most recent complete transcript and switches sessions by ID", async () => {
@@ -698,10 +734,14 @@ describe("local-first chat", () => {
         }
         return response(currentSettings)
       }
-      if (url === "/api/settings/provider" && method === "PUT") {
+      if (url === "/api/settings/model" && method === "PUT") {
+        const { model_id } = JSON.parse(String(init?.body)) as {
+          model_id: string
+        }
         currentSettings = {
           ...currentSettings,
           selected_provider: "anthropic",
+          selected_model_id: model_id,
         }
         return response(currentSettings)
       }
@@ -760,7 +800,7 @@ describe("local-first chat", () => {
     await waitFor(() =>
       expect(anthropic).toHaveAttribute("aria-checked", "true")
     )
-    expect(screen.getByText("Anthropic selected")).toBeInTheDocument()
+    expect(screen.getByText("Claude Sonnet 5 selected")).toBeInTheDocument()
   })
 
   it("shows settings failures in the global notification region", async () => {

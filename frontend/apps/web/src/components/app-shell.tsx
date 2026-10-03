@@ -14,6 +14,7 @@ import { WorkspaceTopbar } from "@/components/workspace-topbar"
 import { ApiError, api } from "@/lib/api"
 import type {
   Message,
+  OnboardingStep,
   Profile,
   Session,
   Settings,
@@ -25,8 +26,6 @@ type FailedTurn = {
   turnId: string
   content: string
 }
-
-const ONBOARDING_STORAGE_KEY = "trellis:onboarding-complete"
 
 function visibleError(error: unknown) {
   return error instanceof ApiError
@@ -59,6 +58,7 @@ export function AppShell() {
   const [profile, setProfile] = useState<Profile | null>(null)
   const [settings, setSettings] = useState<Settings | null>(null)
   const [onboardingRequired, setOnboardingRequired] = useState(false)
+  const [onboardingStep, setOnboardingStep] = useState<OnboardingStep>("intro")
   const [sessions, setSessions] = useState<Session[]>([])
   const [activeSession, setActiveSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
@@ -102,16 +102,23 @@ export function AppShell() {
 
     const restore = async () => {
       try {
-        const [restoredProfile, restoredSettings] = await Promise.all([
-          api.getProfile(),
-          api.getSettings(),
-        ])
+        const [restoredProfile, restoredSettings, restoredOnboarding] =
+          await Promise.all([
+            api.getProfile(),
+            api.getSettings(),
+            api.getOnboarding(),
+          ])
         if (cancelled) return
 
         setProfile(restoredProfile)
         setSettings(restoredSettings)
-        if (!localStorage.getItem(ONBOARDING_STORAGE_KEY)) {
+        if (!restoredOnboarding.completed) {
           setOnboardingRequired(true)
+          setOnboardingStep(
+            restoredOnboarding.current_step === "complete"
+              ? "intro"
+              : restoredOnboarding.current_step
+          )
           return
         }
         await restoreSessions(() => cancelled)
@@ -133,35 +140,35 @@ export function AppShell() {
       throw new Error("Trellis is still loading your local settings.")
     }
 
-    const updatedProfile = await api.updateProfile({
-      display_name: values.displayName,
-      email: values.email,
-    })
-    let updatedSettings = settings
-    if (values.provider !== settings.selected_provider) {
-      updatedSettings = await api.selectProvider(values.provider)
-    }
-
-    const selectedProvider = updatedSettings.providers.find(
-      (item) => item.id === values.provider
+    const progress = await api.saveOnboardingModel(
+      values.modelId,
+      values.apiKey
     )
-    if (!selectedProvider) {
-      throw new Error("The selected model provider is unavailable.")
-    }
-    if (!selectedProvider.configured) {
-      updatedSettings = await api.saveApiKey(values.provider, values.apiKey)
-    }
-
-    setProfile(updatedProfile)
-    setSettings(updatedSettings)
-    localStorage.setItem(ONBOARDING_STORAGE_KEY, "true")
-    try {
-      await restoreSessions()
-    } catch (restoreError) {
-      localStorage.removeItem(ONBOARDING_STORAGE_KEY)
-      throw restoreError
-    }
+    if (!progress.completed)
+      throw new Error("Trellis could not complete setup.")
+    setSettings(await api.getSettings())
+    await restoreSessions()
     setOnboardingRequired(false)
+  }
+
+  const advanceOnboardingIntro = async () => {
+    const progress = await api.completeOnboardingIntro()
+    setOnboardingStep(
+      progress.current_step === "complete" ? "intro" : progress.current_step
+    )
+  }
+
+  const saveOnboardingProfile = async (displayName: string, email: string) => {
+    const progress = await api.saveOnboardingProfile({
+      display_name: displayName,
+      email,
+    })
+    setProfile((current) =>
+      current ? { ...current, display_name: displayName, email } : current
+    )
+    setOnboardingStep(
+      progress.current_step === "complete" ? "intro" : progress.current_step
+    )
   }
 
   const startNewSession = useCallback(() => {
@@ -299,13 +306,17 @@ export function AppShell() {
     const content = composerValue.trim()
     if (!content || pending || sessionLoading || submissionLockRef.current)
       return
-    const provider = settings?.providers.find(
-      (item) => item.id === settings.selected_provider
+    const model = settings?.models?.find(
+      (item) => item.id === settings.selected_model_id
     )
-    if (!provider?.configured) {
+    const provider = settings?.providers.find(
+      (item) => item.id === model?.provider_id
+    )
+    const configured = provider?.configured ?? model?.configured ?? false
+    if (!model || (model.requires_api_key && !configured)) {
       setError(
-        provider
-          ? `Add an API key for ${provider.name} in Settings.`
+        model
+          ? `Add an API key for ${model.provider_name} in Settings.`
           : "Open Settings before starting a session."
       )
       return
@@ -354,10 +365,10 @@ export function AppShell() {
     }
   }
 
-  const selectedProvider = settings?.providers.find(
-    (provider) => provider.id === settings.selected_provider
+  const selectedModel = settings?.models?.find(
+    (model) => model.id === settings.selected_model_id
   )
-  const modelLabel = selectedProvider?.model ?? "Local chat"
+  const modelLabel = selectedModel?.name ?? "Local chat"
 
   if (loading) {
     return (
@@ -377,6 +388,9 @@ export function AppShell() {
       <OnboardingFlow
         profile={profile}
         settings={settings}
+        initialStep={onboardingStep}
+        onAdvanceIntro={advanceOnboardingIntro}
+        onSaveProfile={saveOnboardingProfile}
         onComplete={completeOnboarding}
       />
     )
