@@ -1195,50 +1195,32 @@ html.theme-ripple-fallback::before {
   }
 
   .thread-messages {
-    position: relative;
     display: grid;
+    gap: 12px;
     padding: 24px 0 12px;
   }
 
-  .thread-messages::before {
-    position: absolute;
-    top: 39px;
-    bottom: 27px;
-    left: 15px;
-    width: 1px;
-    background: var(--shell-line);
-    content: "";
-  }
-
   .thread-message {
-    position: relative;
-    display: grid;
-    grid-template-columns: 31px minmax(0, 1fr);
-    gap: 16px;
-    padding: 14px 0 22px;
-  }
-
-  .thread-node {
-    z-index: 1;
-    display: inline-flex;
-    width: 31px;
-    height: 31px;
-    align-items: center;
-    justify-content: center;
-    border: 1px solid var(--shell-line);
-    border-radius: 50%;
-    color: var(--shell-text-muted);
-    background: var(--shell-bg);
-  }
-
-  .thread-message.assistant .thread-node {
-    border-color: color-mix(in srgb, var(--shell-agent) 48%, var(--shell-line));
-    color: var(--shell-agent);
+    display: flex;
+    justify-content: flex-start;
+    padding: 0 0 10px;
   }
 
   .thread-message-copy {
     min-width: 0;
-    padding-top: 3px;
+    width: min(100%, 760px);
+  }
+
+  .thread-message.user .thread-message-copy {
+    width: fit-content;
+    max-width: min(82%, 640px);
+    margin-left: auto;
+    border: 1px solid
+      color-mix(in srgb, var(--shell-user-message) 82%, var(--shell-line));
+    border-radius: 18px;
+    padding: 10px 14px;
+    color: var(--shell-user-message-text);
+    background: var(--shell-user-message);
   }
 
   .thread-message-meta {
@@ -1256,6 +1238,15 @@ html.theme-ripple-fallback::before {
     color: var(--shell-text-strong);
   }
 
+  .thread-message.user .thread-message-meta {
+    justify-content: flex-end;
+    color: color-mix(in srgb, var(--shell-user-message-text) 68%, transparent);
+  }
+
+  .thread-message.user .thread-message-meta span:first-child {
+    color: var(--shell-user-message-text);
+  }
+
   .thread-markdown {
     min-width: 0;
     margin-top: 8px;
@@ -1263,6 +1254,10 @@ html.theme-ripple-fallback::before {
     font-size: 13px;
     line-height: 1.72;
     overflow-wrap: anywhere;
+  }
+
+  .thread-message.user .thread-markdown {
+    color: var(--shell-user-message-text);
   }
 
   .thread-markdown > :first-child {
@@ -1482,7 +1477,7 @@ html.theme-ripple-fallback::before {
     align-items: center;
     justify-content: center;
     gap: 6px;
-    margin-left: auto;
+    margin-right: auto;
     border: 1px solid var(--shell-line);
     border-radius: 0;
     padding: 0 10px;
@@ -1974,6 +1969,18 @@ html.theme-ripple-fallback::before {
     background: var(--onboarding-pressed);
   }
 
+  .onboarding-provider:disabled {
+    cursor: not-allowed;
+    border-color: var(--onboarding-line);
+    color: var(--onboarding-disabled-text);
+    background: var(--onboarding-disabled-surface);
+    opacity: 1;
+  }
+
+  .onboarding-provider:disabled span:first-child {
+    color: var(--onboarding-disabled-text);
+  }
+
   .onboarding-key-input {
     display: flex;
     align-items: center;
@@ -2248,7 +2255,11 @@ html.theme-ripple-fallback::before {
     }
 
     .thread-message {
-      gap: 12px;
+      padding-bottom: 6px;
+    }
+
+    .thread-message.user .thread-message-copy {
+      max-width: min(92%, 640px);
     }
 
     .provider-option {
