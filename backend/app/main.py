@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from typing import cast
 
 import httpx
 from fastapi import FastAPI, Request
@@ -9,14 +10,16 @@ from app.api import router
 from app.application.chat import ChatService
 from app.application.errors import ApplicationError
 from app.application.onboarding import OnboardingService
-from app.application.ports import ProviderAdapter
+from app.application.ports import ProviderAdapter, StreamingProviderAdapter
 from app.application.profile import ProfileService
+from app.application.runs import RunService
 from app.application.sessions import SessionService
 from app.application.settings import SettingsService
 from app.core.config import Settings
 from app.domain.models import ProviderName
 from app.infrastructure.database import Database
 from app.infrastructure.providers import AnthropicProvider, OpenAIProvider
+from app.infrastructure.runtime_events import RuntimeEventHub
 from app.infrastructure.secrets import SecretStore
 
 ERROR_STATUS = {
@@ -42,6 +45,8 @@ ERROR_STATUS = {
 def create_app(
     settings: Settings | None = None,
     provider_adapters: Mapping[ProviderName, ProviderAdapter] | None = None,
+    *,
+    streaming_provider_adapters: Mapping[str, StreamingProviderAdapter] | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings()
 
@@ -69,12 +74,32 @@ def create_app(
                 }
             else:
                 providers = provider_adapters
+            runtime_providers: dict[str, StreamingProviderAdapter] = {}
+            for provider_id, provider in providers.items():
+                if callable(getattr(provider, "stream", None)):
+                    runtime_providers[provider_id] = cast(StreamingProviderAdapter, provider)
+            runtime_providers.update(streaming_provider_adapters or {})
+            event_hub = RuntimeEventHub()
+            application.state.runtime_event_hub = event_hub
+            run_service = RunService(
+                database,
+                database,
+                database,
+                database,
+                secret_store,
+                runtime_providers,
+                event_hub,
+            )
+            application.state.run_service = run_service
             application.state.chat_service = ChatService(
                 database,
                 secret_store,
                 providers,
             )
-            yield
+            try:
+                yield
+            finally:
+                await run_service.close()
 
     application = FastAPI(
         title=resolved_settings.app_name,
