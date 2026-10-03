@@ -21,4 +21,5 @@ Anthropic key. Trellis creates a stable local installation ID automatically and
 restores saved sessions from `~/.trellis` after restarts. Set
 `TRELLIS_DATA_DIR` before starting the backend to store local data elsewhere.
 
-![Uploading image.png…]()
+<img width="386" height="562" alt="image" src="https://github.com/user-attachments/assets/54d5fc93-32a1-4613-b83b-405626055ca3" />
+
