@@ -1,4 +1,4 @@
-import { Bot, RotateCcw, Square, UserRound } from "lucide-react"
+import { RotateCcw, Square } from "lucide-react"
 import Markdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
 
@@ -90,13 +90,6 @@ export function ChatThread({
             className={`thread-message ${message.role}`}
             key={message.id}
           >
-            <span className="thread-node" aria-hidden="true">
-              {message.role === "assistant" ? (
-                <Bot size={14} />
-              ) : (
-                <UserRound size={14} />
-              )}
-            </span>
             <div className="thread-message-copy">
               <div className="thread-message-meta">
                 <span>{message.role === "assistant" ? "Trellis" : "You"}</span>
@@ -112,9 +105,6 @@ export function ChatThread({
             className="thread-message assistant pending"
             aria-label="Assistant response streaming"
           >
-            <span className="thread-node" aria-hidden="true">
-              <Bot size={14} />
-            </span>
             <div className="thread-message-copy">
               <div className="thread-message-meta">
                 <span>Trellis</span>
@@ -127,9 +117,6 @@ export function ChatThread({
             className="thread-message assistant pending"
             aria-label="Assistant response pending"
           >
-            <span className="thread-node" aria-hidden="true">
-              <Bot size={14} />
-            </span>
             <div className="thread-message-copy">
               <div className="thread-message-meta">
                 <span>Trellis</span>
