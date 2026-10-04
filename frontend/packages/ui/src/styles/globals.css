@@ -1526,21 +1526,6 @@ html.theme-ripple-fallback::before {
     margin: 0 auto 18px;
   }
 
-  .composer-context {
-    display: flex;
-    height: 37px;
-    align-items: center;
-    gap: 9px;
-    padding: 0 17px;
-    color: var(--shell-text-strong);
-    font-size: 13px;
-    font-weight: 500;
-  }
-
-  .composer-context svg {
-    color: var(--shell-brand);
-  }
-
   .composer-box {
     display: flex;
     min-height: 126px;
@@ -2434,10 +2419,6 @@ html.theme-ripple-fallback::before {
 
     .wordmark {
       font-size: clamp(2.5rem, 10vw, 3.5rem);
-    }
-
-    .composer-context {
-      display: none;
     }
 
     .composer-box {

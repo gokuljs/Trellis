@@ -1,8 +1,6 @@
 import type { KeyboardEvent } from "react"
 import { ChevronDown, Plus, Send } from "lucide-react"
 
-import { TrellisMark } from "@/components/trellis-mark"
-
 type ComposerProps = {
   value: string
   placeholder: string
@@ -29,10 +27,6 @@ export function Composer({
 
   return (
     <div className="composer-wrap">
-      <div className="composer-context">
-        <TrellisMark size={16} />
-        <span>Trellis</span>
-      </div>
       <div className="composer-box">
         <textarea
           aria-label="Message"
