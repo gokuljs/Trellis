@@ -1524,9 +1524,6 @@ html.theme-ripple-fallback::before {
     flex: 0 0 auto;
     width: min(760px, calc(100% - 64px));
     margin: 0 auto 18px;
-    border: 1px solid var(--shell-line);
-    border-radius: 20px;
-    background: var(--shell-card);
   }
 
   .composer-context {
