@@ -409,10 +409,20 @@ describe("local-first chat", () => {
     expect(
       screen.getByText("The complete local transcript.")
     ).toBeInTheDocument()
+    expect(
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByText(
+        "Persisted conversation"
+      )
+    ).toBeInTheDocument()
 
     await userEvent.click(screen.getByRole("button", { name: "Earlier notes" }))
 
     expect(await screen.findByText("Older context")).toBeInTheDocument()
+    expect(
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByText(
+        "Earlier notes"
+      )
+    ).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/sessions/session-older",
       expect.anything()

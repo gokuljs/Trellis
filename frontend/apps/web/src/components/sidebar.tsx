@@ -1,4 +1,4 @@
-import { MoreHorizontal, PanelLeft, SlidersHorizontal } from "lucide-react"
+import { MoreHorizontal, PanelLeft } from "lucide-react"
 
 import { NAVIGATION_ITEMS } from "@/lib/app-data"
 import type { Session, WorkspaceView } from "@/lib/app-types"
@@ -26,7 +26,7 @@ function PrimaryNavigation({ activeView, onNavigate }: PrimaryNavigationProps) {
           aria-current={activeView === label ? "page" : undefined}
           onClick={() => onNavigate(label)}
         >
-          <Icon size={15} strokeWidth={1.6} aria-hidden="true" />
+          <Icon size={17} strokeWidth={1.65} aria-hidden="true" />
           <span>{label}</span>
           {label === "New session" ? (
             <span className="shortcut-hint">⌘ N</span>
@@ -68,10 +68,7 @@ function SessionList({
   return (
     <section className="sessions-section">
       <div className="section-heading">
-        <span>
-          <span className="section-mark">◆</span> SESSIONS
-        </span>
-        <SlidersHorizontal size={12} strokeWidth={1.5} />
+        <span>Chat</span>
       </div>
 
       {groups.map(([month, items]) => (
@@ -122,7 +119,7 @@ export function Sidebar({
     <aside className="app-sidebar">
       <div className="sidebar-topbar">
         <span className="sidebar-brand" aria-label="Trellis">
-          <TrellisMark size={15} />
+          <TrellisMark size={21} />
           <span className="sidebar-wordmark">Trellis</span>
         </span>
         <div className="sidebar-topbar-spacer" />
@@ -132,7 +129,7 @@ export function Sidebar({
           aria-pressed={sidebarCollapsed}
           onClick={onToggleSidebar}
         >
-          <PanelLeft size={14} strokeWidth={1.7} aria-hidden="true" />
+          <PanelLeft size={17} strokeWidth={1.7} aria-hidden="true" />
         </button>
       </div>
 
