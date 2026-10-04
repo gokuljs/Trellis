@@ -792,14 +792,14 @@ html.theme-ripple-fallback::before {
   }
 
   .settings-header {
-    padding-bottom: 34px;
+    padding-bottom: 30px;
   }
 
   .settings-header p {
-    max-width: 430px;
+    max-width: 530px;
     margin: 0;
     color: var(--shell-text-muted);
-    font-size: 13px;
+    font-size: 14px;
     line-height: 1.6;
   }
 
@@ -810,7 +810,7 @@ html.theme-ripple-fallback::before {
   .settings-section {
     display: grid;
     grid-template-columns: minmax(180px, 0.72fr) minmax(320px, 1.28fr);
-    gap: 44px;
+    gap: 40px;
     border-bottom: 1px solid var(--shell-line);
     padding: 27px 0 31px;
   }
@@ -818,7 +818,7 @@ html.theme-ripple-fallback::before {
   .settings-section-copy h2 {
     margin: 5px 0 0;
     color: var(--shell-text-strong);
-    font-size: 14px;
+    font-size: 16px;
     font-weight: 600;
     letter-spacing: -0.01em;
   }
@@ -826,15 +826,15 @@ html.theme-ripple-fallback::before {
   .settings-section-copy p {
     margin: 8px 0 0;
     color: var(--shell-text-muted);
-    font-size: 11px;
+    font-size: 13px;
     line-height: 1.55;
   }
 
   .settings-section-label {
-    color: var(--shell-accent);
-    font-size: 9px;
-    font-weight: 700;
-    letter-spacing: 0.16em;
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
   }
 
   .provider-options {
@@ -845,11 +845,11 @@ html.theme-ripple-fallback::before {
   .provider-option {
     display: grid;
     grid-template-columns: 30px minmax(0, 1fr) auto 22px;
-    min-height: 65px;
+    min-height: 70px;
     align-items: center;
     gap: 10px;
     border: 1px solid var(--shell-line);
-    border-radius: 0;
+    border-radius: 12px;
     padding: 10px 12px;
     color: var(--shell-text);
     background: var(--shell-card);
@@ -877,7 +877,7 @@ html.theme-ripple-fallback::before {
     align-items: center;
     justify-content: center;
     border: 1px solid var(--shell-line);
-    border-radius: 0;
+    border-radius: 9px;
     color: var(--shell-accent);
     background: var(--shell-bg);
   }
@@ -890,21 +890,21 @@ html.theme-ripple-fallback::before {
 
   .provider-name {
     color: var(--shell-text-bright);
-    font-size: 12px;
+    font-size: 14px;
     font-weight: 600;
   }
 
   .provider-description {
     overflow: hidden;
     color: var(--shell-text-muted);
-    font-size: 10px;
+    font-size: 12px;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .provider-model {
     color: var(--shell-text-faint);
-    font-size: 10px;
+    font-size: 11px;
     white-space: nowrap;
   }
 
@@ -932,17 +932,17 @@ html.theme-ripple-fallback::before {
 
   .settings-field-label {
     color: var(--shell-text-bright);
-    font-size: 11px;
+    font-size: 13px;
     font-weight: 600;
   }
 
   .settings-input-wrap {
     display: flex;
-    min-height: 40px;
+    min-height: 44px;
     align-items: center;
     gap: 9px;
     border: 1px solid var(--shell-line);
-    border-radius: 0;
+    border-radius: 10px;
     padding: 0 10px;
     color: var(--shell-text-muted);
     background: var(--shell-input);
@@ -966,7 +966,7 @@ html.theme-ripple-fallback::before {
     color: var(--shell-text-bright);
     background: transparent;
     font: inherit;
-    font-size: 12px;
+    font-size: 13px;
   }
 
   .settings-input-wrap input::placeholder {
@@ -994,7 +994,7 @@ html.theme-ripple-fallback::before {
 
   .settings-field-help {
     color: var(--shell-text-quiet);
-    font-size: 10px;
+    font-size: 11px;
   }
 
   .settings-form-grid {
@@ -1026,16 +1026,16 @@ html.theme-ripple-fallback::before {
   .settings-remove,
   .chat-error button {
     display: inline-flex;
-    min-height: 32px;
+    min-height: 36px;
     align-items: center;
     justify-content: center;
     gap: 6px;
     border: 1px solid var(--shell-line);
-    border-radius: 0;
+    border-radius: 9px;
     padding: 0 13px;
     color: var(--shell-text-bright);
     background: var(--shell-card);
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 600;
   }
 
@@ -1091,48 +1091,46 @@ html.theme-ripple-fallback::before {
   }
 
   .welcome-panel {
-    width: 100%;
-    margin-top: -0.5vh;
-    text-align: center;
+    width: min(760px, 100%);
+    margin: 0 auto;
+    text-align: left;
   }
 
   .welcome-kicker {
-    margin-bottom: 22px;
+    margin-bottom: 20px;
     color: var(--shell-text-muted);
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0;
   }
 
   .wordmark {
     display: flex;
-    flex-direction: column;
     align-items: center;
-    gap: 22px;
+    gap: 17px;
     color: var(--shell-text-strong);
     font-family: var(--font-sans);
-    font-size: clamp(5rem, 12vw, 12rem);
+    font-size: clamp(3.5rem, 7vw, 6rem);
     font-weight: 500;
-    letter-spacing: -0.08em;
-    line-height: 0.88;
+    letter-spacing: -0.065em;
+    line-height: 1;
   }
 
   .wordmark svg {
-    color: var(--shell-accent);
+    color: var(--shell-brand);
   }
 
   .welcome-copy {
-    max-width: 520px;
-    margin: 34px auto 0;
+    max-width: 530px;
+    margin: 24px 0 0;
     color: var(--shell-text-muted);
-    font-size: 13px;
+    font-size: 15px;
     line-height: 1.55;
   }
 
   .utility-panel {
-    width: min(640px, 100%);
-    margin-top: -8vh;
+    width: min(760px, 100%);
+    margin-top: -4vh;
   }
 
   .utility-panel.compact {
@@ -1141,10 +1139,10 @@ html.theme-ripple-fallback::before {
 
   .utility-kicker {
     margin-bottom: 14px;
-    color: var(--shell-accent);
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.17em;
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
   }
 
   .utility-panel h1 {
@@ -1152,7 +1150,7 @@ html.theme-ripple-fallback::before {
     margin: 0;
     color: var(--shell-text-strong);
     font-family: var(--font-sans);
-    font-size: clamp(2.4rem, 5vw, 4.6rem);
+    font-size: clamp(2.4rem, 4vw, 3.8rem);
     font-weight: 500;
     letter-spacing: -0.06em;
     line-height: 0.98;
@@ -1162,7 +1160,7 @@ html.theme-ripple-fallback::before {
     max-width: 480px;
     margin: 19px 0 0;
     color: var(--shell-text-muted);
-    font-size: 14px;
+    font-size: 15px;
     line-height: 1.65;
   }
 
@@ -1178,8 +1176,8 @@ html.theme-ripple-fallback::before {
     align-items: center;
     gap: 10px;
     border: 1px solid var(--shell-line);
-    border-radius: 0;
-    padding: 13px 14px;
+    border-radius: 12px;
+    padding: 16px;
     color: var(--shell-text);
     background: var(--shell-card);
   }
@@ -1465,7 +1463,7 @@ html.theme-ripple-fallback::before {
     border: 1px solid
       color-mix(in srgb, var(--destructive) 50%, var(--shell-line));
     border-left: 3px solid var(--destructive);
-    border-radius: 0;
+    border-radius: 10px;
     padding: 9px 10px 9px 12px;
     color: var(--destructive);
     background: var(--shell-card);
@@ -1486,7 +1484,7 @@ html.theme-ripple-fallback::before {
     gap: 6px;
     margin-right: auto;
     border: 1px solid var(--shell-line);
-    border-radius: 0;
+    border-radius: 9px;
     padding: 0 10px;
     color: var(--shell-text-muted);
     background: transparent;
@@ -1690,20 +1688,20 @@ html.theme-ripple-fallback::before {
 
 @layer components {
   .onboarding-shell {
-    --onboarding-bg: #000000;
-    --onboarding-surface: #0a0a0a;
-    --onboarding-panel: #111111;
-    --onboarding-hover: #171717;
-    --onboarding-pressed: #292929;
-    --onboarding-focus: #ffffff;
-    --onboarding-accent-hover: #ededed;
-    --onboarding-accent-pressed: #d4d4d4;
-    --onboarding-disabled-surface: #171717;
-    --onboarding-disabled-text: #777777;
-    --onboarding-line: #2e2e2e;
-    --onboarding-text: #ededed;
-    --onboarding-muted: #a1a1a1;
-    --onboarding-faint: #828282;
+    --onboarding-bg: #1a1a1a;
+    --onboarding-surface: #1a1a1a;
+    --onboarding-panel: #202020;
+    --onboarding-hover: #292929;
+    --onboarding-pressed: #343434;
+    --onboarding-focus: #d7ef2c;
+    --onboarding-accent-hover: #dddddd;
+    --onboarding-accent-pressed: #cccccc;
+    --onboarding-disabled-surface: #292929;
+    --onboarding-disabled-text: #858585;
+    --onboarding-line: #2b2b2b;
+    --onboarding-text: #dedede;
+    --onboarding-muted: #ababab;
+    --onboarding-faint: #929292;
 
     position: relative;
     display: flex;
@@ -1734,7 +1732,7 @@ html.theme-ripple-fallback::before {
     min-width: 0;
     min-height: 100svh;
     overflow: hidden;
-    background: #050505;
+    background: #1a1a1a;
   }
 
   .onboarding-image {
@@ -1762,7 +1760,7 @@ html.theme-ripple-fallback::before {
     position: absolute;
     z-index: 3;
     display: flex;
-    min-height: 64px;
+    min-height: 56px;
     align-items: center;
     justify-content: space-between;
     inset: 0 0 auto;
@@ -1780,18 +1778,18 @@ html.theme-ripple-fallback::before {
     align-items: center;
     gap: 9px;
     color: var(--onboarding-text);
-    font-size: 13px;
+    font-size: 15px;
     font-weight: 600;
     letter-spacing: -0.03em;
   }
 
   .onboarding-brand svg {
-    color: var(--onboarding-text);
+    color: var(--shell-brand);
   }
 
   .onboarding-step {
     color: var(--onboarding-faint);
-    font-size: 10px;
+    font-size: 12px;
     font-weight: 600;
     letter-spacing: 0.14em;
   }
@@ -1865,7 +1863,7 @@ html.theme-ripple-fallback::before {
   .onboarding-intro-copy {
     margin: 14px 0 0;
     color: var(--onboarding-muted);
-    font-size: 12px;
+    font-size: 14px;
     font-weight: 400;
     line-height: 1.4;
     text-align: center;
@@ -1878,15 +1876,15 @@ html.theme-ripple-fallback::before {
   .onboarding-intro .onboarding-primary-action {
     width: auto;
     margin-top: 24px;
-    border-color: var(--onboarding-line);
-    color: var(--onboarding-text);
-    background: transparent;
+    border-color: var(--onboarding-text);
+    color: var(--onboarding-bg);
+    background: var(--onboarding-text);
   }
 
   .onboarding-intro .onboarding-primary-action:hover {
-    border-color: var(--onboarding-focus);
-    color: var(--onboarding-text);
-    background: var(--onboarding-hover);
+    border-color: var(--onboarding-accent-hover);
+    color: var(--onboarding-bg);
+    background: var(--onboarding-accent-hover);
   }
 
   .onboarding-form-page {
@@ -1896,7 +1894,7 @@ html.theme-ripple-fallback::before {
   .onboarding-form-page h1 {
     margin: 0 0 28px;
     color: var(--onboarding-muted);
-    font-size: 10px;
+    font-size: 12px;
     font-weight: 600;
     letter-spacing: 0.16em;
     line-height: 1;
@@ -1913,7 +1911,7 @@ html.theme-ripple-fallback::before {
     display: grid;
     gap: 7px;
     color: var(--onboarding-muted);
-    font-size: 9px;
+    font-size: 11px;
     font-weight: 600;
     letter-spacing: 0.14em;
     text-transform: uppercase;
@@ -1923,11 +1921,11 @@ html.theme-ripple-fallback::before {
   .onboarding-key-input {
     min-height: 44px;
     border: 1px solid var(--onboarding-line);
-    border-radius: 0;
+    border-radius: 10px;
     color: var(--onboarding-text);
     background: var(--onboarding-panel);
     font: inherit;
-    font-size: 13px;
+    font-size: 14px;
     font-weight: 400;
     letter-spacing: 0;
     text-transform: none;
@@ -1962,7 +1960,7 @@ html.theme-ripple-fallback::before {
     align-items: center;
     gap: 4px 12px;
     border: 1px solid var(--onboarding-line);
-    border-radius: 0;
+    border-radius: 10px;
     padding: 10px 12px;
     color: var(--onboarding-muted);
     background: var(--onboarding-panel);
@@ -1975,7 +1973,7 @@ html.theme-ripple-fallback::before {
 
   .onboarding-provider span:first-child {
     color: var(--onboarding-text);
-    font-size: 12px;
+    font-size: 14px;
     font-weight: 600;
   }
 
@@ -1989,7 +1987,7 @@ html.theme-ripple-fallback::before {
   .onboarding-provider span:last-child {
     grid-column: 1 / -1;
     color: var(--onboarding-faint);
-    font-size: 9px;
+    font-size: 11px;
   }
 
   .onboarding-provider:hover,
@@ -2072,9 +2070,9 @@ html.theme-ripple-fallback::before {
     justify-content: center;
     min-height: 40px;
     border: 1px solid var(--onboarding-text);
-    border-radius: 0;
+    border-radius: 10px;
     padding: 0 14px;
-    font-size: 11px;
+    font-size: 13px;
     font-weight: 600;
     letter-spacing: 0.02em;
   }
@@ -2416,7 +2414,7 @@ html.theme-ripple-fallback::before {
   gap: 11px;
   border: 1px solid var(--shell-line);
   border-left: 3px solid var(--toast-signal);
-  border-radius: 0;
+  border-radius: 12px;
   padding: 12px 42px 12px 12px;
   color: var(--shell-text-bright);
   background: color-mix(in srgb, var(--shell-card) 94%, transparent);
@@ -2464,7 +2462,7 @@ html.theme-ripple-fallback::before {
   place-items: center;
   margin: 0;
   border: 0;
-  border-radius: 0;
+  border-radius: 7px;
   color: var(--toast-signal);
   background: transparent;
   line-height: 0;
@@ -2477,7 +2475,7 @@ html.theme-ripple-fallback::before {
 
 .trellis-toast .trellis-toast-title {
   color: var(--shell-text-strong);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 650;
   letter-spacing: -0.01em;
   line-height: 1.35;
@@ -2486,7 +2484,7 @@ html.theme-ripple-fallback::before {
 .trellis-toast[data-sonner-toast][data-styled="true"]
   .trellis-toast-description {
   color: var(--shell-text);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.45;
 }
 

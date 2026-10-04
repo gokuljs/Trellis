@@ -60,7 +60,7 @@ export function WelcomePanel({
     <div className="welcome-panel">
       <div className="welcome-kicker">A workspace for ideas in motion</div>
       <div className="wordmark" aria-label="Trellis">
-        <TrellisMark size={22} />
+        <TrellisMark size={42} />
         <span>Trellis</span>
       </div>
       <p className="welcome-copy">
