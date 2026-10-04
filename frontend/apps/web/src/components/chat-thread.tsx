@@ -90,6 +90,7 @@ export function ChatThread({
           <article
             className={`thread-message ${message.role}`}
             key={message.id}
+            aria-label={message.role === "user" ? "Your message" : undefined}
           >
             <div className="thread-message-copy">
               <div className="thread-message-meta">

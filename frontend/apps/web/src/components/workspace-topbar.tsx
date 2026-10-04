@@ -59,7 +59,7 @@ export function WorkspaceTopbar({
       root.style.removeProperty("--theme-ripple-x")
       root.style.removeProperty("--theme-ripple-y")
       root.style.removeProperty("--theme-ripple-radius")
-    }, 620)
+    }, 420)
   }
 
   return (
