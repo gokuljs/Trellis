@@ -10,11 +10,13 @@ type ViewTransitionDocument = Document & {
 
 type WorkspaceTopbarProps = {
   activeView: WorkspaceView
+  activeSessionTitle: string | null
   onNavigate: (view: WorkspaceView) => void
 }
 
 export function WorkspaceTopbar({
   activeView,
+  activeSessionTitle,
   onNavigate,
 }: WorkspaceTopbarProps) {
   const { resolvedTheme, setTheme } = useTheme()
@@ -57,12 +59,23 @@ export function WorkspaceTopbar({
       root.style.removeProperty("--theme-ripple-x")
       root.style.removeProperty("--theme-ripple-y")
       root.style.removeProperty("--theme-ripple-radius")
-    }, 620)
+    }, 420)
   }
 
   return (
     <div className="workspace-topbar">
-      <div className="topbar-spacer" />
+      <nav className="topbar-breadcrumb" aria-label="Breadcrumb">
+        <MessageSquare size={17} strokeWidth={1.7} aria-hidden="true" />
+        <span>{activeView === "Settings" ? "Workspace" : "Chat"}</span>
+        <span className="topbar-divider" aria-hidden="true">
+          /
+        </span>
+        <span className="topbar-current">
+          {activeView === "session"
+            ? (activeSessionTitle ?? "New session")
+            : activeView}
+        </span>
+      </nav>
       <div className="topbar-actions">
         <button className="topbar-icon" aria-label="Layout">
           <LayoutGrid size={15} aria-hidden="true" />

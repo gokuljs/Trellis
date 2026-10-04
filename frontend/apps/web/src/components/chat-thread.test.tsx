@@ -44,6 +44,27 @@ function renderThread(content: string) {
 afterEach(cleanup)
 
 describe("chat Markdown", () => {
+  it("identifies a user message to assistive technology when its label is visually hidden", () => {
+    render(
+      <ChatThread
+        session={session}
+        messages={[{ ...message("A question"), role: "user", model: null }]}
+        pending={false}
+        streamingText={null}
+        error={null}
+        canRetry={false}
+        canCancel={false}
+        cancellationPending={false}
+        onRetry={() => undefined}
+        onCancel={() => undefined}
+      />
+    )
+
+    expect(
+      screen.getByRole("article", { name: "Your message" })
+    ).toBeInTheDocument()
+  })
+
   it("renders headings, paragraphs, emphasis, and lists from saved messages", () => {
     renderThread("## Trip plan\n\nA **useful** route.\n\n- Visit the mall")
 

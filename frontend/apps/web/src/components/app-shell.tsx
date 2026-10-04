@@ -494,7 +494,11 @@ export function AppShell() {
       </div>
 
       <section className="workspace">
-        <WorkspaceTopbar activeView={activeView} onNavigate={handleNavigate} />
+        <WorkspaceTopbar
+          activeView={activeView}
+          activeSessionTitle={activeSession?.title ?? null}
+          onNavigate={handleNavigate}
+        />
 
         <div
           className={`workspace-content ${activeView === "Settings" ? "settings-content" : ""} ${activeView === "session" ? "thread-content" : ""}`}

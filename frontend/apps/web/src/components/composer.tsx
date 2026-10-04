@@ -28,13 +28,6 @@ export function Composer({
   return (
     <div className="composer-wrap">
       <div className="composer-box">
-        <button
-          className="composer-add"
-          aria-label="Attach"
-          disabled={disabled}
-        >
-          <Plus size={16} strokeWidth={1.6} aria-hidden="true" />
-        </button>
         <textarea
           aria-label="Message"
           value={value}
@@ -44,24 +37,33 @@ export function Composer({
           rows={1}
           disabled={disabled}
         />
-        <div className="composer-tools">
-          <span className="model-label">
-            {modelLabel} <ChevronDown size={11} aria-hidden="true" />
-          </span>
+        <div className="composer-toolbar">
           <button
-            className={`send-button ${value.trim() && !disabled ? "ready" : ""}`}
-            aria-label="Send"
-            disabled={disabled || !value.trim()}
-            onClick={onSubmit}
+            className="composer-add"
+            aria-label="Attach"
+            disabled={disabled}
           >
-            {value.trim() ? (
-              <Send size={14} aria-hidden="true" />
-            ) : (
-              <span className="voice-orb" aria-hidden="true">
-                ◔
-              </span>
-            )}
+            <Plus size={18} strokeWidth={1.6} aria-hidden="true" />
           </button>
+          <div className="composer-tools">
+            <span className="model-label">
+              {modelLabel} <ChevronDown size={13} aria-hidden="true" />
+            </span>
+            <button
+              className={`send-button ${value.trim() && !disabled ? "ready" : ""}`}
+              aria-label="Send"
+              disabled={disabled || !value.trim()}
+              onClick={onSubmit}
+            >
+              {value.trim() ? (
+                <Send size={15} aria-hidden="true" />
+              ) : (
+                <span className="voice-orb" aria-hidden="true">
+                  ◔
+                </span>
+              )}
+            </button>
+          </div>
         </div>
       </div>
       <div className="composer-footnote">

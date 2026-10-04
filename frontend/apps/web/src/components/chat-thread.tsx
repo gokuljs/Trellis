@@ -2,6 +2,7 @@ import { RotateCcw, Square } from "lucide-react"
 import Markdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
 
+import { TrellisMark } from "@/components/trellis-mark"
 import type { Message, Session } from "@/lib/app-types"
 
 type ChatThreadProps = {
@@ -78,7 +79,7 @@ export function ChatThread({
 }: ChatThreadProps) {
   return (
     <div className="chat-thread" aria-live="polite">
-      <header className="thread-header">
+      <header className="sr-only">
         <div className="utility-kicker">LOCAL SESSION</div>
         <h1>{session.title}</h1>
         <span>{session.message_count} saved messages</span>
@@ -89,9 +90,15 @@ export function ChatThread({
           <article
             className={`thread-message ${message.role}`}
             key={message.id}
+            aria-label={message.role === "user" ? "Your message" : undefined}
           >
             <div className="thread-message-copy">
               <div className="thread-message-meta">
+                {message.role === "assistant" ? (
+                  <span className="thread-agent-mark" aria-hidden="true">
+                    <TrellisMark size={17} />
+                  </span>
+                ) : null}
                 <span>{message.role === "assistant" ? "Trellis" : "You"}</span>
                 {message.model ? <span>{message.model}</span> : null}
               </div>
@@ -107,6 +114,9 @@ export function ChatThread({
           >
             <div className="thread-message-copy">
               <div className="thread-message-meta">
+                <span className="thread-agent-mark" aria-hidden="true">
+                  <TrellisMark size={17} />
+                </span>
                 <span>Trellis</span>
               </div>
               <MessageMarkdown content={streamingText} />
@@ -119,6 +129,9 @@ export function ChatThread({
           >
             <div className="thread-message-copy">
               <div className="thread-message-meta">
+                <span className="thread-agent-mark" aria-hidden="true">
+                  <TrellisMark size={17} />
+                </span>
                 <span>Trellis</span>
               </div>
               <div className="thinking-pulse">
