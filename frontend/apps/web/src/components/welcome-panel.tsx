@@ -62,8 +62,9 @@ function DitherFace() {
       >
         0
       </text>
+      <path className="welcome-dither__eyelid" d="M 221 101 H 243" />
       <text
-        className="welcome-dither__eye welcome-dither__eye--right"
+        className="welcome-dither__eye"
         fill="currentColor"
         fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
         fontSize="8"
@@ -73,6 +74,10 @@ function DitherFace() {
       >
         0
       </text>
+      <path
+        className="welcome-dither__eyelid welcome-dither__eyelid--right"
+        d="M 295 101 H 317"
+      />
     </svg>
   );
 }
