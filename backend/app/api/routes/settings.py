@@ -2,6 +2,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel, SecretStr
 
 from app.api.dependencies import SettingsServiceDep
+from app.application.budgets import BudgetPreset
 from app.domain.models import AppSettings, ModelId, ProviderName
 
 
@@ -32,6 +33,7 @@ class SettingsResponse(BaseModel):
     providers: list[ProviderStatus]
     selected_model_id: ModelId
     models: list[ModelOption]
+    default_budget_preset: BudgetPreset
 
 
 class ProviderSelection(BaseModel):
@@ -40,6 +42,10 @@ class ProviderSelection(BaseModel):
 
 class ModelSelection(BaseModel):
     model_id: ModelId
+
+
+class BudgetSelection(BaseModel):
+    budget_preset: BudgetPreset
 
 
 class ApiKeyUpdate(BaseModel):
@@ -63,6 +69,7 @@ def serialize_settings(settings: AppSettings) -> SettingsResponse:
             for provider in settings.providers
         ],
         selected_model_id=settings.selected_model_id,
+        default_budget_preset=settings.default_budget_preset,
         models=[
             ModelOption(
                 id=model.id,
@@ -101,6 +108,14 @@ async def select_model(
     service: SettingsServiceDep,
 ) -> SettingsResponse:
     return serialize_settings(await service.select_model(payload.model_id))
+
+
+@router.put("/budget")
+async def select_default_budget(
+    payload: BudgetSelection,
+    service: SettingsServiceDep,
+) -> SettingsResponse:
+    return serialize_settings(await service.select_default_budget(payload.budget_preset))
 
 
 @router.put("/providers/{provider}/api-key")

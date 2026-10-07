@@ -239,6 +239,46 @@ export function SettingsPage({
           </div>
         </section>
 
+        <section
+          className="settings-section"
+          aria-labelledby="default-budget-heading"
+        >
+          <div className="settings-section-copy">
+            <div className="settings-section-label">RUN BUDGET</div>
+            <h2 id="default-budget-heading">Default run budget</h2>
+            <p>
+              New runs use this limit unless you choose another in the composer.
+            </p>
+          </div>
+          <label className="settings-field">
+            <span className="settings-field-label">Default run budget</span>
+            <span className="settings-input-wrap">
+              <select
+                aria-label="Default run budget"
+                value={settings.default_budget_preset ?? "conservative"}
+                disabled={saving !== null}
+                onChange={(event) => {
+                  const preset = event.target.value as "conservative" | "longer"
+                  void runUpdate(
+                    "budget",
+                    {
+                      kind: "info",
+                      title: "Run budget updated",
+                      description: "New runs use your selected default.",
+                    },
+                    async () => {
+                      onSettingsChange(await api.selectDefaultBudget(preset))
+                    }
+                  )
+                }}
+              >
+                <option value="conservative">Conservative</option>
+                <option value="longer">Longer coding run</option>
+              </select>
+            </span>
+          </label>
+        </section>
+
         {selectedModel.requires_api_key ? (
           <section
             className="settings-section"

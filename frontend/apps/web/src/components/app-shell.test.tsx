@@ -25,6 +25,7 @@ const profile = {
 const settings = {
   selected_provider: "openai",
   selected_model_id: "openai:gpt-5.5",
+  default_budget_preset: "conservative",
   providers: [
     {
       id: "openai",
@@ -240,6 +241,111 @@ afterEach(() => {
 })
 
 describe("local-first chat", () => {
+  it("offers a per-run model choice with two configured models and sends the budget", async () => {
+    const configuredSettings = {
+      ...settings,
+      providers: settings.providers.map((provider) => ({
+        ...provider,
+        configured: true,
+      })),
+      models: settings.models.map((model) => ({ ...model, configured: true })),
+      default_budget_preset: "conservative",
+    }
+    const runtimeRequests: Record<string, unknown>[] = []
+    installRuntimeServer((socket, request) => {
+      runtimeRequests.push(request)
+      if (request.method === "run.start") {
+        completeRuntimeRun(socket, request, "run-selected-model", "Done")
+      }
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url, init) => {
+        if (url === "/api/settings") return response(configuredSettings)
+        if (url === "/api/sessions" && init?.method === "POST") {
+          return response(recentSession, 201)
+        }
+        if (url === `/api/sessions/${recentSession.id}`) {
+          return response({ session: recentSession, messages: [] })
+        }
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("combobox", { name: "Run model" })
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Run model" }),
+      "anthropic:claude-sonnet-5"
+    )
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Run budget" }),
+      "longer"
+    )
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "Answer")
+    await user.click(screen.getByRole("button", { name: "Send" }))
+
+    await waitFor(() =>
+      expect(runtimeRequests[0]).toMatchObject({
+        method: "run.start",
+        params: {
+          modelId: "anthropic:claude-sonnet-5",
+          budgetPreset: "longer",
+        },
+      })
+    )
+  })
+
+  it("shows the selected model as text when only one model is configured", async () => {
+    vi.stubGlobal(
+      "fetch",
+      startupFetch(() => undefined)
+    )
+    renderApp()
+    expect(await screen.findByText("GPT-5.5")).toBeInTheDocument()
+    expect(screen.queryByRole("combobox", { name: "Run model" })).toBeNull()
+    expect(
+      screen.getByRole("combobox", { name: "Run budget" })
+    ).toBeInTheDocument()
+  })
+
+  it("saves a default budget in Settings and uses it in the composer", async () => {
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/settings/budget" && init?.method === "PUT") {
+        expect(JSON.parse(String(init.body))).toEqual({
+          budget_preset: "longer",
+        })
+        return response({ ...settings, default_budget_preset: "longer" })
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await user.click(await screen.findByRole("button", { name: "Settings" }))
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Default run budget" }),
+      "longer"
+    )
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/settings/budget",
+        expect.objectContaining({ method: "PUT" })
+      )
+    )
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Default run budget" })
+      ).toHaveValue("longer")
+    )
+    await user.click(screen.getByRole("button", { name: /New session/ }))
+    expect(screen.getByRole("combobox", { name: "Run budget" })).toHaveValue(
+      "longer"
+    )
+  })
+
   it("attaches an absolute folder to a new session before sending a message", async () => {
     const workspacePath = "/tmp/trellis-project"
     const created = {

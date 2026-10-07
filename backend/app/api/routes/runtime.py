@@ -117,6 +117,7 @@ def _event_notification(event: RunEvent) -> dict[str, object]:
 def _run_result(run) -> dict[str, object]:
     return {
         "runId": run.id,
+        "modelId": run.model_id,
         "status": run.status.value,
         "lastSequence": run.last_event_sequence,
         "budgetPreset": run.budget_preset,
@@ -243,15 +244,21 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             turn_id = params.get("turnId")
             if turn_id is not None and not isinstance(turn_id, str):
                 raise RpcFault(-32602, "Invalid params: turnId")
-            budget_preset = params.get("budgetPreset", "conservative")
-            if budget_preset not in ("conservative", "longer"):
+            budget_preset = params.get("budgetPreset")
+            if budget_preset is not None and budget_preset not in ("conservative", "longer"):
                 raise RpcFault(-32602, "Invalid params: budgetPreset")
+            model_id = params.get("modelId")
+            if model_id is not None and (
+                not isinstance(model_id, str) or not model_id or len(model_id) > 200
+            ):
+                raise RpcFault(-32602, "Invalid params: modelId")
             run = await service.create_run(
                 session_id,
                 client_request_id,
                 content,
                 turn_id=turn_id,
-                budget_preset=cast(BudgetPreset, budget_preset),
+                budget_preset=cast(BudgetPreset | None, budget_preset),
+                model_id=cast(str | None, model_id),
             )
             await subscribe(run.id, 0)
             result = _run_result(run)

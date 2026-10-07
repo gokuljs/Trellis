@@ -185,7 +185,8 @@ class RunService:
         content: str,
         *,
         turn_id: str | None = None,
-        budget_preset: BudgetPreset = "conservative",
+        budget_preset: BudgetPreset | None = None,
+        model_id: str | None = None,
     ) -> RunSnapshot:
         session = await self._sessions.get_session(session_id)
         if session is None:
@@ -195,11 +196,18 @@ class RunService:
             raise ApplicationError("message_empty", "Message content cannot be empty.")
 
         models = await self._settings.list_models()
-        selected_model_id = await self._settings.get_selected_model_id()
+        selected_model_id = (
+            model_id if model_id is not None else await self._settings.get_selected_model_id()
+        )
         model = next((item for item in models if item.id == selected_model_id), None)
         if model is None:
             raise ApplicationError("model_not_available", "The selected model is unavailable.")
-        if budget_preset not in {"conservative", "longer"}:
+        selected_budget = (
+            budget_preset
+            if budget_preset is not None
+            else await self._settings.get_default_budget_preset()
+        )
+        if selected_budget not in {"conservative", "longer"}:
             raise ApplicationError("invalid_budget_preset", "Choose an available run budget.")
         self._require_provider(model)
         api_key = await self._secret_store.get(model.provider_id)
@@ -219,7 +227,7 @@ class RunService:
                     client_request_id,
                     normalized_content,
                     model,
-                    budget_preset=budget_preset,
+                    budget_preset=selected_budget,
                 )
             except ValueError as error:
                 message = str(error)

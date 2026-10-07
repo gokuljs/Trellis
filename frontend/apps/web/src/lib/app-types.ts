@@ -61,6 +61,7 @@ export type Settings = {
   providers: ProviderStatus[]
   selected_model_id?: ModelId
   models?: ModelStatus[]
+  default_budget_preset?: "conservative" | "longer"
 }
 
 export type Message = {

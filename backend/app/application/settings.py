@@ -1,3 +1,4 @@
+from app.application.budgets import BudgetPreset
 from app.application.errors import ApplicationError
 from app.application.ports import SecretStorePort, SettingsRepository
 from app.domain.models import AppSettings, ModelId, ModelStatus, ProviderName, ProviderStatus
@@ -47,7 +48,12 @@ class SettingsService:
             providers=providers,
             selected_model_id=await self._repository.get_selected_model_id(),
             models=statuses,
+            default_budget_preset=await self._repository.get_default_budget_preset(),
         )
+
+    async def select_default_budget(self, preset: BudgetPreset) -> AppSettings:
+        await self._repository.set_default_budget_preset(preset)
+        return await self.get()
 
     async def select_provider(self, provider: ProviderName) -> AppSettings:
         if not any(model.provider_id == provider for model in await self._repository.list_models()):

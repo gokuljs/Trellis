@@ -195,6 +195,24 @@ def test_model_selection_rejects_an_unregistered_model_id(tmp_path: Path) -> Non
     assert response.json()["error"]["code"] == "model_not_available"
 
 
+def test_default_run_budget_can_be_changed_and_survives_restart(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+
+    with TestClient(create_app(settings)) as client:
+        initial = client.get("/api/settings")
+        changed = client.put("/api/settings/budget", json={"budget_preset": "longer"})
+        invalid = client.put("/api/settings/budget", json={"budget_preset": "unlimited"})
+
+    with TestClient(create_app(settings)) as restarted_client:
+        restored = restarted_client.get("/api/settings")
+
+    assert initial.json()["default_budget_preset"] == "conservative"
+    assert changed.status_code == 200
+    assert changed.json()["default_budget_preset"] == "longer"
+    assert restored.json()["default_budget_preset"] == "longer"
+    assert invalid.status_code == 422
+
+
 def test_onboarding_progress_and_answers_are_saved_after_each_step(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
 
@@ -349,9 +367,13 @@ def test_database_upgrades_an_existing_v1_schema(tmp_path: Path) -> None:
         claim_table = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'turn_claims'"
         ).fetchone()
+        default_budget = connection.execute(
+            "SELECT default_budget_preset FROM app_settings WHERE id = 1"
+        ).fetchone()
 
     assert versions == EXPECTED_SCHEMA_VERSIONS
     assert claim_table == ("turn_claims",)
+    assert default_budget == ("conservative",)
 
 
 def test_database_upgrades_v5_runs_without_changing_public_messages(tmp_path: Path) -> None:

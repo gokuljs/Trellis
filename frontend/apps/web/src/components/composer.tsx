@@ -1,5 +1,9 @@
 import type { KeyboardEvent } from "react"
-import { ChevronDown, Plus, Send } from "lucide-react"
+import { Plus, Send } from "lucide-react"
+
+import type { ModelStatus } from "@/lib/app-types"
+
+type BudgetPreset = "conservative" | "longer"
 
 type ComposerProps = {
   value: string
@@ -8,6 +12,12 @@ type ComposerProps = {
   onSubmit: () => void
   disabled?: boolean
   modelLabel: string
+  models: ModelStatus[]
+  showModelPicker: boolean
+  selectedModelId: string
+  onModelChange: (modelId: string) => void
+  budgetPreset: BudgetPreset
+  onBudgetChange: (preset: BudgetPreset) => void
 }
 
 export function Composer({
@@ -17,6 +27,12 @@ export function Composer({
   onSubmit,
   disabled = false,
   modelLabel,
+  models,
+  showModelPicker,
+  selectedModelId,
+  onModelChange,
+  budgetPreset,
+  onBudgetChange,
 }: ComposerProps) {
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey) {
@@ -46,9 +62,42 @@ export function Composer({
             <Plus size={18} strokeWidth={1.6} aria-hidden="true" />
           </button>
           <div className="composer-tools">
-            <span className="model-label">
-              {modelLabel} <ChevronDown size={13} aria-hidden="true" />
-            </span>
+            {showModelPicker ? (
+              <select
+                className="composer-select"
+                aria-label="Run model"
+                value={selectedModelId}
+                disabled={disabled}
+                onChange={(event) => onModelChange(event.target.value)}
+              >
+                {models.map((model) => (
+                  <option
+                    key={model.id}
+                    value={model.id}
+                    disabled={model.requires_api_key && !model.configured}
+                  >
+                    {model.name}
+                    {model.requires_api_key && !model.configured
+                      ? " — add API key in Settings"
+                      : ""}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <span className="model-label">{modelLabel}</span>
+            )}
+            <select
+              className="composer-select"
+              aria-label="Run budget"
+              value={budgetPreset}
+              disabled={disabled}
+              onChange={(event) =>
+                onBudgetChange(event.target.value as BudgetPreset)
+              }
+            >
+              <option value="conservative">Conservative</option>
+              <option value="longer">Longer coding run</option>
+            </select>
             <button
               className={`send-button ${value.trim() && !disabled ? "ready" : ""}`}
               aria-label="Send"

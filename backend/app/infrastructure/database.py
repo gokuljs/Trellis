@@ -42,7 +42,7 @@ from app.domain.runtime import (
     validate_run_event_transition,
 )
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 TURN_CLAIM_TTL = timedelta(minutes=5)
 
 MIGRATION_TABLE_SCHEMA = """
@@ -347,6 +347,12 @@ CREATE TABLE IF NOT EXISTS workspace_test_presets (
 );
 """
 
+SCHEMA_V12 = """
+ALTER TABLE app_settings ADD COLUMN default_budget_preset TEXT NOT NULL
+    DEFAULT 'conservative'
+    CHECK (default_budget_preset IN ('conservative', 'longer'));
+"""
+
 MIGRATIONS = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
@@ -359,6 +365,7 @@ MIGRATIONS = {
     9: SCHEMA_V9,
     10: SCHEMA_V10,
     11: SCHEMA_V11,
+    12: SCHEMA_V12,
 }
 
 
@@ -680,6 +687,27 @@ class Database:
         if row is None:
             raise RuntimeError("Trellis settings have not been initialized")
         return row["selected_model_id"]
+
+    async def get_default_budget_preset(self) -> BudgetPreset:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                "SELECT default_budget_preset FROM app_settings WHERE id = 1"
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError("Trellis settings have not been initialized")
+        return cast(BudgetPreset, row["default_budget_preset"])
+
+    async def set_default_budget_preset(self, preset: BudgetPreset) -> None:
+        if preset not in ("conservative", "longer"):
+            raise ValueError("Unknown run budget")
+        async with self._connect() as connection:
+            await connection.execute(
+                """UPDATE app_settings SET default_budget_preset = ?, updated_at = ?
+                   WHERE id = 1""",
+                (preset, utc_now()),
+            )
+            await connection.commit()
 
     async def list_models(self) -> list[ModelDescriptor]:
         async with self._connect() as connection:

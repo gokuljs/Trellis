@@ -44,6 +44,7 @@ class StreamingProvider:
                 kind="usage",
                 input_tokens=4,
                 output_tokens=2,
+                cache_creation_tokens=0,
                 provider_response_id="resp-jsonrpc",
             )
             yield ModelStreamEvent(kind="completed", finish_reason="stop")
@@ -401,6 +402,102 @@ def test_jsonrpc_start_selects_a_budget_preset_and_rejects_unknown_names(tmp_pat
     assert response["result"]["limits"]["maxTotalTokens"] == 200_000
     assert persisted is not None and persisted.budget_preset == "longer"
     assert error["error"] == {"code": -32602, "message": "Invalid params: budgetPreset"}
+
+
+def test_jsonrpc_start_uses_settings_budget_default_when_unspecified(tmp_path: Path) -> None:
+    with configured_client(tmp_path, StreamingProvider()) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-budget"})
+        client.put("/api/settings/budget", json={"budget_preset": "longer"})
+        session_id = client.post("/api/sessions").json()["id"]
+        with client.websocket_connect("/api/runtime") as websocket:
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "default-budget",
+                    "method": "run.start",
+                    "params": {
+                        "sessionId": session_id,
+                        "clientRequestId": "default-budget-request",
+                        "content": "Answer",
+                    },
+                }
+            )
+            received = receive_until(websocket, lambda item: item.get("id") == "default-budget")
+        result = next(item["result"] for item in received if item.get("id") == "default-budget")
+
+    assert result["budgetPreset"] == "longer"
+
+
+def test_jsonrpc_start_selects_a_model_for_one_run_without_changing_settings(
+    tmp_path: Path,
+) -> None:
+    provider = StreamingProvider()
+    app = create_app(
+        Settings(environment="test", data_dir=tmp_path),
+        provider_adapters={"openai": provider, "anthropic": provider},
+    )
+    with TestClient(app) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-default"})
+        client.put("/api/settings/providers/anthropic/api-key", json={"api_key": "sk-model-test"})
+        session_id = client.post("/api/sessions").json()["id"]
+        with client.websocket_connect("/api/runtime") as websocket:
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "model-start",
+                    "method": "run.start",
+                    "params": {
+                        "sessionId": session_id,
+                        "clientRequestId": "model-request",
+                        "content": "Answer",
+                        "modelId": "anthropic:claude-sonnet-5",
+                    },
+                }
+            )
+            received = receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.COMPLETED.value
+                ),
+            )
+        result = next(item["result"] for item in received if item.get("id") == "model-start")
+        selected = client.get("/api/settings").json()["selected_model_id"]
+
+    assert result["modelId"] == "anthropic:claude-sonnet-5"
+    assert provider.request is not None
+    assert provider.request.model_id == "anthropic:claude-sonnet-5"
+    assert selected == "openai:gpt-5.5"
+
+
+def test_jsonrpc_start_rejects_invalid_or_unknown_model_choice(tmp_path: Path) -> None:
+    with configured_client(tmp_path, StreamingProvider()) as client:
+        session_id = client.post("/api/sessions").json()["id"]
+        with client.websocket_connect("/api/runtime") as websocket:
+            for request_id, model_id in (("bad-type", 42), ("unknown", "missing:model")):
+                websocket.send_json(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "run.start",
+                        "params": {
+                            "sessionId": session_id,
+                            "clientRequestId": request_id,
+                            "content": "Answer",
+                            "modelId": model_id,
+                        },
+                    }
+                )
+                response = receive_until(
+                    websocket, lambda item, target=request_id: item.get("id") == target
+                )[-1]
+                if request_id == "bad-type":
+                    assert response["error"] == {
+                        "code": -32602,
+                        "message": "Invalid params: modelId",
+                    }
+                else:
+                    assert response["error"]["data"]["code"] == "model_not_available"
 
 
 def test_jsonrpc_resume_replays_persisted_events_after_disconnect(tmp_path: Path) -> None:

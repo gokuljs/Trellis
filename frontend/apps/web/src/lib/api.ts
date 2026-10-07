@@ -89,6 +89,11 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ model_id: modelId }),
     }),
+  selectDefaultBudget: (budgetPreset: "conservative" | "longer") =>
+    request<Settings>("/api/settings/budget", {
+      method: "PUT",
+      body: JSON.stringify({ budget_preset: budgetPreset }),
+    }),
   saveApiKey: (provider: ProviderId, apiKey: string) =>
     request<Settings>(`/api/settings/providers/${provider}/api-key`, {
       method: "PUT",

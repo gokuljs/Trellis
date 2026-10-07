@@ -489,3 +489,40 @@ tests, and build passed.
 
 **Next.** Let the user choose the model and run budget in the composer, with
 Settings providing defaults.
+
+## Step 13 — Select model and budget per run
+
+**Why this step exists.** The two budget presets and configured model catalog
+already exist, but until now a user had to keep the model chosen in Settings
+and the browser always started the Conservative budget. A coding run needs a
+visible choice for that one request without changing every later run.
+
+**What works now.** Settings stores a default model and a default budget. The
+composer always shows the budget choice. It shows a model picker when at least
+two models have usable credentials; with one configured model it shows the model
+name. A selection in the composer applies to the next run and does not rewrite
+Settings. The browser includes `modelId` and `budgetPreset` in `run.start` and
+keeps those choices when retrying a failed turn in the same page. A WebSocket
+client can omit either field to use the Settings default. Unknown models and
+budget names are rejected.
+
+**Follow the code.** `frontend/apps/web/src/components/settings-page.tsx`
+updates the saved default budget through `/api/settings/budget`.
+`frontend/apps/web/src/components/app-shell.tsx` derives the current choices
+from Settings, and `composer.tsx` renders the controls. The values pass through
+`frontend/apps/web/src/lib/runtime-client.ts` to `run.start` in
+`backend/app/api/routes/runtime.py`. `RunService.create_run` in
+`backend/app/application/runs.py` resolves omitted choices from Settings,
+checks the model and provider credentials, then saves the chosen model and
+budget with the run. Migration 12 in
+`backend/app/infrastructure/database.py` adds the persistent budget default.
+
+**Verification.** The composer tests first failed because neither picker
+existed. Focused backend tests cover one-run model selection without changing
+Settings, invalid choices, a saved budget default across restart, and the
+default used when `run.start` omits a budget. The pinned uv 0.12.5 `make check`
+passed Ruff formatting, Ruff linting, `ty`, and 249 backend tests with 90.26%
+coverage. Frontend format, lint, typecheck, 39 tests, and build passed.
+
+**Next.** Show the ordered model and tool work, usage, budget limits, and
+approval controls inside chat.

@@ -998,6 +998,17 @@ html.theme-ripple-fallback::before {
     font-size: 13px;
   }
 
+  .settings-input-wrap select {
+    width: 100%;
+    border: 0;
+    outline: 0;
+    padding: 2px 0;
+    color: var(--shell-text-bright);
+    background: transparent;
+    font: inherit;
+    font-size: 13px;
+  }
+
   .settings-input-wrap input::placeholder {
     color: var(--shell-text-quiet);
   }
@@ -1785,6 +1796,27 @@ html.theme-ripple-fallback::before {
     white-space: nowrap;
   }
 
+  .composer-select {
+    max-width: 190px;
+    border: 0;
+    border-radius: 6px;
+    padding: 5px 3px;
+    color: var(--shell-text-muted);
+    background: transparent;
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .composer-select:focus-visible {
+    outline: 2px solid var(--shell-accent);
+    outline-offset: 2px;
+  }
+
+  .composer-select:disabled {
+    cursor: default;
+    opacity: 0.65;
+  }
+
   .composer-tool {
     width: 15px;
     height: 24px;
@@ -2548,6 +2580,11 @@ html.theme-ripple-fallback::before {
       overflow: hidden;
       font-size: 12px;
       text-overflow: ellipsis;
+    }
+
+    .composer-select {
+      max-width: 130px;
+      font-size: 12px;
     }
 
     .composer-footnote {

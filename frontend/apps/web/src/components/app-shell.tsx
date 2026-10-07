@@ -28,6 +28,8 @@ type FailedTurn = {
   sessionId: string
   turnId: string
   content: string
+  modelId?: string
+  budgetPreset?: "conservative" | "longer"
 }
 
 function visibleError(error: unknown) {
@@ -58,6 +60,10 @@ export function AppShell() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [composerValue, setComposerValue] = useState("")
+  const [runModelChoice, setRunModelChoice] = useState<string | null>(null)
+  const [runBudgetChoice, setRunBudgetChoice] = useState<
+    "conservative" | "longer" | null
+  >(null)
   const [profile, setProfile] = useState<Profile | null>(null)
   const [settings, setSettings] = useState<Settings | null>(null)
   const [onboardingRequired, setOnboardingRequired] = useState(false)
@@ -295,6 +301,8 @@ export function AppShell() {
           turnId: turn.turnId,
           clientRequestId: crypto.randomUUID(),
           content: turn.content,
+          ...(turn.modelId ? { modelId: turn.modelId } : {}),
+          ...(turn.budgetPreset ? { budgetPreset: turn.budgetPreset } : {}),
         },
         {
           onRunId: (runId) => {
@@ -382,9 +390,7 @@ export function AppShell() {
       workspaceSaveLockRef.current
     )
       return
-    const model = settings?.models?.find(
-      (item) => item.id === settings.selected_model_id
-    )
+    const model = settings?.models?.find((item) => item.id === selectedModelId)
     const provider = settings?.providers.find(
       (item) => item.id === model?.provider_id
     )
@@ -417,6 +423,8 @@ export function AppShell() {
           sessionId: session.id,
           turnId: crypto.randomUUID(),
           content,
+          modelId: model.id,
+          budgetPreset: selectedBudgetPreset,
         },
         true
       )
@@ -441,9 +449,24 @@ export function AppShell() {
     }
   }
 
-  const selectedModel = settings?.models?.find(
-    (model) => model.id === settings.selected_model_id
+  const configuredModels = (settings?.models ?? []).filter(
+    (model) => model.configured || !model.requires_api_key
   )
+  const selectedModelId =
+    configuredModels.find((model) => model.id === runModelChoice)?.id ??
+    settings?.selected_model_id ??
+    configuredModels[0]?.id ??
+    ""
+  const selectedBudgetPreset =
+    runBudgetChoice ?? settings?.default_budget_preset ?? "conservative"
+  const selectedModel = settings?.models?.find(
+    (model) => model.id === selectedModelId
+  )
+  const modelChoices =
+    selectedModel &&
+    !configuredModels.some((model) => model.id === selectedModel.id)
+      ? [selectedModel, ...configuredModels]
+      : configuredModels
   const modelLabel = selectedModel?.name ?? "Local chat"
 
   const saveWorkspace = async (path: string) => {
@@ -610,6 +633,12 @@ export function AppShell() {
               onSubmit={() => void submitComposer()}
               disabled={pending || sessionLoading || workspaceSaving}
               modelLabel={modelLabel}
+              models={modelChoices}
+              showModelPicker={configuredModels.length >= 2}
+              selectedModelId={selectedModelId}
+              onModelChange={setRunModelChoice}
+              budgetPreset={selectedBudgetPreset}
+              onBudgetChange={setRunBudgetChoice}
             />
           </>
         ) : null}

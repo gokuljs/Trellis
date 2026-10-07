@@ -110,6 +110,7 @@ class AppSettings:
     providers: list[ProviderStatus]
     selected_model_id: ModelId
     models: list[ModelStatus]
+    default_budget_preset: Literal["conservative", "longer"] = "conservative"
 
 
 @dataclass(frozen=True, slots=True)

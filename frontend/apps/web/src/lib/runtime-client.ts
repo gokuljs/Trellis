@@ -12,6 +12,8 @@ export type StartRunInput = {
   turnId: string
   clientRequestId: string
   content: string
+  modelId?: string
+  budgetPreset?: "conservative" | "longer"
 }
 
 export type RuntimeErrorPayload = {
