@@ -53,6 +53,7 @@ def create_app(
     provider_adapters: Mapping[ProviderName, ProviderAdapter] | None = None,
     *,
     streaming_provider_adapters: Mapping[str, StreamingProviderAdapter] | None = None,
+    tool_registry: ToolRegistry | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings()
 
@@ -96,10 +97,11 @@ def create_app(
                 secret_store,
                 runtime_providers,
                 event_hub,
-                tool_registry=ToolRegistry(LocalReadToolExecutor()),
+                tool_registry=tool_registry or ToolRegistry(LocalReadToolExecutor()),
                 workspace_guidance_reader=read_workspace_guidance,
             )
             application.state.run_service = run_service
+            await run_service.resume_decided_approvals()
             application.state.chat_service = ChatService(
                 database,
                 secret_store,

@@ -364,3 +364,43 @@ SQLite resource warnings.
 
 **Next.** Add a durable approval pause so a run can wait for a user decision
 before a tool with side effects executes.
+
+## Step 10 — Pause runs for tool approval
+
+**Why this step exists.** A tool that changes a workspace or runs a command
+needs a user decision tied to the exact saved call. The decision must survive a
+lost browser connection or backend restart, and denial must let the model
+continue with that result.
+
+**What works now.** The runtime can pause on a tool marked as requiring approval.
+Its `run.respond` WebSocket method accepts `approved` or `denied` for a specific
+run and tool-call ID. A repeated matching decision is harmless while that exact
+call is still waiting; a conflicting, late, or mismatched decision is rejected.
+A user can cancel a waiting run.
+The current built-in read and Git tools do not require approval, so normal chat
+and read-only agent runs behave as before. The patch and command tools in the
+next steps will use this boundary; approval controls in chat arrive in Step 14.
+
+**Follow the code.** `ToolRegistry` in `backend/app/application/tools.py`
+identifies calls that need approval and can prepare a bounded preview. In
+`backend/app/application/runs.py`, `RunService` saves the model response and
+tool call, asks the registry for a preview, and requests a pause. Migration 10
+and the repository methods in `backend/app/infrastructure/database.py` save the
+preview, the exact waiting tool-call ID, and an ordered
+`tool.approval_requested` event in one transaction. The public run status is
+`waiting_for_approval`; the database represents it as a running row with a
+non-null waiting tool-call ID so an upgrade from older status constraints works.
+`backend/app/api/routes/runtime.py` validates `run.respond`, and the repository
+saves the decision and `tool.approval_decided` event together. The service then
+resumes that saved call without repeating the model request, records its tool
+result, and continues the run. Startup in `backend/app/main.py` reschedules
+decided approvals; undecided waits remain available for a later decision.
+
+**Verification.** Focused tests first failed for the missing wait, decision,
+restart, and cancellation behavior. The pinned uv 0.12.5 `make check` passed
+Ruff formatting, Ruff linting, `ty`, and 210 backend tests with 90.27%
+coverage. Tests cover duplicate and conflicting decisions, approval of the
+exact call, denial, cancellation while waiting, and resumption after restart.
+
+**Next.** Add a precise, previewed patch tool as the first built-in tool that
+uses this approval flow.

@@ -8,7 +8,7 @@ import pytest
 from app.application.budgets import BudgetPreset
 from app.application.errors import ApplicationError, ProviderError
 from app.application.runs import RunService
-from app.application.tools import ToolRegistry
+from app.application.tools import ToolExecutionError, ToolRegistry
 from app.core.config import Settings
 from app.domain.models import ModelDescriptor, ProviderName
 from app.domain.runtime import (
@@ -20,6 +20,7 @@ from app.domain.runtime import (
     RunEventType,
     RunSnapshot,
     RunStatus,
+    ToolApprovalDecision,
     ToolCallStatus,
 )
 from app.infrastructure.database import Database
@@ -569,6 +570,446 @@ def test_estimated_cost_limit_stops_before_publishing_a_final_answer(tmp_path: P
     assert run is not None and run.error_code == "cost_limit"
     assert calls[0].estimated_cost == pytest.approx(0.000046)
     assert [message.content for message in visible] == ["Answer"]
+
+
+def test_approved_tool_resumes_after_restart_without_repeating_the_model_call(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    (tmp_path / "note.txt").write_text("safe contents\n", encoding="utf-8")
+    provider = SequencedProvider(
+        (
+            (
+                ModelStreamEvent(
+                    kind="tool_call",
+                    tool_call=ModelToolCall("provider-read", "read_file", {"path": "note.txt"}),
+                ),
+                ModelStreamEvent(kind="completed", finish_reason="tool_use"),
+            ),
+            (
+                ModelStreamEvent(kind="text_delta", text="The file is safe."),
+                ModelStreamEvent(kind="completed", finish_reason="stop"),
+            ),
+        )
+    )
+    registry = ToolRegistry(LocalReadToolExecutor(), approval_required_names={"read_file"})
+
+    async def run():
+        await database.initialize()
+        session = await database.create_session(str(tmp_path))
+        await secret_store.set("openai", "sk-runtime-secret")
+        first_service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+            tool_registry=registry,
+        )
+        created = await first_service.create_run(session.id, "request-approval", "Read note")
+        await first_service.wait_for_run(created.id)
+        waiting = await database.get_run(created.id)
+        calls = await database.list_tool_calls(created.id)
+        assert waiting is not None and waiting.status is RunStatus.WAITING_FOR_APPROVAL
+        assert len(provider.requests) == 1
+        assert calls[0].status is ToolCallStatus.PENDING
+        await database.record_tool_approval_decision(
+            created.id, calls[0].id, ToolApprovalDecision.APPROVED
+        )
+        await first_service.close()
+
+        restarted_database = Database(settings.database_path)
+        assert await restarted_database.recover_active_runs() == ()
+        second_service = RunService(
+            restarted_database,
+            restarted_database,
+            restarted_database,
+            restarted_database,
+            secret_store,
+            {"openai": provider},
+            tool_registry=registry,
+        )
+        await second_service.resume_decided_approvals()
+        await second_service.wait_for_run(created.id)
+        result = (
+            await restarted_database.get_run(created.id),
+            await restarted_database.list_model_calls(created.id),
+            await restarted_database.list_tool_calls(created.id),
+            await restarted_database.list_run_events(created.id),
+            await restarted_database.list_run_messages(created.id),
+        )
+        await second_service.close()
+        return result
+
+    run, model_calls, tool_calls, events, messages = asyncio.run(run())
+    assert run is not None and run.status is RunStatus.COMPLETED
+    assert [call.step_index for call in model_calls] == [1, 2]
+    assert len(provider.requests) == 2
+    assert tool_calls[0].status is ToolCallStatus.COMPLETED
+    assert [message.role for message in messages] == ["assistant", "tool"]
+    assert "safe contents" in messages[1].content
+    assert [event.event_type for event in events].count(RunEventType.TOOL_APPROVAL_REQUESTED) == 1
+    assert [event.event_type for event in events].count(RunEventType.TOOL_APPROVAL_DECIDED) == 1
+    assert [event.event_type for event in events].count(RunEventType.RESUMED) == 1
+
+
+def test_cancelling_while_waiting_for_approval_closes_the_tool_call(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    provider = SequencedProvider(
+        (
+            (
+                ModelStreamEvent(
+                    kind="tool_call",
+                    tool_call=ModelToolCall("provider-read", "read_file", {"path": "note.txt"}),
+                ),
+                ModelStreamEvent(kind="completed", finish_reason="tool_use"),
+            ),
+        )
+    )
+
+    async def run():
+        await database.initialize()
+        session = await database.create_session(str(tmp_path))
+        await secret_store.set("openai", "sk-runtime-secret")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+            tool_registry=ToolRegistry(
+                LocalReadToolExecutor(), approval_required_names={"read_file"}
+            ),
+        )
+        created = await service.create_run(session.id, "request-cancel-approval", "Read note")
+        await service.wait_for_run(created.id)
+        waiting = await database.get_run(created.id)
+        assert waiting is not None and waiting.status is RunStatus.WAITING_FOR_APPROVAL
+        cancelled = await service.cancel_run(created.id)
+        calls = await database.list_tool_calls(created.id)
+        events = await database.list_run_events(created.id)
+        await service.close()
+        return cancelled, calls, events
+
+    cancelled, calls, events = asyncio.run(run())
+    assert cancelled.status is RunStatus.CANCELLED
+    assert calls[0].status is ToolCallStatus.CANCELLED
+    assert events[-2].event_type is RunEventType.TOOL_RESULT
+    assert events[-1].event_type is RunEventType.CANCELLED
+
+
+def test_cancelling_an_approved_run_before_it_gets_a_slot_finishes_cancellation(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    provider = SequencedProvider(
+        (
+            (
+                ModelStreamEvent(
+                    kind="tool_call",
+                    tool_call=ModelToolCall("provider-read", "read_file", {"path": "note.txt"}),
+                ),
+                ModelStreamEvent(kind="completed", finish_reason="tool_use"),
+            ),
+        )
+    )
+
+    async def run():
+        await database.initialize()
+        session = await database.create_session(str(tmp_path))
+        await secret_store.set("openai", "sk-runtime-secret")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+            tool_registry=ToolRegistry(
+                LocalReadToolExecutor(), approval_required_names={"read_file"}
+            ),
+            max_concurrent_runs=1,
+        )
+        created = await service.create_run(session.id, "request-slot-cancel", "Read note")
+        await service.wait_for_run(created.id)
+        calls = await database.list_tool_calls(created.id)
+        await service._slots.acquire()
+        await service.respond_to_tool_approval(
+            created.id, calls[0].id, ToolApprovalDecision.APPROVED
+        )
+        pending_task = service._tasks[created.id]
+        await service.cancel_run(created.id)
+        await asyncio.gather(pending_task, return_exceptions=True)
+        await asyncio.gather(service.wait_for_run(created.id), return_exceptions=True)
+        service._slots.release()
+        result = await database.get_run(created.id), await database.list_tool_calls(created.id)
+        await service.close()
+        return result
+
+    persisted, calls = asyncio.run(run())
+    assert persisted is not None and persisted.status is RunStatus.CANCELLED
+    assert calls[0].status is ToolCallStatus.CANCELLED
+
+
+def test_shutdown_during_approval_notification_preserves_waiting_run(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    provider = SequencedProvider(
+        (
+            (
+                ModelStreamEvent(
+                    kind="tool_call",
+                    tool_call=ModelToolCall("provider-read", "read_file", {"path": "note.txt"}),
+                ),
+                ModelStreamEvent(kind="completed", finish_reason="tool_use"),
+            ),
+        )
+    )
+
+    class BlockingApprovalPublisher:
+        def __init__(self) -> None:
+            self.request_published = asyncio.Event()
+
+        async def publish(self, event: RunEvent) -> None:
+            if event.event_type is RunEventType.TOOL_APPROVAL_REQUESTED:
+                self.request_published.set()
+                await asyncio.Event().wait()
+
+    async def run():
+        await database.initialize()
+        session = await database.create_session(str(tmp_path))
+        await secret_store.set("openai", "sk-runtime-secret")
+        publisher = BlockingApprovalPublisher()
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+            publisher,
+            tool_registry=ToolRegistry(
+                LocalReadToolExecutor(), approval_required_names={"read_file"}
+            ),
+        )
+        created = await service.create_run(session.id, "request-shutdown-approval", "Read note")
+        await publisher.request_published.wait()
+        await service.close()
+        return await database.get_run(created.id), await database.list_tool_calls(created.id)
+
+    persisted, calls = asyncio.run(run())
+    assert persisted is not None and persisted.status is RunStatus.WAITING_FOR_APPROVAL
+    assert calls[0].status is ToolCallStatus.PENDING
+    assert "Unexpected failure" not in caplog.text
+
+
+def test_denial_becomes_a_tool_result_and_late_decisions_are_rejected(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    provider = SequencedProvider(
+        (
+            (
+                ModelStreamEvent(
+                    kind="tool_call",
+                    tool_call=ModelToolCall("provider-read", "read_file", {"path": "note.txt"}),
+                ),
+                ModelStreamEvent(kind="completed", finish_reason="tool_use"),
+            ),
+            (
+                ModelStreamEvent(kind="text_delta", text="I could not read the note."),
+                ModelStreamEvent(kind="completed", finish_reason="stop"),
+            ),
+        )
+    )
+
+    class CountingExecutor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(
+            self, name: str, arguments: dict[str, object], workspace_root: Path
+        ) -> tuple[str, bool]:
+            self.calls += 1
+            return "unexpected", False
+
+    executor = CountingExecutor()
+
+    async def run():
+        await database.initialize()
+        session = await database.create_session(str(tmp_path))
+        await secret_store.set("openai", "sk-runtime-secret")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+            tool_registry=ToolRegistry(executor, approval_required_names={"read_file"}),
+        )
+        created = await service.create_run(session.id, "request-deny", "Read note")
+        await service.wait_for_run(created.id)
+        call = (await database.list_tool_calls(created.id))[0]
+        await service.respond_to_tool_approval(created.id, call.id, ToolApprovalDecision.DENIED)
+        await service.wait_for_run(created.id)
+        completed = await database.get_run(created.id)
+        with pytest.raises(ApplicationError) as duplicate:
+            await service.respond_to_tool_approval(created.id, call.id, ToolApprovalDecision.DENIED)
+        with pytest.raises(ApplicationError) as conflicting:
+            await service.respond_to_tool_approval(
+                created.id, call.id, ToolApprovalDecision.APPROVED
+            )
+        result = (
+            completed,
+            await database.list_tool_calls(created.id),
+            await database.list_run_messages(created.id),
+            await database.list_run_events(created.id),
+            duplicate.value.code,
+            conflicting.value.code,
+        )
+        await service.close()
+        return result
+
+    run, calls, exchange, events, duplicate_code, conflict_code = asyncio.run(run())
+    assert run is not None and run.status is RunStatus.COMPLETED
+    assert calls[0].status is ToolCallStatus.DENIED
+    assert executor.calls == 0
+    assert "approval_denied" in exchange[1].content
+    assert "approval_denied" in provider.requests[1].messages[-1].content
+    assert [event.event_type for event in events].count(RunEventType.TOOL_APPROVAL_DECIDED) == 1
+    assert duplicate_code == conflict_code == "approval_not_pending"
+
+
+def test_preview_failure_is_a_tool_result_without_requesting_approval(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    provider = SequencedProvider(
+        (
+            (
+                ModelStreamEvent(
+                    kind="tool_call",
+                    tool_call=ModelToolCall("provider-read", "read_file", {"path": "missing.txt"}),
+                ),
+                ModelStreamEvent(kind="completed", finish_reason="tool_use"),
+            ),
+            (
+                ModelStreamEvent(kind="text_delta", text="The file could not be read."),
+                ModelStreamEvent(kind="completed", finish_reason="stop"),
+            ),
+        )
+    )
+
+    class FailingPreviewRegistry(ToolRegistry):
+        async def approval_preview(
+            self, call: ModelToolCall, workspace_root: Path
+        ) -> dict[str, object] | None:
+            raise ToolExecutionError("path_not_found", "The file does not exist.")
+
+    async def run():
+        await database.initialize()
+        session = await database.create_session(str(tmp_path))
+        await secret_store.set("openai", "sk-runtime-secret")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+            tool_registry=FailingPreviewRegistry(
+                LocalReadToolExecutor(), approval_required_names={"read_file"}
+            ),
+        )
+        created = await service.create_run(session.id, "request-preview-failure", "Read note")
+        await service.wait_for_run(created.id)
+        result = (
+            await database.get_run(created.id),
+            await database.list_tool_calls(created.id),
+            await database.list_run_messages(created.id),
+            await database.list_run_events(created.id),
+        )
+        await service.close()
+        return result
+
+    run, calls, exchange, events = asyncio.run(run())
+    assert run is not None and run.status is RunStatus.COMPLETED
+    assert calls[0].status is ToolCallStatus.FAILED
+    assert "path_not_found" in exchange[1].content
+    assert RunEventType.TOOL_APPROVAL_REQUESTED not in [event.event_type for event in events]
+    assert len(provider.requests) == 2
+
+
+def test_secret_in_approval_preview_is_not_persisted_or_shown(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    provider = SequencedProvider(
+        (
+            (
+                ModelStreamEvent(
+                    kind="tool_call",
+                    tool_call=ModelToolCall("provider-read", "read_file", {"path": "note.txt"}),
+                ),
+                ModelStreamEvent(kind="completed", finish_reason="tool_use"),
+            ),
+            (
+                ModelStreamEvent(kind="text_delta", text="I cannot show that preview."),
+                ModelStreamEvent(kind="completed", finish_reason="stop"),
+            ),
+        )
+    )
+
+    class SecretPreviewRegistry(ToolRegistry):
+        async def approval_preview(
+            self, call: ModelToolCall, workspace_root: Path
+        ) -> dict[str, object] | None:
+            return {"diff": "OPENAI_API_KEY=sk-previewsecret123"}
+
+    async def run():
+        await database.initialize()
+        session = await database.create_session(str(tmp_path))
+        await secret_store.set("openai", "sk-runtime-secret")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+            tool_registry=SecretPreviewRegistry(
+                LocalReadToolExecutor(), approval_required_names={"read_file"}
+            ),
+        )
+        created = await service.create_run(session.id, "request-secret-preview", "Read note")
+        await service.wait_for_run(created.id)
+        result = (
+            await database.get_run(created.id),
+            await database.list_run_messages(created.id),
+            await database.list_run_events(created.id),
+        )
+        await service.close()
+        return result
+
+    run, exchange, events = asyncio.run(run())
+    assert run is not None and run.status is RunStatus.COMPLETED
+    assert "sensitive_approval_preview" in exchange[1].content
+    assert RunEventType.TOOL_APPROVAL_REQUESTED not in [event.event_type for event in events]
+    assert b"sk-previewsecret123" not in settings.database_path.read_bytes()
 
 
 def test_tool_only_response_records_two_results_before_continuing(tmp_path: Path) -> None:

@@ -41,7 +41,7 @@ from app.domain.runtime import (
     validate_run_event_transition,
 )
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 TURN_CLAIM_TTL = timedelta(minutes=5)
 
 MIGRATION_TABLE_SCHEMA = """
@@ -330,6 +330,11 @@ ALTER TABLE runs ADD COLUMN max_cost_usd REAL NOT NULL DEFAULT 2.0;
 ALTER TABLE model_calls ADD COLUMN cache_creation_tokens INTEGER;
 """
 
+SCHEMA_V10 = """
+ALTER TABLE runs ADD COLUMN waiting_tool_call_id TEXT REFERENCES tool_calls(id);
+ALTER TABLE tool_calls ADD COLUMN approval_preview_json TEXT;
+"""
+
 MIGRATIONS = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
@@ -340,6 +345,7 @@ MIGRATIONS = {
     7: SCHEMA_V7,
     8: SCHEMA_V8,
     9: SCHEMA_V9,
+    10: SCHEMA_V10,
 }
 
 
@@ -422,6 +428,7 @@ class Database:
             cursor = await connection.execute(
                 """SELECT id, status, last_event_sequence FROM runs
                    WHERE status IN ('queued', 'running', 'cancelling')
+                     AND waiting_tool_call_id IS NULL
                    ORDER BY created_at, id"""
             )
             rows = await cursor.fetchall()
@@ -1037,7 +1044,7 @@ class Database:
                 await connection.rollback()
                 raise ValueError("run not found")
             validate_run_event_transition(
-                RunStatus(run["status"]),
+                self._run_from_row(run).status,
                 RunStatus.COMPLETED,
                 RunEventType.COMPLETED,
             )
@@ -1153,7 +1160,7 @@ class Database:
                 await connection.rollback()
                 raise ValueError("run not found")
 
-            current_status = RunStatus(row["status"])
+            current_status = self._run_from_row(row).status
             if current_status in {
                 RunStatus.CANCELLING,
                 RunStatus.COMPLETED,
@@ -1185,7 +1192,8 @@ class Database:
             validate_run_event_transition(current_status, next_status, event_type)
             sequence = int(row["last_event_sequence"]) + 1
             await connection.execute(
-                """UPDATE runs SET status = ?, cancel_requested_at = COALESCE(
+                """UPDATE runs SET status = ?, waiting_tool_call_id = NULL,
+                       cancel_requested_at = COALESCE(
                        cancel_requested_at, ?), finished_at = ?,
                        stop_reason = COALESCE(?, stop_reason), last_event_sequence = ?
                    WHERE id = ?""",
@@ -1225,9 +1233,15 @@ class Database:
         call_id = str(uuid4())
         now = utc_now()
         async with self._connect() as connection:
-            cursor = await connection.execute("SELECT id FROM runs WHERE id = ?", (run_id,))
-            if await cursor.fetchone() is None:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                "SELECT status, waiting_tool_call_id FROM runs WHERE id = ?", (run_id,)
+            )
+            run_row = await cursor.fetchone()
+            if run_row is None:
                 raise ValueError("run not found")
+            if run_row["waiting_tool_call_id"] is not None:
+                raise ValueError("run is not running")
             await connection.execute(
                 """INSERT INTO model_calls(
                        id, run_id, step_index, provider_id, model_id, adapter_kind,
@@ -1376,12 +1390,16 @@ class Database:
         async with self._connect() as connection:
             await connection.execute("BEGIN IMMEDIATE")
             run_cursor = await connection.execute(
-                "SELECT status, last_event_sequence FROM runs WHERE id = ?", (run_id,)
+                "SELECT status, waiting_tool_call_id, last_event_sequence FROM runs WHERE id = ?",
+                (run_id,),
             )
             run_row = await run_cursor.fetchone()
             if run_row is None:
                 raise ValueError("run not found")
-            if RunStatus(run_row["status"]) is not RunStatus.RUNNING:
+            if (
+                RunStatus(run_row["status"]) is not RunStatus.RUNNING
+                or run_row["waiting_tool_call_id"] is not None
+            ):
                 raise ValueError("run is not running")
             model_cursor = await connection.execute(
                 "SELECT run_id, status FROM model_calls WHERE id = ?", (model_call_id,)
@@ -1531,14 +1549,18 @@ class Database:
         async with self._connect() as connection:
             await connection.execute("BEGIN IMMEDIATE")
             run_cursor = await connection.execute(
-                "SELECT status, last_event_sequence FROM runs WHERE id = ?", (run_id,)
+                "SELECT status, waiting_tool_call_id, last_event_sequence FROM runs WHERE id = ?",
+                (run_id,),
             )
             run_row = await run_cursor.fetchone()
             if run_row is None:
                 raise ValueError("run not found")
-            if RunStatus(run_row["status"]) is not RunStatus.RUNNING and not (
-                RunStatus(run_row["status"]) is RunStatus.CANCELLING
-                and status is ToolCallStatus.CANCELLED
+            if run_row["waiting_tool_call_id"] is not None or (
+                RunStatus(run_row["status"]) is not RunStatus.RUNNING
+                and not (
+                    RunStatus(run_row["status"]) is RunStatus.CANCELLING
+                    and status is ToolCallStatus.CANCELLED
+                )
             ):
                 raise ValueError("run is not running")
             call_cursor = await connection.execute(
@@ -1627,7 +1649,8 @@ class Database:
         async with self._connect() as connection:
             await connection.execute("BEGIN IMMEDIATE")
             run_cursor = await connection.execute(
-                "SELECT status, last_event_sequence FROM runs WHERE id = ?", (run_id,)
+                "SELECT status, waiting_tool_call_id, last_event_sequence FROM runs WHERE id = ?",
+                (run_id,),
             )
             run_row = await run_cursor.fetchone()
             if run_row is None:
@@ -1638,14 +1661,17 @@ class Database:
             call_row = await call_cursor.fetchone()
             if call_row is None:
                 raise ValueError("tool call not found for run")
+            if (
+                RunStatus(run_row["status"]) is not RunStatus.RUNNING
+                or run_row["waiting_tool_call_id"] != tool_call_id
+            ):
+                raise ValueError("run is not waiting for this tool approval")
             existing_decision = call_row["approval_decision"]
             if existing_decision is not None:
                 if existing_decision != decision.value:
                     raise ValueError("tool approval decision already differs")
                 await connection.commit()
                 return self._tool_call_from_row(call_row), None
-            if is_terminal_run_status(RunStatus(run_row["status"])):
-                raise ValueError("cannot decide approval for a terminal run")
             if ToolCallStatus(call_row["status"]) is not ToolCallStatus.PENDING:
                 raise ValueError("tool call is no longer pending")
             await connection.execute(
@@ -1682,6 +1708,150 @@ class Database:
             raise RuntimeError("updated tool call could not be loaded")
         event = RunEvent(run_id, sequence, RunEventType.TOOL_APPROVAL_DECIDED, 1, data, now)
         return self._tool_call_from_row(updated_row), event
+
+    async def request_tool_approval(
+        self,
+        run_id: str,
+        tool_call_id: str,
+        preview: dict[str, object] | None,
+    ) -> tuple[RunSnapshot, RunEvent]:
+        """Atomically mark the run as waiting and publish the saved approval request."""
+        serialized_preview = (
+            None if preview is None else json.dumps(preview, separators=(",", ":"), allow_nan=False)
+        )
+        if serialized_preview is not None and len(serialized_preview.encode("utf-8")) > 128_000:
+            raise ValueError("approval preview exceeds the storage limit")
+        now = utc_now()
+        async with self._connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            run_cursor = await connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
+            run_row = await run_cursor.fetchone()
+            if run_row is None:
+                raise ValueError("run not found")
+            if (
+                RunStatus(run_row["status"]) is not RunStatus.RUNNING
+                or run_row["waiting_tool_call_id"] is not None
+            ):
+                raise ValueError("run is not ready to request approval")
+            call_cursor = await connection.execute(
+                "SELECT * FROM tool_calls WHERE id = ? AND run_id = ?", (tool_call_id, run_id)
+            )
+            call_row = await call_cursor.fetchone()
+            if call_row is None or ToolCallStatus(call_row["status"]) is not ToolCallStatus.PENDING:
+                raise ValueError("pending tool call not found for approval")
+            if call_row["approval_decision"] is not None:
+                raise ValueError("tool approval has already been decided")
+            validate_run_event_transition(
+                RunStatus.RUNNING,
+                RunStatus.WAITING_FOR_APPROVAL,
+                RunEventType.TOOL_APPROVAL_REQUESTED,
+            )
+            sequence = int(run_row["last_event_sequence"]) + 1
+            data: dict[str, object] = {
+                "tool_call_id": tool_call_id,
+                "name": call_row["name"],
+                "arguments": cast(dict[str, object], json.loads(call_row["arguments_json"])),
+                "preview": preview,
+            }
+            await connection.execute(
+                """UPDATE tool_calls SET approval_preview_json = ? WHERE id = ?""",
+                (serialized_preview, tool_call_id),
+            )
+            await connection.execute(
+                """UPDATE runs SET waiting_tool_call_id = ?, last_event_sequence = ?
+                   WHERE id = ?""",
+                (tool_call_id, sequence, run_id),
+            )
+            await connection.execute(
+                """INSERT INTO run_events(
+                       run_id, sequence, event_type, event_version, data, created_at
+                   ) VALUES (?, ?, ?, 1, ?, ?)""",
+                (
+                    run_id,
+                    sequence,
+                    RunEventType.TOOL_APPROVAL_REQUESTED.value,
+                    json.dumps(data, separators=(",", ":"), allow_nan=False),
+                    now,
+                ),
+            )
+            updated_cursor = await connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
+            updated_row = await updated_cursor.fetchone()
+            await connection.commit()
+        if updated_row is None:
+            raise RuntimeError("waiting run could not be loaded")
+        return (
+            self._run_from_row(updated_row),
+            RunEvent(run_id, sequence, RunEventType.TOOL_APPROVAL_REQUESTED, 1, data, now),
+        )
+
+    async def resume_approved_run(self, run_id: str) -> tuple[RunSnapshot, RunEvent]:
+        """Resume only the exact waiting tool call after a durable decision exists."""
+        now = utc_now()
+        async with self._connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            run_cursor = await connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
+            run_row = await run_cursor.fetchone()
+            if run_row is None:
+                raise ValueError("run not found")
+            tool_call_id = run_row["waiting_tool_call_id"]
+            if RunStatus(run_row["status"]) is not RunStatus.RUNNING or tool_call_id is None:
+                raise ValueError("run is not waiting for approval")
+            call_cursor = await connection.execute(
+                "SELECT status, approval_decision FROM tool_calls WHERE id = ? AND run_id = ?",
+                (tool_call_id, run_id),
+            )
+            call_row = await call_cursor.fetchone()
+            if (
+                call_row is None
+                or ToolCallStatus(call_row["status"]) is not ToolCallStatus.PENDING
+                or call_row["approval_decision"] is None
+            ):
+                raise ValueError("waiting tool call has no approval decision")
+            validate_run_event_transition(
+                RunStatus.WAITING_FOR_APPROVAL,
+                RunStatus.RUNNING,
+                RunEventType.RESUMED,
+            )
+            sequence = int(run_row["last_event_sequence"]) + 1
+            data: dict[str, object] = {"tool_call_id": tool_call_id}
+            await connection.execute(
+                """UPDATE runs SET waiting_tool_call_id = NULL, last_event_sequence = ?
+                   WHERE id = ?""",
+                (sequence, run_id),
+            )
+            await connection.execute(
+                """INSERT INTO run_events(
+                       run_id, sequence, event_type, event_version, data, created_at
+                   ) VALUES (?, ?, ?, 1, ?, ?)""",
+                (
+                    run_id,
+                    sequence,
+                    RunEventType.RESUMED.value,
+                    json.dumps(data, separators=(",", ":")),
+                    now,
+                ),
+            )
+            updated_cursor = await connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
+            updated_row = await updated_cursor.fetchone()
+            await connection.commit()
+        if updated_row is None:
+            raise RuntimeError("resumed run could not be loaded")
+        return self._run_from_row(updated_row), RunEvent(
+            run_id, sequence, RunEventType.RESUMED, 1, data, now
+        )
+
+    async def list_decided_approval_runs(self) -> list[str]:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                """SELECT runs.id FROM runs
+                   JOIN tool_calls ON tool_calls.id = runs.waiting_tool_call_id
+                   WHERE runs.status = 'running'
+                     AND tool_calls.status = 'pending'
+                     AND tool_calls.approval_decision IS NOT NULL
+                   ORDER BY runs.created_at, runs.id"""
+            )
+            rows = await cursor.fetchall()
+        return [str(row["id"]) for row in rows]
 
     async def list_run_messages(self, run_id: str) -> list[RunMessageRecord]:
         async with self._connect() as connection:
@@ -1961,6 +2131,7 @@ class Database:
     @staticmethod
     def _tool_call_from_row(row: aiosqlite.Row) -> ToolCallRecord:
         decision = row["approval_decision"]
+        preview = row["approval_preview_json"]
         return ToolCallRecord(
             id=row["id"],
             run_id=row["run_id"],
@@ -1974,6 +2145,9 @@ class Database:
             approval_decided_at=row["approval_decided_at"],
             created_at=row["created_at"],
             finished_at=row["finished_at"],
+            approval_preview=(
+                None if preview is None else cast(dict[str, object], json.loads(preview))
+            ),
         )
 
     @staticmethod
@@ -2009,11 +2183,16 @@ class Database:
 
     @staticmethod
     def _run_from_row(row: aiosqlite.Row) -> RunSnapshot:
+        status = (
+            RunStatus.WAITING_FOR_APPROVAL
+            if row["status"] == RunStatus.RUNNING.value and row["waiting_tool_call_id"] is not None
+            else RunStatus(row["status"])
+        )
         return RunSnapshot(
             id=row["id"],
             session_id=row["session_id"],
             turn_id=row["turn_id"],
-            status=RunStatus(row["status"]),
+            status=status,
             provider_id=row["provider_id"],
             model_id=row["model_id"],
             adapter_kind=row["adapter_kind"],

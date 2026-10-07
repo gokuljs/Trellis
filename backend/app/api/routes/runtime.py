@@ -9,7 +9,12 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from app.application.budgets import BudgetPreset
 from app.application.errors import ApplicationError
 from app.application.runs import RunService
-from app.domain.runtime import RunEvent, RunEventType, is_terminal_run_status
+from app.domain.runtime import (
+    RunEvent,
+    RunEventType,
+    ToolApprovalDecision,
+    is_terminal_run_status,
+)
 from app.infrastructure.runtime_events import RuntimeEventHub, RuntimeEventSubscription
 
 logger = logging.getLogger(__name__)
@@ -283,6 +288,33 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             run = await service.cancel_run(run_id)
             await subscribe(run.id, after_sequence)
             result = _run_result(run)
+        elif method == "run.respond":
+            run_id = _required_string(params, "runId", maximum=200)
+            tool_call_id = _required_string(params, "toolCallId", maximum=200)
+            decision_value = _required_string(params, "decision", maximum=8)
+            if decision_value not in {decision.value for decision in ToolApprovalDecision}:
+                raise RpcFault(-32602, "Invalid params: decision")
+            after_sequence = params.get("afterSequence", 0)
+            if (
+                isinstance(after_sequence, bool)
+                or not isinstance(after_sequence, int)
+                or after_sequence < 0
+            ):
+                raise RpcFault(-32602, "Invalid params: afterSequence")
+            existing_run = await service.get_run(run_id)
+            if existing_run is None:
+                raise ApplicationError("run_not_found", "Run not found.")
+            if after_sequence > existing_run.last_event_sequence:
+                raise RpcFault(-32602, "Invalid params: afterSequence exceeds the run cursor")
+            run, tool_call = await service.respond_to_tool_approval(
+                run_id, tool_call_id, ToolApprovalDecision(decision_value)
+            )
+            if run.id not in active_subscriptions:
+                await subscribe(run.id, after_sequence)
+            result = _run_result(run) | {
+                "toolCallId": tool_call.id,
+                "decision": decision_value,
+            }
         else:
             raise RpcFault(-32601, "Method not found")
 

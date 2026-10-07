@@ -18,6 +18,28 @@ def run_tool(root: Path, name: str, **arguments: object):
     )
 
 
+def test_approval_required_tool_refuses_execution_without_a_recorded_grant(
+    tmp_path: Path,
+) -> None:
+    from app.application.tools import ToolRegistry
+    from app.infrastructure.local_tools import LocalReadToolExecutor
+
+    (tmp_path / "note.txt").write_text("safe\n", encoding="utf-8")
+    registry = ToolRegistry(LocalReadToolExecutor(), approval_required_names={"read_file"})
+    call = ModelToolCall("call-approval", "read_file", {"path": "note.txt"})
+
+    async def check() -> None:
+        assert registry.requires_approval(call)
+        assert await registry.approval_preview(call, tmp_path) is None
+        blocked = await registry.execute(call, tmp_path)
+        assert blocked.error_code == "approval_required"
+        granted = await registry.execute(call, tmp_path, approved=True)
+        assert not granted.is_error
+        assert "safe" in granted.content
+
+    asyncio.run(check())
+
+
 def test_read_tools_expose_the_same_strict_schemas_used_for_execution(tmp_path: Path) -> None:
     from app.application.tools import ToolRegistry
     from app.infrastructure.local_tools import LocalReadToolExecutor

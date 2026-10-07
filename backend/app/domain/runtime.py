@@ -6,6 +6,7 @@ from typing import Literal
 class RunStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
+    WAITING_FOR_APPROVAL = "waiting_for_approval"
     CANCELLING = "cancelling"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -20,6 +21,7 @@ class RunEventType(StrEnum):
     ASSISTANT_DELTA = "assistant.delta"
     ASSISTANT_MESSAGE = "assistant.message"
     TOOL_CALL = "tool.call"
+    TOOL_APPROVAL_REQUESTED = "tool.approval_requested"
     TOOL_RESULT = "tool.result"
     TOOL_APPROVAL_DECIDED = "tool.approval_decided"
     MODEL_USAGE = "model.usage"
@@ -29,6 +31,7 @@ class RunEventType(StrEnum):
     FAILED = "run.failed"
     CANCELLED = "run.cancelled"
     INTERRUPTED = "run.interrupted"
+    RESUMED = "run.resumed"
 
 
 class ModelCallStatus(StrEnum):
@@ -61,6 +64,7 @@ _TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     ),
     RunStatus.RUNNING: frozenset(
         {
+            RunStatus.WAITING_FOR_APPROVAL,
             RunStatus.CANCELLING,
             RunStatus.COMPLETED,
             RunStatus.FAILED,
@@ -68,6 +72,7 @@ _TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
             RunStatus.INTERRUPTED,
         }
     ),
+    RunStatus.WAITING_FOR_APPROVAL: frozenset({RunStatus.RUNNING, RunStatus.CANCELLING}),
     RunStatus.CANCELLING: frozenset({RunStatus.CANCELLED, RunStatus.FAILED, RunStatus.INTERRUPTED}),
     RunStatus.COMPLETED: frozenset(),
     RunStatus.FAILED: frozenset(),
@@ -81,6 +86,9 @@ _TRANSITION_EVENTS: dict[tuple[RunStatus, RunStatus], RunEventType] = {
     (RunStatus.QUEUED, RunStatus.CANCELLED): RunEventType.CANCELLED,
     (RunStatus.QUEUED, RunStatus.INTERRUPTED): RunEventType.INTERRUPTED,
     (RunStatus.RUNNING, RunStatus.CANCELLING): RunEventType.CANCELLATION_REQUESTED,
+    (RunStatus.RUNNING, RunStatus.WAITING_FOR_APPROVAL): RunEventType.TOOL_APPROVAL_REQUESTED,
+    (RunStatus.WAITING_FOR_APPROVAL, RunStatus.RUNNING): RunEventType.RESUMED,
+    (RunStatus.WAITING_FOR_APPROVAL, RunStatus.CANCELLING): RunEventType.CANCELLATION_REQUESTED,
     (RunStatus.RUNNING, RunStatus.COMPLETED): RunEventType.COMPLETED,
     (RunStatus.RUNNING, RunStatus.FAILED): RunEventType.FAILED,
     (RunStatus.RUNNING, RunStatus.CANCELLED): RunEventType.CANCELLED,
@@ -94,6 +102,8 @@ _LIFECYCLE_EVENT_TYPES = frozenset(
         RunEventType.QUEUED,
         RunEventType.STARTED,
         RunEventType.CANCELLATION_REQUESTED,
+        RunEventType.TOOL_APPROVAL_REQUESTED,
+        RunEventType.RESUMED,
         RunEventType.COMPLETED,
         RunEventType.FAILED,
         RunEventType.CANCELLED,
@@ -347,3 +357,4 @@ class ToolCallRecord:
     approval_decided_at: str | None
     created_at: str
     finished_at: str | None
+    approval_preview: dict[str, object] | None = None

@@ -16,6 +16,7 @@ from app.infrastructure.database import (
     SCHEMA_V3,
     SCHEMA_V4,
     SCHEMA_V5,
+    SCHEMA_VERSION,
     Database,
 )
 from app.infrastructure.secrets import SecretStore
@@ -24,6 +25,9 @@ from app.main import create_app
 
 def make_settings(data_dir: Path) -> Settings:
     return Settings(environment="test", data_dir=data_dir)
+
+
+EXPECTED_SCHEMA_VERSIONS = [(version,) for version in range(1, SCHEMA_VERSION + 1)]
 
 
 def test_installation_profile_id_survives_application_restart(tmp_path: Path) -> None:
@@ -326,7 +330,7 @@ def test_database_records_all_schema_migrations(tmp_path: Path) -> None:
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
+    assert versions == EXPECTED_SCHEMA_VERSIONS
 
 
 def test_database_upgrades_an_existing_v1_schema(tmp_path: Path) -> None:
@@ -346,7 +350,7 @@ def test_database_upgrades_an_existing_v1_schema(tmp_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'turn_claims'"
         ).fetchone()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
+    assert versions == EXPECTED_SCHEMA_VERSIONS
     assert claim_table == ("turn_claims",)
 
 
@@ -398,7 +402,7 @@ def test_database_upgrades_v5_runs_without_changing_public_messages(tmp_path: Pa
                WHERE name IN ('run_messages', 'tool_calls') ORDER BY name"""
         ).fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
+    assert versions == EXPECTED_SCHEMA_VERSIONS
     assert [message.content for message in messages] == ["Old request"]
     assert run is not None and run.status is RunStatus.COMPLETED
     assert run.budget_preset == "legacy"

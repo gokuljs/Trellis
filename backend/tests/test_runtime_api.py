@@ -7,9 +7,11 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+from app.application.tools import ToolRegistry
 from app.core.config import Settings
 from app.domain.models import ProviderName
 from app.domain.runtime import ModelRequest, ModelStreamEvent, ModelToolCall, RunEvent, RunEventType
+from app.infrastructure.local_tools import LocalReadToolExecutor
 from app.infrastructure.runtime_events import RuntimeEventHub
 from app.main import create_app
 
@@ -92,6 +94,35 @@ class GappedStreamingProvider(StreamingProvider):
         return generate()
 
 
+class ApprovalStreamingProvider(StreamingProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def stream(
+        self, request: ModelRequest, api_key: str, user_id: str
+    ) -> AsyncGenerator[ModelStreamEvent]:
+        self.request = request
+        self.calls += 1
+        call_number = self.calls
+        del api_key, user_id
+
+        async def generate() -> AsyncGenerator[ModelStreamEvent]:
+            if call_number == 1:
+                yield ModelStreamEvent(
+                    kind="tool_call",
+                    tool_call=ModelToolCall("provider-read", "read_file", {"path": "note.txt"}),
+                )
+                yield ModelStreamEvent(kind="usage", input_tokens=1, output_tokens=1)
+                yield ModelStreamEvent(kind="completed", finish_reason="tool_use")
+            else:
+                yield ModelStreamEvent(kind="text_delta", text="The note was read.")
+                yield ModelStreamEvent(kind="usage", input_tokens=1, output_tokens=1)
+                yield ModelStreamEvent(kind="completed", finish_reason="stop")
+
+        return generate()
+
+
 def configured_client(tmp_path: Path, provider: StreamingProvider) -> TestClient:
     app = create_app(
         Settings(environment="test", data_dir=tmp_path),
@@ -107,6 +138,102 @@ def receive_until(websocket, predicate):
         received.append(message)
         if predicate(message):
             return received
+
+
+def test_jsonrpc_run_respond_approves_exact_waiting_tool_and_resumes(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "note.txt").write_text("safe contents\n", encoding="utf-8")
+    provider = ApprovalStreamingProvider()
+    app = create_app(
+        Settings(environment="test", data_dir=tmp_path / "data"),
+        provider_adapters={"openai": provider},
+        tool_registry=ToolRegistry(LocalReadToolExecutor(), approval_required_names={"read_file"}),
+    )
+    with TestClient(app) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-approval-test"})
+        session_id = client.post("/api/sessions", json={"workspace_path": str(project)}).json()[
+            "id"
+        ]
+        with client.websocket_connect("/api/runtime") as websocket:
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "start",
+                    "method": "run.start",
+                    "params": {
+                        "sessionId": session_id,
+                        "clientRequestId": "approval-request",
+                        "content": "Read the note",
+                    },
+                }
+            )
+            waiting_events = receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.TOOL_APPROVAL_REQUESTED.value
+                ),
+            )
+            run_id = next(
+                item["result"]["runId"] for item in waiting_events if item.get("id") == "start"
+            )
+            request = waiting_events[-1]["params"]
+            call_id = request["data"]["tool_call_id"]
+            assert (
+                client.put(
+                    f"/api/sessions/{session_id}/workspace", json={"workspace_path": None}
+                ).status_code
+                == 409
+            )
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "wrong",
+                    "method": "run.respond",
+                    "params": {"runId": run_id, "toolCallId": "wrong-tool", "decision": "approved"},
+                }
+            )
+            wrong = websocket.receive_json()
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "invalid",
+                    "method": "run.respond",
+                    "params": {"runId": run_id, "toolCallId": call_id, "decision": "maybe"},
+                }
+            )
+            invalid = websocket.receive_json()
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "approve",
+                    "method": "run.respond",
+                    "params": {"runId": run_id, "toolCallId": call_id, "decision": "approved"},
+                }
+            )
+            resumed = receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.COMPLETED.value
+                ),
+            )
+            if not any(item.get("id") == "approve" for item in resumed):
+                resumed.append(websocket.receive_json())
+        detail = client.get(f"/api/sessions/{session_id}").json()
+
+    assert wrong["error"]["data"]["code"] == "tool_call_not_found"
+    assert invalid["error"]["code"] == -32602
+    assert (
+        next(item["result"]["toolCallId"] for item in resumed if item.get("id") == "approve")
+        == call_id
+    )
+    assert [message["content"] for message in detail["messages"]] == [
+        "Read the note",
+        "The note was read.",
+    ]
+    assert provider.calls == 2
 
 
 def test_jsonrpc_websocket_streams_a_durable_run(tmp_path: Path) -> None:

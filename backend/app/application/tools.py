@@ -114,9 +114,25 @@ class ToolExecutionError(Exception):
 
 
 class ToolRegistry:
-    def __init__(self, executor: ReadToolExecutor) -> None:
+    def __init__(
+        self,
+        executor: ReadToolExecutor,
+        *,
+        approval_required_names: frozenset[str] | set[str] = frozenset(),
+    ) -> None:
         self._executor = executor
         self._definitions = {name: model for name, _description, model in _DEFINITIONS}
+        self._approval_required_names = frozenset(approval_required_names)
+
+    def requires_approval(self, call: ModelToolCall, workspace_root: Path | None = None) -> bool:
+        del workspace_root
+        return call.name in self._approval_required_names
+
+    async def approval_preview(
+        self, call: ModelToolCall, workspace_root: Path
+    ) -> dict[str, object] | None:
+        del call, workspace_root
+        return None
 
     def specs(self) -> tuple[ModelToolSpec, ...]:
         return tuple(
@@ -124,7 +140,23 @@ class ToolRegistry:
             for name, description, model in _DEFINITIONS
         )
 
-    async def execute(self, call: ModelToolCall, workspace_root: Path) -> ToolResult:
+    async def execute(
+        self,
+        call: ModelToolCall,
+        workspace_root: Path,
+        *,
+        approved: bool = False,
+        approval_preview: dict[str, object] | None = None,
+    ) -> ToolResult:
+        del approval_preview
+        if self.requires_approval(call, workspace_root) and not approved:
+            return ToolResult(
+                call.id,
+                call.name,
+                "This tool requires approval before it can run.",
+                True,
+                "approval_required",
+            )
         model = self._definitions.get(call.name)
         if model is None:
             return ToolResult(

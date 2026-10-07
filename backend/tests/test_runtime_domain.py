@@ -19,6 +19,17 @@ def test_run_state_transitions_allow_only_lifecycle_progression() -> None:
     assert transition_run(RunStatus.RUNNING, RunStatus.INTERRUPTED) is RunStatus.INTERRUPTED
 
 
+def test_run_can_pause_for_approval_and_resume_or_cancel() -> None:
+    assert (
+        transition_run(RunStatus.RUNNING, RunStatus.WAITING_FOR_APPROVAL)
+        is RunStatus.WAITING_FOR_APPROVAL
+    )
+    assert transition_run(RunStatus.WAITING_FOR_APPROVAL, RunStatus.RUNNING) is RunStatus.RUNNING
+    assert (
+        transition_run(RunStatus.WAITING_FOR_APPROVAL, RunStatus.CANCELLING) is RunStatus.CANCELLING
+    )
+
+
 @pytest.mark.parametrize(
     ("current", "next_status"),
     [

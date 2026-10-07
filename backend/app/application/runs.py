@@ -28,7 +28,13 @@ from app.application.ports import (
     SettingsRepository,
     StreamingProviderAdapter,
 )
-from app.application.tools import MAX_ARGUMENT_BYTES, ToolRegistry, redact_record, redact_secrets
+from app.application.tools import (
+    MAX_ARGUMENT_BYTES,
+    ToolExecutionError,
+    ToolRegistry,
+    redact_record,
+    redact_secrets,
+)
 from app.domain.models import ModelDescriptor
 from app.domain.runtime import (
     ModelCallRecord,
@@ -41,6 +47,8 @@ from app.domain.runtime import (
     RunEventType,
     RunSnapshot,
     RunStatus,
+    ToolApprovalDecision,
+    ToolCallRecord,
     ToolCallStatus,
     ToolResult,
 )
@@ -166,6 +174,8 @@ class RunService:
         self._slots = asyncio.Semaphore(max_concurrent_runs)
         self._admission_lock = asyncio.Lock()
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._cancel_finalizers: dict[str, asyncio.Task[None]] = {}
+        self._reschedule_pending: set[str] = set()
         self._closing = False
 
     async def create_run(
@@ -236,7 +246,16 @@ class RunService:
     async def wait_for_run(self, run_id: str) -> None:
         task = self._tasks.get(run_id)
         if task is not None:
-            await task
+            try:
+                await task
+            finally:
+                finalizer = self._cancel_finalizers.get(run_id)
+                if finalizer is not None:
+                    await finalizer
+        else:
+            finalizer = self._cancel_finalizers.get(run_id)
+            if finalizer is not None:
+                await finalizer
 
     async def get_run(self, run_id: str) -> RunSnapshot | None:
         return await self._runs.get_run(run_id)
@@ -272,8 +291,11 @@ class RunService:
             if (
                 current is not None
                 and current.status is RunStatus.CANCELLING
-                and (task is None or task.done())
+                and task is not None
+                and not task.done()
             ):
+                self._schedule_cancel_finalizer(run_id, task)
+            elif current is not None and current.status is RunStatus.CANCELLING:
                 calls = await self._runs.list_model_calls(run_id)
                 active_call = next(
                     (
@@ -289,6 +311,64 @@ class RunService:
                     run = persisted
         return run
 
+    def _schedule_cancel_finalizer(self, run_id: str, task: asyncio.Task[None]) -> None:
+        existing = self._cancel_finalizers.get(run_id)
+        if existing is not None and not existing.done():
+            return
+        finalizer = asyncio.create_task(
+            self._finalize_cancelled_task(run_id, task), name=f"trellis-cancel-{run_id}"
+        )
+        self._cancel_finalizers[run_id] = finalizer
+        finalizer.add_done_callback(lambda done: self._discard_cancel_finalizer(run_id, done))
+
+    async def _finalize_cancelled_task(self, run_id: str, task: asyncio.Task[None]) -> None:
+        await asyncio.gather(task, return_exceptions=True)
+        current = await self._runs.get_run(run_id)
+        if current is not None and current.status is RunStatus.CANCELLING:
+            await self._mark_cancelled(run_id, None)
+
+    def _discard_cancel_finalizer(self, run_id: str, task: asyncio.Task[None]) -> None:
+        if self._cancel_finalizers.get(run_id) is task:
+            del self._cancel_finalizers[run_id]
+
+    async def respond_to_tool_approval(
+        self,
+        run_id: str,
+        tool_call_id: str,
+        decision: ToolApprovalDecision,
+    ) -> tuple[RunSnapshot, ToolCallRecord]:
+        if self._closing:
+            raise ApplicationError("runtime_shutting_down", "The runtime is shutting down.")
+        try:
+            tool_call, event = await self._runs.record_tool_approval_decision(
+                run_id, tool_call_id, decision
+            )
+        except ValueError as error:
+            message = str(error)
+            if message == "run not found":
+                raise ApplicationError("run_not_found", "Run not found.") from None
+            if message == "tool call not found for run":
+                raise ApplicationError("tool_call_not_found", "Tool call not found.") from None
+            if message == "tool approval decision already differs":
+                raise ApplicationError(
+                    "approval_conflict", "This tool approval was already answered differently."
+                ) from None
+            raise ApplicationError(
+                "approval_not_pending", "This tool call is not waiting for approval."
+            ) from None
+        if event is not None:
+            await self._publish(event)
+        run = await self._runs.get_run(run_id)
+        if run is None:
+            raise ApplicationError("run_not_found", "Run not found.")
+        if run.status is RunStatus.WAITING_FOR_APPROVAL:
+            self._schedule(run.id)
+        return run, tool_call
+
+    async def resume_decided_approvals(self) -> None:
+        for run_id in await self._runs.list_decided_approval_runs():
+            self._schedule(run_id)
+
     async def close(self) -> None:
         async with self._admission_lock:
             self._closing = True
@@ -298,6 +378,9 @@ class RunService:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        finalizers = tuple(self._cancel_finalizers.values())
+        if finalizers:
+            await asyncio.gather(*finalizers, return_exceptions=True)
         for run_id, _task in pending:
             run = await self._runs.get_run(run_id)
             if run is not None and run.status is RunStatus.QUEUED:
@@ -306,6 +389,7 @@ class RunService:
     def _schedule(self, run_id: str) -> None:
         existing = self._tasks.get(run_id)
         if existing is not None and not existing.done():
+            self._reschedule_pending.add(run_id)
             return
         task = asyncio.create_task(self._run_with_limit(run_id), name=f"trellis-run-{run_id}")
         self._tasks[run_id] = task
@@ -314,6 +398,10 @@ class RunService:
     def _discard_task(self, run_id: str, task: asyncio.Task[None]) -> None:
         if self._tasks.get(run_id) is task:
             del self._tasks[run_id]
+        if run_id in self._reschedule_pending:
+            self._reschedule_pending.discard(run_id)
+            if not self._closing:
+                self._schedule(run_id)
 
     async def _run_with_limit(self, run_id: str) -> None:
         try:
@@ -323,6 +411,8 @@ class RunService:
             run = await self._runs.get_run(run_id)
             if run is not None and run.status is RunStatus.QUEUED:
                 await self._interrupt_queued_run(run_id)
+            elif run is not None and run.status is RunStatus.CANCELLING:
+                await self._mark_cancelled(run_id, None)
             raise
         except Exception as error:
             logger.error(
@@ -370,20 +460,28 @@ class RunService:
 
     async def _execute(self, run_id: str) -> None:
         run = await self._runs.get_run(run_id)
-        if run is None or run.status is not RunStatus.QUEUED:
+        if run is None or run.status not in {
+            RunStatus.QUEUED,
+            RunStatus.WAITING_FOR_APPROVAL,
+        }:
             return
 
         call: ModelCallRecord | None = None
         started = False
         try:
-            started_event = await self._runs.transition_run_record(
-                run_id,
-                RunStatus.RUNNING,
-                RunEventType.STARTED,
-                {"status": RunStatus.RUNNING.value},
-            )
-            started = True
-            await self._publish(started_event)
+            if run.status is RunStatus.QUEUED:
+                started_event = await self._runs.transition_run_record(
+                    run_id,
+                    RunStatus.RUNNING,
+                    RunEventType.STARTED,
+                    {"status": RunStatus.RUNNING.value},
+                )
+                started = True
+                await self._publish(started_event)
+            else:
+                run, resumed_event = await self._runs.resume_approved_run(run_id)
+                started = True
+                await self._publish(resumed_event)
 
             model = await self._get_run_model(run)
             provider = self._require_provider(model)
@@ -412,7 +510,13 @@ class RunService:
             )
             visible_messages = await self._sessions.list_messages(run.session_id)
 
-            for step_index in range(1, run.max_model_calls + 1):
+            prior_model_steps = await self._runs.list_model_calls(run.id)
+            if prior_model_steps:
+                call = prior_model_steps[-1]
+                if not await self._execute_pending_tools(run, workspace_root):
+                    return
+
+            for step_index in range(len(prior_model_steps) + 1, run.max_model_calls + 1):
                 run_messages = await self._runs.list_run_messages(run.id)
                 prior_tool_calls = await self._runs.list_tool_calls(run.id)
                 prior_model_calls = await self._runs.list_model_calls(run.id)
@@ -553,58 +657,18 @@ class RunService:
                 )
                 for event in stored_events:
                     await self._publish(event)
-                for call_index, stored_call in enumerate(stored_calls):
-                    self._check_budget(
-                        run,
-                        kind="tool",
-                        model_calls=step_index,
-                        tool_calls=len(prior_tool_calls) + call_index,
-                        tokens=total_tokens,
-                        cost_usd=total_cost,
-                    )
-                    remaining_seconds = self._remaining_seconds(run)
-                    if remaining_seconds <= 0:
-                        raise ProviderError("provider_timeout", "The run deadline was reached.")
-                    tool_request = ModelToolCall(
-                        stored_call.provider_call_id, stored_call.name, stored_call.arguments
-                    )
+                for stored_call in stored_calls:
                     result = preflight_errors.get(stored_call.provider_call_id)
-                    if result is None:
-                        try:
-                            async with asyncio.timeout(remaining_seconds):
-                                result = await self._tool_registry.execute(
-                                    tool_request, workspace_root
-                                )
-                        except TimeoutError:
-                            raise ProviderError(
-                                "provider_timeout", "The run deadline was reached."
-                            ) from None
-                    result_content = (
-                        f"{result.error_code}: {result.content}"
-                        if result.is_error and result.error_code is not None
-                        else result.content
-                    )
-                    if result.truncated:
-                        result_content += "\n[Output truncated by Trellis.]"
-                    (
-                        _result_message,
-                        _updated_call,
-                        result_event,
-                    ) = await self._runs.record_tool_result(
-                        run.id,
-                        stored_call.id,
-                        result_content,
-                        status=(
-                            ToolCallStatus.FAILED if result.is_error else ToolCallStatus.COMPLETED
-                        ),
-                    )
-                    await self._publish(result_event)
+                    if result is not None:
+                        await self._record_tool_result(run.id, stored_call, result)
+                if not await self._execute_pending_tools(run, workspace_root):
+                    return
             raise ProviderError("model_call_limit", "The run reached its model-call limit.")
         except asyncio.CancelledError:
             current = await self._runs.get_run(run_id)
             if current is not None and current.status is RunStatus.CANCELLING:
                 await self._mark_cancelled(run_id, call)
-            elif started:
+            elif started and current is not None and current.status is RunStatus.RUNNING:
                 await self._mark_interrupted(run_id, call)
             raise
         except ProviderError as error:
@@ -626,6 +690,117 @@ class RunService:
                     "runtime_internal_error",
                     "Trellis could not complete this run.",
                 )
+
+    async def _execute_pending_tools(self, run: RunSnapshot, workspace_root: Path | None) -> bool:
+        if self._tool_registry is None or workspace_root is None:
+            raise ProviderError("tool_execution_unavailable", "Tool execution is unavailable.")
+        model_calls = await self._runs.list_model_calls(run.id)
+        all_tool_calls = await self._runs.list_tool_calls(run.id)
+        total_tokens, total_cost = self._budget_totals(run.model_id, model_calls)
+        for call_index, stored_call in enumerate(all_tool_calls):
+            if stored_call.status is not ToolCallStatus.PENDING:
+                continue
+            self._check_budget(
+                run,
+                kind="tool",
+                model_calls=len(model_calls),
+                tool_calls=call_index,
+                tokens=total_tokens,
+                cost_usd=total_cost,
+            )
+            remaining_seconds = self._remaining_seconds(run)
+            if remaining_seconds <= 0:
+                raise ProviderError("provider_timeout", "The run deadline was reached.")
+            tool_request = ModelToolCall(
+                stored_call.provider_call_id, stored_call.name, stored_call.arguments
+            )
+            approval_required = self._tool_registry.requires_approval(tool_request, workspace_root)
+            if approval_required and stored_call.approval_decision is None:
+                try:
+                    async with asyncio.timeout(remaining_seconds):
+                        preview = await self._tool_registry.approval_preview(
+                            tool_request, workspace_root
+                        )
+                except ToolExecutionError as error:
+                    await self._record_tool_result(
+                        run.id,
+                        stored_call,
+                        ToolResult(
+                            tool_request.id, tool_request.name, error.message, True, error.code
+                        ),
+                    )
+                    continue
+                except TimeoutError:
+                    raise ProviderError(
+                        "provider_timeout", "The run deadline was reached."
+                    ) from None
+                safe_preview = cast(dict[str, object] | None, redact_record(preview))
+                if safe_preview != preview:
+                    await self._record_tool_result(
+                        run.id,
+                        stored_call,
+                        ToolResult(
+                            tool_request.id,
+                            tool_request.name,
+                            "The tool preview contained a secret.",
+                            True,
+                            "sensitive_approval_preview",
+                        ),
+                    )
+                    continue
+                _waiting, event = await self._runs.request_tool_approval(
+                    run.id, stored_call.id, safe_preview
+                )
+                await self._publish(event)
+                return False
+            if stored_call.approval_decision is ToolApprovalDecision.DENIED:
+                result = ToolResult(
+                    stored_call.provider_call_id,
+                    stored_call.name,
+                    "The user denied this tool call.",
+                    True,
+                    "approval_denied",
+                )
+                await self._record_tool_result(
+                    run.id, stored_call, result, status=ToolCallStatus.DENIED
+                )
+                continue
+            try:
+                async with asyncio.timeout(remaining_seconds):
+                    result = await self._tool_registry.execute(
+                        tool_request,
+                        workspace_root,
+                        approved=(stored_call.approval_decision is ToolApprovalDecision.APPROVED),
+                        approval_preview=stored_call.approval_preview,
+                    )
+            except TimeoutError:
+                raise ProviderError("provider_timeout", "The run deadline was reached.") from None
+            await self._record_tool_result(run.id, stored_call, result)
+        return True
+
+    async def _record_tool_result(
+        self,
+        run_id: str,
+        stored_call: ToolCallRecord,
+        result: ToolResult,
+        *,
+        status: ToolCallStatus | None = None,
+    ) -> None:
+        result_content = (
+            f"{result.error_code}: {result.content}"
+            if result.is_error and result.error_code is not None
+            else result.content
+        )
+        if result.truncated:
+            result_content += "\n[Output truncated by Trellis.]"
+        _message, _call, event = await self._runs.record_tool_result(
+            run_id,
+            stored_call.id,
+            result_content,
+            status=status
+            or (ToolCallStatus.FAILED if result.is_error else ToolCallStatus.COMPLETED),
+        )
+        await self._publish(event)
 
     @staticmethod
     def _request_snapshot(request: ModelRequest) -> dict[str, object]:

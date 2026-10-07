@@ -160,6 +160,7 @@ def test_tool_approval_decision_is_durable_and_idempotent(tmp_path: Path) -> Non
                 tool_calls=(ModelToolCall("provider-edit", "apply_patch", {"patch": "x"}),),
             ),
         )
+        await database.request_tool_approval(run.id, calls[0].id, None)
         first, first_event = await database.record_tool_approval_decision(
             run.id, calls[0].id, ToolApprovalDecision.DENIED
         )
@@ -174,10 +175,19 @@ def test_tool_approval_decision_is_durable_and_idempotent(tmp_path: Path) -> Non
                 run.id, calls[0].id, ToolApprovalDecision.APPROVED
             )
         with pytest.raises(ValueError, match="denied"):
+            await database.resume_approved_run(run.id)
             await database.record_tool_result(run.id, calls[0].id, "Patch applied")
+        # The recorded decision is replayed through a resume event before a result.
+        # Repeated resume requests cannot replay the same approval.
+        with pytest.raises(ValueError, match="not waiting"):
+            await database.resume_approved_run(run.id)
         await database.record_tool_result(
             run.id, calls[0].id, "User denied the edit", status=ToolCallStatus.DENIED
         )
+        with pytest.raises(ValueError, match="not waiting"):
+            await database.record_tool_approval_decision(
+                run.id, calls[0].id, ToolApprovalDecision.DENIED
+            )
         return run.id, calls[0].id
 
     run_id, tool_call_id = asyncio.run(decide())
@@ -188,6 +198,72 @@ def test_tool_approval_decision_is_durable_and_idempotent(tmp_path: Path) -> Non
     assert calls[0].approval_decision is ToolApprovalDecision.DENIED
     assert calls[0].approval_decided_at is not None
     assert [event.event_type.value for event in events].count("tool.approval_decided") == 1
+
+
+def test_waiting_approval_survives_restart_and_blocks_another_run(tmp_path: Path) -> None:
+    database = Database(make_settings(tmp_path).database_path)
+
+    async def pause() -> tuple[str, str, str]:
+        await database.initialize()
+        session = await database.create_session(str(tmp_path))
+        model = (await database.list_models())[0]
+        run = await database.create_run(
+            session.id, "turn-approval", "request-approval", "Edit", model
+        )
+        await database.transition_run_record(
+            run.id, RunStatus.RUNNING, RunEventType.STARTED, {"status": "running"}
+        )
+        model_call = await database.create_model_call(run.id, 1, model, {"messages": []})
+        await database.update_model_call(model_call.id, ModelCallStatus.COMPLETED)
+        _assistant, calls, _events = await database.record_assistant_message(
+            run.id,
+            model_call.id,
+            ModelMessage(
+                role="assistant",
+                content="",
+                tool_calls=(ModelToolCall("provider-edit", "apply_patch", {"path": "a.py"}),),
+            ),
+        )
+        paused, event = await database.request_tool_approval(
+            run.id,
+            calls[0].id,
+            {"path": "a.py", "target_sha256": "abc", "diff": "--- a.py\n+++ a.py"},
+        )
+        assert paused.status is RunStatus.WAITING_FOR_APPROVAL
+        assert event.event_type is RunEventType.TOOL_APPROVAL_REQUESTED
+        assert event.data["tool_call_id"] == calls[0].id
+        return run.id, calls[0].id, session.id
+
+    run_id, tool_call_id, session_id = asyncio.run(pause())
+    restarted = Database(database.path)
+
+    async def inspect() -> None:
+        assert await restarted.recover_active_runs() == ()
+        run = await restarted.get_run(run_id)
+        assert run is not None and run.status is RunStatus.WAITING_FOR_APPROVAL
+        calls = await restarted.list_tool_calls(run_id)
+        assert calls[0].id == tool_call_id
+        assert calls[0].approval_preview == {
+            "path": "a.py",
+            "target_sha256": "abc",
+            "diff": "--- a.py\n+++ a.py",
+        }
+        with pytest.raises(ValueError, match="not running"):
+            await restarted.create_model_call(
+                run_id, 2, (await restarted.list_models())[0], {"messages": []}
+            )
+        with pytest.raises(ValueError, match="invalid run transition"):
+            await restarted.complete_run(run_id, "The edit is done")
+        with pytest.raises(ValueError, match="active run already exists"):
+            await restarted.create_run(
+                session_id,
+                "next-turn",
+                "next-request",
+                "Another request",
+                (await restarted.list_models())[0],
+            )
+
+    asyncio.run(inspect())
 
 
 def test_duplicate_provider_tool_call_rolls_back_assistant_message_and_events(
