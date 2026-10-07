@@ -9,6 +9,7 @@ from app.application.errors import ProviderError
 from app.domain.models import Message, ProviderName
 from app.domain.runtime import (
     ModelContinuationItem,
+    ModelMessage,
     ModelRequest,
     ModelStreamEvent,
     ModelToolCall,
@@ -18,6 +19,9 @@ _MAX_OPENAI_TOOL_CALLS = 32
 _MAX_OPENAI_TOOL_ARGUMENT_BYTES = 256 * 1024
 _MAX_OPENAI_TOOL_ARGUMENT_NESTING = 64
 _MAX_OPENAI_CONTINUATION_BYTES = 4 * 1024 * 1024
+_MAX_ANTHROPIC_TOOL_CALLS = 32
+_MAX_ANTHROPIC_TOOL_ARGUMENT_BYTES = 256 * 1024
+_MAX_ANTHROPIC_TOOL_ARGUMENT_NESTING = 64
 
 
 @dataclass(slots=True)
@@ -70,6 +74,121 @@ def _openai_invalid_stream() -> ProviderError:
         "provider_invalid_response",
         "OpenAI returned a stream Trellis could not read.",
     )
+
+
+def _anthropic_invalid_stream() -> ProviderError:
+    return ProviderError(
+        "provider_invalid_response",
+        "Anthropic returned a stream Trellis could not read.",
+    )
+
+
+@dataclass(slots=True)
+class _AnthropicToolUse:
+    index: int
+    call_id: str
+    name: str
+    initial_input: dict[str, object]
+    argument_parts: list[str] = field(default_factory=list)
+    argument_bytes: int = 0
+    stopped: bool = False
+    arguments: dict[str, object] | None = None
+
+    def append_arguments(self, delta: str) -> None:
+        if self.stopped:
+            raise _anthropic_invalid_stream()
+        try:
+            self.argument_bytes += len(delta.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise _anthropic_invalid_stream() from None
+        if self.argument_bytes > _MAX_ANTHROPIC_TOOL_ARGUMENT_BYTES:
+            raise _anthropic_invalid_stream()
+        self.argument_parts.append(delta)
+
+    def finish(self) -> None:
+        if self.stopped:
+            raise _anthropic_invalid_stream()
+        self.stopped = True
+        if self.argument_parts and any(self.argument_parts):
+            if self.initial_input:
+                raise _anthropic_invalid_stream()
+            argument_json = "".join(self.argument_parts)
+        else:
+            try:
+                argument_json = json.dumps(self.initial_input, allow_nan=False)
+            except TypeError, ValueError, RecursionError:
+                raise _anthropic_invalid_stream() from None
+        try:
+            if len(argument_json.encode("utf-8")) > _MAX_ANTHROPIC_TOOL_ARGUMENT_BYTES:
+                raise _anthropic_invalid_stream()
+        except UnicodeEncodeError:
+            raise _anthropic_invalid_stream() from None
+        depth = 0
+        in_string = False
+        escaped = False
+        for character in argument_json:
+            if escaped:
+                escaped = False
+            elif in_string and character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = not in_string
+            elif not in_string and character in "[{":
+                depth += 1
+                if depth > _MAX_ANTHROPIC_TOOL_ARGUMENT_NESTING:
+                    raise _anthropic_invalid_stream()
+            elif not in_string and character in "]}":
+                depth -= 1
+                if depth < 0:
+                    raise _anthropic_invalid_stream()
+        try:
+            arguments = json.loads(argument_json, parse_constant=_reject_json_constant)
+        except json.JSONDecodeError, ValueError, RecursionError:
+            raise _anthropic_invalid_stream() from None
+        if not isinstance(arguments, dict):
+            raise _anthropic_invalid_stream()
+        self.arguments = arguments
+
+
+def _anthropic_messages(messages: Sequence[ModelMessage]) -> list[dict[str, object]]:
+    translated: list[dict[str, object]] = []
+    previous_was_tool = False
+    for item in messages:
+        if item.role == "tool":
+            if not item.tool_call_id:
+                raise _anthropic_invalid_stream()
+            block = {
+                "type": "tool_result",
+                "tool_use_id": item.tool_call_id,
+                "content": item.content,
+            }
+            if previous_was_tool:
+                content = translated[-1]["content"]
+                if not isinstance(content, list):
+                    raise _anthropic_invalid_stream()
+                content.append(block)
+            else:
+                translated.append({"role": "user", "content": [block]})
+            previous_was_tool = True
+            continue
+        previous_was_tool = False
+        if item.role == "assistant" and item.tool_calls:
+            blocks: list[dict[str, object]] = []
+            if item.content:
+                blocks.append({"type": "text", "text": item.content})
+            blocks.extend(
+                {
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": call.arguments,
+                }
+                for call in item.tool_calls
+            )
+            translated.append({"role": "assistant", "content": blocks})
+        else:
+            translated.append({"role": item.role, "content": item.content})
+    return translated
 
 
 def _reject_json_constant(_value: str) -> None:
@@ -624,8 +743,19 @@ async def _stream_anthropic(
         "model": request.upstream_model_id,
         "max_tokens": request.max_output_tokens,
         "stream": True,
-        "messages": [{"role": item.role, "content": item.content} for item in request.messages],
+        "messages": _anthropic_messages(request.messages),
     }
+    if request.system_instructions:
+        body["system"] = request.system_instructions
+    if request.tools:
+        body["tools"] = [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            }
+            for tool in request.tools
+        ]
     response_id: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
@@ -633,6 +763,10 @@ async def _stream_anthropic(
     finish_reason: str | None = None
     saw_text = False
     completed = False
+    block_types: dict[int, str] = {}
+    stopped_blocks: set[int] = set()
+    tool_uses: dict[int, _AnthropicToolUse] = {}
+    tool_ids: set[str] = set()
     provider_events = _post_stream(
         client,
         "https://api.anthropic.com/v1/messages",
@@ -652,17 +786,87 @@ async def _stream_anthropic(
             usage = _mapping(message.get("usage"))
             input_tokens = _optional_integer(usage.get("input_tokens"))
             cached_tokens = _optional_integer(usage.get("cache_read_input_tokens"))
+        elif event_type == "content_block_start":
+            index = payload.get("index")
+            block = _mapping(payload.get("content_block"))
+            block_type = block.get("type")
+            if (
+                not isinstance(index, int)
+                or isinstance(index, bool)
+                or index < 0
+                or index in block_types
+                or not isinstance(block_type, str)
+            ):
+                raise _anthropic_invalid_stream()
+            block_types[index] = block_type
+            if block_type == "tool_use":
+                call_id = block.get("id")
+                name = block.get("name")
+                initial_input = block.get("input")
+                if (
+                    not isinstance(call_id, str)
+                    or not call_id
+                    or call_id in tool_ids
+                    or not isinstance(name, str)
+                    or not name
+                    or not isinstance(initial_input, dict)
+                    or len(tool_uses) >= _MAX_ANTHROPIC_TOOL_CALLS
+                ):
+                    raise _anthropic_invalid_stream()
+                tool_uses[index] = _AnthropicToolUse(index, call_id, name, initial_input)
+                tool_ids.add(call_id)
+            elif block_type == "text":
+                initial_text = block.get("text", "")
+                if not isinstance(initial_text, str):
+                    raise _anthropic_invalid_stream()
+                if initial_text:
+                    saw_text = True
+                    yield ModelStreamEvent(kind="text_delta", text=initial_text)
         elif event_type == "content_block_delta":
             delta = _mapping(payload.get("delta"))
-            if delta.get("type") == "text_delta":
+            delta_type = delta.get("type")
+            index = payload.get("index")
+            if index is not None and (
+                not isinstance(index, int)
+                or isinstance(index, bool)
+                or index not in block_types
+                or index in stopped_blocks
+            ):
+                raise _anthropic_invalid_stream()
+            if delta_type == "input_json_delta":
+                partial_json = delta.get("partial_json")
+                if (
+                    not isinstance(index, int)
+                    or isinstance(index, bool)
+                    or index not in tool_uses
+                    or not isinstance(partial_json, str)
+                ):
+                    raise _anthropic_invalid_stream()
+                tool_uses[index].append_arguments(partial_json)
+            elif delta_type == "text_delta":
+                if index is not None and (
+                    not isinstance(index, int)
+                    or isinstance(index, bool)
+                    or block_types.get(index) != "text"
+                ):
+                    raise _anthropic_invalid_stream()
                 text = delta.get("text")
                 if not isinstance(text, str):
-                    raise ProviderError(
-                        "provider_invalid_response",
-                        "Anthropic returned a stream Trellis could not read.",
-                    )
+                    raise _anthropic_invalid_stream()
                 saw_text = saw_text or bool(text)
                 yield ModelStreamEvent(kind="text_delta", text=text)
+        elif event_type == "content_block_stop":
+            index = payload.get("index")
+            if (
+                not isinstance(index, int)
+                or isinstance(index, bool)
+                or index not in block_types
+                or index in stopped_blocks
+            ):
+                raise _anthropic_invalid_stream()
+            if index in tool_uses:
+                tool_uses[index].finish()
+            stopped_blocks.add(index)
         elif event_type == "message_delta":
             delta = _mapping(payload.get("delta"))
             stop_reason = delta.get("stop_reason")
@@ -670,7 +874,9 @@ async def _stream_anthropic(
             usage = _mapping(payload.get("usage"))
             output_tokens = _optional_integer(usage.get("output_tokens"))
         elif event_type == "message_stop":
-            if not saw_text:
+            if block_types.keys() - stopped_blocks or (tool_uses and finish_reason != "tool_use"):
+                raise _anthropic_invalid_stream()
+            if not saw_text and not tool_uses:
                 raise ProviderError(
                     "provider_invalid_response",
                     "Anthropic returned an empty response.",
@@ -686,6 +892,18 @@ async def _stream_anthropic(
                 )
             completed = True
             await provider_events.aclose()
+            for index in sorted(tool_uses):
+                item = tool_uses[index]
+                if item.arguments is None:
+                    raise _anthropic_invalid_stream()
+                yield ModelStreamEvent(
+                    kind="tool_call",
+                    tool_call=ModelToolCall(
+                        id=item.call_id,
+                        name=item.name,
+                        arguments=item.arguments,
+                    ),
+                )
             if usage_event is not None:
                 yield usage_event
             yield ModelStreamEvent(

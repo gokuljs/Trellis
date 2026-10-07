@@ -54,6 +54,10 @@ def sse_named(*events: tuple[str, dict[str, object]]) -> bytes:
     )
 
 
+def anthropic_event(event_type: str, **fields: object) -> tuple[str, dict[str, object]]:
+    return event_type, {"type": event_type, **fields}
+
+
 def test_openai_provider_uses_stateless_responses_contract() -> None:
     async def run() -> tuple[str, httpx.Request]:
         captured: list[httpx.Request] = []
@@ -1037,6 +1041,344 @@ def test_anthropic_stream_normalizes_sse_events_and_cumulative_usage() -> None:
             provider_response_id="msg_456",
         ),
     ]
+
+
+def test_anthropic_stream_replays_tool_exchange_and_assembles_mixed_blocks() -> None:
+    async def run() -> tuple[list[ModelStreamEvent], httpx.Request]:
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=sse_named(
+                    anthropic_event("message_start", message={"id": "msg_tools"}),
+                    anthropic_event(
+                        "content_block_start", index=0, content_block={"type": "text", "text": ""}
+                    ),
+                    anthropic_event(
+                        "content_block_delta",
+                        index=0,
+                        delta={"type": "text_delta", "text": "I'll inspect both."},
+                    ),
+                    anthropic_event("content_block_stop", index=0),
+                    anthropic_event(
+                        "content_block_start",
+                        index=1,
+                        content_block={
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "read_file",
+                            "input": {},
+                        },
+                    ),
+                    anthropic_event(
+                        "content_block_delta",
+                        index=1,
+                        delta={"type": "input_json_delta", "partial_json": '{"path":'},
+                    ),
+                    anthropic_event(
+                        "content_block_delta",
+                        index=1,
+                        delta={"type": "input_json_delta", "partial_json": '"README.md"}'},
+                    ),
+                    anthropic_event("content_block_stop", index=1),
+                    anthropic_event(
+                        "content_block_start",
+                        index=2,
+                        content_block={
+                            "type": "tool_use",
+                            "id": "toolu_2",
+                            "name": "inspect_git",
+                            "input": {},
+                        },
+                    ),
+                    anthropic_event("content_block_stop", index=2),
+                    anthropic_event(
+                        "message_delta",
+                        delta={"stop_reason": "tool_use"},
+                        usage={"output_tokens": 19},
+                    ),
+                    anthropic_event("message_stop"),
+                ),
+            )
+
+        request = ModelRequest(
+            provider_id="anthropic",
+            model_id="anthropic:test-model",
+            adapter_kind="anthropic",
+            upstream_model_id="future-claude-model",
+            messages=(
+                ModelMessage(role="user", content="Inspect the repository"),
+                ModelMessage(
+                    role="assistant",
+                    content="I will check.",
+                    tool_calls=(
+                        ModelToolCall(id="prior_1", name="read_file", arguments={"path": "a.py"}),
+                        ModelToolCall(id="prior_2", name="inspect_git", arguments={}),
+                    ),
+                ),
+                ModelMessage(role="tool", content="file contents", tool_call_id="prior_1"),
+                ModelMessage(role="tool", content="clean", tool_call_id="prior_2"),
+            ),
+            max_output_tokens=256,
+            system_instructions="Work carefully.",
+            tools=(
+                ModelToolSpec(
+                    name="read_file",
+                    description="Read one file",
+                    input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
+                ),
+            ),
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            events = [
+                event async for event in AnthropicProvider(client).stream(request, "sk-ant", "user")
+            ]
+        return events, captured[0]
+
+    events, sent = asyncio.run(run())
+    payload = json.loads(sent.content)
+    assert payload["system"] == "Work carefully."
+    assert payload["tools"] == [
+        {
+            "name": "read_file",
+            "description": "Read one file",
+            "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+        }
+    ]
+    assert payload["messages"] == [
+        {"role": "user", "content": "Inspect the repository"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "I will check."},
+                {
+                    "type": "tool_use",
+                    "id": "prior_1",
+                    "name": "read_file",
+                    "input": {"path": "a.py"},
+                },
+                {"type": "tool_use", "id": "prior_2", "name": "inspect_git", "input": {}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "prior_1", "content": "file contents"},
+                {"type": "tool_result", "tool_use_id": "prior_2", "content": "clean"},
+            ],
+        },
+    ]
+    assert events == [
+        ModelStreamEvent(kind="text_delta", text="I'll inspect both."),
+        ModelStreamEvent(
+            kind="tool_call",
+            tool_call=ModelToolCall(
+                id="toolu_1", name="read_file", arguments={"path": "README.md"}
+            ),
+        ),
+        ModelStreamEvent(
+            kind="tool_call",
+            tool_call=ModelToolCall(id="toolu_2", name="inspect_git", arguments={}),
+        ),
+        ModelStreamEvent(kind="usage", output_tokens=19, provider_response_id="msg_tools"),
+        ModelStreamEvent(
+            kind="completed", finish_reason="tool_use", provider_response_id="msg_tools"
+        ),
+    ]
+
+
+def test_anthropic_stream_accepts_tool_only_completion() -> None:
+    async def run() -> list[ModelStreamEvent]:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=sse_named(
+                    anthropic_event("message_start", message={"id": "msg_only"}),
+                    anthropic_event(
+                        "content_block_start",
+                        index=0,
+                        content_block={
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "inspect_git",
+                            "input": {},
+                        },
+                    ),
+                    anthropic_event("content_block_stop", index=0),
+                    anthropic_event("message_delta", delta={"stop_reason": "tool_use"}),
+                    anthropic_event("message_stop"),
+                ),
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return [
+                event
+                async for event in AnthropicProvider(client).stream(
+                    model_request("anthropic", "anthropic", "future-claude-model"), "sk", "user"
+                )
+            ]
+
+    assert asyncio.run(run()) == [
+        ModelStreamEvent(
+            kind="tool_call",
+            tool_call=ModelToolCall(id="toolu_1", name="inspect_git", arguments={}),
+        ),
+        ModelStreamEvent(
+            kind="completed", finish_reason="tool_use", provider_response_id="msg_only"
+        ),
+    ]
+
+
+@pytest.mark.parametrize("case", ["malformed_json", "unclosed_block", "max_tokens"])
+def test_anthropic_stream_rejects_incomplete_tool_use_before_emitting_call(case: str) -> None:
+    seen: list[ModelStreamEvent] = []
+    partial_json = '{"path":' if case == "malformed_json" else '{"path":"x"}'
+    events = [
+        anthropic_event("message_start", message={"id": "msg"}),
+        anthropic_event(
+            "content_block_start",
+            index=0,
+            content_block={"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}},
+        ),
+        anthropic_event(
+            "content_block_delta",
+            index=0,
+            delta={"type": "input_json_delta", "partial_json": partial_json},
+        ),
+    ]
+    if case != "unclosed_block":
+        events.append(anthropic_event("content_block_stop", index=0))
+    reason = "max_tokens" if case == "max_tokens" else "tool_use"
+    events.extend(
+        [
+            anthropic_event("message_delta", delta={"stop_reason": reason}),
+            anthropic_event("message_stop"),
+        ]
+    )
+
+    async def run() -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=sse_named(*events),
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            async for event in AnthropicProvider(client).stream(
+                model_request("anthropic", "anthropic", "future-claude-model"), "sk", "user"
+            ):
+                seen.append(event)
+
+    with pytest.raises(ProviderError) as raised:
+        asyncio.run(run())
+    assert raised.value.code == "provider_invalid_response"
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "duplicate_index",
+        "duplicate_id",
+        "unknown_index",
+        "oversize_arguments",
+        "duplicate_stop",
+        "delta_after_stop",
+        "unclosed_text",
+        "truncated_stream",
+    ],
+)
+def test_anthropic_stream_rejects_invalid_tool_blocks_before_emitting_call(case: str) -> None:
+    seen: list[ModelStreamEvent] = []
+
+    def start(index: int, call_id: str) -> tuple[str, dict[str, object]]:
+        return (
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": "read_file",
+                    "input": {},
+                },
+            },
+        )
+
+    def stop(index: int) -> tuple[str, dict[str, object]]:
+        return ("content_block_stop", {"type": "content_block_stop", "index": index})
+
+    def input_delta(index: int, value: str) -> tuple[str, dict[str, object]]:
+        return (
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": value},
+            },
+        )
+
+    events: list[tuple[str, dict[str, object]]] = [start(0, "toolu_1")]
+    if case == "duplicate_index":
+        events.append(start(0, "toolu_2"))
+    elif case == "duplicate_id":
+        events.extend([stop(0), start(1, "toolu_1"), stop(1)])
+    elif case == "unknown_index":
+        events.append(input_delta(1, "{}"))
+    elif case == "oversize_arguments":
+        events.append(input_delta(0, '{"x":"' + "a" * (256 * 1024) + '"}'))
+    elif case == "duplicate_stop":
+        events.append(stop(0))
+    elif case == "delta_after_stop":
+        events.extend([stop(0), input_delta(0, "{}")])
+    elif case == "unclosed_text":
+        events.append(
+            (
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            )
+        )
+    if case != "duplicate_id":
+        events.append(stop(0))
+    if case != "truncated_stream":
+        events.extend(
+            [
+                ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+                ("message_stop", {"type": "message_stop"}),
+            ]
+        )
+
+    async def run() -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=sse_named(
+                    ("message_start", {"type": "message_start", "message": {"id": "msg"}}),
+                    *events,
+                ),
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            async for event in AnthropicProvider(client).stream(
+                model_request("anthropic", "anthropic", "future-claude-model"), "sk", "user"
+            ):
+                seen.append(event)
+
+    with pytest.raises(ProviderError) as raised:
+        asyncio.run(run())
+    assert raised.value.code == "provider_invalid_response"
+    assert seen == []
 
 
 def test_openai_stream_rejects_malformed_and_truncated_events_safely() -> None:

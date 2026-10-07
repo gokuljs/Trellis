@@ -81,3 +81,37 @@ Starlette/httpx deprecation warning.
 
 **Next.** Translate Anthropic's streamed `tool_use` blocks into the same Trellis
 call type.
+
+## Step 3 — Parse Anthropic streamed tool use
+
+**Why this step exists.** Anthropic sends a tool request inside an assistant
+content block, with its input arriving as partial JSON. Its next request also
+needs the assistant's `tool_use` blocks followed immediately by a user message
+containing the matching `tool_result` blocks. The runtime needs the same
+provider-neutral calls it receives from OpenAI.
+
+**What works now.** The Anthropic adapter accepts tool definitions, stable
+instructions, mixed text and tool blocks, and multiple tool requests. It can
+replay an assistant message and its grouped tool results. Chat still uses one
+model call and does not yet execute tools; these are adapter capabilities ready
+for the later run loop.
+
+**Follow the code.** In `backend/app/infrastructure/providers.py`,
+`_anthropic_messages` converts ordered Trellis messages into Anthropic's
+assistant and user content blocks. `_stream_anthropic` tracks each block by
+index. `_AnthropicToolUse` collects `input_json_delta` fragments and validates
+one complete JSON object when the block stops. Calls are emitted as
+`ModelStreamEvent(kind="tool_call")` only after `message_stop` confirms a
+complete tool-use response. Duplicate IDs, excessive or malformed arguments,
+unclosed blocks, and a `max_tokens` stop during tool use return a safe provider
+error.
+
+**Verification.** The first focused test failed because the request had no
+Anthropic `system` field. After implementation, 14 Anthropic stream tests
+passed, including mixed blocks, grouped results, tool-only completion, and
+invalid streams. The final uv 0.12.5 `make check` passed Ruff formatting, Ruff
+linting, `ty`, and 131 backend tests with 90.22% coverage. Pytest reported the
+existing Starlette/httpx deprecation warning and a SQLite resource warning.
+
+**Next.** Save ordered assistant and tool exchanges so a later model call can
+rebuild its context after each step.
