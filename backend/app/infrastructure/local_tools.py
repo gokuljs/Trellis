@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import cast
 
+from app.application.context import MAX_WORKSPACE_GUIDANCE_BYTES
 from app.application.tools import ToolExecutionError
 
 MAX_OUTPUT_BYTES = 20_000
@@ -475,3 +476,32 @@ class LocalReadToolExecutor:
                     "tool_timeout", "The tool reached its time limit."
                 ) from None
         raise ToolExecutionError("unknown_tool", "This tool is not available.")
+
+
+def _guidance_file_operation(
+    root: Path, _arguments: dict[str, object], stopped: threading.Event
+) -> str | None:
+    if stopped.is_set():
+        return None
+    directory_fd = _open_directory(root, ())
+    try:
+        try:
+            data = _read_bytes(directory_fd, "AGENTS.md", MAX_WORKSPACE_GUIDANCE_BYTES)
+        except ToolExecutionError as error:
+            if error.code in {"path_not_allowed", "not_text_file"}:
+                return None
+            raise
+    finally:
+        os.close(directory_fd)
+    if len(data) > MAX_WORKSPACE_GUIDANCE_BYTES or b"\x00" in data:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+async def read_workspace_guidance(workspace_root: Path) -> str | None:
+    """Read a bounded root AGENTS.md without following a workspace symlink."""
+    root = await asyncio.to_thread(_root, workspace_root)
+    return await _run_bounded_file_operation(_guidance_file_operation, root, {})

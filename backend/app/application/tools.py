@@ -22,7 +22,7 @@ _STANDALONE_TOKEN = re.compile(
 )
 
 
-def _redact_content(content: str) -> str:
+def redact_secrets(content: str) -> str:
     content = _BEARER_TOKEN.sub(lambda match: f"{match[1]}[REDACTED]", content)
     content = _KEY_ASSIGNMENT.sub(lambda match: f"{match[1]}[REDACTED]", content)
     return _STANDALONE_TOKEN.sub("[REDACTED]", content)
@@ -127,7 +127,7 @@ class ToolRegistry:
             return ToolResult(
                 call.id, call.name, "The tool could not complete.", True, "tool_failed"
             )
-        safe_content = _redact_content(content)
+        safe_content = redact_secrets(content)
         encoded = safe_content.encode("utf-8")
         if len(encoded) > MAX_RESULT_BYTES:
             safe_content = encoded[:MAX_RESULT_BYTES].decode("utf-8", errors="ignore")

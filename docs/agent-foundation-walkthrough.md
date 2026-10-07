@@ -222,3 +222,42 @@ Starlette/httpx deprecation and SQLite resource warnings.
 
 **Next.** Build one deterministic model context from the visible transcript,
 saved agent exchange, workspace guidance, and these tool definitions.
+
+## Step 7 — Build deterministic model context
+
+**Why this step exists.** Each model step needs the same ordered view of the
+conversation, even after a run pauses or resumes. The runtime also needs one
+stable instruction version and a clear place for workspace guidance and tool
+definitions.
+
+**What works now.** A context builder assembles the visible session messages,
+then the current run's saved assistant and tool messages, in ordinal order. It
+preserves tool-call IDs and provider continuation items. With an attached
+workspace it includes sorted tool definitions, the root path, and bounded
+root `AGENTS.md` guidance if supplied; without one it offers no local tools.
+The guidance is treated as project data and common secret patterns are
+redacted. The live run still uses its existing text-only request; Step 8 will
+call this builder.
+
+**Follow the code.** `build_model_context` in
+`backend/app/application/context.py` converts `Message` and
+`RunMessageRecord` into provider-neutral `ModelMessage` items, sorts each
+source, and returns versioned instructions plus tool schemas. It translates
+each saved internal tool-call ID back to the provider call ID before replay;
+an unmatched result is rejected. It rejects
+guidance without a workspace or above 16 KiB. `read_workspace_guidance` in
+`backend/app/infrastructure/local_tools.py` reads only a regular root
+`AGENTS.md`, without following a symlink or accepting oversized or non-text
+content. The builder uses `redact_secrets` from
+`backend/app/application/tools.py` before guidance can enter a model request.
+
+**Verification.** Focused tests first failed for missing guidance support and
+then for an unredacted key and missing guidance reader. Review found that a
+saved tool result held Trellis' internal call ID rather than the provider's;
+a database-to-context replay test failed until the builder translated it.
+The final uv 0.12.5 `make check` passed Ruff formatting, Ruff linting, `ty`,
+and 169 backend tests with 90.40% coverage. Pytest reported the existing
+Starlette/httpx deprecation and SQLite resource warnings.
+
+**Next.** Use this context for a run that can make several model calls, execute
+tools between them, and save each step before moving on.

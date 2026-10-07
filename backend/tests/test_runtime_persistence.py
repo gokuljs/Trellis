@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from app.application.context import build_model_context
 from app.core.config import Settings
 from app.domain.runtime import (
     ModelCallStatus,
@@ -94,6 +95,17 @@ def test_agent_messages_and_tool_results_keep_order_without_polluting_public_cha
     assert [message.tool_call_id for message in agent_messages[1:3]] == [
         tool_calls[1].id,
         tool_calls[0].id,
+    ]
+    replay = build_model_context(
+        public_messages[:1],
+        agent_messages[:3],
+        workspace_root=None,
+        run_tool_calls=tool_calls,
+        tools=[],
+    )
+    assert [message.tool_call_id for message in replay.messages[2:]] == [
+        "provider-b",
+        "provider-a",
     ]
     assert agent_messages[0].continuation_items == (
         ModelContinuationItem(
