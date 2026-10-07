@@ -252,6 +252,23 @@ afterEach(() => {
 })
 
 describe("local-first chat", () => {
+  it("omits Capabilities navigation and keeps the new-session welcome view", async () => {
+    vi.stubGlobal(
+      "fetch",
+      startupFetch(() => undefined)
+    )
+
+    renderApp()
+
+    await screen.findByRole("textbox", { name: "Message" })
+    expect(
+      screen.queryByRole("button", { name: "Capabilities" })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.getByText("What would you like to work on?")
+    ).toBeInTheDocument()
+  })
+
   it("shows an approval preview, answers it, and keeps the ordered tool result in chat", async () => {
     const created = {
       ...recentSession,

@@ -1200,28 +1200,6 @@ html.theme-ripple-fallback::before {
     line-height: 1.65;
   }
 
-  .capability-grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
-    margin-top: 32px;
-  }
-
-  .capability-grid div {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    border: 1px solid var(--shell-line);
-    border-radius: 12px;
-    padding: 16px;
-    color: var(--shell-text);
-    background: var(--shell-card);
-  }
-
-  .capability-grid svg {
-    color: var(--shell-accent-strong);
-  }
-
   .chat-thread {
     width: min(760px, 100%);
   }

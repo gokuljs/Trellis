@@ -1,7 +1,6 @@
 import type { LucideIcon } from "lucide-react"
 
-export type WorkspaceView =
-  "New session" | "Capabilities" | "Settings" | "session"
+export type WorkspaceView = "New session" | "Settings" | "session"
 export type ProviderId = string
 export type ModelId = string
 export type OnboardingStep = "intro" | "profile" | "model"
