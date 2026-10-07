@@ -404,3 +404,41 @@ exact call, denial, cancellation while waiting, and resumption after restart.
 
 **Next.** Add a precise, previewed patch tool as the first built-in tool that
 uses this approval flow.
+
+## Step 11 — Apply approved workspace patches
+
+**Why this step exists.** The agent needs a controlled way to change code after
+the user sees the exact edit. An approval should apply only to the file and
+content shown in the preview, even if the workspace changes while the run is
+waiting.
+
+**What works now.** With a workspace attached, the model can request
+`apply_patch` to create one text file or replace one uniquely matching piece of
+text in an existing file. Trellis builds a bounded unified diff and pauses for
+approval. The `run.respond` method can approve or deny it; chat controls arrive
+in Step 14. Protected paths, symlinks, binary files, ambiguous matches, and
+edits whose diff or file exceeds the limits return safe tool errors. An edit to
+`AGENTS.md` or its instruction directories is rejected.
+
+**Follow the code.** `backend/app/application/tools.py` adds a strict schema for
+`path`, `old_text`, and `new_text` and marks `apply_patch` as approval-required.
+`backend/app/infrastructure/local_patch.py` resolves the path under the attached
+workspace with directory handles that do not follow symlinks. During preview it
+reads the target and any ancestor `AGENTS.md` files, verifies one exact match,
+and saves a diff, file identity and hash, and guidance hashes. After approval,
+it compares the saved arguments and preview against the current target and
+guidance, then writes a temporary file and atomically moves it into place.
+`backend/app/main.py` wires the executor into the registry, and
+`backend/app/infrastructure/local_tools.py` hides the temporary file names from
+read tools. The approval and tool-result events from Step 10 keep the edit in
+the ordered run history.
+
+**Verification.** A focused failing test first showed that the registry did not
+offer `apply_patch`. The patch tests then exercised an approved WebSocket run
+through the next model response, denial, stale or replaced targets, changed
+guidance, path rejection, and preview limits. The pinned uv 0.12.5 `make check`
+passed Ruff formatting, Ruff linting, `ty`, and 230 backend tests with 90.01%
+coverage.
+
+**Next.** Add a bounded command tool and saved test commands, using the same
+approval boundary for arbitrary commands.

@@ -74,6 +74,12 @@ class _InspectGitArguments(_StrictArguments):
     operation: Literal["status", "diff", "log"]
 
 
+class _ApplyPatchArguments(_StrictArguments):
+    path: str = Field(min_length=1, max_length=4096)
+    old_text: str = Field(max_length=8192)
+    new_text: str = Field(max_length=8192)
+
+
 _DEFINITIONS: tuple[tuple[str, str, type[_StrictArguments]], ...] = (
     (
         "list_files",
@@ -96,11 +102,29 @@ _DEFINITIONS: tuple[tuple[str, str, type[_StrictArguments]], ...] = (
         _InspectGitArguments,
     ),
 )
+_PATCH_DEFINITION = (
+    "apply_patch",
+    "Create or replace exact text in one workspace file after a diff preview and user approval.",
+    _ApplyPatchArguments,
+)
 
 
 class ReadToolExecutor(Protocol):
     async def execute(
         self, name: str, arguments: dict[str, object], workspace_root: Path
+    ) -> tuple[str, bool]: ...
+
+
+class PatchToolExecutor(Protocol):
+    async def approval_preview(
+        self, arguments: dict[str, object], workspace_root: Path
+    ) -> dict[str, object]: ...
+
+    async def execute(
+        self,
+        arguments: dict[str, object],
+        workspace_root: Path,
+        approval_preview: dict[str, object] | None,
     ) -> tuple[str, bool]: ...
 
 
@@ -118,11 +142,20 @@ class ToolRegistry:
         self,
         executor: ReadToolExecutor,
         *,
+        patch_executor: PatchToolExecutor | None = None,
         approval_required_names: frozenset[str] | set[str] = frozenset(),
     ) -> None:
         self._executor = executor
-        self._definitions = {name: model for name, _description, model in _DEFINITIONS}
-        self._approval_required_names = frozenset(approval_required_names)
+        self._patch_executor = patch_executor
+        self._available_definitions = (
+            (*_DEFINITIONS, _PATCH_DEFINITION) if patch_executor is not None else _DEFINITIONS
+        )
+        self._definitions = {
+            name: model for name, _description, model in self._available_definitions
+        }
+        self._approval_required_names = frozenset(approval_required_names) | (
+            {"apply_patch"} if patch_executor is not None else set()
+        )
 
     def requires_approval(self, call: ModelToolCall, workspace_root: Path | None = None) -> bool:
         del workspace_root
@@ -131,14 +164,31 @@ class ToolRegistry:
     async def approval_preview(
         self, call: ModelToolCall, workspace_root: Path
     ) -> dict[str, object] | None:
-        del call, workspace_root
-        return None
+        if call.name != "apply_patch" or self._patch_executor is None:
+            return None
+        return await self._patch_executor.approval_preview(
+            self._validated_arguments(call), workspace_root
+        )
 
     def specs(self) -> tuple[ModelToolSpec, ...]:
         return tuple(
             ModelToolSpec(name, description, model.model_json_schema())
-            for name, description, model in _DEFINITIONS
+            for name, description, model in self._available_definitions
         )
+
+    def _validated_arguments(self, call: ModelToolCall) -> dict[str, object]:
+        model = self._definitions.get(call.name)
+        if model is None:
+            raise ToolExecutionError("unknown_tool", "This tool is not available.")
+        try:
+            encoded = json.dumps(call.arguments, separators=(",", ":"))
+            if len(encoded.encode("utf-8")) > MAX_ARGUMENT_BYTES:
+                raise ValueError("tool arguments exceed the size limit")
+            return model.model_validate(call.arguments).model_dump()
+        except TypeError, ValueError, ValidationError:
+            raise ToolExecutionError(
+                "invalid_tool_arguments", "Tool arguments are invalid."
+            ) from None
 
     async def execute(
         self,
@@ -148,7 +198,6 @@ class ToolRegistry:
         approved: bool = False,
         approval_preview: dict[str, object] | None = None,
     ) -> ToolResult:
-        del approval_preview
         if self.requires_approval(call, workspace_root) and not approved:
             return ToolResult(
                 call.id,
@@ -157,22 +206,21 @@ class ToolRegistry:
                 True,
                 "approval_required",
             )
-        model = self._definitions.get(call.name)
-        if model is None:
-            return ToolResult(
-                call.id, call.name, "This tool is not available.", True, "unknown_tool"
-            )
         try:
-            encoded = json.dumps(call.arguments, separators=(",", ":"))
-            if len(encoded.encode("utf-8")) > MAX_ARGUMENT_BYTES:
-                raise ValueError("tool arguments exceed the size limit")
-            arguments = model.model_validate(call.arguments).model_dump()
-        except TypeError, ValueError, ValidationError:
-            return ToolResult(
-                call.id, call.name, "Tool arguments are invalid.", True, "invalid_tool_arguments"
-            )
+            arguments = self._validated_arguments(call)
+        except ToolExecutionError as error:
+            return ToolResult(call.id, call.name, error.message, True, error.code)
         try:
-            content, truncated = await self._executor.execute(call.name, arguments, workspace_root)
+            if call.name == "apply_patch":
+                if self._patch_executor is None:
+                    raise ToolExecutionError("unknown_tool", "This tool is not available.")
+                content, truncated = await self._patch_executor.execute(
+                    arguments, workspace_root, approval_preview
+                )
+            else:
+                content, truncated = await self._executor.execute(
+                    call.name, arguments, workspace_root
+                )
         except ToolExecutionError as error:
             return ToolResult(call.id, call.name, error.message, True, error.code)
         except Exception:

@@ -50,7 +50,9 @@ _PROTECTED_NAMES = frozenset(
 def _protected(name: str) -> bool:
     lower = name.casefold()
     return (
-        lower in _PROTECTED_NAMES or lower.startswith(".env.") or lower.endswith((".pem", ".key"))
+        lower in _PROTECTED_NAMES
+        or lower.startswith((".env.", ".trellis-patch-"))
+        or lower.endswith((".pem", ".key"))
     )
 
 
