@@ -437,22 +437,8 @@ export function AppShell() {
       if (isCancelled()) return
 
       setSessions(restoredSessions)
-      if (!restoredSessions[0]) return
-
-      const detail = await api.getSession(restoredSessions[0].id)
-      if (isCancelled()) return
-      activeSessionIdRef.current = detail.session.id
-      setActiveSession(detail.session)
-      setMessages(detail.messages)
-      setActiveView("session")
-      const loadSequence = sessionLoadSequenceRef.current
-      await restoreSessionRun(
-        detail.session.id,
-        detail.messages,
-        () => isCancelled() || sessionLoadSequenceRef.current !== loadSequence
-      )
     },
-    [restoreSessionRun]
+    []
   )
 
   useEffect(() => {

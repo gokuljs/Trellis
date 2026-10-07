@@ -141,6 +141,10 @@ function sidebarSessionTitles() {
   )
 }
 
+async function openSavedSession(title: string) {
+  await userEvent.click(await screen.findByRole("button", { name: title }))
+}
+
 class TestWebSocket {
   static instances: TestWebSocket[] = []
   static onSend: (
@@ -1095,6 +1099,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
+    await openSavedSession("Persisted conversation")
     await screen.findByRole("textbox", { name: "Message" })
     const currentChip = await screen.findByText("first-project")
     expect(currentChip.closest(".composer-box")).not.toBeNull()
@@ -1254,7 +1259,83 @@ describe("local-first chat", () => {
     ).toBeInTheDocument()
   })
 
-  it("restores the most recent complete transcript and switches sessions by ID", async () => {
+  it("opens a blank chat when saved sessions exist", async () => {
+    const fetchMock = startupFetch((url) => {
+      if (url === "/api/sessions")
+        return response([recentSession, olderSession])
+      if (url === "/api/sessions/session-recent")
+        return response({ session: recentSession, messages: [] })
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    renderApp()
+
+    expect(
+      await screen.findByRole("button", { name: "Persisted conversation" })
+    ).not.toHaveAttribute("aria-current")
+    expect(
+      screen.getByText("What would you like to work on?")
+    ).toBeInTheDocument()
+    expect(
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByText(
+        "New session"
+      )
+    ).toBeInTheDocument()
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/sessions/session-recent",
+      expect.anything()
+    )
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/sessions",
+      expect.objectContaining({ method: "POST" })
+    )
+  })
+
+  it("returns to a blank chat after reloading a saved session", async () => {
+    const fetchMock = startupFetch((url) => {
+      if (url === "/api/sessions") return response([recentSession])
+      if (url === "/api/sessions/session-recent")
+        return response({
+          session: recentSession,
+          messages: [
+            {
+              id: "saved-answer",
+              turn_id: "saved-turn",
+              role: "assistant",
+              content: "Saved response",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-08-25T10:00:01Z",
+            },
+          ],
+        })
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    const firstLoad = renderApp()
+    await openSavedSession("Persisted conversation")
+    expect(await screen.findByText("Saved response")).toBeInTheDocument()
+
+    firstLoad.unmount()
+    fetchMock.mockClear()
+    renderApp()
+
+    expect(
+      await screen.findByRole("button", { name: "Persisted conversation" })
+    ).not.toHaveAttribute("aria-current")
+    expect(
+      screen.getByText("What would you like to work on?")
+    ).toBeInTheDocument()
+    expect(screen.queryByText("Saved response")).not.toBeInTheDocument()
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/sessions/session-recent",
+      expect.anything()
+    )
+  })
+
+  it("opens a saved transcript when selected and switches sessions by ID", async () => {
     const fetchMock = startupFetch((url) => {
       if (url === "/api/sessions")
         return response([recentSession, olderSession])
@@ -1304,6 +1385,7 @@ describe("local-first chat", () => {
     vi.stubGlobal("fetch", fetchMock)
 
     renderApp()
+    await openSavedSession("Persisted conversation")
 
     expect(
       await screen.findByText("What survived the restart?")
@@ -1763,6 +1845,7 @@ describe("local-first chat", () => {
     vi.stubGlobal("fetch", fetchMock)
 
     renderApp()
+    await openSavedSession("Persisted conversation")
     expect(
       await screen.findByText("Current session content")
     ).toBeInTheDocument()
@@ -2182,6 +2265,7 @@ describe("local-first chat", () => {
     vi.stubGlobal("fetch", fetchMock)
 
     renderApp()
+    await openSavedSession("Persisted conversation")
     expect(await screen.findByText("Recover after restart")).toBeInTheDocument()
     await userEvent.click(screen.getByRole("button", { name: "Retry" }))
 
@@ -2263,6 +2347,16 @@ describe("local-first chat", () => {
     vi.stubGlobal("fetch", fetchMock)
 
     renderApp()
+    await screen.findByRole("button", { name: "Persisted conversation" })
+    expect(
+      screen.getByText("What would you like to work on?")
+    ).toBeInTheDocument()
+    expect(methods).toEqual([])
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/sessions/session-recent/runs/latest",
+      expect.anything()
+    )
+    await openSavedSession("Persisted conversation")
     expect(await screen.findByText("Working")).toBeInTheDocument()
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
     expect(
@@ -2353,6 +2447,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
+    await openSavedSession("Persisted conversation")
     const reconnect = await screen.findByRole("button", {
       name: "Reconnect",
     })
@@ -2405,6 +2500,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
+    await openSavedSession("Persisted conversation")
     const reconnect = await screen.findByRole("button", {
       name: "Reconnect",
     })
@@ -2580,6 +2676,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
+    await openSavedSession("Persisted conversation")
     const approval = await screen.findByRole("region", {
       name: "Approval required for apply_patch",
     })
@@ -2679,6 +2776,7 @@ describe("local-first chat", () => {
     )
 
     renderApp()
+    await openSavedSession("Persisted conversation")
     expect(await screen.findByText("Recovered answer")).toBeInTheDocument()
     expect(attempts).toBe(2)
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
@@ -2772,6 +2870,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
+    await openSavedSession("Persisted conversation")
     await screen.findByText("Reconnecting to Trellis…")
     await user.click(screen.getByRole("button", { name: "Stop generating" }))
     expect(cancelled).toBe(true)
@@ -2877,6 +2976,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
+    await openSavedSession("Persisted conversation")
     const reconnect = await screen.findByRole(
       "button",
       { name: "Reconnect" },
@@ -2978,6 +3078,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
+    await openSavedSession("Persisted conversation")
     const approval = await screen.findByRole("region", {
       name: "Approval required for apply_patch",
     })
@@ -3077,6 +3178,7 @@ describe("local-first chat", () => {
       )
 
       renderApp()
+      await openSavedSession("Persisted conversation")
       expect(
         await screen.findByRole("button", { name: "Stop generating" })
       ).toBeInTheDocument()
@@ -3169,6 +3271,7 @@ describe("local-first chat", () => {
     )
 
     renderApp()
+    await openSavedSession("Persisted conversation")
     expect(
       await screen.findByRole("button", { name: "Stop generating" })
     ).toBeInTheDocument()
@@ -3256,6 +3359,7 @@ describe("local-first chat", () => {
 
     const user = userEvent.setup()
     renderApp()
+    await openSavedSession("Persisted conversation")
     expect(await screen.findByText("Saved answer")).toBeInTheDocument()
     expect(methods).toEqual([])
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
