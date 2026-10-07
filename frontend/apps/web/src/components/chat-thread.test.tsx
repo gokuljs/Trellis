@@ -142,4 +142,47 @@ describe("chat Markdown", () => {
     ).toBeInTheDocument()
     expect(screen.getByText("in progress").tagName).toBe("STRONG")
   })
+
+  it("shows the approval request instead of a thinking pulse while paused", () => {
+    render(
+      <ChatThread
+        session={session}
+        messages={[{ ...message("Run a command"), role: "user", model: null }]}
+        pending
+        streamingText={null}
+        error={null}
+        canRetry={false}
+        canCancel
+        cancellationPending={false}
+        activeRunTurnId="turn-1"
+        runActivities={{
+          "turn-1": {
+            runInfo: null,
+            events: [
+              {
+                runId: "run-1",
+                sequence: 1,
+                eventType: "tool.approval_requested",
+                eventVersion: 1,
+                data: {
+                  tool_call_id: "tool-1",
+                  name: "run_command",
+                  preview: { command: "git status" },
+                },
+              },
+            ],
+          },
+        }}
+        onRetry={() => undefined}
+        onCancel={() => undefined}
+      />
+    )
+
+    expect(
+      screen.getByRole("region", { name: "Approval required for run_command" })
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByLabelText("Assistant response pending")
+    ).not.toBeInTheDocument()
+  })
 })

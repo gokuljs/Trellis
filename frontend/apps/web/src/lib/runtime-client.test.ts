@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { cancelRun, streamRun } from "@/lib/runtime-client"
+import {
+  cancelRun,
+  respondToToolApproval,
+  streamRun,
+} from "@/lib/runtime-client"
 
 type SocketMessage = { data: string }
 
@@ -67,6 +71,54 @@ afterEach(() => {
 })
 
 describe("streamRun", () => {
+  it("reports the selected run limits from the start response", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-budget",
+          status: "running",
+          lastSequence: 0,
+          budgetPreset: "conservative",
+          limits: {
+            maxModelCalls: 8,
+            maxToolCalls: 16,
+            maxTotalTokens: 100000,
+            maxCostUsd: 2,
+            deadlineAt: "2026-10-07T12:10:00Z",
+          },
+        },
+      })
+      socket.reply(event("run-budget", 1, "run.completed", {}))
+    }
+    const onRunInfo = vi.fn()
+
+    await streamRun(
+      {
+        sessionId: "session-1",
+        turnId: "turn-budget",
+        clientRequestId: "request-budget",
+        content: "Hello",
+      },
+      { onRunInfo }
+    )
+
+    expect(onRunInfo).toHaveBeenCalledWith({
+      runId: "run-budget",
+      budgetPreset: "conservative",
+      limits: {
+        maxModelCalls: 8,
+        maxToolCalls: 16,
+        maxTotalTokens: 100000,
+        maxCostUsd: 2,
+        deadlineAt: "2026-10-07T12:10:00Z",
+      },
+    })
+  })
+
   it("starts a run and delivers ordered events through terminal completion", async () => {
     vi.stubGlobal("WebSocket", MockWebSocket)
     MockWebSocket.onSend = (socket, payload) => {
@@ -259,5 +311,62 @@ describe("cancelRun", () => {
       runId: "run-stop",
       status: "cancelling",
     })
+  })
+})
+
+describe("respondToToolApproval", () => {
+  it("answers the exact waiting call at the current event cursor", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      expect(request).toMatchObject({
+        jsonrpc: "2.0",
+        method: "run.respond",
+        params: {
+          runId: "run-edit",
+          toolCallId: "tool-7",
+          decision: "approved",
+          afterSequence: 12,
+        },
+      })
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-edit",
+          status: "waiting_for_approval",
+          toolCallId: "tool-7",
+          decision: "approved",
+        },
+      })
+    }
+
+    await expect(
+      respondToToolApproval("run-edit", "tool-7", "approved", 12)
+    ).resolves.toEqual({
+      runId: "run-edit",
+      toolCallId: "tool-7",
+      decision: "approved",
+    })
+  })
+
+  it("surfaces a late decision as a retryable local error", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: {
+          code: -32000,
+          message: "This tool call is not waiting for approval.",
+          data: { code: "approval_not_pending" },
+        },
+      })
+    }
+
+    await expect(
+      respondToToolApproval("run-edit", "tool-7", "denied", 12)
+    ).rejects.toMatchObject({ code: "approval_not_pending" })
   })
 })

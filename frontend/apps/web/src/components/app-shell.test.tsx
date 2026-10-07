@@ -241,6 +241,459 @@ afterEach(() => {
 })
 
 describe("local-first chat", () => {
+  it("shows an approval preview, answers it, and keeps the ordered tool result in chat", async () => {
+    const created = {
+      ...recentSession,
+      id: "session-approval",
+      message_count: 0,
+      workspace_path: "/tmp/trellis-project",
+    }
+    let runSocket: TestWebSocket | null = null
+    let turnId = ""
+    const decisionGate = deferred<void>()
+    const requests: Record<string, unknown>[] = []
+    installRuntimeServer((socket, request) => {
+      requests.push(request)
+      if (request.method === "run.start") {
+        runSocket = socket
+        turnId = String((request.params as Record<string, unknown>).turnId)
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-approval",
+            status: "running",
+            lastSequence: 0,
+            budgetPreset: "conservative",
+            limits: {
+              maxModelCalls: 8,
+              maxToolCalls: 16,
+              maxTotalTokens: 100000,
+              maxCostUsd: 2,
+              deadlineAt: "2026-10-07T12:10:00Z",
+            },
+          },
+        })
+        runtimeEvent(socket, "run-approval", 1, "run.queued", {
+          status: "queued",
+        })
+        runtimeEvent(socket, "run-approval", 2, "run.started", {
+          status: "running",
+        })
+        runtimeEvent(socket, "run-approval", 3, "model.usage", {
+          input_tokens: 20,
+          output_tokens: 10,
+          total_tokens: 30,
+          total_estimated_cost_usd: 0.001,
+        })
+        runtimeEvent(socket, "run-approval", 4, "model.completed", {})
+        runtimeEvent(socket, "run-approval", 5, "tool.call", {
+          tool_call_id: "tool-patch",
+          name: "apply_patch",
+          arguments: { path: "src/main.ts" },
+        })
+        runtimeEvent(socket, "run-approval", 6, "tool.approval_requested", {
+          tool_call_id: "tool-patch",
+          name: "apply_patch",
+          preview: { path: "src/main.ts", diff: "-old\n+new" },
+        })
+      } else if (request.method === "run.respond") {
+        expect(request.params).toMatchObject({
+          runId: "run-approval",
+          toolCallId: "tool-patch",
+          decision: "approved",
+          afterSequence: 6,
+        })
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-approval",
+            status: "waiting_for_approval",
+            toolCallId: "tool-patch",
+            decision: "approved",
+          },
+        })
+        if (!runSocket) throw new Error("Run socket missing")
+        const eventSocket = runSocket
+        void decisionGate.promise.then(() => {
+          runtimeEvent(
+            eventSocket,
+            "run-approval",
+            7,
+            "tool.approval_decided",
+            {
+              tool_call_id: "tool-patch",
+              decision: "approved",
+            }
+          )
+          runtimeEvent(eventSocket, "run-approval", 8, "run.resumed", {
+            tool_call_id: "tool-patch",
+          })
+          runtimeEvent(eventSocket, "run-approval", 9, "tool.result", {
+            tool_call_id: "tool-patch",
+            status: "completed",
+            content: "Patch applied.",
+          })
+          runtimeEvent(eventSocket, "run-approval", 10, "model.usage", {
+            input_tokens: 40,
+            output_tokens: 10,
+            total_tokens: 80,
+            total_estimated_cost_usd: 0.002,
+          })
+          runtimeEvent(eventSocket, "run-approval", 11, "model.completed", {})
+          runtimeEvent(eventSocket, "run-approval", 12, "assistant.delta", {
+            text: "Updated.",
+          })
+          runtimeEvent(eventSocket, "run-approval", 13, "assistant.completed", {
+            content: "Updated.",
+          })
+          runtimeEvent(eventSocket, "run-approval", 14, "run.completed", {
+            status: "completed",
+          })
+        })
+      }
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url, init) => {
+        if (url === "/api/sessions" && init?.method === "POST")
+          return response(created, 201)
+        if (
+          url === "/api/sessions/session-approval" &&
+          (init?.method ?? "GET") === "GET"
+        ) {
+          return response({
+            session: { ...created, message_count: 2 },
+            messages: [
+              {
+                id: "user-approval",
+                turn_id: turnId,
+                role: "user",
+                content: "Update it",
+                provider: null,
+                model: null,
+                created_at: "2026-10-07T12:00:00Z",
+              },
+              {
+                id: "assistant-approval",
+                turn_id: turnId,
+                role: "assistant",
+                content: "Updated.",
+                provider: "openai",
+                model: "gpt-5.5",
+                created_at: "2026-10-07T12:00:01Z",
+              },
+            ],
+          })
+        }
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.type(
+      screen.getByRole("textbox", { name: "Message" }),
+      "Update it"
+    )
+    await user.click(screen.getByRole("button", { name: "Send" }))
+
+    const approval = await screen.findByRole("region", {
+      name: "Approval required for apply_patch",
+    })
+    expect(within(approval).getByText(/\+new/)).toBeInTheDocument()
+    expect(screen.getByText("30 / 100,000 tokens")).toBeInTheDocument()
+    await user.click(within(approval).getByRole("button", { name: "Approve" }))
+    await waitFor(() =>
+      expect(
+        within(approval).getByRole("button", { name: "Approve" })
+      ).toBeDisabled()
+    )
+    decisionGate.resolve()
+
+    expect(await screen.findByText("Patch applied.")).toBeInTheDocument()
+    expect(await screen.findByText("Updated.")).toBeInTheDocument()
+    expect(screen.getByText("80 / 100,000 tokens")).toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: "Approve" })
+    ).not.toBeInTheDocument()
+    expect(requests.map((request) => request.method)).toEqual([
+      "run.start",
+      "run.respond",
+    ])
+  })
+
+  it("accepts a second approval before the first response RPC returns", async () => {
+    const created = {
+      ...recentSession,
+      id: "session-two-approvals",
+      message_count: 0,
+    }
+    let runSocket: TestWebSocket | null = null
+    let turnId = ""
+    let firstResponse: {
+      socket: TestWebSocket
+      request: Record<string, unknown>
+    } | null = null
+    const decisions: Record<string, unknown>[] = []
+    installRuntimeServer((socket, request) => {
+      if (request.method === "run.start") {
+        runSocket = socket
+        turnId = String((request.params as Record<string, unknown>).turnId)
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-two-approvals",
+            status: "running",
+            lastSequence: 0,
+          },
+        })
+        runtimeEvent(
+          socket,
+          "run-two-approvals",
+          1,
+          "tool.approval_requested",
+          {
+            tool_call_id: "tool-1",
+            name: "run_command",
+            preview: { command: "git status" },
+          }
+        )
+        return
+      }
+      if (request.method !== "run.respond") return
+      decisions.push(request)
+      if (decisions.length === 1) {
+        firstResponse = { socket, request }
+        if (!runSocket) throw new Error("Run socket missing")
+        runtimeEvent(
+          runSocket,
+          "run-two-approvals",
+          2,
+          "tool.approval_decided",
+          {
+            tool_call_id: "tool-1",
+            decision: "approved",
+          }
+        )
+        runtimeEvent(runSocket, "run-two-approvals", 3, "tool.result", {
+          tool_call_id: "tool-1",
+          status: "completed",
+          content: "First command done.",
+        })
+        runtimeEvent(
+          runSocket,
+          "run-two-approvals",
+          4,
+          "tool.approval_requested",
+          {
+            tool_call_id: "tool-2",
+            name: "run_command",
+            preview: { command: "git diff" },
+          }
+        )
+        return
+      }
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "run-two-approvals", status: "waiting_for_approval" },
+      })
+      if (!runSocket || !firstResponse)
+        throw new Error("Approval sockets missing")
+      firstResponse.socket.reply({
+        jsonrpc: "2.0",
+        id: firstResponse.request.id,
+        result: { runId: "run-two-approvals", status: "waiting_for_approval" },
+      })
+      runtimeEvent(runSocket, "run-two-approvals", 5, "tool.approval_decided", {
+        tool_call_id: "tool-2",
+        decision: "approved",
+      })
+      runtimeEvent(runSocket, "run-two-approvals", 6, "assistant.delta", {
+        text: "Done.",
+      })
+      runtimeEvent(runSocket, "run-two-approvals", 7, "assistant.completed", {
+        content: "Done.",
+      })
+      runtimeEvent(runSocket, "run-two-approvals", 8, "run.completed", {
+        status: "completed",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url, init) => {
+        if (url === "/api/sessions" && init?.method === "POST")
+          return response(created, 201)
+        if (url === "/api/sessions/session-two-approvals")
+          return response({
+            session: { ...created, message_count: 2 },
+            messages: [
+              {
+                id: "user-two-approvals",
+                turn_id: turnId,
+                role: "user",
+                content: "Run two commands",
+                provider: null,
+                model: null,
+                created_at: "2026-10-07T12:00:00Z",
+              },
+              {
+                id: "assistant-two-approvals",
+                turn_id: turnId,
+                role: "assistant",
+                content: "Done.",
+                provider: "openai",
+                model: "gpt-5.5",
+                created_at: "2026-10-07T12:00:01Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+    renderApp()
+    await user.type(
+      await screen.findByRole("textbox", { name: "Message" }),
+      "Run two commands"
+    )
+    await user.click(screen.getByRole("button", { name: "Send" }))
+    const firstApproval = await screen.findByRole("region", {
+      name: "Approval required for run_command",
+    })
+    await user.click(
+      within(firstApproval).getByRole("button", { name: "Approve" })
+    )
+    const secondApproval = (
+      await screen.findByText("git diff")
+    ).closest<HTMLElement>('[role="region"]')
+    if (!secondApproval) throw new Error("Second approval missing")
+    await user.click(
+      within(secondApproval).getByRole("button", { name: "Approve" })
+    )
+    await waitFor(() => expect(decisions).toHaveLength(2))
+    expect(
+      decisions.map(
+        (item) => (item.params as Record<string, unknown>).toolCallId
+      )
+    ).toEqual(["tool-1", "tool-2"])
+    expect(await screen.findByText("Done.")).toBeInTheDocument()
+  })
+
+  it("keeps earlier turn activity beside its answer after another run", async () => {
+    const created = {
+      ...recentSession,
+      id: "session-history",
+      message_count: 0,
+    }
+    const turnIds: string[] = []
+    let completedRuns = 0
+    installRuntimeServer((socket, request) => {
+      if (request.method !== "run.start") return
+      turnIds.push(String((request.params as Record<string, unknown>).turnId))
+      const runNumber = turnIds.length
+      const runId = `run-${runNumber}`
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId, status: "running", lastSequence: 0 },
+      })
+      if (runNumber === 1) {
+        runtimeEvent(socket, runId, 1, "tool.call", {
+          tool_call_id: "tool-1",
+          name: "read_file",
+          arguments: { path: "src/main.ts" },
+        })
+        runtimeEvent(socket, runId, 2, "tool.result", {
+          tool_call_id: "tool-1",
+          status: "completed",
+          content: "First tool output",
+        })
+      }
+      completedRuns = runNumber
+      runtimeEvent(socket, runId, runNumber === 1 ? 3 : 1, "assistant.delta", {
+        text: runNumber === 1 ? "First answer" : "Second answer",
+      })
+      runtimeEvent(
+        socket,
+        runId,
+        runNumber === 1 ? 4 : 2,
+        "assistant.completed",
+        {
+          content: runNumber === 1 ? "First answer" : "Second answer",
+        }
+      )
+      runtimeEvent(socket, runId, runNumber === 1 ? 5 : 3, "run.completed", {
+        status: "completed",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url, init) => {
+        if (url === "/api/sessions" && init?.method === "POST")
+          return response(created, 201)
+        if (url === "/api/sessions/session-history") {
+          const messages: TestMessage[] = []
+          for (let index = 0; index < completedRuns; index += 1) {
+            messages.push({
+              id: `user-${index}`,
+              turn_id: turnIds[index],
+              role: "user",
+              content: index === 0 ? "First prompt" : "Second prompt",
+              provider: null,
+              model: null,
+              created_at: "2026-10-07T12:00:00Z",
+            })
+            messages.push({
+              id: `assistant-${index}`,
+              turn_id: turnIds[index],
+              role: "assistant",
+              content: index === 0 ? "First answer" : "Second answer",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-10-07T12:00:01Z",
+            })
+          }
+          return response({
+            session: { ...created, message_count: messages.length },
+            messages,
+          })
+        }
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+    renderApp()
+    const composer = await screen.findByRole("textbox", { name: "Message" })
+    await user.type(composer, "First prompt")
+    await user.click(screen.getByRole("button", { name: "Send" }))
+    expect(await screen.findByText("First answer")).toBeInTheDocument()
+    expect(screen.getByText("First tool output")).toBeInTheDocument()
+
+    await user.type(composer, "Second prompt")
+    await user.click(screen.getByRole("button", { name: "Send" }))
+    expect(await screen.findByText("Second answer")).toBeInTheDocument()
+    const firstResult = screen.getByText("First tool output")
+    const firstAnswer = screen.getByText("First answer")
+    expect(
+      firstResult.compareDocumentPosition(firstAnswer) &
+        Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
+    const activities = screen.getAllByRole("region", { name: "Run activity" })
+    expect(activities).toHaveLength(2)
+    expect(
+      within(activities[0]).getByText("First tool output")
+    ).toBeInTheDocument()
+    expect(
+      firstAnswer.compareDocumentPosition(activities[1]) &
+        Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
+  })
+
   it("offers a per-run model choice with two configured models and sends the budget", async () => {
     const configuredSettings = {
       ...settings,

@@ -14,7 +14,14 @@ import { WorkspaceTopbar } from "@/components/workspace-topbar"
 import { WorkspaceAttachment } from "@/components/workspace-attachment"
 import { TestPresets } from "@/components/test-presets"
 import { ApiError, api } from "@/lib/api"
-import { RuntimeError, cancelRun, streamRun } from "@/lib/runtime-client"
+import {
+  RuntimeError,
+  cancelRun,
+  respondToToolApproval,
+  streamRun,
+  type ToolApprovalDecision,
+  type TurnRunActivity,
+} from "@/lib/runtime-client"
 import type {
   Message,
   OnboardingStep,
@@ -77,6 +84,14 @@ export function AppShell() {
   const [pending, setPending] = useState(false)
   const [streamingText, setStreamingText] = useState<string | null>(null)
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
+  const [runActivities, setRunActivities] = useState<
+    Record<string, TurnRunActivity>
+  >({})
+  const [activeRunTurnId, setActiveRunTurnId] = useState<string | null>(null)
+  const [approvalPendingToolId, setApprovalPendingToolId] = useState<
+    string | null
+  >(null)
+  const [approvalError, setApprovalError] = useState<string | null>(null)
   const [cancellingRun, setCancellingRun] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [failedTurn, setFailedTurn] = useState<FailedTurn | null>(null)
@@ -88,6 +103,7 @@ export function AppShell() {
     null
   )
   const cancelRequestRef = useRef(false)
+  const approvalRequestRef = useRef<string | null>(null)
 
   const restoreSessions = useCallback(
     async (isCancelled: () => boolean = () => false) => {
@@ -198,6 +214,11 @@ export function AppShell() {
     setMessages([])
     setStreamingText(null)
     setActiveRunId(null)
+    setRunActivities({})
+    setActiveRunTurnId(null)
+    setApprovalPendingToolId(null)
+    setApprovalError(null)
+    approvalRequestRef.current = null
     setCancellingRun(false)
     cancelRequestRef.current = false
     activeRunRef.current = null
@@ -232,6 +253,11 @@ export function AppShell() {
     setMessages([])
     setStreamingText(null)
     setActiveRunId(null)
+    setRunActivities({})
+    setActiveRunTurnId(null)
+    setApprovalPendingToolId(null)
+    setApprovalError(null)
+    approvalRequestRef.current = null
     setCancellingRun(false)
     cancelRequestRef.current = false
     activeRunRef.current = null
@@ -276,6 +302,14 @@ export function AppShell() {
     setError(null)
     setStreamingText(null)
     setActiveRunId(null)
+    setRunActivities((current) => ({
+      ...current,
+      [turn.turnId]: { events: [], runInfo: null },
+    }))
+    setActiveRunTurnId(turn.turnId)
+    setApprovalPendingToolId(null)
+    setApprovalError(null)
+    approvalRequestRef.current = null
     setCancellingRun(false)
     cancelRequestRef.current = false
     activeRunRef.current = null
@@ -309,9 +343,63 @@ export function AppShell() {
             activeRunRef.current = { runId, lastSequence: 0 }
             setActiveRunId(runId)
           },
+          onRunInfo: (runInfo) =>
+            setRunActivities((current) => ({
+              ...current,
+              [turn.turnId]: {
+                events: current[turn.turnId]?.events ?? [],
+                runInfo,
+              },
+            })),
           onEvent: (event) => {
-            if (activeRunRef.current?.runId === event.runId) {
-              activeRunRef.current.lastSequence = event.sequence
+            if (activeRunRef.current?.runId !== event.runId) return
+            activeRunRef.current.lastSequence = event.sequence
+            if (
+              event.eventType !== "assistant.delta" &&
+              event.eventType !== "assistant.completed"
+            ) {
+              setRunActivities((current) => {
+                const activity = current[turn.turnId] ?? {
+                  events: [],
+                  runInfo: null,
+                }
+                if (
+                  activity.events.some(
+                    (item) => item.sequence === event.sequence
+                  )
+                )
+                  return current
+                return {
+                  ...current,
+                  [turn.turnId]: {
+                    ...activity,
+                    events: [...activity.events, event],
+                  },
+                }
+              })
+            }
+            if (event.eventType === "tool.approval_decided") {
+              const decidedToolCallId = event.data.tool_call_id
+              if (typeof decidedToolCallId === "string") {
+                if (approvalRequestRef.current === decidedToolCallId)
+                  approvalRequestRef.current = null
+                setApprovalPendingToolId((current) =>
+                  current === decidedToolCallId ? null : current
+                )
+              }
+              setApprovalError(null)
+            }
+            if (
+              [
+                "run.cancellation_requested",
+                "run.completed",
+                "run.failed",
+                "run.cancelled",
+                "run.interrupted",
+              ].includes(event.eventType)
+            ) {
+              setApprovalPendingToolId(null)
+              approvalRequestRef.current = null
             }
             if (
               event.eventType === "assistant.delta" &&
@@ -377,6 +465,40 @@ export function AppShell() {
       cancelRequestRef.current = false
       setCancellingRun(false)
       if (activeSessionIdRef.current) setError(visibleError(cancelError))
+    }
+  }
+
+  const answerToolApproval = async (
+    toolCallId: string,
+    decision: ToolApprovalDecision
+  ) => {
+    const activeRun = activeRunRef.current
+    if (
+      !activeRun ||
+      approvalRequestRef.current !== null ||
+      approvalPendingToolId
+    )
+      return
+    approvalRequestRef.current = toolCallId
+    setApprovalPendingToolId(toolCallId)
+    setApprovalError(null)
+    try {
+      await respondToToolApproval(
+        activeRun.runId,
+        toolCallId,
+        decision,
+        activeRun.lastSequence
+      )
+    } catch (responseError) {
+      if (approvalRequestRef.current === toolCallId) {
+        setApprovalError(visibleError(responseError))
+        setApprovalPendingToolId((current) =>
+          current === toolCallId ? null : current
+        )
+      }
+    } finally {
+      if (approvalRequestRef.current === toolCallId)
+        approvalRequestRef.current = null
     }
   }
 
@@ -591,6 +713,13 @@ export function AppShell() {
               canRetry={failedTurn !== null && !pending}
               canCancel={pending && activeRunId !== null}
               cancellationPending={cancellingRun}
+              runActivities={runActivities}
+              activeRunTurnId={activeRunTurnId}
+              approvalPendingToolId={approvalPendingToolId}
+              approvalError={approvalError}
+              onApprovalDecision={(toolCallId, decision) =>
+                void answerToolApproval(toolCallId, decision)
+              }
               onRetry={() => void retryFailedTurn()}
               onCancel={() => void cancelActiveRun()}
             />

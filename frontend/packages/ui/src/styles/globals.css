@@ -1226,6 +1226,245 @@ html.theme-ripple-fallback::before {
     width: min(760px, 100%);
   }
 
+  .run-activity {
+    min-width: 0;
+    border: 1px solid var(--shell-line);
+    border-radius: 14px;
+    padding: 14px 16px 8px;
+    background: var(--shell-card);
+  }
+
+  .run-activity-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 4px 14px;
+    margin-bottom: 10px;
+  }
+
+  .run-activity-kicker {
+    color: var(--shell-text-strong);
+    font-size: 12px;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+  }
+
+  .run-activity-budget-name {
+    color: var(--shell-text-muted);
+    font-size: 11px;
+  }
+
+  .run-activity-budget {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding-bottom: 12px;
+  }
+
+  .run-activity-budget span,
+  .run-activity-budget time {
+    border: 1px solid var(--shell-line);
+    border-radius: 6px;
+    padding: 3px 7px;
+    color: var(--shell-text-muted);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.4;
+  }
+
+  .run-activity-list {
+    margin: 0 0 0 5px;
+    border-left: 1px solid var(--shell-line);
+    padding: 0 0 0 18px;
+    list-style: none;
+  }
+
+  .run-activity-entry {
+    position: relative;
+    min-width: 0;
+    padding: 3px 0 15px;
+  }
+
+  .run-activity-entry:last-child {
+    padding-bottom: 7px;
+  }
+
+  .run-activity-marker {
+    position: absolute;
+    top: 8px;
+    left: -23px;
+    width: 9px;
+    height: 9px;
+    border: 2px solid var(--shell-card);
+    border-radius: 50%;
+    background: var(--shell-text-faint);
+    box-shadow: 0 0 0 1px var(--shell-line);
+  }
+
+  .run-activity-entry.approval .run-activity-marker {
+    background: var(--warning);
+  }
+
+  .run-activity-entry.warning .run-activity-marker {
+    background: var(--destructive);
+  }
+
+  .run-activity-title {
+    color: var(--shell-text-strong);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.5;
+  }
+
+  .run-activity-detail {
+    min-width: 0;
+    margin-top: 3px;
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+  }
+
+  .run-activity-detail p {
+    margin: 0;
+  }
+
+  .run-activity-detail code,
+  .run-activity-path,
+  .run-approval-preview pre,
+  .run-tool-result {
+    font-family: var(
+      --font-mono,
+      ui-monospace,
+      SFMono-Regular,
+      Menlo,
+      monospace
+    );
+    font-size: 10px;
+  }
+
+  .run-activity-detail code {
+    color: var(--shell-text-bright);
+  }
+
+  .run-approval {
+    border: 1px solid color-mix(in srgb, var(--warning) 38%, var(--shell-line));
+    border-radius: 9px;
+    padding: 10px;
+    background: color-mix(in srgb, var(--warning) 6%, var(--shell-card));
+  }
+
+  .run-approval-tool {
+    margin-bottom: 6px;
+    color: var(--shell-text-strong);
+    font-family: var(
+      --font-mono,
+      ui-monospace,
+      SFMono-Regular,
+      Menlo,
+      monospace
+    );
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .run-approval-preview {
+    display: grid;
+    gap: 5px;
+    min-width: 0;
+  }
+
+  .run-approval-arguments {
+    margin-top: 8px;
+  }
+
+  .run-approval-arguments summary {
+    width: fit-content;
+    color: var(--shell-text-strong);
+    cursor: pointer;
+  }
+
+  .run-approval-arguments pre {
+    max-height: 240px;
+    overflow: auto;
+    margin: 6px 0 0;
+    border: 1px solid var(--shell-line);
+    border-radius: 6px;
+    padding: 8px;
+    color: var(--shell-text-bright);
+    background: var(--shell-card);
+    font-family: var(
+      --font-mono,
+      ui-monospace,
+      SFMono-Regular,
+      Menlo,
+      monospace
+    );
+    font-size: 10px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .run-activity-path {
+    color: var(--shell-text-strong);
+    overflow-wrap: anywhere;
+  }
+
+  .run-approval-preview pre,
+  .run-tool-result {
+    max-height: 240px;
+    overflow: auto;
+    margin: 0;
+    border: 1px solid var(--shell-line);
+    border-radius: 6px;
+    padding: 8px;
+    color: var(--shell-text-bright);
+    background: var(--shell-card);
+    line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .run-approval-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    margin-top: 10px;
+  }
+
+  .run-approval-actions button {
+    min-height: 30px;
+    border: 1px solid var(--shell-line);
+    border-radius: 7px;
+    padding: 0 10px;
+    color: var(--shell-text-strong);
+    background: var(--shell-card);
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .run-approval-actions button:first-child {
+    border-color: var(--shell-accent-strong);
+    color: var(--shell-bg);
+    background: var(--shell-accent-strong);
+  }
+
+  .run-approval-actions button:hover:not(:disabled) {
+    filter: brightness(0.9);
+  }
+
+  .run-approval-actions button:focus-visible {
+    outline: 2px solid var(--shell-focus);
+    outline-offset: 2px;
+  }
+
+  .run-approval-actions button:disabled {
+    cursor: wait;
+    opacity: 0.55;
+  }
+
   .thread-messages {
     display: grid;
     gap: 30px;

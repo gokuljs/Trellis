@@ -526,3 +526,38 @@ coverage. Frontend format, lint, typecheck, 39 tests, and build passed.
 
 **Next.** Show the ordered model and tool work, usage, budget limits, and
 approval controls inside chat.
+
+## Step 14 — Show tool activity and approvals
+
+**Why this step exists.** Earlier steps saved model and tool work, but chat did
+not show that work while a run was underway. A user needs to see which tool was
+requested, what it returned, and exactly what they are approving before the
+agent continues.
+
+**What works now.** Each turn has an ordered activity timeline beside its chat
+messages. It shows model steps, working notes, tool requests and results,
+approval decisions, failures, estimated cost, token use, and the selected run
+limits. An approval card shows the saved command or patch preview and the tool
+arguments, with Approve and Deny controls. A decision stays disabled until its
+saved event arrives; a later approval can still be answered if its event arrives
+before the earlier WebSocket reply. Activity from an earlier turn remains beside
+that turn when another turn starts in the same page. Refresh recovery comes in
+the next step.
+
+**Follow the code.** `backend/app/application/runs.py` saves and publishes each
+event, and `backend/app/api/routes/runtime.py` sends it as `run.event`.
+`frontend/apps/web/src/lib/runtime-client.ts` validates, orders, and replays
+events across a WebSocket reconnect. `frontend/apps/web/src/components/app-shell.tsx`
+keeps the events by turn, advances the run cursor, and sends approval decisions
+through `run.respond`. `frontend/apps/web/src/components/chat-thread.tsx`
+places each timeline beside its answer, and `run-activity.tsx` renders the
+limits, results, and approval controls. Streaming text chunks stay in the
+temporary answer display instead of filling the activity history.
+
+**Verification.** Focused failing tests first exposed the missing timeline,
+lost activity after a second turn, and a second approval click ignored when its
+event arrived before the previous RPC reply. The reviewed implementation passed
+frontend formatting, lint, typecheck, all 51 tests, and build with Node 24.
+
+**Next.** Find the latest saved run after a page refresh, replay its events,
+and show Retry only after the saved state is known.
