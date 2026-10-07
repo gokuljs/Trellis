@@ -18,11 +18,14 @@ type ChatThreadProps = {
   pending: boolean
   streamingText: string | null
   error: string | null
+  activityHistoryError?: string | null
+  onRetryActivityHistory?: () => void
   canRetry: boolean
   canReconnect?: boolean
   canCancel: boolean
   cancellationPending: boolean
   runActivities?: Record<string, TurnRunActivity>
+  onRequestActivityEvents?: (turnId: string) => void
   activeRunTurnId?: string | null
   approvalPendingToolId?: string | null
   approvalError?: string | null
@@ -88,11 +91,14 @@ export function ChatThread({
   pending,
   streamingText,
   error,
+  activityHistoryError = null,
+  onRetryActivityHistory = () => undefined,
   canRetry,
   canReconnect = false,
   canCancel,
   cancellationPending,
   runActivities = {},
+  onRequestActivityEvents = () => undefined,
   activeRunTurnId = null,
   approvalPendingToolId = null,
   approvalError = null,
@@ -126,22 +132,23 @@ export function ChatThread({
   )
   const waitingForApproval =
     latestApprovalState?.eventType === "tool.approval_requested"
-  const activityForTurn = (turnId: string) => {
-    const activity = runActivities[turnId]
+  const activityForTurn = (turnId: string, assistantReply = false) => {
+    const activity =
+      runActivities[turnId] ??
+      (assistantReply ? { events: [], runInfo: null } : null)
     const active = activeRunTurnId === turnId
-    if (!activity || (!activity.events.length && !(active && pending)))
-      return null
+    if (!activity) return null
     return (
       <RunActivityDisclosure
         activity={activity}
         pending={pending && active}
         expanded={openActivityTurnId === turnId}
-        onToggle={() =>
-          setOpenActivityTurnId((current) =>
-            current === turnId ? null : turnId
-          )
-        }
+        onToggle={() => {
+          if (openActivityTurnId !== turnId) onRequestActivityEvents(turnId)
+          setOpenActivityTurnId(openActivityTurnId === turnId ? null : turnId)
+        }}
         onClose={() => setOpenActivityTurnId(null)}
+        onRequestEvents={() => onRequestActivityEvents(turnId)}
         approvalPendingToolId={active ? approvalPendingToolId : null}
         approvalError={active ? approvalError : null}
         onApprovalDecision={onApprovalDecision}
@@ -162,7 +169,7 @@ export function ChatThread({
           <Fragment key={message.id}>
             {message.role === "assistant" &&
             firstAssistantByTurn.get(message.turn_id) === message.id
-              ? activityForTurn(message.turn_id)
+              ? activityForTurn(message.turn_id, true)
               : null}
             <article
               className={`thread-message ${message.role}`}
@@ -240,6 +247,18 @@ export function ChatThread({
               <RotateCcw size={13} aria-hidden="true" /> Reconnect
             </button>
           ) : null}
+        </div>
+      ) : null}
+      {activityHistoryError ? (
+        <div className="chat-error" role="alert">
+          <span>{activityHistoryError}</span>
+          <button
+            type="button"
+            onClick={onRetryActivityHistory}
+            disabled={pending}
+          >
+            <RotateCcw size={13} aria-hidden="true" /> Retry activity
+          </button>
         </div>
       ) : null}
       {canCancel ? (

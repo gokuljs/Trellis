@@ -1,6 +1,8 @@
 import type {
   Profile,
   LatestRun,
+  RunSummary,
+  SavedRunEvent,
   OnboardingState,
   ProviderId,
   Session,
@@ -125,6 +127,14 @@ export const api = {
     request<SessionDetail>(`/api/sessions/${sessionId}`),
   getLatestRun: (sessionId: string) =>
     request<LatestRun | null>(`/api/sessions/${sessionId}/runs/latest`),
+  listRunSummaries: (sessionId: string, offset: number) =>
+    request<{ items: RunSummary[]; next_offset: number | null }>(
+      `/api/sessions/${sessionId}/runs?offset=${offset}&limit=100`
+    ),
+  listRunEvents: (sessionId: string, runId: string, afterSequence: number) =>
+    request<{ items: SavedRunEvent[]; next_after_sequence: number | null }>(
+      `/api/sessions/${sessionId}/runs/${encodeURIComponent(runId)}/events?after_sequence=${afterSequence}&limit=500`
+    ),
   listTestPresets: (sessionId: string) =>
     request<TestPreset[]>(`/api/sessions/${sessionId}/test-presets`),
   saveTestPreset: (sessionId: string, preset: TestPreset) =>

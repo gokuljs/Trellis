@@ -91,6 +91,32 @@ export type LatestRun = {
   last_sequence: number
 }
 
+export type RunSummary = {
+  run_id: string
+  turn_id: string
+  retry_of: string | null
+  status: string
+  budget_preset: string
+  max_model_calls: number
+  max_tool_calls: number
+  max_total_tokens: number
+  max_cost_usd: number
+  deadline_at: string
+  last_sequence: number
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+}
+
+export type SavedRunEvent = {
+  run_id: string
+  sequence: number
+  event_type: string
+  event_version: number
+  data: Record<string, unknown>
+  created_at: string
+}
+
 export type TurnResult = {
   session: Session
   user_message: Message

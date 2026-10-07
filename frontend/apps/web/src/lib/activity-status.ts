@@ -1,5 +1,6 @@
 import type { OrbState } from "thinking-orbs"
 
+import type { RunSummary } from "@/lib/app-types"
 import type { RuntimeRunEvent } from "@/lib/runtime-client"
 
 export type ActivityStatus = {
@@ -74,9 +75,40 @@ export function describeActivity(
   events: RuntimeRunEvent[],
   pending: boolean,
   now: number,
-  latestEvent?: RuntimeRunEvent
+  latestEvent?: RuntimeRunEvent,
+  summary?: RunSummary
 ): ActivityStatus {
   if (events.length === 0 && !latestEvent) {
+    if (summary) {
+      const eventType =
+        {
+          queued: "run.queued",
+          waiting_for_approval: "tool.approval_requested",
+          cancelling: "run.cancellation_requested",
+          completed: "run.completed",
+          failed: "run.failed",
+          cancelled: "run.cancelled",
+          interrupted: "run.interrupted",
+        }[summary.status] ?? "run.started"
+      const terminal = terminalEvents.has(eventType)
+      const start = Date.parse(summary.created_at)
+      const finish =
+        terminal && summary.finished_at ? Date.parse(summary.finished_at) : now
+      return {
+        ...currentState({
+          runId: summary.run_id,
+          sequence: summary.last_sequence,
+          eventType,
+          eventVersion: 1,
+          data: {},
+        }),
+        duration:
+          Number.isFinite(start) && Number.isFinite(finish)
+            ? elapsedLabel(finish - start)
+            : null,
+        terminal,
+      }
+    }
     return pending
       ? { label: "Thinking", orb: "working", duration: null, terminal: false }
       : {
@@ -94,9 +126,18 @@ export function describeActivity(
   const terminal = terminalEvents.has(latest.eventType)
   const queued =
     ordered.find((event) => event.eventType === "run.queued") ?? ordered[0]
-  const start = queued.createdAt ? Date.parse(queued.createdAt) : Number.NaN
-  const finish =
-    terminal && latest.createdAt ? Date.parse(latest.createdAt) : now
+  const start = queued.createdAt
+    ? Date.parse(queued.createdAt)
+    : summary
+      ? Date.parse(summary.created_at)
+      : Number.NaN
+  const finish = terminal
+    ? latest.createdAt
+      ? Date.parse(latest.createdAt)
+      : summary?.finished_at
+        ? Date.parse(summary.finished_at)
+        : Number.NaN
+    : now
   const duration =
     Number.isFinite(start) && Number.isFinite(finish)
       ? elapsedLabel(finish - start)

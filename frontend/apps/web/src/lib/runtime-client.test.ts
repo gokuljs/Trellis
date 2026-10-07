@@ -2,10 +2,32 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
   cancelRun,
+  mergeRunEvents,
   resumeRun,
   respondToToolApproval,
   streamRun,
 } from "@/lib/runtime-client"
+
+it("keeps newer live events when saved history overlaps a running stream", () => {
+  const event = (sequence: number, eventType: string) => ({
+    runId: "run-1",
+    sequence,
+    eventType,
+    eventVersion: 1,
+    data: {},
+  })
+  expect(
+    mergeRunEvents(
+      "run-1",
+      [event(1, "run.queued"), event(2, "run.started")],
+      [
+        { ...event(4, "run.failed"), runId: "another-attempt" },
+        event(2, "run.started"),
+        event(3, "tool.call"),
+      ]
+    ).map((item) => item.sequence)
+  ).toEqual([1, 2, 3])
+})
 
 type SocketMessage = { data: string }
 

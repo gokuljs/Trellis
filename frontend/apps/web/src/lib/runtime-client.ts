@@ -1,3 +1,5 @@
+import type { RunSummary } from "@/lib/app-types"
+
 export type RuntimeRunEvent = {
   runId: string
   sequence: number
@@ -23,6 +25,37 @@ export type TurnRunActivity = {
   events: RuntimeRunEvent[]
   runInfo: RuntimeRunInfo | null
   latestEvent?: RuntimeRunEvent
+  summary?: RunSummary
+  priorAttempts?: RunAttemptActivity[]
+  eventsLoading?: boolean
+  eventsError?: string | null
+}
+
+export type RunAttemptActivity = {
+  runId: string
+  summary: RunSummary | null
+  runInfo: RuntimeRunInfo | null
+  events: RuntimeRunEvent[] | null
+  loading?: boolean
+  error?: string | null
+}
+
+export function mergeRunEvents(
+  runId: string,
+  saved: RuntimeRunEvent[],
+  live: RuntimeRunEvent[]
+): RuntimeRunEvent[] {
+  const bySequence = new Map(
+    saved
+      .filter((event) => event.runId === runId)
+      .map((event) => [event.sequence, event])
+  )
+  for (const event of live) {
+    if (event.runId === runId) bySequence.set(event.sequence, event)
+  }
+  return [...bySequence.values()].sort(
+    (left, right) => left.sequence - right.sequence
+  )
 }
 
 export type ToolApprovalDecision = "approved" | "denied"

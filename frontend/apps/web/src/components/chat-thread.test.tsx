@@ -301,10 +301,14 @@ describe("chat Markdown", () => {
     expect(orb).toHaveAttribute("aria-hidden", "true")
   })
 
-  it("does not show the working orb when the assistant is idle", () => {
+  it("shows unavailable activity without a made-up duration for a saved reply with no run", () => {
     renderThread("A completed response")
 
-    expect(screen.queryByTestId("thinking-orb")).not.toBeInTheDocument()
+    expect(screen.getByText("Activity unavailable")).toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: /Activity unavailable/ })
+    ).toBeNull()
+    expect(screen.queryByText(/\ds/)).toBeNull()
   })
 
   it("shows the approval request in the expanded activity while paused", async () => {

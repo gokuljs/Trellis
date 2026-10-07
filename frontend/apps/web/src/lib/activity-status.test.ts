@@ -67,4 +67,34 @@ describe("activity status", () => {
       duration: null,
     })
   })
+
+  it("uses a saved summary before its events have been fetched", () => {
+    const status = describeActivity(
+      [],
+      false,
+      Date.parse("2026-10-07T13:00:00Z"),
+      undefined,
+      {
+        run_id: "run-1",
+        turn_id: "turn-1",
+        retry_of: null,
+        status: "completed",
+        budget_preset: "conservative",
+        max_model_calls: 8,
+        max_tool_calls: 16,
+        max_total_tokens: 100000,
+        max_cost_usd: 2,
+        deadline_at: "2026-10-07T12:10:00Z",
+        last_sequence: 7,
+        created_at: "2026-10-07T12:00:00Z",
+        started_at: "2026-10-07T12:00:01Z",
+        finished_at: "2026-10-07T12:00:12Z",
+      }
+    )
+    expect(status).toMatchObject({
+      label: "Completed",
+      duration: "12s",
+      terminal: true,
+    })
+  })
 })

@@ -1240,6 +1240,15 @@ html.theme-ripple-fallback::before {
     background: color-mix(in srgb, var(--shell-text-strong) 5%, transparent);
   }
 
+  .run-activity-trigger.unavailable {
+    cursor: default;
+  }
+
+  .run-activity-trigger.unavailable:hover {
+    color: var(--shell-text-muted);
+    background: transparent;
+  }
+
   .run-activity-trigger:focus-visible {
     outline: 2px solid var(--shell-text-strong);
     outline-offset: 2px;
@@ -1276,6 +1285,35 @@ html.theme-ripple-fallback::before {
 
   .run-activity-expanded {
     animation: run-activity-reveal 180ms ease-out both;
+  }
+
+  .run-activity-attempt + .run-activity-attempt,
+  .run-activity-attempt + .run-activity-attempt-label {
+    margin-top: 16px;
+  }
+
+  .run-activity-attempt-label {
+    margin: 8px 0 0 27px;
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    font-weight: 650;
+  }
+
+  .run-activity-load-state {
+    margin: 8px 0 6px 27px;
+    color: var(--shell-text-muted);
+    font-size: 11px;
+  }
+
+  .run-activity-retry {
+    margin: 4px 0 0 27px;
+    border: 0;
+    padding: 0;
+    color: var(--shell-text-strong);
+    background: transparent;
+    cursor: pointer;
+    font-size: 11px;
+    text-decoration: underline;
   }
 
   @keyframes run-activity-reveal {

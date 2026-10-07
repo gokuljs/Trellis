@@ -239,6 +239,8 @@ function startupFetch(
       return response(onboardingState)
     if (url === "/api/sessions" && method === "GET") return response([])
     if (url.endsWith("/runs/latest") && method === "GET") return response(null)
+    if (url.includes("/runs?") && method === "GET")
+      return response({ items: [], next_offset: null })
     throw new Error(`Unhandled request: ${method} ${url}`)
   })
 }
@@ -252,6 +254,227 @@ afterEach(() => {
 })
 
 describe("local-first chat", () => {
+  it("reports saved activity lookup failures and retries the chat load", async () => {
+    const session = {
+      ...recentSession,
+      id: "session-history-error",
+      message_count: 2,
+    }
+    let lookups = 0
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([session])
+        if (url === `/api/sessions/${session.id}`)
+          return response({
+            session,
+            messages: [
+              {
+                id: "user-error",
+                turn_id: "turn-error",
+                role: "user",
+                content: "Prompt",
+                provider: null,
+                model: null,
+                created_at: "2026-10-07T12:00:00Z",
+              },
+              {
+                id: "answer-error",
+                turn_id: "turn-error",
+                role: "assistant",
+                content: "Answer",
+                provider: "openai",
+                model: "gpt-5.5",
+                created_at: "2026-10-07T12:00:02Z",
+              },
+            ],
+          })
+        if (url === `/api/sessions/${session.id}/runs?offset=0&limit=100`) {
+          lookups += 1
+          if (lookups === 1) throw new Error("History unavailable")
+          return response({
+            items: [
+              {
+                run_id: "run-recovered-history",
+                turn_id: "turn-error",
+                retry_of: null,
+                status: "completed",
+                budget_preset: "conservative",
+                max_model_calls: 8,
+                max_tool_calls: 16,
+                max_total_tokens: 100000,
+                max_cost_usd: 2,
+                deadline_at: "2026-10-07T12:10:00Z",
+                last_sequence: 2,
+                created_at: "2026-10-07T12:00:00Z",
+                started_at: "2026-10-07T12:00:01Z",
+                finished_at: "2026-10-07T12:00:02Z",
+              },
+            ],
+            next_offset: null,
+          })
+        }
+        return undefined
+      })
+    )
+    renderApp()
+    await openSavedSession(session.title)
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("Saved activity could not be loaded")
+    await userEvent.click(
+      within(alert).getByRole("button", { name: "Retry activity" })
+    )
+    expect(
+      await screen.findByRole("button", { name: /^Completed/ })
+    ).toBeInTheDocument()
+    expect(screen.queryByText("Saved activity could not be loaded")).toBeNull()
+    expect(lookups).toBe(2)
+  })
+
+  it("loads paged saved attempts and fetches their events only when expanded", async () => {
+    const session = {
+      ...recentSession,
+      id: "session-saved-activity",
+      message_count: 2,
+    }
+    const turnId = "turn-saved-activity"
+    const runSummary = (runId: string, status: string, finishedAt: string) => ({
+      run_id: runId,
+      turn_id: turnId,
+      retry_of: runId === "attempt-2" ? "attempt-1" : null,
+      status,
+      budget_preset: "conservative",
+      max_model_calls: 8,
+      max_tool_calls: 16,
+      max_total_tokens: 100000,
+      max_cost_usd: 2,
+      deadline_at: "2026-10-07T12:10:00Z",
+      last_sequence: runId === "attempt-2" ? 3 : 2,
+      created_at: "2026-10-07T12:00:00Z",
+      started_at: "2026-10-07T12:00:01Z",
+      finished_at: finishedAt,
+    })
+    const fetchedEvents: string[] = []
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([session])
+        if (url === `/api/sessions/${session.id}`)
+          return response({
+            session,
+            messages: [
+              {
+                id: "user-saved",
+                turn_id: turnId,
+                role: "user",
+                content: "Try this",
+                provider: null,
+                model: null,
+                created_at: "2026-10-07T12:00:00Z",
+              },
+              {
+                id: "assistant-saved",
+                turn_id: turnId,
+                role: "assistant",
+                content: "Done",
+                provider: "openai",
+                model: "gpt-5.5",
+                created_at: "2026-10-07T12:00:05Z",
+              },
+            ],
+          })
+        if (url === `/api/sessions/${session.id}/runs?offset=0&limit=100`)
+          return response({
+            items: [runSummary("attempt-1", "failed", "2026-10-07T12:00:02Z")],
+            next_offset: 1,
+          })
+        if (url === `/api/sessions/${session.id}/runs?offset=1&limit=100`)
+          return response({
+            items: [
+              runSummary("attempt-2", "completed", "2026-10-07T12:00:05Z"),
+            ],
+            next_offset: null,
+          })
+        if (url.includes("/runs/attempt-1/events")) {
+          fetchedEvents.push(url)
+          return response({
+            items: [
+              {
+                run_id: "attempt-1",
+                sequence: 1,
+                event_type: "run.queued",
+                event_version: 1,
+                data: {},
+                created_at: "2026-10-07T12:00:00Z",
+              },
+              {
+                run_id: "attempt-1",
+                sequence: 2,
+                event_type: "run.failed",
+                event_version: 1,
+                data: { message: "First attempt failed" },
+                created_at: "2026-10-07T12:00:02Z",
+              },
+            ],
+            next_after_sequence: null,
+          })
+        }
+        if (url.includes("/runs/attempt-2/events")) {
+          fetchedEvents.push(url)
+          if (url.includes("after_sequence=0"))
+            return response({
+              items: [
+                {
+                  run_id: "attempt-2",
+                  sequence: 1,
+                  event_type: "run.queued",
+                  event_version: 1,
+                  data: {},
+                  created_at: "2026-10-07T12:00:00Z",
+                },
+                {
+                  run_id: "attempt-2",
+                  sequence: 2,
+                  event_type: "model.usage",
+                  event_version: 1,
+                  data: { input_tokens: 2, output_tokens: 1 },
+                  created_at: "2026-10-07T12:00:03Z",
+                },
+              ],
+              next_after_sequence: 2,
+            })
+          return response({
+            items: [
+              {
+                run_id: "attempt-2",
+                sequence: 3,
+                event_type: "run.completed",
+                event_version: 1,
+                data: {},
+                created_at: "2026-10-07T12:00:05Z",
+              },
+            ],
+            next_after_sequence: null,
+          })
+        }
+        return undefined
+      })
+    )
+    renderApp()
+    await openSavedSession(session.title)
+    const activity = await screen.findByRole("button", { name: /Completed/ })
+    expect(activity).toHaveTextContent("5s")
+    expect(fetchedEvents).toEqual([])
+    await userEvent.click(activity)
+    expect(await screen.findByText("First attempt failed")).toBeInTheDocument()
+    expect(screen.getByText("Model usage")).toBeInTheDocument()
+    expect(fetchedEvents).toHaveLength(3)
+    expect(screen.getByText("Attempt 1")).toBeInTheDocument()
+    await userEvent.click(activity)
+    await userEvent.click(activity)
+    expect(fetchedEvents).toHaveLength(3)
+  })
+
   it("omits Capabilities navigation and keeps the new-session welcome view", async () => {
     vi.stubGlobal(
       "fetch",
@@ -2318,6 +2541,9 @@ describe("local-first chat", () => {
     await user.click(within(alert).getByRole("button", { name: "Retry" }))
 
     expect(await screen.findByText("Recovered response")).toBeInTheDocument()
+    await user.click(screen.getByRole("button", { name: "Completed" }))
+    expect(screen.getByText("Attempt 1")).toBeInTheDocument()
+    expect(screen.getByText("The provider timed out.")).toBeInTheDocument()
     expect(attempts).toBe(2)
     expect(requestIds[0]).not.toBe(requestIds[1])
   })
@@ -2722,6 +2948,50 @@ describe("local-first chat", () => {
       "fetch",
       startupFetch((url) => {
         if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs?offset=0&limit=100")
+          return response({
+            items: [
+              {
+                run_id: "run-previous-attempt",
+                turn_id: turnId,
+                retry_of: null,
+                status: "failed",
+                budget_preset: "conservative",
+                max_model_calls: 8,
+                max_tool_calls: 16,
+                max_total_tokens: 100000,
+                max_cost_usd: 2,
+                deadline_at: "2026-10-07T12:10:00Z",
+                last_sequence: 2,
+                created_at: "2026-10-07T12:00:00Z",
+                started_at: "2026-10-07T12:00:01Z",
+                finished_at: "2026-10-07T12:00:02Z",
+              },
+            ],
+            next_offset: null,
+          })
+        if (url.includes("/runs/run-previous-attempt/events"))
+          return response({
+            items: [
+              {
+                run_id: "run-previous-attempt",
+                sequence: 1,
+                event_type: "run.queued",
+                event_version: 1,
+                data: {},
+                created_at: "2026-10-07T12:00:00Z",
+              },
+              {
+                run_id: "run-previous-attempt",
+                sequence: 2,
+                event_type: "run.failed",
+                event_version: 1,
+                data: { message: "Previous attempt failed" },
+                created_at: "2026-10-07T12:00:02Z",
+              },
+            ],
+            next_after_sequence: null,
+          })
         if (url === "/api/sessions/session-recent/runs/latest")
           return response({
             run_id: "run-refresh-approval",
@@ -2794,9 +3064,13 @@ describe("local-first chat", () => {
     const approval = await screen.findByRole("region", {
       name: "Approval required for apply_patch",
     })
+    expect(
+      await screen.findByText("Previous attempt failed")
+    ).toBeInTheDocument()
+    expect(screen.getByText("Attempt 1")).toBeInTheDocument()
     expect(detailLoads).toBeGreaterThanOrEqual(2)
     expect(within(approval).getByText(/\+new/)).toBeInTheDocument()
-    expect(screen.getByText("0 / 8 model calls")).toBeInTheDocument()
+    expect(screen.getAllByText("0 / 8 model calls")).toHaveLength(2)
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
     await user.click(within(approval).getByRole("button", { name: "Approve" }))
 
@@ -3344,25 +3618,12 @@ describe("local-first chat", () => {
     }
   )
 
-  it("waits for a saved failure event before showing Retry after refresh", async () => {
+  it("offers Retry for a saved terminal failure without replaying its events", async () => {
     const turnId = "0cbac0bb-d031-4ef2-a7e1-cc006487e756"
-    let runtimeSocket: TestWebSocket | null = null
-    installRuntimeServer((socket, request) => {
-      expect(request.method).toBe("run.resume")
-      runtimeSocket = socket
-      socket.reply({
-        jsonrpc: "2.0",
-        id: request.id,
-        result: {
-          runId: "run-failed-before-refresh",
-          status: "failed",
-          lastSequence: 2,
-        },
-      })
-      runtimeEvent(socket, "run-failed-before-refresh", 1, "run.queued", {
-        status: "queued",
-      })
-    })
+    const methods: string[] = []
+    installRuntimeServer((_socket, request) =>
+      methods.push(String(request.method))
+    )
     vi.stubGlobal(
       "fetch",
       startupFetch((url) => {
@@ -3395,30 +3656,15 @@ describe("local-first chat", () => {
 
     renderApp()
     await openSavedSession("Persisted conversation")
-    expect(
-      await screen.findByRole("button", { name: "Stop generating" })
-    ).toBeInTheDocument()
-    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
-
-    act(() => {
-      if (!runtimeSocket) throw new Error("failed run was not replayed")
-      runtimeEvent(
-        runtimeSocket,
-        "run-failed-before-refresh",
-        2,
-        "run.failed",
-        {
-          code: "provider_timeout",
-          message: "The provider timed out.",
-        }
-      )
-    })
-
     const alert = await screen.findByRole("alert")
-    expect(alert).toHaveTextContent("The provider timed out.")
+    expect(alert).toHaveTextContent(
+      "The previous assistant response did not complete."
+    )
     expect(
       within(alert).getByRole("button", { name: "Retry" })
     ).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Stop generating" })).toBeNull()
+    expect(methods).toEqual([])
   })
 
   it("starts new work without replaying a completed run from the restored timeline", async () => {

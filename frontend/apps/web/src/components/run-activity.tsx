@@ -6,6 +6,7 @@ import type {
 import { groupRunEvents } from "@/lib/run-event-groups"
 
 type RunActivityProps = {
+  label?: string
   events: RuntimeRunEvent[]
   runInfo: RuntimeRunInfo | null
   pending: boolean
@@ -89,6 +90,7 @@ function argumentSummary(argumentsValue: Record<string, unknown> | null) {
 }
 
 export function RunActivity({
+  label = "Run activity",
   events,
   runInfo,
   pending,
@@ -154,7 +156,7 @@ export function RunActivity({
   const deadline = deadlineAt ? new Date(deadlineAt) : null
 
   return (
-    <section className="run-activity" aria-label="Run activity">
+    <section className="run-activity" aria-label={label}>
       <div className="run-activity-header">
         <span className="run-activity-kicker">Activity</span>
         <span className="run-activity-budget-name">
@@ -187,7 +189,7 @@ export function RunActivity({
           </time>
         ) : null}
       </div>
-      <ol className="run-activity-list" aria-label="Run activity timeline">
+      <ol className="run-activity-list" aria-label="Run activity steps">
         {groups.map((group) => (
           <li className={`run-activity-group ${group.kind}`} key={group.key}>
             <h3 className="run-activity-group-title">{group.title}</h3>

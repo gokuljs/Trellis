@@ -16,11 +16,13 @@ import { ApiError, api } from "@/lib/api"
 import {
   RuntimeError,
   cancelRun,
+  mergeRunEvents,
   resumeRun,
   respondToToolApproval,
   streamRun,
   type RuntimeRunEvent,
   type RuntimeRunInfo,
+  type RunAttemptActivity,
   type ToolApprovalDecision,
   type TurnRunActivity,
 } from "@/lib/runtime-client"
@@ -30,6 +32,8 @@ import type {
   OnboardingStep,
   Profile,
   Session,
+  RunSummary,
+  SavedRunEvent,
   Settings,
   WorkspaceView,
 } from "@/lib/app-types"
@@ -81,6 +85,107 @@ const activeRunStatuses = new Set([
 ])
 const maxRestoredReconnectAttempts = 4
 
+function runInfoFromSummary(summary: RunSummary): RuntimeRunInfo {
+  return {
+    runId: summary.run_id,
+    budgetPreset: summary.budget_preset,
+    limits: {
+      maxModelCalls: summary.max_model_calls,
+      maxToolCalls: summary.max_tool_calls,
+      maxTotalTokens: summary.max_total_tokens,
+      maxCostUsd: summary.max_cost_usd,
+      deadlineAt: summary.deadline_at,
+    },
+  }
+}
+
+function activitiesFromSummaries(
+  summaries: RunSummary[]
+): Record<string, TurnRunActivity> {
+  const byTurn = new Map<string, RunSummary[]>()
+  for (const summary of summaries) {
+    const attempts = byTurn.get(summary.turn_id) ?? []
+    attempts.push(summary)
+    byTurn.set(summary.turn_id, attempts)
+  }
+  return Object.fromEntries(
+    [...byTurn].map(([turnId, attempts]) => {
+      const latest = attempts.at(-1)!
+      return [
+        turnId,
+        {
+          events: [],
+          runInfo: runInfoFromSummary(latest),
+          summary: latest,
+          priorAttempts: attempts
+            .slice(0, -1)
+            .map((summary): RunAttemptActivity => ({
+              runId: summary.run_id,
+              summary,
+              runInfo: runInfoFromSummary(summary),
+              events: null,
+            })),
+        },
+      ]
+    })
+  )
+}
+
+async function loadSessionRunSummaries(
+  sessionId: string
+): Promise<RunSummary[]> {
+  const runs: RunSummary[] = []
+  let offset = 0
+  while (true) {
+    const page = await api.listRunSummaries(sessionId, offset)
+    runs.push(...page.items)
+    if (page.next_offset === null) return runs
+    if (page.next_offset <= offset) throw new Error("Invalid run history page")
+    offset = page.next_offset
+  }
+}
+
+function savedRunEvent(event: SavedRunEvent): RuntimeRunEvent {
+  return {
+    runId: event.run_id,
+    sequence: event.sequence,
+    eventType: event.event_type,
+    eventVersion: event.event_version,
+    data: event.data,
+    createdAt: event.created_at,
+  }
+}
+
+async function loadRunEventHistory(
+  sessionId: string,
+  runId: string
+): Promise<RuntimeRunEvent[]> {
+  const events: RuntimeRunEvent[] = []
+  let afterSequence = 0
+  while (true) {
+    const page = await api.listRunEvents(sessionId, runId, afterSequence)
+    events.push(...page.items.map(savedRunEvent))
+    if (page.next_after_sequence === null) return events
+    if (page.next_after_sequence <= afterSequence)
+      throw new Error("Invalid run event page")
+    afterSequence = page.next_after_sequence
+  }
+}
+
+function startNextAttempt(previous?: TurnRunActivity): TurnRunActivity {
+  const priorAttempts = [...(previous?.priorAttempts ?? [])]
+  const runId = previous?.runInfo?.runId ?? previous?.summary?.run_id
+  if (runId && !priorAttempts.some((attempt) => attempt.runId === runId)) {
+    priorAttempts.push({
+      runId,
+      summary: previous?.summary ?? null,
+      runInfo: previous?.runInfo ?? null,
+      events: previous?.events.length ? previous.events : null,
+    })
+  }
+  return { events: [], runInfo: null, priorAttempts }
+}
+
 export function AppShell() {
   const [activeView, setActiveView] = useState<WorkspaceView>("New session")
   const [sidebarOpen, setSidebarOpen] = useState(false)
@@ -113,6 +218,9 @@ export function AppShell() {
   const [reconnectAvailable, setReconnectAvailable] = useState(false)
   const [cancellingRun, setCancellingRun] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [activityHistoryError, setActivityHistoryError] = useState<
+    string | null
+  >(null)
   const [failedTurn, setFailedTurn] = useState<FailedTurn | null>(null)
   const activeSessionIdRef = useRef<string | null>(null)
   const sessionLoadSequenceRef = useRef(0)
@@ -124,12 +232,14 @@ export function AppShell() {
   const runGenerationRef = useRef(0)
   const cancelRequestRef = useRef(false)
   const approvalRequestRef = useRef<string | null>(null)
+  const fetchingRunIdsRef = useRef(new Set<string>())
 
   const recordRunInfo = useCallback(
     (turnId: string, runInfo: RuntimeRunInfo) =>
       setRunActivities((current) => ({
         ...current,
         [turnId]: {
+          ...current[turnId],
           events: current[turnId]?.events ?? [],
           runInfo,
           latestEvent: current[turnId]?.latestEvent,
@@ -142,12 +252,17 @@ export function AppShell() {
     (turnId: string, event: RuntimeRunEvent) => {
       setRunActivities((current) => {
         const activity = current[turnId] ?? { events: [], runInfo: null }
+        if (activity.runInfo && activity.runInfo.runId !== event.runId)
+          return current
         const retain = !["assistant.delta", "assistant.completed"].includes(
           event.eventType
         )
         const events =
           retain &&
-          !activity.events.some((item) => item.sequence === event.sequence)
+          !activity.events.some(
+            (item) =>
+              item.runId === event.runId && item.sequence === event.sequence
+          )
             ? [...activity.events, event]
             : activity.events
         return {
@@ -187,6 +302,108 @@ export function AppShell() {
     },
     []
   )
+
+  const loadTurnEvents = (turnId: string) => {
+    const sessionId = activeSessionIdRef.current
+    const activity = runActivities[turnId]
+    if (!sessionId || !activity) return
+    const needed = [
+      ...(activity.priorAttempts ?? [])
+        .filter((attempt) => attempt.events === null)
+        .map((attempt) => attempt.runId),
+      ...(activity.summary && activity.events.length === 0
+        ? [activity.summary.run_id]
+        : []),
+    ]
+    void (async () => {
+      for (const runId of needed) {
+        if (fetchingRunIdsRef.current.has(runId)) continue
+        fetchingRunIdsRef.current.add(runId)
+        setRunActivities((current) => {
+          const turn = current[turnId]
+          if (!turn) return current
+          return {
+            ...current,
+            [turnId]: {
+              ...turn,
+              eventsLoading:
+                turn.summary?.run_id === runId || turn.eventsLoading,
+              eventsError:
+                turn.summary?.run_id === runId ? null : turn.eventsError,
+              priorAttempts: turn.priorAttempts?.map((attempt) =>
+                attempt.runId === runId
+                  ? { ...attempt, loading: true, error: null }
+                  : attempt
+              ),
+            },
+          }
+        })
+        try {
+          const events = await loadRunEventHistory(sessionId, runId)
+          if (activeSessionIdRef.current !== sessionId) return
+          setRunActivities((current) => {
+            const turn = current[turnId]
+            if (!turn) return current
+            const merged = mergeRunEvents(runId, events, turn.events)
+            const mostRecent = merged.at(-1)
+            const latestEvent =
+              turn.latestEvent?.runId === runId &&
+              turn.latestEvent.sequence > (mostRecent?.sequence ?? 0)
+                ? turn.latestEvent
+                : mostRecent
+            return {
+              ...current,
+              [turnId]: {
+                ...turn,
+                ...(turn.summary?.run_id === runId
+                  ? {
+                      events: merged,
+                      latestEvent,
+                      eventsLoading: false,
+                      eventsError: null,
+                    }
+                  : {}),
+                priorAttempts: turn.priorAttempts?.map((attempt) =>
+                  attempt.runId === runId
+                    ? { ...attempt, events, loading: false, error: null }
+                    : attempt
+                ),
+              },
+            }
+          })
+        } catch {
+          if (activeSessionIdRef.current !== sessionId) return
+          setRunActivities((current) => {
+            const turn = current[turnId]
+            if (!turn) return current
+            return {
+              ...current,
+              [turnId]: {
+                ...turn,
+                eventsLoading:
+                  turn.summary?.run_id === runId ? false : turn.eventsLoading,
+                eventsError:
+                  turn.summary?.run_id === runId
+                    ? "Could not load activity."
+                    : turn.eventsError,
+                priorAttempts: turn.priorAttempts?.map((attempt) =>
+                  attempt.runId === runId
+                    ? {
+                        ...attempt,
+                        loading: false,
+                        error: "Could not load this attempt.",
+                      }
+                    : attempt
+                ),
+              },
+            }
+          })
+        } finally {
+          fetchingRunIdsRef.current.delete(runId)
+        }
+      }
+    })()
+  }
 
   const restoreSessionRun = useCallback(
     async (
@@ -278,7 +495,7 @@ export function AppShell() {
         return
       }
 
-      if (!activeRunStatuses.has(latest.status) && !turn) {
+      if (!activeRunStatuses.has(latest.status)) {
         setPending(false)
         setStreamingText(null)
         setActiveRunId(null)
@@ -286,7 +503,13 @@ export function AppShell() {
         activeRunRef.current = null
         setReconnectAvailable(false)
         setCancellingRun(false)
-        setError(null)
+        if (turn && latest.status !== "completed") {
+          setFailedTurn(turn)
+          setError("The previous assistant response did not complete.")
+        } else {
+          setFailedTurn(null)
+          setError(null)
+        }
         return
       }
 
@@ -294,10 +517,27 @@ export function AppShell() {
       setError(null)
       setPending(!!turn || activeRunStatuses.has(latest.status))
       setStreamingText(null)
-      setRunActivities((current) => ({
-        ...current,
-        [latest.turn_id]: { events: [], runInfo: null },
-      }))
+      setRunActivities((current) => {
+        const previous = current[latest.turn_id]
+        const previousRunId =
+          previous?.runInfo?.runId ?? previous?.summary?.run_id
+        const aligned =
+          previousRunId && previousRunId !== latest.run_id
+            ? startNextAttempt(previous)
+            : previous
+        return {
+          ...current,
+          [latest.turn_id]: {
+            ...aligned,
+            events: [],
+            latestEvent: undefined,
+            runInfo: {
+              ...(aligned?.runInfo ?? {}),
+              runId: latest.run_id,
+            },
+          },
+        }
+      })
       setActiveRunTurnId(latest.turn_id)
       setApprovalPendingToolId(null)
       setApprovalError(null)
@@ -525,6 +765,7 @@ export function AppShell() {
     setStreamingText(null)
     setActiveRunId(null)
     setRunActivities({})
+    fetchingRunIdsRef.current.clear()
     setActiveRunTurnId(null)
     setApprovalPendingToolId(null)
     setApprovalError(null)
@@ -536,6 +777,7 @@ export function AppShell() {
     setSessionLoading(false)
     setFailedTurn(null)
     setError(null)
+    setActivityHistoryError(null)
     setActiveView("New session")
     setSidebarOpen(false)
     setSidebarCollapsed(false)
@@ -566,6 +808,7 @@ export function AppShell() {
     setStreamingText(null)
     setActiveRunId(null)
     setRunActivities({})
+    fetchingRunIdsRef.current.clear()
     setActiveRunTurnId(null)
     setApprovalPendingToolId(null)
     setApprovalError(null)
@@ -576,9 +819,19 @@ export function AppShell() {
     activeRunRef.current = null
     setSessionLoading(true)
     setError(null)
+    setActivityHistoryError(null)
     setFailedTurn(null)
     try {
-      const detail = await api.getSession(sessionId)
+      const [detail, history] = await Promise.all([
+        api.getSession(sessionId),
+        loadSessionRunSummaries(sessionId).then(
+          (summaries) => ({ summaries, error: null }),
+          () => ({
+            summaries: [] as RunSummary[],
+            error: "Saved activity could not be loaded.",
+          })
+        ),
+      ])
       if (
         sessionLoadSequenceRef.current !== loadSequence ||
         activeSessionIdRef.current !== sessionId
@@ -587,6 +840,8 @@ export function AppShell() {
       }
       setActiveSession(detail.session)
       setMessages(detail.messages)
+      setRunActivities(activitiesFromSummaries(history.summaries))
+      setActivityHistoryError(history.error)
       await restoreSessionRun(
         sessionId,
         detail.messages,
@@ -620,7 +875,7 @@ export function AppShell() {
     setActiveRunId(null)
     setRunActivities((current) => ({
       ...current,
-      [turn.turnId]: { events: [], runInfo: null },
+      [turn.turnId]: startNextAttempt(current[turn.turnId]),
     }))
     setActiveRunTurnId(turn.turnId)
     setApprovalPendingToolId(null)
@@ -994,11 +1249,16 @@ export function AppShell() {
               pending={pending}
               streamingText={streamingText}
               error={error}
+              activityHistoryError={activityHistoryError}
+              onRetryActivityHistory={() =>
+                void selectSession(activeSession.id)
+              }
               canRetry={failedTurn !== null && !pending}
               canReconnect={reconnectAvailable}
               canCancel={pending && activeRunId !== null}
               cancellationPending={cancellingRun}
               runActivities={runActivities}
+              onRequestActivityEvents={loadTurnEvents}
               activeRunTurnId={activeRunTurnId}
               approvalPendingToolId={approvalPendingToolId}
               approvalError={approvalError}
