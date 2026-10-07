@@ -4,9 +4,11 @@ import sqlite3
 import sys
 import threading
 from collections.abc import AsyncGenerator
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.application.tools import ToolRegistry
@@ -206,6 +208,29 @@ def test_session_run_history_pages_summaries_and_events(tmp_path: Path) -> None:
     assert [item["sequence"] for item in remaining_events.json()["items"]] == [3, 4, 5, 6, 7]
     assert remaining_events.json()["next_after_sequence"] is None
     assert all(item["created_at"] for item in remaining_events.json()["items"])
+
+
+def test_run_event_cursor_uses_page_lookahead_when_snapshot_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with configured_client(tmp_path, StreamingProvider()) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-history"})
+        session_id = client.post("/api/sessions").json()["id"]
+        run_id = start_completed_run(client, session_id, "stale-snapshot")
+        database = client.app.state.database
+        original_get_run = database.get_run
+
+        async def stale_get_run(requested_run_id: str):
+            snapshot = await original_get_run(requested_run_id)
+            assert snapshot is not None
+            return replace(snapshot, last_event_sequence=2)
+
+        monkeypatch.setattr(database, "get_run", stale_get_run)
+        page = client.get(f"/api/sessions/{session_id}/runs/{run_id}/events", params={"limit": 2})
+
+    assert page.status_code == 200
+    assert [item["sequence"] for item in page.json()["items"]] == [1, 2]
+    assert page.json()["next_after_sequence"] == 2
 
 
 def test_session_run_history_rejects_other_sessions_and_invalid_pages(tmp_path: Path) -> None:

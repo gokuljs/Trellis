@@ -289,13 +289,10 @@ class RunService:
         run = await self._runs.get_run(run_id)
         if run is None or run.session_id != session_id:
             raise ApplicationError("run_not_found", "Run not found.")
-        events = await self._runs.list_run_events(run_id, after_sequence, limit=limit)
-        next_sequence = (
-            events[-1].sequence
-            if events and events[-1].sequence < run.last_event_sequence
-            else None
-        )
-        return events, next_sequence
+        events = await self._runs.list_run_events(run_id, after_sequence, limit=limit + 1)
+        page = events[:limit]
+        next_sequence = page[-1].sequence if len(events) > limit else None
+        return page, next_sequence
 
     async def list_run_events(
         self,

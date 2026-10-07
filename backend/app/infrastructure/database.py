@@ -1029,7 +1029,7 @@ class Database:
         *,
         limit: int = 500,
     ) -> list[RunEvent]:
-        if after_sequence < 0 or not 1 <= limit <= 500:
+        if after_sequence < 0 or not 1 <= limit <= 501:
             raise ValueError("event cursor and limit are outside the supported range")
         async with self._connect() as connection:
             cursor = await connection.execute(
