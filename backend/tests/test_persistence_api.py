@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
-from app.domain.runtime import RunEventType, RunStatus
+from app.domain.runtime import ModelCallStatus, ModelMessage, ModelToolCall, RunEventType, RunStatus
 from app.infrastructure.database import (
     SCHEMA_V1,
     SCHEMA_V2,
@@ -349,6 +349,73 @@ def test_database_records_all_schema_migrations(tmp_path: Path) -> None:
         ).fetchall()
 
     assert versions == EXPECTED_SCHEMA_VERSIONS
+
+
+def test_fresh_database_keeps_one_continuation_column_after_restart(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+
+    asyncio.run(database.initialize())
+    asyncio.run(database.initialize())
+
+    with closing(sqlite3.connect(settings.database_path)) as connection:
+        columns = [row[1] for row in connection.execute("PRAGMA table_info(run_messages)")]
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+
+    assert columns.count("continuation_json") == 1
+    assert versions == [(version,) for version in range(1, 14)]
+
+
+def test_database_repairs_v12_run_messages_without_losing_rows(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+
+    async def create_existing_message() -> str:
+        await database.initialize()
+        session = await database.create_session()
+        model = (await database.list_models())[0]
+        run = await database.create_run(session.id, "turn-1", "request-1", "Inspect files", model)
+        await database.transition_run_record(
+            run.id, RunStatus.RUNNING, RunEventType.STARTED, {"status": "running"}
+        )
+        model_call = await database.create_model_call(run.id, 1, model, {"messages": []})
+        await database.update_model_call(model_call.id, ModelCallStatus.COMPLETED)
+        await database.record_assistant_message(
+            run.id, model_call.id, ModelMessage(role="assistant", content="Kept before repair")
+        )
+        return run.id
+
+    run_id = asyncio.run(create_existing_message())
+    with closing(sqlite3.connect(settings.database_path)) as connection:
+        connection.execute("ALTER TABLE run_messages DROP COLUMN continuation_json")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 13")
+        connection.commit()
+
+    asyncio.run(database.initialize())
+
+    async def append_new_message() -> list[str]:
+        model = (await database.list_models())[0]
+        model_call = await database.create_model_call(run_id, 2, model, {"messages": []})
+        await database.update_model_call(model_call.id, ModelCallStatus.COMPLETED)
+        await database.record_assistant_message(
+            run_id,
+            model_call.id,
+            ModelMessage(
+                role="assistant",
+                content="Checking files",
+                tool_calls=(ModelToolCall("file-call", "list_files", {"path": "."}),),
+            ),
+        )
+        return [message.content for message in await database.list_run_messages(run_id)]
+
+    assert asyncio.run(append_new_message()) == ["Kept before repair", "Checking files"]
+    with closing(sqlite3.connect(settings.database_path)) as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+    assert versions == [(version,) for version in range(1, 14)]
 
 
 def test_database_upgrades_an_existing_v1_schema(tmp_path: Path) -> None:

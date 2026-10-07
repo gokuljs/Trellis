@@ -639,3 +639,35 @@ one complete run through the code in execution order.
 | `backend/app/application/tools.py` and `backend/app/infrastructure/command_tools.py` | Validate the tool request, prepare approval, and execute the bounded command. |
 | `backend/app/infrastructure/database.py` | Save the ordered exchange, approval decision, result, deadline, and final turn. |
 | `frontend/apps/web/src/components/chat-thread.tsx` and `run-activity.tsx` | Show the ordered work, approval controls, and final answer. |
+
+## Step 16 — Repair legacy run message schema
+
+**Why this step exists.** Databases created before the agent foundation work
+already recorded migration 6. That migration gained a `continuation_json`
+column in the source, but changing an old migration does not change databases
+that already applied it. When a model requested a tool, saving its assistant
+message raised `OperationalError: table run_messages has no column named
+continuation_json`. The run failed before its tool could start.
+
+**What works now.** On startup, migration 13 checks the actual `run_messages`
+columns. It adds `continuation_json` to older databases that lack it, and
+records the migration without adding a duplicate column to a fresh database.
+Existing messages and runs stay in place. Runs that already failed remain
+failed; send the prompt again to start a new run.
+
+**Follow the code.** `Database.initialize` in
+`backend/app/infrastructure/database.py` reads the schema version, inspects
+`PRAGMA table_info(run_messages)`, and applies the conditional change and
+migration record in one transaction. Later, `record_assistant_message` saves
+the assistant message and its tool-call continuation using that column.
+`backend/tests/test_persistence_api.py` exercises both fresh initialization
+and an existing version 12 database with a saved message.
+
+**Verification.** A regression test reproduced the missing-column failure
+before the migration. The repaired database kept its earlier message and
+accepted a new assistant tool call. The pinned uv 0.12.5 `make check` passed
+Ruff formatting, Ruff linting, `ty`, and all 254 backend tests with 90.31%
+coverage.
+
+**Next.** Retry any run that failed with the missing-column error. Its new
+model and tool steps will use the repaired schema.

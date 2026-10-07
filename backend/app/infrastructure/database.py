@@ -42,7 +42,7 @@ from app.domain.runtime import (
     validate_run_event_transition,
 )
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 TURN_CLAIM_TTL = timedelta(minutes=5)
 
 MIGRATION_TABLE_SCHEMA = """
@@ -353,6 +353,10 @@ ALTER TABLE app_settings ADD COLUMN default_budget_preset TEXT NOT NULL
     CHECK (default_budget_preset IN ('conservative', 'longer'));
 """
 
+SCHEMA_V13 = """
+ALTER TABLE run_messages ADD COLUMN continuation_json TEXT NOT NULL DEFAULT '[]';
+"""
+
 MIGRATIONS = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
@@ -366,6 +370,7 @@ MIGRATIONS = {
     10: SCHEMA_V10,
     11: SCHEMA_V11,
     12: SCHEMA_V12,
+    13: SCHEMA_V13,
 }
 
 
@@ -393,6 +398,23 @@ class Database:
                 )
             for version in range(current_version + 1, SCHEMA_VERSION + 1):
                 migration = MIGRATIONS[version]
+                if version == 13:
+                    await connection.execute("BEGIN IMMEDIATE")
+                    try:
+                        cursor = await connection.execute("PRAGMA table_info(run_messages)")
+                        columns = {row["name"] for row in await cursor.fetchall()}
+                        if "continuation_json" not in columns:
+                            await connection.execute(migration)
+                        await connection.execute(
+                            """INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+                               VALUES (?, STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'))""",
+                            (version,),
+                        )
+                        await connection.commit()
+                    except BaseException:
+                        await connection.rollback()
+                        raise
+                    continue
                 await connection.executescript(
                     f"""
                     BEGIN IMMEDIATE;
