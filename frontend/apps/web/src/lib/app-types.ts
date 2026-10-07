@@ -85,6 +85,13 @@ export type TestPreset = {
   cwd: string
 }
 
+export type LatestRun = {
+  run_id: string
+  turn_id: string
+  status: string
+  last_sequence: number
+}
+
 export type TurnResult = {
   session: Session
   user_message: Message

@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
-from app.api.dependencies import ChatServiceDep, SessionServiceDep
+from app.api.dependencies import ChatServiceDep, RunServiceDep, SessionServiceDep
 from app.domain.models import Message, Session
 
 
@@ -33,6 +33,13 @@ class MessageResponse(BaseModel):
 class SessionDetailResponse(BaseModel):
     session: SessionResponse
     messages: list[MessageResponse]
+
+
+class LatestRunResponse(BaseModel):
+    run_id: str
+    turn_id: str
+    status: str
+    last_sequence: int
 
 
 class TurnRequest(BaseModel):
@@ -99,6 +106,21 @@ async def get_session(session_id: str, service: SessionServiceDep) -> SessionDet
     return SessionDetailResponse(
         session=serialize_session(detail.session),
         messages=[serialize_message(message) for message in detail.messages],
+    )
+
+
+@router.get("/{session_id}/runs/latest")
+async def get_latest_run(session_id: str, service: RunServiceDep) -> LatestRunResponse | None:
+    run = await service.get_latest_run_for_session(session_id)
+    return (
+        None
+        if run is None
+        else LatestRunResponse(
+            run_id=run.id,
+            turn_id=run.turn_id,
+            status=run.status.value,
+            last_sequence=run.last_event_sequence,
+        )
     )
 
 

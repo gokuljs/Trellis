@@ -268,6 +268,11 @@ class RunService:
     async def get_run(self, run_id: str) -> RunSnapshot | None:
         return await self._runs.get_run(run_id)
 
+    async def get_latest_run_for_session(self, session_id: str) -> RunSnapshot | None:
+        if await self._sessions.get_session(session_id) is None:
+            raise ApplicationError("session_not_found", "Session not found.")
+        return await self._runs.get_latest_run_for_session(session_id)
+
     async def list_run_events(
         self,
         run_id: str,

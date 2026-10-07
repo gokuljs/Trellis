@@ -940,6 +940,15 @@ class Database:
             row = await cursor.fetchone()
         return None if row is None else self._run_from_row(row)
 
+    async def get_latest_run_for_session(self, session_id: str) -> RunSnapshot | None:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                "SELECT * FROM runs WHERE session_id = ? ORDER BY rowid DESC LIMIT 1",
+                (session_id,),
+            )
+            row = await cursor.fetchone()
+        return None if row is None else self._run_from_row(row)
+
     async def append_run_event(
         self,
         run_id: str,
@@ -1827,7 +1836,6 @@ class Database:
 
     async def resume_approved_run(self, run_id: str) -> tuple[RunSnapshot, RunEvent]:
         """Resume only the exact waiting tool call after a durable decision exists."""
-        now = utc_now()
         async with self._connect() as connection:
             await connection.execute("BEGIN IMMEDIATE")
             run_cursor = await connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
@@ -1853,12 +1861,33 @@ class Database:
                 RunStatus.RUNNING,
                 RunEventType.RESUMED,
             )
+            approval_cursor = await connection.execute(
+                """SELECT data, created_at FROM run_events
+                   WHERE run_id = ? AND event_type = ?
+                   ORDER BY sequence DESC LIMIT 1""",
+                (run_id, RunEventType.TOOL_APPROVAL_REQUESTED.value),
+            )
+            approval_row = await approval_cursor.fetchone()
+            if (
+                approval_row is None
+                or json.loads(approval_row["data"]).get("tool_call_id") != tool_call_id
+            ):
+                raise ValueError("waiting tool call has no approval request")
+            resumed_at = datetime.now(UTC)
+            requested_at = datetime.fromisoformat(
+                str(approval_row["created_at"]).replace("Z", "+00:00")
+            )
+            deadline = datetime.fromisoformat(str(run_row["deadline_at"]).replace("Z", "+00:00"))
+            extended_deadline = deadline + max(resumed_at - requested_at, timedelta())
+            deadline_at = extended_deadline.isoformat().replace("+00:00", "Z")
+            now = resumed_at.isoformat().replace("+00:00", "Z")
             sequence = int(run_row["last_event_sequence"]) + 1
-            data: dict[str, object] = {"tool_call_id": tool_call_id}
+            data: dict[str, object] = {"tool_call_id": tool_call_id, "deadline_at": deadline_at}
             await connection.execute(
-                """UPDATE runs SET waiting_tool_call_id = NULL, last_event_sequence = ?
+                """UPDATE runs SET waiting_tool_call_id = NULL,
+                   deadline_at = ?, last_event_sequence = ?
                    WHERE id = ?""",
-                (sequence, run_id),
+                (deadline_at, sequence, run_id),
             )
             await connection.execute(
                 """INSERT INTO run_events(

@@ -1,5 +1,6 @@
 import type {
   Profile,
+  LatestRun,
   OnboardingState,
   ProviderId,
   Session,
@@ -118,6 +119,8 @@ export const api = {
     }),
   getSession: (sessionId: string) =>
     request<SessionDetail>(`/api/sessions/${sessionId}`),
+  getLatestRun: (sessionId: string) =>
+    request<LatestRun | null>(`/api/sessions/${sessionId}/runs/latest`),
   listTestPresets: (sessionId: string) =>
     request<TestPreset[]>(`/api/sessions/${sessionId}/test-presets`),
   saveTestPreset: (sessionId: string, preset: TestPreset) =>

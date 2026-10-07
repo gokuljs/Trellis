@@ -265,4 +265,57 @@ describe("run activity", () => {
     )
     expect(screen.getByText("Time limit reached")).toBeInTheDocument()
   })
+
+  it("updates the displayed deadline from a persisted resume event", () => {
+    const events = [
+      event(1, "tool.approval_requested", {
+        tool_call_id: "tool-edit",
+        name: "apply_patch",
+      }),
+      event(2, "tool.approval_decided", {
+        tool_call_id: "tool-edit",
+        decision: "approved",
+      }),
+      event(3, "run.resumed", {
+        tool_call_id: "tool-edit",
+        deadline_at: "2026-10-07T12:30:00Z",
+      }),
+    ]
+    const { rerender } = render(
+      <RunActivity
+        events={events}
+        runInfo={runInfo}
+        pending
+        approvalPendingToolId={null}
+        approvalError={null}
+        onApprovalDecision={vi.fn()}
+      />
+    )
+
+    expect(screen.getByText(/Deadline/).closest("time")).toHaveAttribute(
+      "dateTime",
+      "2026-10-07T12:30:00Z"
+    )
+
+    rerender(
+      <RunActivity
+        events={[
+          ...events,
+          event(4, "run.resumed", {
+            tool_call_id: "tool-next",
+            deadline_at: "2026-10-07T13:00:00Z",
+          }),
+        ]}
+        runInfo={runInfo}
+        pending
+        approvalPendingToolId={null}
+        approvalError={null}
+        onApprovalDecision={vi.fn()}
+      />
+    )
+    expect(screen.getByText(/Deadline/).closest("time")).toHaveAttribute(
+      "dateTime",
+      "2026-10-07T13:00:00Z"
+    )
+  })
 })

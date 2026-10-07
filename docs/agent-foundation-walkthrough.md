@@ -561,3 +561,81 @@ frontend formatting, lint, typecheck, all 51 tests, and build with Node 24.
 
 **Next.** Find the latest saved run after a page refresh, replay its events,
 and show Retry only after the saved state is known.
+
+## Step 15 — Restore active runs after refresh
+
+**Why this step exists.** A page refresh used to lose the browser's connection
+to a run. An unanswered user message could then look like a failed turn even
+while the backend was still working or waiting for approval. The browser needs
+to read saved run state before offering Retry or another submission.
+
+**What works now.** When a session opens, Trellis looks up its latest run and
+replays saved events into that turn's activity timeline before following live
+events. A waiting approval regains its preview and controls. Queued and running
+work keeps the composer blocked; terminal work refreshes the visible transcript.
+If another tab started the run just after the transcript was fetched, Trellis
+fetches the transcript again so the new turn and its approval card appear.
+Reconnect attempts are bounded. If the service stays unavailable or the first
+lookup cannot establish the run's state, the UI suppresses Retry and offers a
+manual Reconnect action. Approval controls are hidden whenever the run identity
+is unknown. A full refresh restores the **latest run** for the selected session;
+activity from older runs remains visible only while that page stays open.
+
+**Follow the code.** `backend/app/api/routes/sessions.py` exposes the latest-run
+lookup. `RunService.get_latest_run_for_session` checks the session, and
+`backend/app/infrastructure/database.py` reads the latest saved run. The same
+repository extends the saved deadline by time spent waiting for a human
+approval, then puts the new deadline in `run.resumed`. In the browser,
+`frontend/apps/web/src/lib/api.ts` and `app-types.ts` describe the lookup;
+`runtime-client.ts` resumes from an event cursor, buffers events before the
+resume reply, and follows replay requests. `app-shell.tsx` reconciles the
+transcript, restores the run, bounds reconnection, and decides when Retry or
+Reconnect is available. `chat-thread.tsx` and `run-activity.tsx` show the
+restored activity, approval card, and updated deadline.
+
+**Verification.** Focused failing tests covered active and waiting runs after
+refresh, an approval started from another tab, a replay request before the
+first resume reply, a lost connection, bounded reconnection, unknown run state,
+and approval controls after failed rediscovery. A backend regression test first
+showed that approval after the original deadline failed, then verified the tool
+and next model step complete after the human wait is excluded. The pinned uv
+0.12.5 `make check` passed Ruff formatting, Ruff linting, `ty`, and 252 backend
+tests with 90.35% coverage. Frontend format, lint, typecheck, all 67 tests, and
+production build passed with Node 24.
+
+**Next.** The foundation is ready for review. The example and map below trace
+one complete run through the code in execution order.
+
+### One complete run
+
+1. The user attaches a workspace, enters “Run `python -m pytest tests/test_api.py`
+   and summarize failures,” and sends the prompt. The browser sends `run.start`
+   with the chosen model and budget. Trellis saves the user turn and run.
+2. The context builder combines stable instructions, the transcript, saved run
+   work, workspace guidance, and tool definitions. The provider adapter streams
+   the first model call; Trellis saves its request, response, usage, and events.
+3. The model requests `run_command`. The tool registry validates its arguments
+   and creates a command preview. Trellis saves the tool call and pauses the run
+   in `waiting_for_approval`; the activity timeline shows the request.
+4. The user checks the command and clicks Approve. `run.respond` saves the
+   decision. When the run resumes, the human wait is added back to its deadline.
+5. The bounded command executor runs the command. Trellis saves its result and
+   emits `tool.result`, which appears in the timeline.
+6. The run builder includes that tool result in the next model request. The
+   provider streams the model's explanation; Trellis saves its usage and the
+   final assistant answer, then emits `run.completed`.
+7. The answer appears in the ordinary chat transcript. If the page refreshes
+   during steps 3–6, latest-run lookup and event replay restore the current
+   state before Trellis decides whether to show approval, Reconnect, or Retry.
+
+### Code-reading map
+
+| Read in this order | What it does |
+| --- | --- |
+| `frontend/apps/web/src/components/app-shell.tsx` and `frontend/apps/web/src/lib/runtime-client.ts` | Send `run.start`, track events, and resume a saved run. |
+| `backend/app/api/routes/runtime.py` and `backend/app/api/routes/sessions.py` | Accept run RPCs and expose latest-run lookup. |
+| `backend/app/application/runs.py` and `backend/app/application/context.py` | Build requests, enforce budgets, record each model and tool step, and continue the loop. |
+| `backend/app/infrastructure/providers.py` | Turn provider streams into Trellis messages and tool calls. |
+| `backend/app/application/tools.py` and `backend/app/infrastructure/command_tools.py` | Validate the tool request, prepare approval, and execute the bounded command. |
+| `backend/app/infrastructure/database.py` | Save the ordered exchange, approval decision, result, deadline, and final turn. |
+| `frontend/apps/web/src/components/chat-thread.tsx` and `run-activity.tsx` | Show the ordered work, approval controls, and final answer. |

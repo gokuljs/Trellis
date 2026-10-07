@@ -17,12 +17,16 @@ import { ApiError, api } from "@/lib/api"
 import {
   RuntimeError,
   cancelRun,
+  resumeRun,
   respondToToolApproval,
   streamRun,
+  type RuntimeRunEvent,
+  type RuntimeRunInfo,
   type ToolApprovalDecision,
   type TurnRunActivity,
 } from "@/lib/runtime-client"
 import type {
+  LatestRun,
   Message,
   OnboardingStep,
   Profile,
@@ -62,6 +66,14 @@ function retryFromTranscript(
   }
 }
 
+const activeRunStatuses = new Set([
+  "queued",
+  "running",
+  "waiting_for_approval",
+  "cancelling",
+])
+const maxRestoredReconnectAttempts = 4
+
 export function AppShell() {
   const [activeView, setActiveView] = useState<WorkspaceView>("New session")
   const [sidebarOpen, setSidebarOpen] = useState(false)
@@ -92,6 +104,7 @@ export function AppShell() {
     string | null
   >(null)
   const [approvalError, setApprovalError] = useState<string | null>(null)
+  const [reconnectAvailable, setReconnectAvailable] = useState(false)
   const [cancellingRun, setCancellingRun] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [failedTurn, setFailedTurn] = useState<FailedTurn | null>(null)
@@ -102,8 +115,296 @@ export function AppShell() {
   const activeRunRef = useRef<{ runId: string; lastSequence: number } | null>(
     null
   )
+  const runGenerationRef = useRef(0)
   const cancelRequestRef = useRef(false)
   const approvalRequestRef = useRef<string | null>(null)
+
+  const recordRunInfo = useCallback(
+    (turnId: string, runInfo: RuntimeRunInfo) =>
+      setRunActivities((current) => ({
+        ...current,
+        [turnId]: {
+          events: current[turnId]?.events ?? [],
+          runInfo,
+        },
+      })),
+    []
+  )
+
+  const recordRunEvent = useCallback(
+    (turnId: string, event: RuntimeRunEvent) => {
+      if (
+        event.eventType !== "assistant.delta" &&
+        event.eventType !== "assistant.completed"
+      ) {
+        setRunActivities((current) => {
+          const activity = current[turnId] ?? { events: [], runInfo: null }
+          if (activity.events.some((item) => item.sequence === event.sequence))
+            return current
+          return {
+            ...current,
+            [turnId]: {
+              ...activity,
+              events: [...activity.events, event],
+            },
+          }
+        })
+      }
+      if (event.eventType === "tool.approval_decided") {
+        const decidedToolCallId = event.data.tool_call_id
+        if (typeof decidedToolCallId === "string") {
+          if (approvalRequestRef.current === decidedToolCallId)
+            approvalRequestRef.current = null
+          setApprovalPendingToolId((current) =>
+            current === decidedToolCallId ? null : current
+          )
+        }
+        setApprovalError(null)
+      }
+      if (
+        [
+          "run.cancellation_requested",
+          "run.completed",
+          "run.failed",
+          "run.cancelled",
+          "run.interrupted",
+        ].includes(event.eventType)
+      ) {
+        setApprovalPendingToolId(null)
+        approvalRequestRef.current = null
+      }
+      if (
+        event.eventType === "assistant.delta" &&
+        typeof event.data.text === "string"
+      ) {
+        setStreamingText((current) => (current ?? "") + event.data.text)
+      }
+    },
+    []
+  )
+
+  const restoreSessionRun = useCallback(
+    async (
+      sessionId: string,
+      transcript: Message[],
+      isCancelled: () => boolean
+    ) => {
+      const generation = ++runGenerationRef.current
+      const isStale = () =>
+        isCancelled() || runGenerationRef.current !== generation
+      setReconnectAvailable(false)
+      setActiveRunTurnId(null)
+      setApprovalPendingToolId(null)
+      setApprovalError(null)
+      approvalRequestRef.current = null
+      const waitForDiscovery = (message: string) => {
+        setPending(true)
+        setStreamingText(null)
+        setActiveRunId(null)
+        setActiveRunTurnId(null)
+        setApprovalPendingToolId(null)
+        setApprovalError(null)
+        approvalRequestRef.current = null
+        activeRunRef.current = null
+        setFailedTurn(null)
+        setError(message)
+        setReconnectAvailable(true)
+      }
+      let restoredTranscript = transcript
+      let turn = retryFromTranscript(sessionId, restoredTranscript)
+      let latest: LatestRun | null
+      try {
+        latest = await api.getLatestRun(sessionId)
+      } catch {
+        if (isStale()) return
+        waitForDiscovery(
+          "Trellis could not check the previous run. Reconnect when the local service returns."
+        )
+        return
+      }
+      if (isStale()) return
+      if (
+        latest &&
+        !restoredTranscript.some(
+          (message) => message.turn_id === latest.turn_id
+        )
+      ) {
+        try {
+          const detail = await api.getSession(sessionId)
+          if (isStale()) return
+          restoredTranscript = detail.messages
+          turn = retryFromTranscript(sessionId, restoredTranscript)
+          setSessions((current) => moveSessionToTop(current, detail.session))
+          setActiveSession(detail.session)
+          setMessages(detail.messages)
+        } catch {
+          if (isStale()) return
+          waitForDiscovery(
+            "Trellis could not load the active run's messages. Reconnect when the local service returns."
+          )
+          return
+        }
+        if (
+          !restoredTranscript.some(
+            (message) => message.turn_id === latest.turn_id
+          )
+        ) {
+          waitForDiscovery(
+            "Trellis could not load the active run's messages. Reconnect to try again."
+          )
+          return
+        }
+      }
+      if (!latest || (turn && latest.turn_id !== turn.turnId)) {
+        setPending(false)
+        setStreamingText(null)
+        setActiveRunId(null)
+        activeRunRef.current = null
+        setReconnectAvailable(false)
+        if (turn) {
+          setFailedTurn(turn)
+          setError("The previous assistant response did not complete.")
+        } else {
+          setFailedTurn(null)
+          setError(null)
+        }
+        return
+      }
+
+      setFailedTurn(null)
+      setError(null)
+      setPending(!!turn || activeRunStatuses.has(latest.status))
+      setStreamingText(null)
+      setRunActivities((current) => ({
+        ...current,
+        [latest.turn_id]: { events: [], runInfo: null },
+      }))
+      setActiveRunTurnId(latest.turn_id)
+      setApprovalPendingToolId(null)
+      setApprovalError(null)
+      approvalRequestRef.current = null
+      activeRunRef.current = { runId: latest.run_id, lastSequence: 0 }
+      setActiveRunId(latest.run_id)
+
+      void (async () => {
+        let keepActive = false
+        try {
+          let reconnectAttempts = 0
+          while (!isStale()) {
+            try {
+              await resumeRun(
+                latest.run_id,
+                {
+                  reconnectAttempts: 0,
+                  onRunId: (runId) => {
+                    if (!isStale()) setActiveRunId(runId)
+                  },
+                  onRunInfo: (runInfo) => {
+                    if (!isStale()) recordRunInfo(latest.turn_id, runInfo)
+                  },
+                  onEvent: (event) => {
+                    if (isStale()) return
+                    if (activeRunRef.current?.runId !== event.runId) return
+                    activeRunRef.current.lastSequence = event.sequence
+                    recordRunEvent(latest.turn_id, event)
+                  },
+                },
+                activeRunRef.current?.lastSequence ?? 0
+              )
+              break
+            } catch (streamError) {
+              if (isStale()) return
+              if (
+                !(streamError instanceof RuntimeError) ||
+                !["connection_lost", "runtime_timeout"].includes(
+                  streamError.code
+                )
+              ) {
+                throw streamError
+              }
+              setError("Reconnecting to Trellis…")
+              let currentStatus: string | null = null
+              try {
+                const currentRun = await api.getLatestRun(sessionId)
+                if (isStale()) return
+                if (!currentRun || currentRun.run_id !== latest.run_id) {
+                  throw streamError
+                }
+                currentStatus = currentRun.status
+              } catch (lookupError) {
+                if (lookupError === streamError) throw streamError
+                // The local service may still be restarting; retry the stream.
+              }
+              reconnectAttempts += 1
+              if (reconnectAttempts >= maxRestoredReconnectAttempts) {
+                keepActive =
+                  currentStatus === null || activeRunStatuses.has(currentStatus)
+                if (keepActive) {
+                  setError(
+                    "Connection to Trellis is unavailable. Reconnect when it returns."
+                  )
+                  setReconnectAvailable(true)
+                  return
+                }
+                throw streamError
+              }
+              await new Promise((resolve) =>
+                setTimeout(resolve, Math.min(150 * reconnectAttempts, 750))
+              )
+            }
+          }
+          if (isStale()) return
+          const detail = await api.getSession(sessionId)
+          if (isStale()) return
+          setSessions((current) => moveSessionToTop(current, detail.session))
+          setActiveSession(detail.session)
+          setMessages(detail.messages)
+          setFailedTurn(null)
+          setError(null)
+          setReconnectAvailable(false)
+        } catch (restoreError) {
+          if (isStale()) return
+          setError(visibleError(restoreError))
+          try {
+            const currentRun = await api.getLatestRun(sessionId)
+            if (isStale()) return
+            keepActive =
+              currentRun?.run_id === latest.run_id &&
+              activeRunStatuses.has(currentRun.status)
+            setReconnectAvailable(keepActive)
+            if (!keepActive && turn) setFailedTurn(turn)
+            const detail = await api.getSession(sessionId)
+            if (isStale()) return
+            setSessions((current) => moveSessionToTop(current, detail.session))
+            setActiveSession(detail.session)
+            setMessages(detail.messages)
+            if (
+              !keepActive &&
+              !retryFromTranscript(sessionId, detail.messages)
+            ) {
+              setFailedTurn(null)
+              setError(null)
+            }
+          } catch {
+            keepActive = true
+            setReconnectAvailable(true)
+            // The run may still be active while the local service is unavailable.
+          }
+        } finally {
+          if (!isStale() && !keepActive) {
+            setPending(false)
+            setStreamingText(null)
+            setActiveRunId(null)
+            setCancellingRun(false)
+            cancelRequestRef.current = false
+            activeRunRef.current = null
+            setReconnectAvailable(false)
+          }
+        }
+      })()
+    },
+    [recordRunEvent, recordRunInfo]
+  )
 
   const restoreSessions = useCallback(
     async (isCancelled: () => boolean = () => false) => {
@@ -115,20 +416,18 @@ export function AppShell() {
 
       const detail = await api.getSession(restoredSessions[0].id)
       if (isCancelled()) return
-      const restoredRetry = retryFromTranscript(
-        detail.session.id,
-        detail.messages
-      )
       activeSessionIdRef.current = detail.session.id
       setActiveSession(detail.session)
       setMessages(detail.messages)
-      setFailedTurn(restoredRetry)
-      if (restoredRetry) {
-        setError("The previous assistant response did not complete.")
-      }
       setActiveView("session")
+      const loadSequence = sessionLoadSequenceRef.current
+      await restoreSessionRun(
+        detail.session.id,
+        detail.messages,
+        () => isCancelled() || sessionLoadSequenceRef.current !== loadSequence
+      )
     },
-    []
+    [restoreSessionRun]
   )
 
   useEffect(() => {
@@ -207,11 +506,13 @@ export function AppShell() {
 
   const startNewSession = useCallback(() => {
     if (workspaceSaveLockRef.current) return
+    runGenerationRef.current += 1
     sessionLoadSequenceRef.current += 1
     activeSessionIdRef.current = null
     setComposerValue("")
     setActiveSession(null)
     setMessages([])
+    setPending(false)
     setStreamingText(null)
     setActiveRunId(null)
     setRunActivities({})
@@ -219,6 +520,7 @@ export function AppShell() {
     setApprovalPendingToolId(null)
     setApprovalError(null)
     approvalRequestRef.current = null
+    setReconnectAvailable(false)
     setCancellingRun(false)
     cancelRequestRef.current = false
     activeRunRef.current = null
@@ -242,6 +544,7 @@ export function AppShell() {
 
   const selectSession = async (sessionId: string) => {
     if (pending || workspaceSaveLockRef.current) return
+    runGenerationRef.current += 1
     const loadSequence = sessionLoadSequenceRef.current + 1
     sessionLoadSequenceRef.current = loadSequence
     activeSessionIdRef.current = sessionId
@@ -258,6 +561,7 @@ export function AppShell() {
     setApprovalPendingToolId(null)
     setApprovalError(null)
     approvalRequestRef.current = null
+    setReconnectAvailable(false)
     setCancellingRun(false)
     cancelRequestRef.current = false
     activeRunRef.current = null
@@ -272,13 +576,15 @@ export function AppShell() {
       ) {
         return
       }
-      const recoveredRetry = retryFromTranscript(sessionId, detail.messages)
       setActiveSession(detail.session)
       setMessages(detail.messages)
-      setFailedTurn(recoveredRetry)
-      if (recoveredRetry) {
-        setError("The previous assistant response did not complete.")
-      }
+      await restoreSessionRun(
+        sessionId,
+        detail.messages,
+        () =>
+          sessionLoadSequenceRef.current !== loadSequence ||
+          activeSessionIdRef.current !== sessionId
+      )
     } catch (sessionError) {
       if (sessionLoadSequenceRef.current === loadSequence) {
         setError(visibleError(sessionError))
@@ -299,6 +605,7 @@ export function AppShell() {
   }
 
   const completeTurn = async (turn: FailedTurn, optimistic: boolean) => {
+    runGenerationRef.current += 1
     setError(null)
     setStreamingText(null)
     setActiveRunId(null)
@@ -310,6 +617,7 @@ export function AppShell() {
     setApprovalPendingToolId(null)
     setApprovalError(null)
     approvalRequestRef.current = null
+    setReconnectAvailable(false)
     setCancellingRun(false)
     cancelRequestRef.current = false
     activeRunRef.current = null
@@ -343,70 +651,11 @@ export function AppShell() {
             activeRunRef.current = { runId, lastSequence: 0 }
             setActiveRunId(runId)
           },
-          onRunInfo: (runInfo) =>
-            setRunActivities((current) => ({
-              ...current,
-              [turn.turnId]: {
-                events: current[turn.turnId]?.events ?? [],
-                runInfo,
-              },
-            })),
+          onRunInfo: (runInfo) => recordRunInfo(turn.turnId, runInfo),
           onEvent: (event) => {
             if (activeRunRef.current?.runId !== event.runId) return
             activeRunRef.current.lastSequence = event.sequence
-            if (
-              event.eventType !== "assistant.delta" &&
-              event.eventType !== "assistant.completed"
-            ) {
-              setRunActivities((current) => {
-                const activity = current[turn.turnId] ?? {
-                  events: [],
-                  runInfo: null,
-                }
-                if (
-                  activity.events.some(
-                    (item) => item.sequence === event.sequence
-                  )
-                )
-                  return current
-                return {
-                  ...current,
-                  [turn.turnId]: {
-                    ...activity,
-                    events: [...activity.events, event],
-                  },
-                }
-              })
-            }
-            if (event.eventType === "tool.approval_decided") {
-              const decidedToolCallId = event.data.tool_call_id
-              if (typeof decidedToolCallId === "string") {
-                if (approvalRequestRef.current === decidedToolCallId)
-                  approvalRequestRef.current = null
-                setApprovalPendingToolId((current) =>
-                  current === decidedToolCallId ? null : current
-                )
-              }
-              setApprovalError(null)
-            }
-            if (
-              [
-                "run.cancellation_requested",
-                "run.completed",
-                "run.failed",
-                "run.cancelled",
-                "run.interrupted",
-              ].includes(event.eventType)
-            ) {
-              setApprovalPendingToolId(null)
-              approvalRequestRef.current = null
-            }
-            if (
-              event.eventType === "assistant.delta" &&
-              typeof event.data.text === "string"
-            ) {
-              setStreamingText((current) => (current ?? "") + event.data.text)
-            }
+            recordRunEvent(turn.turnId, event)
           },
         }
       )
@@ -571,6 +820,26 @@ export function AppShell() {
     }
   }
 
+  const reconnectRestoredRun = () => {
+    const sessionId = activeSessionIdRef.current
+    if (!sessionId || !reconnectAvailable) return
+    const recovery = restoreSessionRun(
+      sessionId,
+      messages,
+      () => activeSessionIdRef.current !== sessionId
+    )
+    const generation = runGenerationRef.current
+    void recovery.catch((restoreError) => {
+      if (
+        activeSessionIdRef.current !== sessionId ||
+        runGenerationRef.current !== generation
+      )
+        return
+      setError(visibleError(restoreError))
+      setReconnectAvailable(true)
+    })
+  }
+
   const configuredModels = (settings?.models ?? []).filter(
     (model) => model.configured || !model.requires_api_key
   )
@@ -711,6 +980,7 @@ export function AppShell() {
               streamingText={streamingText}
               error={error}
               canRetry={failedTurn !== null && !pending}
+              canReconnect={reconnectAvailable}
               canCancel={pending && activeRunId !== null}
               cancellationPending={cancellingRun}
               runActivities={runActivities}
@@ -721,6 +991,7 @@ export function AppShell() {
                 void answerToolApproval(toolCallId, decision)
               }
               onRetry={() => void retryFailedTurn()}
+              onReconnect={reconnectRestoredRun}
               onCancel={() => void cancelActiveRun()}
             />
           ) : (

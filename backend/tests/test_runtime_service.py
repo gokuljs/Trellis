@@ -656,6 +656,114 @@ def test_approved_tool_resumes_after_restart_without_repeating_the_model_call(
     assert [event.event_type for event in events].count(RunEventType.RESUMED) == 1
 
 
+def test_approved_tool_keeps_execution_budget_after_a_delayed_decision(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    (tmp_path / "note.txt").write_text("safe contents\n", encoding="utf-8")
+    provider = SequencedProvider(
+        (
+            (
+                ModelStreamEvent(
+                    kind="tool_call",
+                    tool_call=ModelToolCall("provider-read", "read_file", {"path": "note.txt"}),
+                ),
+                ModelStreamEvent(kind="completed", finish_reason="tool_use"),
+            ),
+            (
+                ModelStreamEvent(kind="text_delta", text="The file is safe."),
+                ModelStreamEvent(kind="completed", finish_reason="stop"),
+            ),
+        )
+    )
+    registry = ToolRegistry(LocalReadToolExecutor(), approval_required_names={"read_file"})
+
+    async def exercise():
+        await database.initialize()
+        session = await database.create_session(str(tmp_path))
+        await secret_store.set("openai", "sk-runtime-secret")
+        first_service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+            tool_registry=registry,
+        )
+        created = await first_service.create_run(session.id, "request-late-approval", "Read note")
+        await first_service.wait_for_run(created.id)
+        waiting = await database.get_run(created.id)
+        calls = await database.list_tool_calls(created.id)
+        assert waiting is not None and waiting.status is RunStatus.WAITING_FOR_APPROVAL
+
+        reference = datetime.now(UTC)
+        original_deadline = (reference - timedelta(minutes=2)).isoformat()
+        requested_at = (reference - timedelta(minutes=4)).isoformat()
+        decided_at = (reference - timedelta(minutes=3)).isoformat()
+        async with database._connect() as connection:
+            await connection.execute(
+                "UPDATE runs SET deadline_at = ? WHERE id = ?", (original_deadline, created.id)
+            )
+            await connection.execute(
+                """UPDATE run_events SET created_at = ?
+                   WHERE run_id = ? AND event_type = ?""",
+                (requested_at, created.id, RunEventType.TOOL_APPROVAL_REQUESTED.value),
+            )
+            await connection.commit()
+        await database.record_tool_approval_decision(
+            created.id, calls[0].id, ToolApprovalDecision.APPROVED
+        )
+        async with database._connect() as connection:
+            await connection.execute(
+                "UPDATE tool_calls SET approval_decided_at = ? WHERE id = ?",
+                (decided_at, calls[0].id),
+            )
+            await connection.execute(
+                """UPDATE run_events SET created_at = ?
+                   WHERE run_id = ? AND event_type = ?""",
+                (decided_at, created.id, RunEventType.TOOL_APPROVAL_DECIDED.value),
+            )
+            await connection.commit()
+        await first_service.close()
+
+        restarted_database = Database(settings.database_path)
+        assert await restarted_database.recover_active_runs() == ()
+        second_service = RunService(
+            restarted_database,
+            restarted_database,
+            restarted_database,
+            restarted_database,
+            secret_store,
+            {"openai": provider},
+            tool_registry=registry,
+        )
+        try:
+            await second_service.resume_decided_approvals()
+            await second_service.wait_for_run(created.id)
+            return (
+                await restarted_database.get_run(created.id),
+                await restarted_database.list_tool_calls(created.id),
+                await restarted_database.list_run_events(created.id),
+                reference,
+            )
+        finally:
+            await second_service.close()
+
+    run, calls, events, reference = asyncio.run(exercise())
+    assert run is not None and run.status is RunStatus.COMPLETED
+    assert calls[0].status is ToolCallStatus.COMPLETED
+    assert len(provider.requests) == 2
+    resumed = next(event for event in events if event.event_type is RunEventType.RESUMED)
+    assert resumed.data["deadline_at"] == run.deadline_at
+    assert datetime.fromisoformat(run.deadline_at.replace("Z", "+00:00")) > (
+        reference + timedelta(seconds=110)
+    )
+    assert datetime.fromisoformat(run.deadline_at.replace("Z", "+00:00")) < (
+        reference + timedelta(seconds=130)
+    )
+
+
 def test_cancelling_while_waiting_for_approval_closes_the_tool_call(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     database = Database(settings.database_path)

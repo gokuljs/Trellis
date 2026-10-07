@@ -228,6 +228,7 @@ function startupFetch(
     if (url === "/api/onboarding" && method === "GET")
       return response(onboardingState)
     if (url === "/api/sessions" && method === "GET") return response([])
+    if (url.endsWith("/runs/latest") && method === "GET") return response(null)
     throw new Error(`Unhandled request: ${method} ${url}`)
   })
 }
@@ -1594,6 +1595,1123 @@ describe("local-first chat", () => {
     expect(
       await screen.findByText("Recovered after restart")
     ).toBeInTheDocument()
+  })
+
+  it("discovers and replays an active run before offering Retry after refresh", async () => {
+    const turnId = "8a7fb1b8-8280-4a02-9292-487fd605e81e"
+    let completed = false
+    let runtimeSocket: TestWebSocket | null = null
+    const methods: string[] = []
+    installRuntimeServer((socket, request) => {
+      methods.push(String(request.method))
+      expect(request).toMatchObject({
+        method: "run.resume",
+        params: { runId: "run-already-active", afterSequence: 0 },
+      })
+      runtimeSocket = socket
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-already-active",
+          status: "running",
+          lastSequence: 3,
+        },
+      })
+      runtimeEvent(socket, "run-already-active", 1, "run.queued", {
+        status: "queued",
+      })
+      runtimeEvent(socket, "run-already-active", 2, "run.started", {
+        status: "running",
+      })
+      runtimeEvent(socket, "run-already-active", 3, "assistant.delta", {
+        text: "Working",
+      })
+    })
+    const fetchMock = startupFetch((url, init) => {
+      const method = init?.method ?? "GET"
+      if (url === "/api/sessions") return response([recentSession])
+      if (url === "/api/sessions/session-recent/runs/latest")
+        return response({
+          run_id: "run-already-active",
+          turn_id: turnId,
+          status: "running",
+          last_sequence: 3,
+        })
+      if (url === "/api/sessions/session-recent" && method === "GET") {
+        const messages: TestMessage[] = [
+          {
+            id: "persisted-user",
+            turn_id: turnId,
+            role: "user",
+            content: "Continue this run",
+            provider: null,
+            model: null,
+            created_at: "2026-08-25T10:00:00Z",
+          },
+        ]
+        if (completed)
+          messages.push({
+            id: "persisted-answer",
+            turn_id: turnId,
+            role: "assistant",
+            content: "Done after refresh",
+            provider: "openai",
+            model: "gpt-5.5",
+            created_at: "2026-08-25T10:00:01Z",
+          })
+        return response({
+          session: { ...recentSession, message_count: messages.length },
+          messages,
+        })
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    renderApp()
+    expect(await screen.findByText("Working")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+    expect(
+      screen.getByRole("button", { name: "Stop generating" })
+    ).toBeInTheDocument()
+    expect(methods).toEqual(["run.resume"])
+
+    completed = true
+    act(() => {
+      if (!runtimeSocket) throw new Error("run was not resumed")
+      runtimeEvent(runtimeSocket, "run-already-active", 4, "run.completed", {
+        status: "completed",
+      })
+    })
+
+    expect(await screen.findByText("Done after refresh")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+  })
+
+  it("blocks duplicate runs when the first latest-run lookup fails", async () => {
+    const turnId = "049a301b-eb21-4fc9-bf73-a0dc3ab3bd0a"
+    let lookupUnavailable = true
+    let completed = false
+    const methods: string[] = []
+    installRuntimeServer((socket, request) => {
+      methods.push(String(request.method))
+      expect(request.method).toBe("run.resume")
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-lookup-recovery",
+          status: "running",
+          lastSequence: 2,
+        },
+      })
+      runtimeEvent(socket, "run-lookup-recovery", 1, "run.queued", {
+        status: "queued",
+      })
+      completed = true
+      runtimeEvent(socket, "run-lookup-recovery", 2, "run.completed", {
+        status: "completed",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest") {
+          if (lookupUnavailable) throw new Error("Local service is offline")
+          return response({
+            run_id: "run-lookup-recovery",
+            turn_id: turnId,
+            status: completed ? "completed" : "running",
+            last_sequence: completed ? 2 : 0,
+          })
+        }
+        if (url === "/api/sessions/session-recent") {
+          const messages: TestMessage[] = [
+            {
+              id: "persisted-user",
+              turn_id: turnId,
+              role: "user",
+              content: "Resume after lookup failure",
+              provider: null,
+              model: null,
+              created_at: "2026-10-07T12:00:00Z",
+            },
+          ]
+          if (completed)
+            messages.push({
+              id: "persisted-answer",
+              turn_id: turnId,
+              role: "assistant",
+              content: "Recovered after lookup failure",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-10-07T12:00:01Z",
+            })
+          return response({
+            session: { ...recentSession, message_count: messages.length },
+            messages,
+          })
+        }
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    const reconnect = await screen.findByRole("button", {
+      name: "Reconnect",
+    })
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Stop generating" })).toBeNull()
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeDisabled()
+    expect(methods).toEqual([])
+
+    lookupUnavailable = false
+    await user.click(reconnect)
+    expect(
+      await screen.findByText("Recovered after lookup failure")
+    ).toBeInTheDocument()
+    expect(methods).toEqual(["run.resume"])
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+  })
+
+  it("offers Retry after reconnection confirms no run exists", async () => {
+    const turnId = "58cf8d40-0ac7-4bef-89a6-461461d27879"
+    let lookupUnavailable = true
+    installRuntimeServer(() => {
+      throw new Error("No run should be resumed")
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest") {
+          if (lookupUnavailable) throw new Error("Local service is offline")
+          return response(null)
+        }
+        if (url === "/api/sessions/session-recent")
+          return response({
+            session: { ...recentSession, message_count: 1 },
+            messages: [
+              {
+                id: "persisted-user",
+                turn_id: turnId,
+                role: "user",
+                content: "No run started",
+                provider: null,
+                model: null,
+                created_at: "2026-10-07T12:00:00Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    const reconnect = await screen.findByRole("button", {
+      name: "Reconnect",
+    })
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+    lookupUnavailable = false
+    await user.click(reconnect)
+
+    expect(
+      await screen.findByRole("button", { name: "Retry" })
+    ).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Reconnect" })).toBeNull()
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+  })
+
+  it("restores an actionable approval and its ordered result after refresh", async () => {
+    const turnId = "c345edbf-f3a4-4a0a-8067-c408d15bed55"
+    let completed = false
+    let detailLoads = 0
+    let runSocket: TestWebSocket | null = null
+    const methods: string[] = []
+    installRuntimeServer((socket, request) => {
+      methods.push(String(request.method))
+      if (request.method === "run.resume") {
+        expect(request.params).toMatchObject({
+          runId: "run-refresh-approval",
+          afterSequence: 0,
+        })
+        runSocket = socket
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-refresh-approval",
+            status: "waiting_for_approval",
+            lastSequence: 4,
+            budgetPreset: "conservative",
+            limits: {
+              maxModelCalls: 8,
+              maxToolCalls: 16,
+              maxTotalTokens: 100000,
+              maxCostUsd: 2,
+              deadlineAt: "2026-10-07T12:10:00Z",
+            },
+          },
+        })
+        runtimeEvent(socket, "run-refresh-approval", 1, "run.queued", {
+          status: "queued",
+        })
+        runtimeEvent(socket, "run-refresh-approval", 2, "run.started", {
+          status: "running",
+        })
+        runtimeEvent(socket, "run-refresh-approval", 3, "tool.call", {
+          tool_call_id: "tool-refresh-patch",
+          name: "apply_patch",
+          arguments: { path: "src/main.ts" },
+        })
+        runtimeEvent(
+          socket,
+          "run-refresh-approval",
+          4,
+          "tool.approval_requested",
+          {
+            tool_call_id: "tool-refresh-patch",
+            name: "apply_patch",
+            preview: { path: "src/main.ts", diff: "-old\n+new" },
+          }
+        )
+      } else if (request.method === "run.respond") {
+        expect(request.params).toMatchObject({
+          runId: "run-refresh-approval",
+          toolCallId: "tool-refresh-patch",
+          decision: "approved",
+          afterSequence: 4,
+        })
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-refresh-approval",
+            status: "waiting_for_approval",
+            toolCallId: "tool-refresh-patch",
+            decision: "approved",
+          },
+        })
+        if (!runSocket) throw new Error("Restored run socket missing")
+        runtimeEvent(
+          runSocket,
+          "run-refresh-approval",
+          5,
+          "tool.approval_decided",
+          { tool_call_id: "tool-refresh-patch", decision: "approved" }
+        )
+        runtimeEvent(runSocket, "run-refresh-approval", 6, "run.resumed", {
+          tool_call_id: "tool-refresh-patch",
+        })
+        runtimeEvent(runSocket, "run-refresh-approval", 7, "tool.result", {
+          tool_call_id: "tool-refresh-patch",
+          status: "completed",
+          content: "Patch applied after refresh.",
+        })
+        completed = true
+        runtimeEvent(runSocket, "run-refresh-approval", 8, "run.completed", {
+          status: "completed",
+        })
+      }
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest")
+          return response({
+            run_id: "run-refresh-approval",
+            turn_id: turnId,
+            status: completed ? "completed" : "waiting_for_approval",
+            last_sequence: completed ? 8 : 4,
+          })
+        if (url === "/api/sessions/session-recent") {
+          detailLoads += 1
+          if (detailLoads === 1)
+            return response({
+              session: { ...recentSession, message_count: 2 },
+              messages: [
+                {
+                  id: "earlier-user",
+                  turn_id: "earlier-turn",
+                  role: "user",
+                  content: "Earlier request",
+                  provider: null,
+                  model: null,
+                  created_at: "2026-10-07T11:00:00Z",
+                },
+                {
+                  id: "earlier-answer",
+                  turn_id: "earlier-turn",
+                  role: "assistant",
+                  content: "Earlier answer",
+                  provider: "openai",
+                  model: "gpt-5.5",
+                  created_at: "2026-10-07T11:00:01Z",
+                },
+              ],
+            })
+          const messages: TestMessage[] = [
+            {
+              id: "persisted-user",
+              turn_id: turnId,
+              role: "user",
+              content: "Patch this file",
+              provider: null,
+              model: null,
+              created_at: "2026-10-07T12:00:00Z",
+            },
+          ]
+          if (completed)
+            messages.push({
+              id: "persisted-answer",
+              turn_id: turnId,
+              role: "assistant",
+              content: "Patch complete.",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-10-07T12:00:01Z",
+            })
+          return response({
+            session: { ...recentSession, message_count: messages.length },
+            messages,
+          })
+        }
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    const approval = await screen.findByRole("region", {
+      name: "Approval required for apply_patch",
+    })
+    expect(detailLoads).toBeGreaterThanOrEqual(2)
+    expect(within(approval).getByText(/\+new/)).toBeInTheDocument()
+    expect(screen.getByText("0 / 8 model calls")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+    await user.click(within(approval).getByRole("button", { name: "Approve" }))
+
+    expect(
+      await screen.findByText("Patch applied after refresh.")
+    ).toBeInTheDocument()
+    expect(await screen.findByText("Patch complete.")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull()
+    expect(methods).toEqual(["run.resume", "run.respond"])
+  })
+
+  it("reconnects a discovered active run after its first replay connection fails", async () => {
+    const turnId = "7087cb08-dd55-4405-a928-2f23c15848df"
+    let attempts = 0
+    let completed = false
+    installRuntimeServer((socket, request) => {
+      expect(request.method).toBe("run.resume")
+      expect(request.params).toMatchObject({
+        runId: "run-recovery",
+        afterSequence: 0,
+      })
+      attempts += 1
+      if (attempts === 1) {
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          error: {
+            code: -32000,
+            message: "Connection to Trellis was lost.",
+            data: { code: "connection_lost" },
+          },
+        })
+        return
+      }
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "run-recovery", status: "running", lastSequence: 3 },
+      })
+      runtimeEvent(socket, "run-recovery", 1, "run.queued", {
+        status: "queued",
+      })
+      runtimeEvent(socket, "run-recovery", 2, "assistant.delta", {
+        text: "Recovered",
+      })
+      completed = true
+      runtimeEvent(socket, "run-recovery", 3, "run.completed", {
+        status: "completed",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest")
+          return response({
+            run_id: "run-recovery",
+            turn_id: turnId,
+            status: completed ? "completed" : "running",
+            last_sequence: completed ? 3 : 1,
+          })
+        if (url === "/api/sessions/session-recent") {
+          const messages: TestMessage[] = [
+            {
+              id: "persisted-user",
+              turn_id: turnId,
+              role: "user",
+              content: "Recover this",
+              provider: null,
+              model: null,
+              created_at: "2026-08-25T10:00:00Z",
+            },
+          ]
+          if (completed)
+            messages.push({
+              id: "persisted-answer",
+              turn_id: turnId,
+              role: "assistant",
+              content: "Recovered answer",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-08-25T10:00:01Z",
+            })
+          return response({
+            session: { ...recentSession, message_count: messages.length },
+            messages,
+          })
+        }
+        return undefined
+      })
+    )
+
+    renderApp()
+    expect(await screen.findByText("Recovered answer")).toBeInTheDocument()
+    expect(attempts).toBe(2)
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Stop generating" })).toBeNull()
+  })
+
+  it("finishes cancellation after a restored stream loses its connection", async () => {
+    const turnId = "b502668b-7d27-4298-89b2-4e18864aae0a"
+    const retryLookup = deferred<Response>()
+    let lookups = 0
+    let resumeAttempts = 0
+    let cancelled = false
+    installRuntimeServer((socket, request) => {
+      if (request.method === "run.cancel") {
+        expect(request.params).toMatchObject({
+          runId: "run-cancel-after-loss",
+          afterSequence: 0,
+        })
+        cancelled = true
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: { runId: "run-cancel-after-loss", status: "cancelling" },
+        })
+        return
+      }
+      expect(request.method).toBe("run.resume")
+      resumeAttempts += 1
+      if (resumeAttempts === 1) {
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          error: {
+            code: -32000,
+            message: "Connection to Trellis was lost.",
+            data: { code: "connection_lost" },
+          },
+        })
+        return
+      }
+      expect(cancelled).toBe(true)
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-cancel-after-loss",
+          status: "cancelled",
+          lastSequence: 2,
+        },
+      })
+      runtimeEvent(socket, "run-cancel-after-loss", 1, "run.queued", {
+        status: "queued",
+      })
+      runtimeEvent(socket, "run-cancel-after-loss", 2, "run.cancelled", {
+        code: "user_cancelled",
+        message: "The run was cancelled.",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest") {
+          lookups += 1
+          if (lookups === 2) return retryLookup.promise
+          return response({
+            run_id: "run-cancel-after-loss",
+            turn_id: turnId,
+            status: cancelled ? "cancelled" : "running",
+            last_sequence: cancelled ? 2 : 0,
+          })
+        }
+        if (url === "/api/sessions/session-recent")
+          return response({
+            session: { ...recentSession, message_count: 1 },
+            messages: [
+              {
+                id: "persisted-user",
+                turn_id: turnId,
+                role: "user",
+                content: "Stop after connection loss",
+                provider: null,
+                model: null,
+                created_at: "2026-08-25T10:00:00Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByText("Reconnecting to Trellis…")
+    await user.click(screen.getByRole("button", { name: "Stop generating" }))
+    expect(cancelled).toBe(true)
+    retryLookup.resolve(
+      response({
+        run_id: "run-cancel-after-loss",
+        turn_id: turnId,
+        status: "cancelled",
+        last_sequence: 2,
+      })
+    )
+
+    const alert = await screen.findByRole("alert")
+    await waitFor(() =>
+      expect(alert).toHaveTextContent("The run was cancelled.")
+    )
+    expect(within(alert).getByRole("button", { name: "Retry" })).toBeEnabled()
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+    expect(resumeAttempts).toBe(2)
+  })
+
+  it("offers manual reconnection after a bounded restored-run outage", async () => {
+    const turnId = "187819a4-3696-4b45-a242-39d3bf3939a7"
+    let attempts = 0
+    let serviceReturned = false
+    let lookupUnavailable = false
+    let completed = false
+    installRuntimeServer((socket, request) => {
+      expect(request.method).toBe("run.resume")
+      attempts += 1
+      if (!serviceReturned) {
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          error: {
+            code: -32000,
+            message: "Connection to Trellis was lost.",
+            data: { code: "connection_lost" },
+          },
+        })
+        return
+      }
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-outage",
+          status: "running",
+          lastSequence: 2,
+        },
+      })
+      runtimeEvent(socket, "run-outage", 1, "run.queued", {
+        status: "queued",
+      })
+      completed = true
+      runtimeEvent(socket, "run-outage", 2, "run.completed", {
+        status: "completed",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest") {
+          if (lookupUnavailable) throw new Error("Local service is offline")
+          return response({
+            run_id: "run-outage",
+            turn_id: turnId,
+            status: completed ? "completed" : "running",
+            last_sequence: completed ? 2 : 0,
+          })
+        }
+        if (url === "/api/sessions/session-recent") {
+          const messages: TestMessage[] = [
+            {
+              id: "persisted-user",
+              turn_id: turnId,
+              role: "user",
+              content: "Recover after an outage",
+              provider: null,
+              model: null,
+              created_at: "2026-08-25T10:00:00Z",
+            },
+          ]
+          if (completed)
+            messages.push({
+              id: "persisted-answer",
+              turn_id: turnId,
+              role: "assistant",
+              content: "Recovered after outage",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-08-25T10:00:01Z",
+            })
+          return response({
+            session: { ...recentSession, message_count: messages.length },
+            messages,
+          })
+        }
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    const reconnect = await screen.findByRole(
+      "button",
+      { name: "Reconnect" },
+      { timeout: 3_000 }
+    )
+    expect(attempts).toBe(4)
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeDisabled()
+    lookupUnavailable = true
+    await user.click(reconnect)
+    expect(
+      await screen.findByRole("button", { name: "Reconnect" })
+    ).toBeInTheDocument()
+    serviceReturned = true
+    lookupUnavailable = false
+    await user.click(screen.getByRole("button", { name: "Reconnect" }))
+    expect(
+      await screen.findByText("Recovered after outage")
+    ).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Reconnect" })).toBeNull()
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+  })
+
+  it("hides stale approval actions while rediscovering a run", async () => {
+    const turnId = "bb03fa3a-65fd-4190-bb76-045b8d5fcda0"
+    let resumes = 0
+    let lookupUnavailable = false
+    installRuntimeServer((socket, request) => {
+      expect(request.method).toBe("run.resume")
+      resumes += 1
+      if (resumes === 1) {
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-stale-approval",
+            status: "waiting_for_approval",
+            lastSequence: 3,
+          },
+        })
+        runtimeEvent(socket, "run-stale-approval", 1, "run.queued", {
+          status: "queued",
+        })
+        runtimeEvent(socket, "run-stale-approval", 2, "tool.call", {
+          tool_call_id: "tool-stale",
+          name: "apply_patch",
+        })
+        runtimeEvent(
+          socket,
+          "run-stale-approval",
+          3,
+          "tool.approval_requested",
+          { tool_call_id: "tool-stale", name: "apply_patch" }
+        )
+        setTimeout(() => socket.close(), 50)
+        return
+      }
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: {
+          code: -32000,
+          message: "Connection to Trellis was lost.",
+          data: { code: "connection_lost" },
+        },
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest") {
+          if (lookupUnavailable) throw new Error("Local service is offline")
+          return response({
+            run_id: "run-stale-approval",
+            turn_id: turnId,
+            status: "waiting_for_approval",
+            last_sequence: 3,
+          })
+        }
+        if (url === "/api/sessions/session-recent")
+          return response({
+            session: { ...recentSession, message_count: 1 },
+            messages: [
+              {
+                id: "persisted-user",
+                turn_id: turnId,
+                role: "user",
+                content: "Patch this file",
+                provider: null,
+                model: null,
+                created_at: "2026-10-07T12:00:00Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    const approval = await screen.findByRole("region", {
+      name: "Approval required for apply_patch",
+    })
+    expect(
+      within(approval).getByRole("button", { name: "Approve" })
+    ).toBeEnabled()
+    const reconnect = await screen.findByRole(
+      "button",
+      { name: "Reconnect" },
+      { timeout: 3_000 }
+    )
+    lookupUnavailable = true
+    await user.click(reconnect)
+
+    expect(
+      await screen.findByRole("button", { name: "Reconnect" })
+    ).toBeInTheDocument()
+    expect(
+      within(approval).queryByRole("button", { name: "Approve" })
+    ).toBeNull()
+    expect(within(approval).queryByRole("button", { name: "Deny" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+    expect(resumes).toBe(4)
+  })
+
+  it.each(["queued", "waiting_for_approval"])(
+    "keeps Retry hidden while a restored run is %s",
+    async (initialStatus) => {
+      const turnId = "a369bf43-07d8-4b5b-a128-f058d24bb87f"
+      const replay =
+        initialStatus === "queued"
+          ? [["run.queued", { status: "queued" }]]
+          : [
+              ["run.queued", { status: "queued" }],
+              ["run.started", { status: "running" }],
+              [
+                "tool.call",
+                { tool_call_id: "tool-approval", name: "read_file" },
+              ],
+              [
+                "tool.approval_requested",
+                { tool_call_id: "tool-approval", name: "read_file" },
+              ],
+            ]
+      let latestStatus = initialStatus
+      let runtimeSocket: TestWebSocket | null = null
+      installRuntimeServer((socket, request) => {
+        expect(request.method).toBe("run.resume")
+        runtimeSocket = socket
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-pending-refresh",
+            status: initialStatus,
+            lastSequence: replay.length,
+          },
+        })
+        replay.forEach(([eventType, data], index) => {
+          runtimeEvent(
+            socket,
+            "run-pending-refresh",
+            index + 1,
+            eventType as string,
+            data as Record<string, unknown>
+          )
+        })
+      })
+      vi.stubGlobal(
+        "fetch",
+        startupFetch((url) => {
+          if (url === "/api/sessions") return response([recentSession])
+          if (url === "/api/sessions/session-recent/runs/latest")
+            return response({
+              run_id: "run-pending-refresh",
+              turn_id: turnId,
+              status: latestStatus,
+              last_sequence: replay.length,
+            })
+          if (url === "/api/sessions/session-recent")
+            return response({
+              session: { ...recentSession, message_count: 1 },
+              messages: [
+                {
+                  id: "persisted-user",
+                  turn_id: turnId,
+                  role: "user",
+                  content: "Wait for this run",
+                  provider: null,
+                  model: null,
+                  created_at: "2026-08-25T10:00:00Z",
+                },
+              ],
+            })
+          return undefined
+        })
+      )
+
+      renderApp()
+      expect(
+        await screen.findByRole("button", { name: "Stop generating" })
+      ).toBeInTheDocument()
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+      expect(screen.getByRole("textbox", { name: "Message" })).toBeDisabled()
+
+      if (initialStatus === "waiting_for_approval") {
+        const user = userEvent.setup()
+        await user.click(screen.getByRole("button", { name: /New session/ }))
+        expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+        latestStatus = "cancelled"
+        act(() => {
+          if (!runtimeSocket) throw new Error("run was not resumed")
+          runtimeEvent(
+            runtimeSocket,
+            "run-pending-refresh",
+            replay.length + 1,
+            "run.cancelled",
+            { status: "cancelled" }
+          )
+        })
+        expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+        return
+      }
+
+      latestStatus = "cancelled"
+      act(() => {
+        if (!runtimeSocket) throw new Error("run was not resumed")
+        runtimeEvent(
+          runtimeSocket,
+          "run-pending-refresh",
+          replay.length + 1,
+          "run.cancelled",
+          { status: "cancelled" }
+        )
+      })
+      expect(
+        await screen.findByRole("button", { name: "Retry" })
+      ).toBeInTheDocument()
+    }
+  )
+
+  it("waits for a saved failure event before showing Retry after refresh", async () => {
+    const turnId = "0cbac0bb-d031-4ef2-a7e1-cc006487e756"
+    let runtimeSocket: TestWebSocket | null = null
+    installRuntimeServer((socket, request) => {
+      expect(request.method).toBe("run.resume")
+      runtimeSocket = socket
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-failed-before-refresh",
+          status: "failed",
+          lastSequence: 2,
+        },
+      })
+      runtimeEvent(socket, "run-failed-before-refresh", 1, "run.queued", {
+        status: "queued",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest")
+          return response({
+            run_id: "run-failed-before-refresh",
+            turn_id: turnId,
+            status: "failed",
+            last_sequence: 2,
+          })
+        if (url === "/api/sessions/session-recent")
+          return response({
+            session: { ...recentSession, message_count: 1 },
+            messages: [
+              {
+                id: "persisted-user",
+                turn_id: turnId,
+                role: "user",
+                content: "Try this again",
+                provider: null,
+                model: null,
+                created_at: "2026-08-25T10:00:00Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+
+    renderApp()
+    expect(
+      await screen.findByRole("button", { name: "Stop generating" })
+    ).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+
+    act(() => {
+      if (!runtimeSocket) throw new Error("failed run was not replayed")
+      runtimeEvent(
+        runtimeSocket,
+        "run-failed-before-refresh",
+        2,
+        "run.failed",
+        {
+          code: "provider_timeout",
+          message: "The provider timed out.",
+        }
+      )
+    })
+
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("The provider timed out.")
+    expect(
+      within(alert).getByRole("button", { name: "Retry" })
+    ).toBeInTheDocument()
+  })
+
+  it("replays the latest completed run for a restored session timeline", async () => {
+    const turnId = "bc3f4014-2e95-424e-988d-3060d7087fc3"
+    const methods: string[] = []
+    let previousSocket: TestWebSocket | null = null
+    installRuntimeServer((socket, request) => {
+      methods.push(String(request.method))
+      if (request.method === "run.start") {
+        expect(request.params).toMatchObject({
+          sessionId: "session-recent",
+          content: "Next request",
+        })
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: { runId: "run-new", status: "running", lastSequence: 2 },
+        })
+        runtimeEvent(socket, "run-new", 1, "run.queued", { status: "queued" })
+        runtimeEvent(socket, "run-new", 2, "run.started", {
+          status: "running",
+        })
+        return
+      }
+      expect(request).toMatchObject({
+        method: "run.resume",
+        params: { runId: "run-complete", afterSequence: 0 },
+      })
+      previousSocket = socket
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-complete",
+          status: "completed",
+          lastSequence: 3,
+        },
+      })
+      runtimeEvent(socket, "run-complete", 1, "run.queued", {
+        status: "queued",
+      })
+      runtimeEvent(socket, "run-complete", 2, "run.started", {
+        status: "running",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest")
+          return response({
+            run_id: "run-complete",
+            turn_id: turnId,
+            status: "completed",
+            last_sequence: 3,
+          })
+        if (url === "/api/sessions/session-recent")
+          return response({
+            session: recentSession,
+            messages: [
+              {
+                id: "saved-user",
+                turn_id: turnId,
+                role: "user",
+                content: "A finished request",
+                provider: null,
+                model: null,
+                created_at: "2026-08-25T10:00:00Z",
+              },
+              {
+                id: "saved-answer",
+                turn_id: turnId,
+                role: "assistant",
+                content: "Saved answer",
+                provider: "openai",
+                model: "gpt-5.5",
+                created_at: "2026-08-25T10:00:01Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+
+    const user = userEvent.setup()
+    renderApp()
+    expect(await screen.findByText("Saved answer")).toBeInTheDocument()
+    await waitFor(() => expect(methods).toEqual(["run.resume"]))
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+
+    await user.type(
+      screen.getByRole("textbox", { name: "Message" }),
+      "Next request"
+    )
+    await user.click(screen.getByRole("button", { name: "Send" }))
+    expect(
+      await screen.findByRole("button", { name: "Stop generating" })
+    ).toBeInTheDocument()
+    expect(methods).toEqual(["run.resume", "run.start"])
+
+    await act(async () => {
+      if (!previousSocket) throw new Error("previous run was not replayed")
+      runtimeEvent(previousSocket, "run-complete", 3, "run.completed", {
+        status: "completed",
+      })
+      await Promise.resolve()
+    })
+    expect(
+      screen.getByRole("button", { name: "Stop generating" })
+    ).toBeInTheDocument()
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeDisabled()
+    expect(screen.getByText("Next request")).toBeInTheDocument()
   })
 
   it("edits the local profile and treats provider keys as write-only", async () => {

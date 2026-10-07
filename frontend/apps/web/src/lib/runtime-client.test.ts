@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
   cancelRun,
+  resumeRun,
   respondToToolApproval,
   streamRun,
 } from "@/lib/runtime-client"
@@ -287,6 +288,127 @@ describe("streamRun", () => {
       code: "provider_timeout",
       message: "The provider timed out.",
     })
+  })
+})
+
+describe("resumeRun", () => {
+  it("replays again when replay_required arrives before the resume response", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    let resumes = 0
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      expect(request).toMatchObject({
+        method: "run.resume",
+        params: { runId: "run-early-replay", afterSequence: 0 },
+      })
+      resumes += 1
+      if (resumes === 1) {
+        socket.reply({
+          jsonrpc: "2.0",
+          method: "run.replay_required",
+          params: { runId: "run-early-replay", afterSequence: 0 },
+        })
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-early-replay",
+            status: "running",
+            lastSequence: 0,
+          },
+        })
+        return
+      }
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-early-replay",
+          status: "running",
+          lastSequence: 2,
+        },
+      })
+      socket.reply(
+        event("run-early-replay", 1, "run.queued", { status: "queued" })
+      )
+      socket.reply(
+        event("run-early-replay", 2, "run.completed", { status: "completed" })
+      )
+    }
+    const onEvent = vi.fn()
+
+    await expect(resumeRun("run-early-replay", { onEvent })).resolves.toEqual({
+      runId: "run-early-replay",
+    })
+    expect(resumes).toBe(2)
+    expect(onEvent.mock.calls.map(([runEvent]) => runEvent.sequence)).toEqual([
+      1, 2,
+    ])
+  })
+
+  it("replays a discovered run from the beginning without starting another run", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      expect(request).toMatchObject({
+        method: "run.resume",
+        params: { runId: "run-restored", afterSequence: 0 },
+      })
+      socket.reply(event("run-restored", 1, "run.queued", { status: "queued" }))
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "run-restored", status: "running", lastSequence: 2 },
+      })
+      socket.reply(
+        event("run-restored", 2, "assistant.delta", { text: "Restored" })
+      )
+      socket.reply(
+        event("run-restored", 3, "run.completed", { status: "completed" })
+      )
+    }
+    const onEvent = vi.fn()
+    const onRunId = vi.fn()
+
+    await expect(
+      resumeRun("run-restored", { onEvent, onRunId })
+    ).resolves.toEqual({ runId: "run-restored" })
+
+    expect(onRunId).toHaveBeenCalledOnce()
+    expect(onRunId).toHaveBeenCalledWith("run-restored")
+    expect(onEvent.mock.calls.map(([runEvent]) => runEvent.sequence)).toEqual([
+      1, 2, 3,
+    ])
+    expect(MockWebSocket.instances).toHaveLength(1)
+  })
+
+  it("resumes from the last delivered event after a later connection loss", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      expect(request).toMatchObject({
+        method: "run.resume",
+        params: { runId: "run-reconnect", afterSequence: 3 },
+      })
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "run-reconnect", status: "running", lastSequence: 4 },
+      })
+      socket.reply(
+        event("run-reconnect", 4, "assistant.delta", { text: "Done" })
+      )
+      socket.reply(
+        event("run-reconnect", 5, "run.completed", { status: "completed" })
+      )
+    }
+    const onEvent = vi.fn()
+
+    await resumeRun("run-reconnect", { onEvent }, 3)
+
+    expect(onEvent.mock.calls.map(([runEvent]) => runEvent.sequence)).toEqual([
+      4, 5,
+    ])
   })
 })
 

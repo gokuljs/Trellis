@@ -18,6 +18,7 @@ type ChatThreadProps = {
   streamingText: string | null
   error: string | null
   canRetry: boolean
+  canReconnect?: boolean
   canCancel: boolean
   cancellationPending: boolean
   runActivities?: Record<string, TurnRunActivity>
@@ -29,6 +30,7 @@ type ChatThreadProps = {
     decision: ToolApprovalDecision
   ) => void
   onRetry: () => void
+  onReconnect?: () => void
   onCancel: () => void
 }
 
@@ -86,6 +88,7 @@ export function ChatThread({
   streamingText,
   error,
   canRetry,
+  canReconnect = false,
   canCancel,
   cancellationPending,
   runActivities = {},
@@ -94,6 +97,7 @@ export function ChatThread({
   approvalError = null,
   onApprovalDecision = () => undefined,
   onRetry,
+  onReconnect = () => undefined,
   onCancel,
 }: ChatThreadProps) {
   const firstAssistantByTurn = new Map<string, string>()
@@ -218,6 +222,11 @@ export function ChatThread({
           {canRetry ? (
             <button type="button" onClick={onRetry}>
               <RotateCcw size={13} aria-hidden="true" /> Retry
+            </button>
+          ) : null}
+          {canReconnect ? (
+            <button type="button" onClick={onReconnect}>
+              <RotateCcw size={13} aria-hidden="true" /> Reconnect
             </button>
           ) : null}
         </div>

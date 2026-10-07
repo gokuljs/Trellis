@@ -164,22 +164,27 @@ function parseRunInfo(result: Record<string, unknown>): RuntimeRunInfo {
   return info
 }
 
-export function streamRun(
-  input: StartRunInput,
-  options: RuntimeClientOptions = {}
+function followRun(
+  input: StartRunInput | null,
+  resumedRunId: string | null,
+  options: RuntimeClientOptions,
+  initialSequence: number
 ): Promise<RunResult> {
   const reconnectLimit = options.reconnectAttempts ?? 4
   const reconnectDelay = options.reconnectDelayMs ?? 200
 
   return new Promise((resolve, reject) => {
     let socket: WebSocket | null = null
-    let runId: string | null = null
-    let lastSequence = 0
+    let runId: string | null = resumedRunId
+    let lastSequence = initialSequence
+    let runIdNotified = false
+    let subscriptionReady = false
     let reconnects = 0
     let nextRpcId = 0
     let settled = false
     let subscriptionRequestPending = false
     let bufferedEventOverflowed = false
+    let replayRequiredForRun: string | null = null
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     const pending = new Map<
       string,
@@ -283,6 +288,15 @@ export function streamRun(
       subscriptionRequestPending = true
       const method = runId ? "run.resume" : "run.start"
       const params = runId ? { runId, afterSequence: lastSequence } : input
+      if (!params) {
+        finish(
+          new RuntimeError(
+            "runtime_protocol_error",
+            "Run cannot start without its request."
+          )
+        )
+        return
+      }
       void sendRpc(activeSocket, method, params)
         .then((response) => {
           if (settled || socket !== activeSocket) return
@@ -302,12 +316,18 @@ export function streamRun(
               "The local service resumed a different run."
             )
           }
-          if (!runId) {
-            runId = responseRunId
+          if (!runId) runId = responseRunId
+          if (!runIdNotified) {
+            runIdNotified = true
             options.onRunId?.(runId)
           }
           options.onRunInfo?.(parseRunInfo(result))
+          subscriptionReady = true
           flushBufferedEvents()
+          if (!settled && replayRequiredForRun === runId) {
+            replayRequiredForRun = null
+            beginRequest(activeSocket)
+          }
         })
         .catch((error: unknown) => {
           if (settled || socket !== activeSocket) return
@@ -371,7 +391,7 @@ export function streamRun(
           const params = asRecord(message.params)
           const event = params ? parseRunEvent(params) : null
           if (!event) continue
-          if (!runId) {
+          if (!subscriptionReady) {
             if (bufferedEvents.length < maxBufferedEvents)
               bufferedEvents.push(event)
             else bufferedEventOverflowed = true
@@ -380,8 +400,15 @@ export function streamRun(
           }
         } else if (message.method === "run.replay_required") {
           const params = asRecord(message.params)
-          if (runId && params?.runId === runId && socket === activeSocket) {
-            beginRequest(activeSocket)
+          const requestedRunId = params?.runId
+          if (
+            typeof requestedRunId === "string" &&
+            (!runId || requestedRunId === runId) &&
+            socket === activeSocket
+          ) {
+            if (subscriptionRequestPending)
+              replayRequiredForRun = requestedRunId
+            else if (runId) beginRequest(activeSocket)
           }
         }
       }
@@ -407,6 +434,8 @@ export function streamRun(
         if (socket !== activeSocket || settled) return
         socket = null
         subscriptionRequestPending = false
+        subscriptionReady = false
+        replayRequiredForRun = null
         const closed = new RuntimeError(
           "connection_lost",
           "Connection to Trellis was lost."
@@ -419,6 +448,25 @@ export function streamRun(
 
     connect()
   })
+}
+
+export function streamRun(
+  input: StartRunInput,
+  options: RuntimeClientOptions = {}
+): Promise<RunResult> {
+  return followRun(input, null, options, 0)
+}
+
+export function resumeRun(
+  runId: string,
+  options: RuntimeClientOptions = {},
+  afterSequence = 0
+): Promise<RunResult> {
+  if (!runId || !Number.isSafeInteger(afterSequence) || afterSequence < 0)
+    return Promise.reject(
+      new RuntimeError("runtime_protocol_error", "Run cursor is invalid.")
+    )
+  return followRun(null, runId, options, afterSequence)
 }
 
 function requestRunAction(

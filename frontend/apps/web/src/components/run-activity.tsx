@@ -144,7 +144,15 @@ export function RunActivity({
   const toolLimit = runInfo?.limits?.maxToolCalls
   const tokenLimit = runInfo?.limits?.maxTotalTokens
   const costLimit = runInfo?.limits?.maxCostUsd
-  const deadlineAt = runInfo?.limits?.deadlineAt
+  const latestResumedDeadline = ordered.findLast(
+    (event) =>
+      event.eventType === "run.resumed" &&
+      typeof event.data.deadline_at === "string" &&
+      Number.isFinite(Date.parse(event.data.deadline_at))
+  )
+  const deadlineAt = latestResumedDeadline
+    ? (textField(latestResumedDeadline.data, "deadline_at") ?? undefined)
+    : runInfo?.limits?.deadlineAt
   const deadline = deadlineAt ? new Date(deadlineAt) : null
 
   return (
