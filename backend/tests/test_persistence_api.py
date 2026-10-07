@@ -326,7 +326,7 @@ def test_database_records_all_schema_migrations(tmp_path: Path) -> None:
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
 
 
 def test_database_upgrades_an_existing_v1_schema(tmp_path: Path) -> None:
@@ -346,7 +346,7 @@ def test_database_upgrades_an_existing_v1_schema(tmp_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'turn_claims'"
         ).fetchone()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
     assert claim_table == ("turn_claims",)
 
 
@@ -398,7 +398,7 @@ def test_database_upgrades_v5_runs_without_changing_public_messages(tmp_path: Pa
                WHERE name IN ('run_messages', 'tool_calls') ORDER BY name"""
         ).fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
     assert [message.content for message in messages] == ["Old request"]
     assert run is not None and run.status is RunStatus.COMPLETED
     assert foreign_key_errors == []

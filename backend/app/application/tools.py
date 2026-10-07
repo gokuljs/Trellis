@@ -28,6 +28,26 @@ def redact_secrets(content: str) -> str:
     return _STANDALONE_TOKEN.sub("[REDACTED]", content)
 
 
+def redact_record(value: object) -> object:
+    """Redact common credentials in nested model and tool records."""
+    if isinstance(value, dict):
+        redacted: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                continue
+            normalized = key.casefold().replace("-", "_")
+            sensitive = normalized in {"token", "secret", "password", "credential", "api_key"} or (
+                normalized.endswith(("_token", "_secret", "_password", "_credential", "_api_key"))
+            )
+            redacted[key] = "[REDACTED]" if sensitive else redact_record(item)
+        return redacted
+    if isinstance(value, list | tuple):
+        return [redact_record(item) for item in value]
+    if isinstance(value, str):
+        return redact_secrets(value)
+    return value
+
+
 class _StrictArguments(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 

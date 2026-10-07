@@ -15,9 +15,11 @@ from app.application.profile import ProfileService
 from app.application.runs import RunService
 from app.application.sessions import SessionService
 from app.application.settings import SettingsService
+from app.application.tools import ToolRegistry
 from app.core.config import Settings
 from app.domain.models import ProviderName
 from app.infrastructure.database import Database
+from app.infrastructure.local_tools import LocalReadToolExecutor, read_workspace_guidance
 from app.infrastructure.providers import AnthropicProvider, OpenAIProvider
 from app.infrastructure.runtime_events import RuntimeEventHub
 from app.infrastructure.secrets import SecretStore
@@ -92,6 +94,8 @@ def create_app(
                 secret_store,
                 runtime_providers,
                 event_hub,
+                tool_registry=ToolRegistry(LocalReadToolExecutor()),
+                workspace_guidance_reader=read_workspace_guidance,
             )
             application.state.run_service = run_service
             application.state.chat_service = ChatService(

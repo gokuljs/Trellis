@@ -48,6 +48,10 @@ class StreamingProvider:
 
 
 class BlockingStreamingProvider(StreamingProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+
     def stream(
         self,
         request: ModelRequest,
@@ -58,6 +62,7 @@ class BlockingStreamingProvider(StreamingProvider):
 
         async def generate() -> AsyncGenerator[ModelStreamEvent]:
             yield ModelStreamEvent(kind="text_delta", text="Working")
+            self.started.set()
             await asyncio.Event().wait()
 
         return generate()
@@ -79,6 +84,7 @@ class GappedStreamingProvider(StreamingProvider):
 
         async def generate() -> AsyncGenerator[ModelStreamEvent]:
             yield ModelStreamEvent(kind="text_delta", text="dropped delta")
+            yield ModelStreamEvent(kind="usage", input_tokens=1, output_tokens=1)
             await asyncio.to_thread(self.continue_stream.wait)
             yield ModelStreamEvent(kind="text_delta", text="replayed delta")
             yield ModelStreamEvent(kind="completed", finish_reason="stop")
@@ -142,14 +148,13 @@ def test_jsonrpc_websocket_streams_a_durable_run(tmp_path: Path) -> None:
     assert [item["eventType"] for item in notifications] == [
         RunEventType.QUEUED.value,
         RunEventType.STARTED.value,
-        RunEventType.ASSISTANT_DELTA.value,
-        RunEventType.ASSISTANT_DELTA.value,
         RunEventType.MODEL_USAGE.value,
         RunEventType.MODEL_COMPLETED.value,
+        RunEventType.ASSISTANT_DELTA.value,
         RunEventType.ASSISTANT_COMPLETED.value,
         RunEventType.COMPLETED.value,
     ]
-    assert [item["sequence"] for item in notifications] == list(range(1, 9))
+    assert [item["sequence"] for item in notifications] == list(range(1, 8))
     assert [message["content"] for message in detail["messages"]] == [
         "Stream this",
         "Streaming works",
@@ -205,7 +210,7 @@ def test_jsonrpc_resume_replays_persisted_events_after_disconnect(tmp_path: Path
     acknowledgement = next(item for item in resumed if item.get("id") == 2)
     events = [item["params"] for item in resumed if item.get("method") == "run.event"]
     assert acknowledgement["result"]["runId"] == run_id
-    assert [event["sequence"] for event in events] == list(range(5, 9))
+    assert [event["sequence"] for event in events] == list(range(5, 8))
 
 
 def test_jsonrpc_replays_when_a_live_event_sequence_has_a_gap(tmp_path: Path) -> None:
@@ -218,18 +223,18 @@ def test_jsonrpc_replays_when_a_live_event_sequence_has_a_gap(tmp_path: Path) ->
         event_hub: RuntimeEventHub = client.app.state.runtime_event_hub
         dropped = threading.Event()
 
-        class DropFirstDelta:
+        class DropFirstUsage:
             def __init__(self) -> None:
                 self.has_dropped = False
 
             async def publish(self, event: RunEvent) -> None:
-                if event.event_type is RunEventType.ASSISTANT_DELTA and not self.has_dropped:
+                if event.event_type is RunEventType.MODEL_USAGE and not self.has_dropped:
                     self.has_dropped = True
                     dropped.set()
                     return
                 await event_hub.publish(event)
 
-        client.app.state.run_service._event_publisher = DropFirstDelta()
+        client.app.state.run_service._event_publisher = DropFirstUsage()
         session_id = client.post("/api/sessions").json()["id"]
         with client.websocket_connect("/api/runtime") as websocket:
             websocket.send_json(
@@ -427,9 +432,10 @@ def test_jsonrpc_can_cancel_a_streaming_run(tmp_path: Path) -> None:
                 websocket,
                 lambda item: (
                     item.get("method") == "run.event"
-                    and item["params"]["eventType"] == RunEventType.ASSISTANT_DELTA.value
+                    and item["params"]["eventType"] == RunEventType.STARTED.value
                 ),
             )
+            assert provider.started.wait(timeout=5)
             run_id = next(
                 item["result"]["runId"] for item in started if item.get("id") == "start-cancel"
             )

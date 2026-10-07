@@ -40,7 +40,7 @@ from app.domain.runtime import (
     validate_run_event_transition,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 TURN_CLAIM_TTL = timedelta(minutes=5)
 
 MIGRATION_TABLE_SCHEMA = """
@@ -316,6 +316,11 @@ SCHEMA_V7 = """
 ALTER TABLE sessions ADD COLUMN workspace_path TEXT;
 """
 
+SCHEMA_V8 = """
+UPDATE models SET supports_tools = 1
+WHERE id IN ('openai:gpt-5.5', 'anthropic:claude-sonnet-5');
+"""
+
 MIGRATIONS = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
@@ -324,6 +329,7 @@ MIGRATIONS = {
     5: SCHEMA_V5,
     6: SCHEMA_V6,
     7: SCHEMA_V7,
+    8: SCHEMA_V8,
 }
 
 
@@ -418,6 +424,57 @@ class Database:
                     RunEventType.INTERRUPTED,
                 )
                 sequence = row["last_event_sequence"] + 1
+                pending_cursor = await connection.execute(
+                    """SELECT tc.id FROM tool_calls AS tc
+                       JOIN run_messages AS rm ON rm.id = tc.assistant_message_id
+                       WHERE tc.run_id = ? AND tc.status IN ('pending', 'running')
+                       ORDER BY rm.ordinal, tc.call_index""",
+                    (run_id,),
+                )
+                pending_tools = await pending_cursor.fetchall()
+                ordinal_cursor = await connection.execute(
+                    "SELECT COALESCE(MAX(ordinal), 0) FROM run_messages WHERE run_id = ?",
+                    (run_id,),
+                )
+                ordinal_row = await ordinal_cursor.fetchone()
+                ordinal = 0 if ordinal_row is None else int(ordinal_row[0])
+                for tool in pending_tools:
+                    ordinal += 1
+                    result_id = str(uuid4())
+                    result_content = "The tool was interrupted when the service restarted."
+                    await connection.execute(
+                        """INSERT INTO run_messages(
+                               id, run_id, ordinal, role, content, tool_call_id, created_at
+                           ) VALUES (?, ?, ?, 'tool', ?, ?, ?)""",
+                        (result_id, run_id, ordinal, result_content, tool["id"], now),
+                    )
+                    await connection.execute(
+                        """UPDATE tool_calls SET status = 'cancelled', finished_at = ?
+                           WHERE id = ?""",
+                        (now, tool["id"]),
+                    )
+                    result_data: dict[str, object] = {
+                        "tool_call_id": tool["id"],
+                        "message_id": result_id,
+                        "status": ToolCallStatus.CANCELLED.value,
+                        "content": result_content,
+                    }
+                    await connection.execute(
+                        """INSERT INTO run_events(
+                               run_id, sequence, event_type, event_version, data, created_at
+                           ) VALUES (?, ?, ?, 1, ?, ?)""",
+                        (
+                            run_id,
+                            sequence,
+                            RunEventType.TOOL_RESULT.value,
+                            json.dumps(result_data, separators=(",", ":")),
+                            now,
+                        ),
+                    )
+                    recovered.append(
+                        RunEvent(run_id, sequence, RunEventType.TOOL_RESULT, 1, result_data, now)
+                    )
+                    sequence += 1
                 await connection.execute(
                     """UPDATE runs SET status = 'interrupted', recovery_count = recovery_count + 1,
                        stop_reason = 'runtime_restart', error_code = 'runtime_restart',
@@ -768,7 +825,7 @@ class Database:
                    retry_of, status, provider_id, model_id, adapter_kind,
                    upstream_model_id, max_model_calls, max_tool_calls, deadline_at,
                        last_event_sequence, created_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, 1, 0, ?, 1, ?)""",
+                   ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, 8, 16, ?, 1, ?)""",
                 (
                     run_id,
                     session_id,
@@ -1452,7 +1509,10 @@ class Database:
             run_row = await run_cursor.fetchone()
             if run_row is None:
                 raise ValueError("run not found")
-            if RunStatus(run_row["status"]) is not RunStatus.RUNNING:
+            if RunStatus(run_row["status"]) is not RunStatus.RUNNING and not (
+                RunStatus(run_row["status"]) is RunStatus.CANCELLING
+                and status is ToolCallStatus.CANCELLED
+            ):
                 raise ValueError("run is not running")
             call_cursor = await connection.execute(
                 "SELECT * FROM tool_calls WHERE id = ? AND run_id = ?", (tool_call_id, run_id)

@@ -471,6 +471,52 @@ def test_restart_recovery_interrupts_orphaned_runs_once(tmp_path: Path) -> None:
     assert all(event.data["code"] == "runtime_restart" for event in recovered)
 
 
+def test_restart_recovery_finishes_a_pending_tool_call(tmp_path: Path) -> None:
+    database = Database(make_settings(tmp_path).database_path)
+
+    async def recover():
+        await database.initialize()
+        session = await database.create_session(str(tmp_path))
+        model = (await database.list_models())[0]
+        run = await database.create_run(session.id, "turn-tool", "request-tool", "read", model)
+        await database.transition_run_record(
+            run.id, RunStatus.RUNNING, RunEventType.STARTED, {"status": "running"}
+        )
+        model_call = await database.create_model_call(run.id, 1, model, {"messages": []})
+        await database.update_model_call(model_call.id, ModelCallStatus.COMPLETED)
+        await database.record_assistant_message(
+            run.id,
+            model_call.id,
+            ModelMessage(
+                role="assistant",
+                content="",
+                tool_calls=(ModelToolCall("provider-tool", "read_file", {"path": "a.txt"}),),
+            ),
+        )
+
+        recovered = await database.recover_active_runs()
+        return (
+            recovered,
+            await database.get_run(run.id),
+            await database.list_tool_calls(run.id),
+            await database.list_run_messages(run.id),
+            await database.list_run_events(run.id),
+        )
+
+    recovered, run, calls, messages, events = asyncio.run(recover())
+    assert run is not None and run.status is RunStatus.INTERRUPTED
+    assert calls[0].status is ToolCallStatus.CANCELLED
+    assert [message.role for message in messages] == ["assistant", "tool"]
+    assert [event.event_type for event in events][-2:] == [
+        RunEventType.TOOL_RESULT,
+        RunEventType.INTERRUPTED,
+    ]
+    assert [event.event_type for event in recovered] == [
+        RunEventType.TOOL_RESULT,
+        RunEventType.INTERRUPTED,
+    ]
+
+
 def test_run_transitions_atomically_update_snapshot_and_event_log(tmp_path: Path) -> None:
     database = Database(make_settings(tmp_path).database_path)
 

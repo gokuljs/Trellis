@@ -261,3 +261,57 @@ Starlette/httpx deprecation and SQLite resource warnings.
 
 **Next.** Use this context for a run that can make several model calls, execute
 tools between them, and save each step before moving on.
+
+## Step 8 — Execute multi-step agent runs
+
+**Why this step exists.** The adapters can decode tool requests, the database
+can save an ordered exchange, and the registry can safely read a workspace.
+This step connects those pieces so one user turn can inspect files and then ask
+the model to answer using the result.
+
+**What works now.** With a workspace attached, a run can make several model
+calls and execute `list_files`, `search_files`, `read_file`, and `inspect_git`
+between them. It can handle several tool calls in one response, including tool
+errors. Each model call, intermediate assistant message, tool request, tool
+result, and event is saved before the next model call. Only the final answer
+appears in the visible session transcript. Without a workspace, ordinary chat
+still works and no local tools are offered. Tool requests from a model without
+an attached workspace fail the run safely.
+
+**Follow the code.** `RunService._execute` in
+`backend/app/application/runs.py` loads the session workspace and root guidance,
+builds context from the visible transcript and saved run exchange, then records
+a model call before streaming its response. A completed tool request is checked
+against the offered tool names and call limits, saved with its assistant
+message, executed through `ToolRegistry`, and saved as a result before the loop
+builds the next request. `backend/app/main.py` wires the registry and guidance
+reader. SQLite migration 8 in `backend/app/infrastructure/database.py` enables
+tool support for the built-in models; restart recovery closes unfinished tool
+calls. `RunService` closes pending calls on failure or cancellation and keeps
+each tool within the run deadline.
+
+**Events and records.** A `model.completed` event marks every completed model
+step, and `tool.call` and `tool.result` events show the intermediate work. The
+WebSocket method and event shapes stay the same. Final `assistant.delta` text
+is emitted after a model step completes: the runtime must first know whether
+text belongs to a final answer or to a tool-requesting assistant message, and
+redacting a complete response prevents secrets split across stream fragments
+from leaking into events. Tool arguments and model snapshots are redacted;
+secret-looking call IDs are rejected. Tool and continuation streams have size
+limits, and a truncated tool result tells the next model step that it is
+incomplete. The existing run row currently supplies provisional 8-model-call,
+16-tool-call, and three-minute bounds; the next commit replaces these with
+selectable budget presets and cost accounting.
+
+**Verification.** The first integration test failed because the run service
+still made one text-only call. Focused tests then caught split-token leakage,
+an incomplete tool result on cancellation or restart, unbounded tool execution,
+raw provider metadata, secret-looking call IDs, excess tool and continuation
+events, and a cancellation race. Tests cover two model steps, multiple tools,
+tool-only responses, safe errors, a failed second model call, and a truncated
+result reaching the next step. The final uv 0.12.5 `make check` passed Ruff
+formatting, Ruff linting, `ty`, and 183 backend tests with 90.38% coverage.
+Pytest reported the existing Starlette/httpx deprecation and SQLite resource
+warnings.
+
+**Next.** Give each run a named budget with clear limits and estimated cost.

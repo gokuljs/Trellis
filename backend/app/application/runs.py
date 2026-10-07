@@ -1,8 +1,13 @@
 import asyncio
+import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import cast
 
+from app.application.context import build_model_context
 from app.application.errors import ApplicationError, ProviderError
 from app.application.ports import (
     ProfileRepository,
@@ -13,22 +18,78 @@ from app.application.ports import (
     SettingsRepository,
     StreamingProviderAdapter,
 )
+from app.application.tools import MAX_ARGUMENT_BYTES, ToolRegistry, redact_record, redact_secrets
 from app.domain.models import ModelDescriptor
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
+    ModelContinuationItem,
     ModelMessage,
     ModelRequest,
+    ModelToolCall,
     RunEvent,
     RunEventType,
     RunSnapshot,
     RunStatus,
+    ToolCallStatus,
+    ToolResult,
 )
 
 logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_TOKENS = 4096
 DEFAULT_MAX_CONCURRENT_RUNS = 4
+MAX_MODEL_RESPONSE_BYTES = 256_000
+MAX_CONTINUATION_BYTES = 256_000
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelStep:
+    content: str
+    tool_calls: tuple[ModelToolCall, ...]
+    continuation_items: tuple[ModelContinuationItem, ...]
+    usage: dict[str, int | None]
+    provider_response_id: str | None
+    finish_reason: str | None
+
+
+def _prepare_tool_calls(
+    calls: tuple[ModelToolCall, ...],
+) -> tuple[tuple[ModelToolCall, ...], dict[str, ToolResult]]:
+    safe_calls: list[ModelToolCall] = []
+    errors: dict[str, ToolResult] = {}
+    for call in calls:
+        if (
+            len(call.id) > 200
+            or len(call.name) > 100
+            or redact_secrets(call.id) != call.id
+            or redact_secrets(call.name) != call.name
+        ):
+            raise ProviderError(
+                "provider_invalid_response", "The provider returned an invalid tool call."
+            )
+        try:
+            encoded = json.dumps(call.arguments, separators=(",", ":"), allow_nan=False)
+            oversized = len(encoded.encode("utf-8")) > MAX_ARGUMENT_BYTES
+        except TypeError, ValueError, UnicodeEncodeError:
+            oversized = True
+        if oversized:
+            safe_arguments: dict[str, object] = {}
+            errors[call.id] = ToolResult(
+                call.id, call.name, "Tool arguments are invalid.", True, "invalid_tool_arguments"
+            )
+        else:
+            safe_arguments = cast(dict[str, object], redact_record(call.arguments))
+            if safe_arguments != call.arguments:
+                errors[call.id] = ToolResult(
+                    call.id,
+                    call.name,
+                    "Tool arguments contained a secret and were not used.",
+                    True,
+                    "sensitive_tool_arguments",
+                )
+        safe_calls.append(ModelToolCall(call.id, call.name, safe_arguments))
+    return tuple(safe_calls), errors
 
 
 class RunService:
@@ -42,6 +103,8 @@ class RunService:
         providers: Mapping[str, StreamingProviderAdapter],
         event_publisher: RunEventPublisher | None = None,
         *,
+        tool_registry: ToolRegistry | None = None,
+        workspace_guidance_reader: Callable[[Path], Awaitable[str | None]] | None = None,
         max_concurrent_runs: int = DEFAULT_MAX_CONCURRENT_RUNS,
     ) -> None:
         if max_concurrent_runs < 1:
@@ -53,6 +116,8 @@ class RunService:
         self._secret_store = secret_store
         self._providers = providers
         self._event_publisher = event_publisher
+        self._tool_registry = tool_registry
+        self._workspace_guidance_reader = workspace_guidance_reader
         self._slots = asyncio.Semaphore(max_concurrent_runs)
         self._admission_lock = asyncio.Lock()
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -143,16 +208,23 @@ class RunService:
             if str(error) == "run not found":
                 raise ApplicationError("run_not_found", "Run not found.") from None
             raise
+        task = self._tasks.get(run_id)
+        if (
+            event is not None
+            and run.status in {RunStatus.CANCELLING, RunStatus.CANCELLED}
+            and task is not None
+            and not task.done()
+        ):
+            task.cancel()
         if event is not None:
             await self._publish(event)
-        if event is not None and run.status in {
-            RunStatus.CANCELLING,
-            RunStatus.CANCELLED,
-        }:
-            task = self._tasks.get(run_id)
-            if task is not None and not task.done():
-                task.cancel()
-            elif run.status is RunStatus.CANCELLING:
+        if event is not None and run.status is RunStatus.CANCELLING:
+            current = await self._runs.get_run(run_id)
+            if (
+                current is not None
+                and current.status is RunStatus.CANCELLING
+                and (task is None or task.done())
+            ):
                 calls = await self._runs.list_model_calls(run_id)
                 active_call = next(
                     (
@@ -273,218 +345,165 @@ class RunService:
                     "Add an API key for the selected provider in Settings.",
                 )
             profile = await self._profiles.get_profile()
-            messages = await self._sessions.list_messages(run.session_id)
-            model_messages = tuple(
-                ModelMessage(role=message.role, content=message.content) for message in messages
+            session = await self._sessions.get_session(run.session_id)
+            if session is None:
+                raise ApplicationError("session_not_found", "Session not found.")
+            workspace_root = Path(session.workspace_path) if session.workspace_path else None
+            guidance = (
+                await self._workspace_guidance_reader(workspace_root)
+                if workspace_root is not None and self._workspace_guidance_reader is not None
+                else None
             )
-            request = ModelRequest(
-                provider_id=run.provider_id,
-                model_id=run.model_id,
-                adapter_kind=run.adapter_kind,
-                upstream_model_id=run.upstream_model_id,
-                messages=model_messages,
-                max_output_tokens=MAX_OUTPUT_TOKENS,
+            offered_tools = (
+                self._tool_registry.specs()
+                if workspace_root is not None
+                and model.supports_tools
+                and self._tool_registry is not None
+                else ()
             )
-            request_snapshot: dict[str, object] = {
-                "provider_id": request.provider_id,
-                "model_id": request.model_id,
-                "adapter_kind": request.adapter_kind,
-                "upstream_model_id": request.upstream_model_id,
-                "system_instructions": request.system_instructions,
-                "messages": [
+            visible_messages = await self._sessions.list_messages(run.session_id)
+
+            for step_index in range(1, run.max_model_calls + 1):
+                run_messages = await self._runs.list_run_messages(run.id)
+                prior_tool_calls = await self._runs.list_tool_calls(run.id)
+                context = build_model_context(
+                    visible_messages,
+                    run_messages,
+                    workspace_root=workspace_root,
+                    workspace_guidance=guidance,
+                    run_tool_calls=prior_tool_calls,
+                    tools=offered_tools,
+                )
+                request = ModelRequest(
+                    provider_id=run.provider_id,
+                    model_id=run.model_id,
+                    adapter_kind=run.adapter_kind,
+                    upstream_model_id=run.upstream_model_id,
+                    messages=context.messages,
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                    system_instructions=context.system_instructions,
+                    tools=context.tools,
+                )
+                call = await self._runs.create_model_call(
+                    run.id, step_index, model, self._request_snapshot(request)
+                )
+                call = await self._runs.update_model_call(call.id, ModelCallStatus.STREAMING)
+                step = await self._stream_model_step(
+                    run, call, request, provider, api_key or "", profile.id
+                )
+                if not step.content.strip() and not step.tool_calls:
+                    raise ProviderError(
+                        "provider_invalid_response", "The provider returned an empty response."
+                    )
+                safe_calls, preflight_errors = _prepare_tool_calls(step.tool_calls)
+                step = replace(step, content=redact_secrets(step.content), tool_calls=safe_calls)
+                call = await self._runs.update_model_call(
+                    call.id,
+                    ModelCallStatus.COMPLETED,
+                    response_snapshot=self._response_snapshot(step),
+                    provider_response_id=step.provider_response_id,
+                    finish_reason=step.finish_reason,
+                    input_tokens=step.usage["input_tokens"],
+                    output_tokens=step.usage["output_tokens"],
+                    reasoning_tokens=step.usage["reasoning_tokens"],
+                    cached_tokens=step.usage["cached_tokens"],
+                )
+                await self._append_and_publish(
+                    run.id,
+                    RunEventType.MODEL_COMPLETED,
                     {
-                        "role": message.role,
-                        "content": message.content,
-                        **(
-                            {"tool_call_id": message.tool_call_id}
-                            if message.tool_call_id is not None
-                            else {}
+                        "model_call_id": call.id,
+                        "provider_response_id": step.provider_response_id,
+                        "finish_reason": step.finish_reason,
+                    },
+                )
+                if not step.tool_calls:
+                    final_content = redact_secrets(step.content).strip()
+                    if not final_content:
+                        raise ProviderError(
+                            "provider_invalid_response", "The provider returned an empty response."
+                        )
+                    await self._append_and_publish(
+                        run.id, RunEventType.ASSISTANT_DELTA, {"text": final_content}
+                    )
+                    _message, completion_events = await self._runs.complete_run(
+                        run.id, final_content
+                    )
+                    for event in completion_events:
+                        await self._publish(event)
+                    return
+
+                if self._tool_registry is None or workspace_root is None or not request.tools:
+                    raise ProviderError(
+                        "tool_execution_unavailable", "This run cannot execute tool requests yet."
+                    )
+                offered_names = {tool.name for tool in request.tools}
+                if any(tool.name not in offered_names for tool in step.tool_calls):
+                    raise ProviderError(
+                        "provider_invalid_response", "The provider requested an unoffered tool."
+                    )
+                prior_ids = {tool.provider_call_id for tool in prior_tool_calls}
+                new_ids = [tool.id for tool in step.tool_calls]
+                if len(new_ids) != len(set(new_ids)) or any(
+                    tool_id in prior_ids for tool_id in new_ids
+                ):
+                    raise ProviderError(
+                        "provider_invalid_response", "The provider repeated a tool call ID."
+                    )
+                if len(prior_tool_calls) + len(step.tool_calls) > run.max_tool_calls:
+                    raise ProviderError("tool_call_limit", "The run reached its tool-call limit.")
+                if step_index >= run.max_model_calls:
+                    raise ProviderError("model_call_limit", "The run reached its model-call limit.")
+                assistant_message = ModelMessage(
+                    role="assistant",
+                    content=redact_secrets(step.content),
+                    tool_calls=step.tool_calls,
+                    continuation_items=step.continuation_items,
+                )
+                _assistant, stored_calls, stored_events = await self._runs.record_assistant_message(
+                    run.id, call.id, assistant_message
+                )
+                for event in stored_events:
+                    await self._publish(event)
+                for stored_call in stored_calls:
+                    remaining_seconds = self._remaining_seconds(run)
+                    if remaining_seconds <= 0:
+                        raise ProviderError("provider_timeout", "The run deadline was reached.")
+                    tool_request = ModelToolCall(
+                        stored_call.provider_call_id, stored_call.name, stored_call.arguments
+                    )
+                    result = preflight_errors.get(stored_call.provider_call_id)
+                    if result is None:
+                        try:
+                            async with asyncio.timeout(remaining_seconds):
+                                result = await self._tool_registry.execute(
+                                    tool_request, workspace_root
+                                )
+                        except TimeoutError:
+                            raise ProviderError(
+                                "provider_timeout", "The run deadline was reached."
+                            ) from None
+                    result_content = (
+                        f"{result.error_code}: {result.content}"
+                        if result.is_error and result.error_code is not None
+                        else result.content
+                    )
+                    if result.truncated:
+                        result_content += "\n[Output truncated by Trellis.]"
+                    (
+                        _result_message,
+                        _updated_call,
+                        result_event,
+                    ) = await self._runs.record_tool_result(
+                        run.id,
+                        stored_call.id,
+                        result_content,
+                        status=(
+                            ToolCallStatus.FAILED if result.is_error else ToolCallStatus.COMPLETED
                         ),
-                        "tool_calls": [
-                            {"id": tool.id, "name": tool.name, "arguments": tool.arguments}
-                            for tool in message.tool_calls
-                        ],
-                        "continuation_items": [
-                            {
-                                "provider_id": item.provider_id,
-                                "model_id": item.model_id,
-                                "payload_json": item.payload_json,
-                            }
-                            for item in message.continuation_items
-                        ],
-                    }
-                    for message in request.messages
-                ],
-                "tools": [
-                    {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "input_schema": tool.input_schema,
-                    }
-                    for tool in request.tools
-                ],
-                "max_output_tokens": request.max_output_tokens,
-            }
-            call = await self._runs.create_model_call(
-                run.id,
-                1,
-                model,
-                request_snapshot,
-            )
-            call = await self._runs.update_model_call(call.id, ModelCallStatus.STREAMING)
-
-            output_parts: list[str] = []
-            streamed_tool_calls: list[dict[str, object]] = []
-            continuation_items: list[dict[str, str]] = []
-            usage: dict[str, int | None] = {
-                "input_tokens": None,
-                "output_tokens": None,
-                "reasoning_tokens": None,
-                "cached_tokens": None,
-            }
-            provider_response_id: str | None = None
-            finish_reason: str | None = None
-            received_completion = False
-            deadline = datetime.fromisoformat(run.deadline_at.replace("Z", "+00:00"))
-            timeout_seconds = (deadline - datetime.now(UTC)).total_seconds()
-            if timeout_seconds <= 0:
-                raise ProviderError("provider_timeout", "The run deadline was reached.")
-
-            try:
-                async with asyncio.timeout(timeout_seconds):
-                    async for event in provider.stream(
-                        request,
-                        api_key or "",
-                        profile.id,
-                    ):
-                        if event.kind == "text_delta":
-                            if event.text is None:
-                                raise ProviderError(
-                                    "provider_invalid_response",
-                                    "The provider returned an invalid text event.",
-                                )
-                            output_parts.append(event.text)
-                            await self._append_and_publish(
-                                run.id,
-                                RunEventType.ASSISTANT_DELTA,
-                                {"text": event.text},
-                            )
-                        elif event.kind == "tool_call":
-                            if event.tool_call is None:
-                                raise ProviderError(
-                                    "provider_invalid_response",
-                                    "The provider returned an invalid tool call.",
-                                )
-                            streamed_tool_calls.append(
-                                {
-                                    "id": event.tool_call.id,
-                                    "name": event.tool_call.name,
-                                    "arguments": event.tool_call.arguments,
-                                }
-                            )
-                        elif event.kind == "continuation_item":
-                            if event.continuation_item is None:
-                                raise ProviderError(
-                                    "provider_invalid_response",
-                                    "The provider returned invalid continuation data.",
-                                )
-                            continuation_items.append(
-                                {
-                                    "provider_id": event.continuation_item.provider_id,
-                                    "model_id": event.continuation_item.model_id,
-                                    "payload_json": event.continuation_item.payload_json,
-                                }
-                            )
-                        elif event.kind == "usage":
-                            usage = {
-                                "input_tokens": event.input_tokens,
-                                "output_tokens": event.output_tokens,
-                                "reasoning_tokens": event.reasoning_tokens,
-                                "cached_tokens": event.cached_tokens,
-                            }
-                            provider_response_id = (
-                                event.provider_response_id or provider_response_id
-                            )
-                            call = await self._runs.update_model_call(
-                                call.id,
-                                ModelCallStatus.STREAMING,
-                                provider_response_id=provider_response_id,
-                                input_tokens=usage["input_tokens"],
-                                output_tokens=usage["output_tokens"],
-                                reasoning_tokens=usage["reasoning_tokens"],
-                                cached_tokens=usage["cached_tokens"],
-                            )
-                            await self._append_and_publish(
-                                run.id,
-                                RunEventType.MODEL_USAGE,
-                                {
-                                    **{
-                                        key: value
-                                        for key, value in usage.items()
-                                        if value is not None
-                                    },
-                                    **(
-                                        {"provider_response_id": provider_response_id}
-                                        if provider_response_id is not None
-                                        else {}
-                                    ),
-                                },
-                            )
-                        elif event.kind == "completed":
-                            received_completion = True
-                            provider_response_id = (
-                                event.provider_response_id or provider_response_id
-                            )
-                            finish_reason = event.finish_reason
-            except TimeoutError:
-                raise ProviderError("provider_timeout", "The run deadline was reached.") from None
-
-            if not received_completion:
-                raise ProviderError(
-                    "provider_invalid_response",
-                    "The provider stream ended before completion.",
-                )
-            assistant_content = "".join(output_parts).strip()
-            if not assistant_content:
-                raise ProviderError(
-                    "provider_invalid_response",
-                    "The provider returned an empty response.",
-                )
-            call = await self._runs.update_model_call(
-                call.id,
-                ModelCallStatus.COMPLETED,
-                response_snapshot={
-                    "content": "".join(output_parts),
-                    "tool_calls": streamed_tool_calls,
-                    "continuation_items": continuation_items,
-                    "usage": usage,
-                    "finish_reason": finish_reason,
-                    "provider_response_id": provider_response_id,
-                },
-                provider_response_id=provider_response_id,
-                finish_reason=finish_reason,
-                input_tokens=usage["input_tokens"],
-                output_tokens=usage["output_tokens"],
-                reasoning_tokens=usage["reasoning_tokens"],
-                cached_tokens=usage["cached_tokens"],
-            )
-            await self._append_and_publish(
-                run.id,
-                RunEventType.MODEL_COMPLETED,
-                {
-                    "model_call_id": call.id,
-                    "provider_response_id": provider_response_id,
-                    "finish_reason": finish_reason,
-                },
-            )
-            if streamed_tool_calls:
-                raise ProviderError(
-                    "tool_execution_unavailable",
-                    "This run cannot execute tool requests yet.",
-                )
-            _message, completion_events = await self._runs.complete_run(run.id, assistant_content)
-            for event in completion_events:
-                await self._publish(event)
+                    )
+                    await self._publish(result_event)
+            raise ProviderError("model_call_limit", "The run reached its model-call limit.")
         except asyncio.CancelledError:
             current = await self._runs.get_run(run_id)
             if current is not None and current.status is RunStatus.CANCELLING:
@@ -494,10 +513,10 @@ class RunService:
             raise
         except ProviderError as error:
             if started:
-                await self._fail(run_id, call, error.code, error.message)
+                await self._fail_or_cancel(run_id, call, error.code, error.message)
         except ApplicationError as error:
             if started:
-                await self._fail(run_id, call, error.code, error.message)
+                await self._fail_or_cancel(run_id, call, error.code, error.message)
         except Exception as error:
             logger.error(
                 "Unexpected failure while executing run %s (error type: %s)",
@@ -505,12 +524,217 @@ class RunService:
                 type(error).__name__,
             )
             if started:
-                await self._fail(
+                await self._fail_or_cancel(
                     run_id,
                     call,
                     "runtime_internal_error",
                     "Trellis could not complete this run.",
                 )
+
+    @staticmethod
+    def _request_snapshot(request: ModelRequest) -> dict[str, object]:
+        snapshot: dict[str, object] = {
+            "provider_id": request.provider_id,
+            "model_id": request.model_id,
+            "adapter_kind": request.adapter_kind,
+            "upstream_model_id": request.upstream_model_id,
+            "system_instructions": request.system_instructions,
+            "messages": [
+                {
+                    "role": message.role,
+                    "content": redact_secrets(message.content),
+                    **(
+                        {"tool_call_id": message.tool_call_id}
+                        if message.tool_call_id is not None
+                        else {}
+                    ),
+                    "tool_calls": [
+                        {"id": tool.id, "name": tool.name, "arguments": tool.arguments}
+                        for tool in message.tool_calls
+                    ],
+                    "continuation_items": [
+                        {
+                            "provider_id": item.provider_id,
+                            "model_id": item.model_id,
+                            "payload_json": item.payload_json,
+                        }
+                        for item in message.continuation_items
+                    ],
+                }
+                for message in request.messages
+            ],
+            "tools": [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.input_schema,
+                }
+                for tool in request.tools
+            ],
+            "max_output_tokens": request.max_output_tokens,
+        }
+        return cast(dict[str, object], redact_record(snapshot))
+
+    @staticmethod
+    def _response_snapshot(step: _ModelStep) -> dict[str, object]:
+        snapshot: dict[str, object] = {
+            "content": redact_secrets(step.content),
+            "tool_calls": [
+                {"id": tool.id, "name": tool.name, "arguments": tool.arguments}
+                for tool in step.tool_calls
+            ],
+            "continuation_items": [
+                {
+                    "provider_id": item.provider_id,
+                    "model_id": item.model_id,
+                    "payload_json": item.payload_json,
+                }
+                for item in step.continuation_items
+            ],
+            "usage": step.usage,
+            "finish_reason": step.finish_reason,
+            "provider_response_id": step.provider_response_id,
+        }
+        return cast(dict[str, object], redact_record(snapshot))
+
+    async def _stream_model_step(
+        self,
+        run: RunSnapshot,
+        call: ModelCallRecord,
+        request: ModelRequest,
+        provider: StreamingProviderAdapter,
+        api_key: str,
+        user_id: str,
+    ) -> _ModelStep:
+        output_parts: list[str] = []
+        output_bytes = 0
+        continuation_bytes = 0
+        tool_calls: list[ModelToolCall] = []
+        continuation_items: list[ModelContinuationItem] = []
+        usage: dict[str, int | None] = {
+            "input_tokens": None,
+            "output_tokens": None,
+            "reasoning_tokens": None,
+            "cached_tokens": None,
+        }
+        provider_response_id: str | None = None
+        finish_reason: str | None = None
+        received_completion = False
+        timeout_seconds = self._remaining_seconds(run)
+        if timeout_seconds <= 0:
+            raise ProviderError("provider_timeout", "The run deadline was reached.")
+
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                async for event in provider.stream(request, api_key, user_id):
+                    if event.kind == "text_delta":
+                        if event.text is None:
+                            raise ProviderError(
+                                "provider_invalid_response", "The provider returned invalid text."
+                            )
+                        output_bytes += len(event.text.encode("utf-8"))
+                        if output_bytes > MAX_MODEL_RESPONSE_BYTES:
+                            raise ProviderError(
+                                "provider_invalid_response", "The provider response is too large."
+                            )
+                        output_parts.append(event.text)
+                    elif event.kind == "tool_call":
+                        if event.tool_call is None:
+                            raise ProviderError(
+                                "provider_invalid_response",
+                                "The provider returned an invalid tool call.",
+                            )
+                        if len(tool_calls) >= run.max_tool_calls:
+                            raise ProviderError(
+                                "tool_call_limit", "The run reached its tool-call limit."
+                            )
+                        tool_calls.append(event.tool_call)
+                    elif event.kind == "continuation_item":
+                        if event.continuation_item is None:
+                            raise ProviderError(
+                                "provider_invalid_response",
+                                "The provider returned invalid continuation data.",
+                            )
+                        item = event.continuation_item
+                        continuation_bytes += len(item.payload_json.encode("utf-8"))
+                        if (
+                            continuation_bytes > MAX_CONTINUATION_BYTES
+                            or redact_secrets(item.payload_json) != item.payload_json
+                        ):
+                            raise ProviderError(
+                                "provider_invalid_response",
+                                "The provider returned invalid continuation data.",
+                            )
+                        continuation_items.append(item)
+                    elif event.kind == "usage":
+                        usage = {
+                            "input_tokens": event.input_tokens,
+                            "output_tokens": event.output_tokens,
+                            "reasoning_tokens": event.reasoning_tokens,
+                            "cached_tokens": event.cached_tokens,
+                        }
+                        provider_response_id = (
+                            self._safe_provider_metadata(event.provider_response_id)
+                            or provider_response_id
+                        )
+                        call = await self._runs.update_model_call(
+                            call.id,
+                            ModelCallStatus.STREAMING,
+                            provider_response_id=provider_response_id,
+                            input_tokens=usage["input_tokens"],
+                            output_tokens=usage["output_tokens"],
+                            reasoning_tokens=usage["reasoning_tokens"],
+                            cached_tokens=usage["cached_tokens"],
+                        )
+                        await self._append_and_publish(
+                            run.id,
+                            RunEventType.MODEL_USAGE,
+                            {
+                                **{key: value for key, value in usage.items() if value is not None},
+                                **(
+                                    {"provider_response_id": provider_response_id}
+                                    if provider_response_id is not None
+                                    else {}
+                                ),
+                            },
+                        )
+                    elif event.kind == "completed":
+                        received_completion = True
+                        provider_response_id = (
+                            self._safe_provider_metadata(event.provider_response_id)
+                            or provider_response_id
+                        )
+                        finish_reason = self._safe_provider_metadata(event.finish_reason)
+        except TimeoutError:
+            raise ProviderError("provider_timeout", "The run deadline was reached.") from None
+
+        if not received_completion:
+            raise ProviderError(
+                "provider_invalid_response", "The provider stream ended before completion."
+            )
+        return _ModelStep(
+            content="".join(output_parts),
+            tool_calls=tuple(tool_calls),
+            continuation_items=tuple(continuation_items),
+            usage=usage,
+            provider_response_id=provider_response_id,
+            finish_reason=finish_reason,
+        )
+
+    @staticmethod
+    def _safe_provider_metadata(value: str | None) -> str | None:
+        if value is None:
+            return None
+        if len(value) > 200:
+            raise ProviderError(
+                "provider_invalid_response", "The provider returned invalid response metadata."
+            )
+        return redact_secrets(value)
+
+    @staticmethod
+    def _remaining_seconds(run: RunSnapshot) -> float:
+        deadline = datetime.fromisoformat(run.deadline_at.replace("Z", "+00:00"))
+        return (deadline - datetime.now(UTC)).total_seconds()
 
     async def _get_run_model(self, run: RunSnapshot) -> ModelDescriptor:
         models = await self._settings.list_models()
@@ -570,6 +794,11 @@ class RunService:
                 error_code=error_code,
                 error_message=error_message,
             )
+        await self._finish_pending_tools(
+            run_id,
+            ToolCallStatus.TIMED_OUT if error_code == "provider_timeout" else ToolCallStatus.FAILED,
+            "The tool could not complete.",
+        )
         event = await self._runs.transition_run_record(
             run_id,
             RunStatus.FAILED,
@@ -581,9 +810,25 @@ class RunService:
         )
         await self._publish(event)
 
+    async def _fail_or_cancel(
+        self,
+        run_id: str,
+        call: ModelCallRecord | None,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        current = await self._runs.get_run(run_id)
+        if current is not None and current.status is RunStatus.CANCELLING:
+            await self._mark_cancelled(run_id, call)
+        elif current is not None and current.status is RunStatus.RUNNING:
+            await self._fail(run_id, call, error_code, error_message)
+
     async def _mark_interrupted(self, run_id: str, call: ModelCallRecord | None) -> None:
         if call is not None and call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
             await self._runs.update_model_call(call.id, ModelCallStatus.CANCELLED)
+        await self._finish_pending_tools(
+            run_id, ToolCallStatus.CANCELLED, "The run was interrupted."
+        )
         event = await self._runs.transition_run_record(
             run_id,
             RunStatus.INTERRUPTED,
@@ -598,6 +843,9 @@ class RunService:
     async def _mark_cancelled(self, run_id: str, call: ModelCallRecord | None) -> None:
         if call is not None and call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
             await self._runs.update_model_call(call.id, ModelCallStatus.CANCELLED)
+        await self._finish_pending_tools(
+            run_id, ToolCallStatus.CANCELLED, "The tool was cancelled."
+        )
         event = await self._runs.transition_run_record(
             run_id,
             RunStatus.CANCELLED,
@@ -606,3 +854,14 @@ class RunService:
             stop_reason="user_cancelled",
         )
         await self._publish(event)
+
+    async def _finish_pending_tools(
+        self, run_id: str, status: ToolCallStatus, content: str
+    ) -> None:
+        for tool in await self._runs.list_tool_calls(run_id):
+            if tool.status not in {ToolCallStatus.PENDING, ToolCallStatus.RUNNING}:
+                continue
+            _message, _updated, event = await self._runs.record_tool_result(
+                run_id, tool.id, content, status=status
+            )
+            await self._publish(event)
