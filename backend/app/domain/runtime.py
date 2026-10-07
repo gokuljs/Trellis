@@ -158,11 +158,25 @@ class ModelToolCall:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelContinuationItem:
+    """Provider-owned state carried opaquely between model calls."""
+
+    provider_id: str
+    model_id: str
+    payload_json: str
+
+    def __post_init__(self) -> None:
+        if not self.provider_id or not self.model_id or not self.payload_json:
+            raise ValueError("continuation source and payload cannot be empty")
+
+
+@dataclass(frozen=True, slots=True)
 class ModelMessage:
     role: Literal["user", "assistant", "tool"]
     content: str
     tool_call_id: str | None = None
     tool_calls: tuple[ModelToolCall, ...] = ()
+    continuation_items: tuple[ModelContinuationItem, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,9 +193,10 @@ class ModelRequest:
 
 @dataclass(frozen=True, slots=True)
 class ModelStreamEvent:
-    kind: Literal["text_delta", "tool_call", "usage", "completed"]
+    kind: Literal["text_delta", "tool_call", "continuation_item", "usage", "completed"]
     text: str | None = None
     tool_call: ModelToolCall | None = None
+    continuation_item: ModelContinuationItem | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
     reasoning_tokens: int | None = None
@@ -194,6 +209,8 @@ class ModelStreamEvent:
             raise ValueError("text_delta events require text")
         if self.kind == "tool_call" and self.tool_call is None:
             raise ValueError("tool_call events require a tool call")
+        if self.kind == "continuation_item" and self.continuation_item is None:
+            raise ValueError("continuation_item events require a continuation item")
         if self.kind == "usage":
             for token_count in (
                 self.input_tokens,

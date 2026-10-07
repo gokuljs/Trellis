@@ -1,6 +1,7 @@
 import pytest
 
 from app.domain.runtime import (
+    ModelContinuationItem,
     ModelMessage,
     ModelRequest,
     ModelStreamEvent,
@@ -98,3 +99,18 @@ def test_model_request_carries_tools_and_their_round_trip_messages() -> None:
 def test_stream_rejects_tool_call_event_without_a_complete_call() -> None:
     with pytest.raises(ValueError, match="tool_call events require a tool call"):
         ModelStreamEvent(kind="tool_call")
+
+
+def test_opaque_model_continuation_can_move_from_stream_to_next_request() -> None:
+    continuation = ModelContinuationItem(
+        provider_id="openai",
+        model_id="openai:gpt-5.5",
+        payload_json='{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}',
+    )
+    event = ModelStreamEvent(kind="continuation_item", continuation_item=continuation)
+    message = ModelMessage(role="assistant", content="", continuation_items=(continuation,))
+
+    assert event.continuation_item == message.continuation_items[0]
+
+    with pytest.raises(ValueError, match="continuation_item events require"):
+        ModelStreamEvent(kind="continuation_item")

@@ -46,3 +46,38 @@ dependency/resource warnings.
 
 **Next.** Translate each provider's streamed tool-call format into this shared
 contract, one provider at a time.
+
+## Step 2 — Parse OpenAI streamed function calls
+
+**Why this step exists.** OpenAI sends function calls as several stream events:
+an item announcement, pieces of an argument string, and a final item. The
+runtime must receive one validated Trellis call only after the whole response
+completes. Otherwise a partial or malformed request could reach a local tool.
+
+**What works now.** The OpenAI adapter can send tool definitions and stable
+instructions, read multiple streamed function calls, and replay assistant calls
+with their tool results on the next request. It also carries encrypted reasoning
+items through an opaque domain type for stateless GPT-5.5 follow-ups. The run
+service still makes a single text-only model call, so no tool executes yet.
+
+**Follow the code.** `ModelContinuationItem` in
+`backend/app/domain/runtime.py` carries provider-owned reasoning state without
+teaching the domain OpenAI's format. In
+`backend/app/infrastructure/providers.py`, `OpenAIProvider.stream` converts
+`ModelRequest` into the Responses input, then `_stream_openai` tracks item and
+call IDs, assembles arguments, checks their size and nesting, parses a JSON
+object, and emits `ModelStreamEvent(kind="tool_call")` after
+`response.completed`. It rejects duplicate, truncated, and inconsistent items
+with a safe provider error. Completed reasoning items are replayed ahead of the
+assistant call and result on the next stateless request.
+
+**Verification.** Focused provider tests first failed for the missing call
+parsing, normal `arguments.done` events without a name, malformed arguments,
+and reasoning replay. The first pinned aggregate check exposed a stack-size
+dependent deep-JSON test; the parser now rejects nesting beyond 64 levels
+directly. The final uv 0.12.5 `make check` passed Ruff formatting, Ruff linting,
+`ty`, and 118 backend tests with 90.66% coverage. Pytest reported one existing
+Starlette/httpx deprecation warning.
+
+**Next.** Translate Anthropic's streamed `tool_use` blocks into the same Trellis
+call type.
