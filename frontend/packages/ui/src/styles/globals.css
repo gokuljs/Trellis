@@ -1284,7 +1284,25 @@ html.theme-ripple-fallback::before {
   }
 
   .run-activity-expanded {
+    max-height: min(360px, 50dvh);
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-width: none;
     animation: run-activity-reveal 180ms ease-out both;
+  }
+
+  .run-activity-expanded pre {
+    scrollbar-width: none;
+  }
+
+  .run-activity-expanded::-webkit-scrollbar,
+  .run-activity-expanded pre::-webkit-scrollbar {
+    display: none;
+  }
+
+  .run-activity-expanded:focus-visible {
+    outline: 2px solid var(--shell-text-strong);
+    outline-offset: 2px;
   }
 
   .run-activity-attempt + .run-activity-attempt,

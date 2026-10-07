@@ -115,7 +115,13 @@ export function RunActivityDisclosure({
         </div>
       )}
       {expanded && available ? (
-        <div id={detailsId} className="run-activity-expanded">
+        <div
+          id={detailsId}
+          className="run-activity-expanded"
+          role="region"
+          aria-label="Activity details"
+          tabIndex={0}
+        >
           {activity.priorAttempts?.map((attempt, index) => (
             <div className="run-activity-attempt" key={attempt.runId}>
               <div className="run-activity-attempt-label">

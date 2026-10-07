@@ -63,6 +63,47 @@ function renderThread(content: string) {
 afterEach(cleanup)
 
 describe("chat Markdown", () => {
+  it("lets keyboard users enter expanded activity without stealing focus", async () => {
+    const user = userEvent.setup()
+    render(
+      <ChatThread
+        session={session}
+        messages={[message("Answer")]}
+        pending={false}
+        streamingText={null}
+        error={null}
+        canRetry={false}
+        canCancel={false}
+        cancellationPending={false}
+        runActivities={{
+          "turn-1": {
+            runInfo: null,
+            events: [
+              {
+                runId: "run-1",
+                sequence: 1,
+                eventType: "run.completed",
+                eventVersion: 1,
+                data: {},
+                createdAt: "2026-10-07T12:00:00Z",
+              },
+            ],
+          },
+        }}
+        onRetry={() => undefined}
+        onCancel={() => undefined}
+      />
+    )
+
+    const trigger = screen.getByRole("button", { name: /Completed/ })
+    await user.click(trigger)
+    expect(trigger).toHaveFocus()
+    await user.tab()
+    expect(
+      screen.getByRole("region", { name: "Activity details" })
+    ).toHaveFocus()
+  })
+
   it("shows one compact activity line at a time and closes it on outside click or Escape", async () => {
     const user = userEvent.setup()
     render(
