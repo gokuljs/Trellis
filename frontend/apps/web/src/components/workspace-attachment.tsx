@@ -1,5 +1,5 @@
-import { FolderClosed, X } from "lucide-react"
-import { useState } from "react"
+import { FolderClosed, Plus, X } from "lucide-react"
+import { useEffect, useRef, useState } from "react"
 
 import { ApiError } from "@/lib/api"
 
@@ -11,6 +11,13 @@ type WorkspaceAttachmentProps = {
   onRemove: () => Promise<void>
 }
 
+const workspaceMenuId = "composer-workspace-menu"
+
+function workspaceName(path: string) {
+  const withoutTrailingSeparators = path.replace(/[\\/]+$/, "")
+  return withoutTrailingSeparators.split(/[\\/]/).at(-1) || path
+}
+
 export function WorkspaceAttachment({
   workspacePath,
   disabled,
@@ -18,6 +25,7 @@ export function WorkspaceAttachment({
   onSave,
   onRemove,
 }: WorkspaceAttachmentProps) {
+  const [menuOpen, setMenuOpen] = useState(false)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(workspacePath ?? "")
   const [busyAction, setBusyAction] = useState<
@@ -25,7 +33,46 @@ export function WorkspaceAttachment({
   >(null)
   const [error, setError] = useState<string | null>(null)
   const [manualEntryAvailable, setManualEntryAvailable] = useState(false)
+  const anchorRef = useRef<HTMLDivElement>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const workspaceItemRef = useRef<HTMLButtonElement>(null)
+  const manualInputRef = useRef<HTMLInputElement>(null)
   const busy = disabled || busyAction !== null
+
+  useEffect(() => {
+    if (!menuOpen) return
+
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (
+        busyAction === null &&
+        !anchorRef.current?.contains(event.target as Node)
+      ) {
+        setMenuOpen(false)
+      }
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && busyAction === null) {
+        setMenuOpen(false)
+        triggerRef.current?.focus()
+      }
+    }
+
+    document.addEventListener("pointerdown", closeOnOutsidePointer)
+    document.addEventListener("keydown", closeOnEscape)
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer)
+      document.removeEventListener("keydown", closeOnEscape)
+    }
+  }, [busyAction, menuOpen])
+
+  useEffect(() => {
+    if (!menuOpen) return
+    if (editing) {
+      manualInputRef.current?.focus()
+    } else {
+      workspaceItemRef.current?.focus()
+    }
+  }, [editing, menuOpen])
 
   const save = async () => {
     const path = draft.trim()
@@ -39,6 +86,7 @@ export function WorkspaceAttachment({
       await onSave(path)
       setEditing(false)
       setManualEntryAvailable(false)
+      setMenuOpen(false)
     } catch (saveError) {
       setError(
         saveError instanceof ApiError
@@ -53,17 +101,26 @@ export function WorkspaceAttachment({
   const pickWorkspace = async () => {
     setBusyAction("pick")
     setError(null)
-    setManualEntryAvailable(false)
     try {
       const saved = await onPickWorkspace()
-      if (saved) setEditing(false)
+      if (saved) {
+        setEditing(false)
+        setManualEntryAvailable(false)
+        setMenuOpen(false)
+      } else if (!editing) {
+        setMenuOpen(false)
+      }
     } catch (pickerError) {
       setError(
         pickerError instanceof ApiError
           ? pickerError.message
           : "Trellis could not open the folder picker."
       )
-      setManualEntryAvailable(true)
+      setManualEntryAvailable(
+        pickerError instanceof ApiError &&
+          pickerError.code === "workspace_picker_unavailable"
+      )
+      setMenuOpen(true)
     } finally {
       setBusyAction(null)
     }
@@ -77,106 +134,181 @@ export function WorkspaceAttachment({
       setDraft("")
       setEditing(false)
       setManualEntryAvailable(false)
+      setMenuOpen(false)
     } catch (removeError) {
       setError(
         removeError instanceof ApiError
           ? removeError.message
           : "Trellis could not remove that folder."
       )
+      setMenuOpen(true)
     } finally {
       setBusyAction(null)
     }
   }
 
   return (
-    <div className="workspace-attachment">
-      <div className="workspace-attachment-summary">
-        <FolderClosed size={15} aria-hidden="true" />
-        {workspacePath ? (
-          <span className="workspace-attachment-path" title={workspacePath}>
-            {workspacePath}
-          </span>
-        ) : (
-          <span>Chat without a folder</span>
-        )}
-        <button
-          type="button"
-          onClick={() => {
-            void pickWorkspace()
-          }}
-          disabled={busy}
-        >
-          {busyAction === "pick"
-            ? "Opening folder…"
-            : workspacePath
-              ? "Change workspace"
-              : "Attach workspace"}
-        </button>
-        {workspacePath ? (
+    <>
+      {workspacePath ? (
+        <div className="composer-workspace-chip">
+          <span>{workspaceName(workspacePath)}</span>
           <button
             type="button"
-            className="workspace-attachment-remove"
+            aria-label="Remove workspace"
             onClick={() => void remove()}
             disabled={busy}
           >
-            Remove workspace
+            <X size={13} aria-hidden="true" />
           </button>
-        ) : null}
-      </div>
-      {editing ? (
-        <form
-          className="workspace-attachment-editor"
-          onSubmit={(event) => {
-            event.preventDefault()
-            void save()
-          }}
-        >
-          <label htmlFor="workspace-folder">Workspace folder</label>
-          <div className="workspace-attachment-input-row">
-            <input
-              id="workspace-folder"
-              type="text"
-              value={draft}
-              onChange={(event) => setDraft(event.target.value)}
-              placeholder="/absolute/path/to/project"
-              autoCapitalize="off"
-              autoComplete="off"
-              spellCheck={false}
-              maxLength={4096}
-              disabled={busy}
-            />
-            <button type="submit" disabled={busy}>
-              Save workspace
-            </button>
-            <button
-              type="button"
-              className="workspace-attachment-close"
-              aria-label="Close workspace editor"
-              onClick={() => setEditing(false)}
-              disabled={busy}
-            >
-              <X size={15} aria-hidden="true" />
-            </button>
-          </div>
-        </form>
+        </div>
       ) : null}
-      {error ? <div role="alert">{error}</div> : null}
-      {manualEntryAvailable ? (
+      <div className="composer-workspace-anchor" ref={anchorRef}>
         <button
+          className="composer-add"
           type="button"
-          className="workspace-attachment-manual"
+          aria-label="Attach"
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          aria-controls={workspaceMenuId}
           onClick={() => {
-            setDraft((currentDraft) =>
-              editing ? currentDraft : (workspacePath ?? "")
-            )
-            setEditing(true)
-            setManualEntryAvailable(false)
+            if (menuOpen) {
+              setMenuOpen(false)
+            } else {
+              setError(null)
+              setMenuOpen(true)
+            }
           }}
           disabled={busy}
+          ref={triggerRef}
         >
-          Enter path manually
+          <Plus size={18} strokeWidth={1.6} aria-hidden="true" />
         </button>
-      ) : null}
-    </div>
+        {menuOpen ? (
+          <div
+            id={workspaceMenuId}
+            className="composer-workspace-menu"
+            role={editing ? "dialog" : "menu"}
+            aria-label={editing ? "Enter workspace path" : "Add to chat"}
+            aria-busy={busyAction !== null}
+            onKeyDown={(event) => {
+              if (editing) return
+              const items = Array.from(
+                event.currentTarget.querySelectorAll<HTMLButtonElement>(
+                  '[role="menuitem"]:not(:disabled)'
+                )
+              )
+              if (items.length === 0) return
+
+              const currentIndex = items.indexOf(
+                document.activeElement as HTMLButtonElement
+              )
+              let nextIndex: number | null = null
+              if (event.key === "ArrowDown") {
+                nextIndex = (currentIndex + 1) % items.length
+              } else if (event.key === "ArrowUp") {
+                nextIndex = (currentIndex - 1 + items.length) % items.length
+              } else if (event.key === "Home") {
+                nextIndex = 0
+              } else if (event.key === "End") {
+                nextIndex = items.length - 1
+              }
+
+              if (nextIndex !== null) {
+                event.preventDefault()
+                items[nextIndex]?.focus()
+              }
+            }}
+          >
+            {editing ? (
+              <form
+                className="composer-workspace-form"
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  void save()
+                }}
+              >
+                <label htmlFor="workspace-folder">Workspace folder</label>
+                <input
+                  id="workspace-folder"
+                  ref={manualInputRef}
+                  type="text"
+                  value={draft}
+                  onChange={(event) => setDraft(event.target.value)}
+                  placeholder="/absolute/path/to/project"
+                  autoCapitalize="off"
+                  autoComplete="off"
+                  spellCheck={false}
+                  maxLength={4096}
+                  disabled={busy}
+                />
+                <div className="composer-workspace-form-actions">
+                  <button type="submit" disabled={busy}>
+                    {busyAction === "save" ? "Saving…" : "Save workspace"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditing(false)
+                      setError(null)
+                    }}
+                    disabled={busy}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void pickWorkspace()}
+                    disabled={busy}
+                  >
+                    Choose folder…
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <>
+                <button
+                  className="composer-workspace-menu-item"
+                  type="button"
+                  role="menuitem"
+                  onClick={() => void pickWorkspace()}
+                  disabled={busy}
+                  ref={workspaceItemRef}
+                >
+                  <FolderClosed size={16} aria-hidden="true" />
+                  <span>Workspace</span>
+                </button>
+                {manualEntryAvailable ? (
+                  <button
+                    className="composer-workspace-menu-item"
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setDraft(workspacePath ?? "")
+                      setEditing(true)
+                      setManualEntryAvailable(false)
+                      setError(null)
+                    }}
+                    disabled={busy}
+                  >
+                    <span>Enter path manually</span>
+                  </button>
+                ) : null}
+              </>
+            )}
+            {busyAction === "pick" ? (
+              <div className="composer-workspace-status" role="status">
+                Opening folder…
+              </div>
+            ) : null}
+            {busyAction === "save" ? (
+              <div className="composer-workspace-status" role="status">
+                Saving workspace…
+              </div>
+            ) : null}
+            {error ? <div role="alert">{error}</div> : null}
+          </div>
+        ) : null}
+      </div>
+    </>
   )
 }

@@ -11,7 +11,6 @@ import { SettingsPage } from "@/components/settings-page"
 import { Sidebar } from "@/components/sidebar"
 import { WelcomePanel } from "@/components/welcome-panel"
 import { WorkspaceTopbar } from "@/components/workspace-topbar"
-import { WorkspaceAttachment } from "@/components/workspace-attachment"
 import { TestPresets } from "@/components/test-presets"
 import { ApiError, api } from "@/lib/api"
 import {
@@ -1052,14 +1051,6 @@ export function AppShell() {
 
         {activeView !== "Settings" ? (
           <>
-            <WorkspaceAttachment
-              key={activeSession?.id ?? "new-session"}
-              workspacePath={activeSession?.workspace_path ?? null}
-              disabled={pending || sessionLoading || workspaceSaving}
-              onPickWorkspace={pickWorkspace}
-              onSave={saveWorkspace}
-              onRemove={removeWorkspace}
-            />
             {activeSession?.workspace_path ? (
               <TestPresets
                 key={`${activeSession.id}:${activeSession.workspace_path}`}
@@ -1074,8 +1065,13 @@ export function AppShell() {
                   ? "What are we building?"
                   : "Adjust or continue"
               }
+              workspacePath={activeSession?.workspace_path ?? null}
+              workspaceSessionKey={activeSession?.id ?? "new-session"}
               onChange={setComposerValue}
               onSubmit={() => void submitComposer()}
+              onPickWorkspace={pickWorkspace}
+              onSaveWorkspace={saveWorkspace}
+              onRemoveWorkspace={removeWorkspace}
               disabled={pending || sessionLoading || workspaceSaving}
               modelLabel={modelLabel}
               models={modelChoices}

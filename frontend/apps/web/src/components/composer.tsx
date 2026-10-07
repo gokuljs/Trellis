@@ -1,6 +1,7 @@
 import type { KeyboardEvent } from "react"
-import { Plus, Send } from "lucide-react"
+import { Send } from "lucide-react"
 
+import { WorkspaceAttachment } from "@/components/workspace-attachment"
 import type { ModelStatus } from "@/lib/app-types"
 
 type BudgetPreset = "conservative" | "longer"
@@ -8,8 +9,13 @@ type BudgetPreset = "conservative" | "longer"
 type ComposerProps = {
   value: string
   placeholder: string
+  workspacePath: string | null
+  workspaceSessionKey: string
   onChange: (value: string) => void
   onSubmit: () => void
+  onPickWorkspace: () => Promise<boolean>
+  onSaveWorkspace: (path: string) => Promise<void>
+  onRemoveWorkspace: () => Promise<void>
   disabled?: boolean
   modelLabel: string
   models: ModelStatus[]
@@ -23,8 +29,13 @@ type ComposerProps = {
 export function Composer({
   value,
   placeholder,
+  workspacePath,
+  workspaceSessionKey,
   onChange,
   onSubmit,
+  onPickWorkspace,
+  onSaveWorkspace,
+  onRemoveWorkspace,
   disabled = false,
   modelLabel,
   models,
@@ -44,6 +55,14 @@ export function Composer({
   return (
     <div className="composer-wrap">
       <div className="composer-box">
+        <WorkspaceAttachment
+          key={workspaceSessionKey}
+          workspacePath={workspacePath}
+          disabled={disabled}
+          onPickWorkspace={onPickWorkspace}
+          onSave={onSaveWorkspace}
+          onRemove={onRemoveWorkspace}
+        />
         <textarea
           aria-label="Message"
           value={value}
@@ -54,13 +73,6 @@ export function Composer({
           disabled={disabled}
         />
         <div className="composer-toolbar">
-          <button
-            className="composer-add"
-            aria-label="Attach"
-            disabled={disabled}
-          >
-            <Plus size={18} strokeWidth={1.6} aria-hidden="true" />
-          </button>
           <div className="composer-tools">
             {showModelPicker ? (
               <select

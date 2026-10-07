@@ -819,6 +819,61 @@ describe("local-first chat", () => {
     )
   })
 
+  it("opens and dismisses the composer attachment menu", async () => {
+    vi.stubGlobal(
+      "fetch",
+      startupFetch(() => undefined)
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    expect(await screen.findByRole("menu")).toBeInTheDocument()
+
+    await user.click(screen.getByRole("textbox", { name: "Message" }))
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.keyboard("{Escape}")
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument()
+  })
+
+  it("supports arrow-key navigation in the composer attachment menu", async () => {
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        return response(
+          {
+            error: {
+              code: "workspace_picker_unavailable",
+              message: "Trellis could not open the folder picker.",
+            },
+          },
+          503
+        )
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    const workspaceItem = await screen.findByRole("menuitem", {
+      name: "Workspace",
+    })
+    await user.click(workspaceItem)
+    const manualEntry = await screen.findByRole("menuitem", {
+      name: "Enter path manually",
+    })
+
+    await user.keyboard("{ArrowDown}")
+    expect(manualEntry).toHaveFocus()
+    await user.keyboard("{ArrowUp}")
+    expect(workspaceItem).toHaveFocus()
+  })
+
   it("attaches a picked folder to a new session immediately", async () => {
     const workspacePath = "/tmp/trellis-project"
     const created = {
@@ -845,9 +900,13 @@ describe("local-first chat", () => {
 
     renderApp()
     await screen.findByRole("textbox", { name: "Message" })
-    await user.click(screen.getByRole("button", { name: "Attach workspace" }))
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
 
-    expect(await screen.findByText(workspacePath)).toBeInTheDocument()
+    const workspaceChip = await screen.findByText("trellis-project")
+    expect(workspaceChip.closest(".composer-box")).not.toBeNull()
+    expect(screen.queryByText(workspacePath)).not.toBeInTheDocument()
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("")
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/workspaces/pick",
       expect.objectContaining({ method: "POST" })
@@ -856,6 +915,7 @@ describe("local-first chat", () => {
       "/api/sessions",
       expect.objectContaining({ method: "POST" })
     )
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument()
     expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
   })
 
@@ -879,13 +939,16 @@ describe("local-first chat", () => {
 
     renderApp()
     await screen.findByRole("textbox", { name: "Message" })
-    await user.click(screen.getByRole("button", { name: "Attach workspace" }))
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
 
     expect(screen.getByRole("textbox", { name: "Message" })).toBeDisabled()
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Opening folder…"
+    )
     pickGate.resolve(response({ path: workspacePath }))
-    expect(
-      await screen.findByRole("button", { name: "Change workspace" })
-    ).toBeEnabled()
+    expect(await screen.findByText("trellis-project")).toBeInTheDocument()
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument()
     expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
   })
 
@@ -909,12 +972,13 @@ describe("local-first chat", () => {
 
     renderApp()
     await screen.findByRole("textbox", { name: "Message" })
-    await user.click(screen.getByRole("button", { name: "Attach workspace" }))
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Trellis could not open the folder picker."
     )
     await user.click(
-      screen.getByRole("button", { name: "Enter path manually" })
+      screen.getByRole("menuitem", { name: "Enter path manually" })
     )
     await user.type(
       screen.getByRole("textbox", { name: "Workspace folder" }),
@@ -929,6 +993,37 @@ describe("local-first chat", () => {
       "/api/sessions",
       expect.objectContaining({ method: "POST" })
     )
+  })
+
+  it("does not offer manual entry when the folder picker times out", async () => {
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        return response(
+          {
+            error: {
+              code: "workspace_picker_timeout",
+              message: "The folder picker took too long to respond.",
+            },
+          },
+          504
+        )
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The folder picker took too long to respond."
+    )
+    expect(
+      screen.queryByRole("menuitem", { name: "Enter path manually" })
+    ).not.toBeInTheDocument()
   })
 
   it("preserves a manual path draft when a picker retry fails", async () => {
@@ -951,29 +1046,29 @@ describe("local-first chat", () => {
 
     renderApp()
     await screen.findByRole("textbox", { name: "Message" })
-    await user.click(screen.getByRole("button", { name: "Attach workspace" }))
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
     await user.click(
-      await screen.findByRole("button", { name: "Enter path manually" })
+      await screen.findByRole("menuitem", { name: "Enter path manually" })
     )
     const pathInput = screen.getByRole("textbox", { name: "Workspace folder" })
     await user.type(pathInput, "/tmp/manual-draft")
-    await user.click(screen.getByRole("button", { name: "Attach workspace" }))
-    await user.click(
-      await screen.findByRole("button", { name: "Enter path manually" })
-    )
+    await user.click(screen.getByRole("button", { name: "Choose folder…" }))
 
     expect(
       screen.getByRole("textbox", { name: "Workspace folder" })
     ).toHaveValue("/tmp/manual-draft")
   })
 
-  it("changes and removes the folder attached to an existing session", async () => {
+  it("preserves, replaces, and removes a workspace on an existing session", async () => {
     const current = { ...recentSession, workspace_path: "/tmp/first-project" }
     const replacement = "/tmp/second-project"
+    let pickerCalls = 0
     const updates: Array<string | null> = []
     const fetchMock = startupFetch((url, init) => {
       if (url === "/api/workspaces/pick" && init?.method === "POST") {
-        return response({ path: replacement })
+        pickerCalls += 1
+        return response({ path: pickerCalls === 1 ? null : replacement })
       }
       if (url === "/api/sessions" && !init?.method) return response([current])
       if (url === `/api/sessions/${current.id}` && !init?.method) {
@@ -995,12 +1090,24 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
-    expect(await screen.findByText("/tmp/first-project")).toBeInTheDocument()
-    await user.click(screen.getByRole("button", { name: "Change workspace" }))
-    expect(await screen.findByText(replacement)).toBeInTheDocument()
+    await screen.findByRole("textbox", { name: "Message" })
+    const currentChip = await screen.findByText("first-project")
+    expect(currentChip.closest(".composer-box")).not.toBeNull()
+    expect(screen.queryByText(current.workspace_path!)).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+    expect(screen.getByText("first-project")).toBeInTheDocument()
+    expect(updates).toEqual([])
+
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+    const replacementChip = await screen.findByText("second-project")
+    expect(replacementChip.closest(".composer-box")).not.toBeNull()
+    expect(screen.queryByText(replacement)).not.toBeInTheDocument()
 
     await user.click(screen.getByRole("button", { name: "Remove workspace" }))
-    expect(await screen.findByText("Chat without a folder")).toBeInTheDocument()
+    expect(screen.queryByText("second-project")).not.toBeInTheDocument()
     expect(updates).toEqual([replacement, null])
   })
 
@@ -1016,9 +1123,11 @@ describe("local-first chat", () => {
 
     renderApp()
     await screen.findByRole("textbox", { name: "Message" })
-    await user.click(screen.getByRole("button", { name: "Attach workspace" }))
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
 
-    expect(await screen.findByText("Chat without a folder")).toBeInTheDocument()
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument()
+    expect(screen.queryByText("trellis-project")).not.toBeInTheDocument()
     expect(fetchMock).not.toHaveBeenCalledWith(
       "/api/sessions",
       expect.objectContaining({ method: "POST" })
