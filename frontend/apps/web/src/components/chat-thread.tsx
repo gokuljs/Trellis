@@ -2,6 +2,7 @@ import { RotateCcw, Square } from "lucide-react"
 import { Fragment } from "react"
 import Markdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
+import { ThinkingOrb } from "thinking-orbs"
 
 import { TrellisMark } from "@/components/trellis-mark"
 import { RunActivity } from "@/components/run-activity"
@@ -206,11 +207,12 @@ export function ChatThread({
                 </span>
                 <span>Trellis</span>
               </div>
-              <div className="thinking-pulse">
-                <span />
-                <span />
-                <span />
-              </div>
+              <ThinkingOrb
+                state="working"
+                size={20}
+                theme="auto"
+                aria-hidden="true"
+              />
             </div>
           </article>
         ) : null}

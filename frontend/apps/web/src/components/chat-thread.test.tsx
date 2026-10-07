@@ -1,8 +1,25 @@
 import { cleanup, render, screen } from "@testing-library/react"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { ChatThread } from "@/components/chat-thread"
 import type { Message, Session } from "@/lib/app-types"
+
+vi.mock("thinking-orbs", () => ({
+  ThinkingOrb: (props: {
+    state?: string
+    size?: number
+    theme?: string
+    "aria-hidden"?: boolean
+  }) => (
+    <canvas
+      data-testid="thinking-orb"
+      data-state={props.state}
+      data-size={props.size}
+      data-theme={props.theme}
+      aria-hidden={props["aria-hidden"]}
+    />
+  ),
+}))
 
 const session: Session = {
   id: "session-1",
@@ -141,6 +158,41 @@ describe("chat Markdown", () => {
       screen.getByRole("heading", { level: 3, name: /Still working/ })
     ).toBeInTheDocument()
     expect(screen.getByText("in progress").tagName).toBe("STRONG")
+    expect(screen.queryByTestId("thinking-orb")).not.toBeInTheDocument()
+  })
+
+  it("shows the working orb while waiting for the assistant response", () => {
+    render(
+      <ChatThread
+        session={session}
+        messages={[]}
+        pending
+        streamingText={null}
+        error={null}
+        canRetry={false}
+        canCancel
+        cancellationPending={false}
+        onRetry={() => undefined}
+        onCancel={() => undefined}
+      />
+    )
+
+    const pendingMessage = screen.getByRole("article", {
+      name: "Assistant response pending",
+    })
+    const orb = screen.getByTestId("thinking-orb")
+
+    expect(pendingMessage).toContainElement(orb)
+    expect(orb).toHaveAttribute("data-state", "working")
+    expect(orb).toHaveAttribute("data-size", "20")
+    expect(orb).toHaveAttribute("data-theme", "auto")
+    expect(orb).toHaveAttribute("aria-hidden", "true")
+  })
+
+  it("does not show the working orb when the assistant is idle", () => {
+    renderThread("A completed response")
+
+    expect(screen.queryByTestId("thinking-orb")).not.toBeInTheDocument()
   })
 
   it("shows the approval request instead of a thinking pulse while paused", () => {
@@ -184,5 +236,6 @@ describe("chat Markdown", () => {
     expect(
       screen.queryByLabelText("Assistant response pending")
     ).not.toBeInTheDocument()
+    expect(screen.queryByTestId("thinking-orb")).not.toBeInTheDocument()
   })
 })
