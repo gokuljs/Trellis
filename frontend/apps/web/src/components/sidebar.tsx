@@ -74,32 +74,34 @@ function SessionList({
       {groups.map(([month, items]) => (
         <div className="session-group" key={month}>
           <div className="month-label">{month}</div>
-          {items.map((session) => {
-            const isSelected = session.id === activeSessionId
-            return (
-              <button
-                className={`session-row ${isSelected ? "selected" : ""}`}
-                key={session.id}
-                aria-label={session.title}
-                aria-current={isSelected ? "page" : undefined}
-                onClick={() => onSelectSession(session.id)}
-              >
-                <span className="session-dot">•</span>
-                <span className="session-title">{session.title}</span>
-                <span className="session-date">
-                  {formatSessionDate(session.updated_at)}
-                </span>
-                {session.title === "Resume File Location" ? (
-                  <MoreHorizontal
-                    className="session-more"
-                    size={13}
-                    strokeWidth={1.8}
-                    aria-hidden="true"
-                  />
-                ) : null}
-              </button>
-            )
-          })}
+          <div className="session-items">
+            {items.map((session) => {
+              const isSelected = session.id === activeSessionId
+              return (
+                <button
+                  className={`session-row ${isSelected ? "selected" : ""}`}
+                  key={session.id}
+                  aria-label={session.title}
+                  aria-current={isSelected ? "page" : undefined}
+                  onClick={() => onSelectSession(session.id)}
+                >
+                  <span className="session-dot">•</span>
+                  <span className="session-title">{session.title}</span>
+                  <span className="session-date">
+                    {formatSessionDate(session.updated_at)}
+                  </span>
+                  {session.title === "Resume File Location" ? (
+                    <MoreHorizontal
+                      className="session-more"
+                      size={13}
+                      strokeWidth={1.8}
+                      aria-hidden="true"
+                    />
+                  ) : null}
+                </button>
+              )
+            })}
+          </div>
         </div>
       ))}
     </section>
