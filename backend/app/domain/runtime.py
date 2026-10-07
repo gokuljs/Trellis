@@ -18,6 +18,10 @@ class RunEventType(StrEnum):
     STARTED = "run.started"
     CANCELLATION_REQUESTED = "run.cancellation_requested"
     ASSISTANT_DELTA = "assistant.delta"
+    ASSISTANT_MESSAGE = "assistant.message"
+    TOOL_CALL = "tool.call"
+    TOOL_RESULT = "tool.result"
+    TOOL_APPROVAL_DECIDED = "tool.approval_decided"
     MODEL_USAGE = "model.usage"
     MODEL_COMPLETED = "model.completed"
     ASSISTANT_COMPLETED = "assistant.completed"
@@ -34,6 +38,21 @@ class ModelCallStatus(StrEnum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     TIMED_OUT = "timed_out"
+
+
+class ToolCallStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    DENIED = "denied"
+    CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
+
+
+class ToolApprovalDecision(StrEnum):
+    APPROVED = "approved"
+    DENIED = "denied"
 
 
 _TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
@@ -281,4 +300,34 @@ class ModelCallRecord:
     error_code: str | None
     error_message: str | None
     started_at: str
+    finished_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RunMessageRecord:
+    id: str
+    run_id: str
+    ordinal: int
+    role: Literal["assistant", "tool"]
+    content: str
+    model_call_id: str | None
+    tool_call_id: str | None
+    created_at: str
+    tool_calls: tuple[ModelToolCall, ...] = ()
+    continuation_items: tuple[ModelContinuationItem, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallRecord:
+    id: str
+    run_id: str
+    assistant_message_id: str
+    call_index: int
+    provider_call_id: str
+    name: str
+    arguments: dict[str, object]
+    status: ToolCallStatus
+    approval_decision: ToolApprovalDecision | None
+    approval_decided_at: str | None
+    created_at: str
     finished_at: str | None

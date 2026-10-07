@@ -115,3 +115,41 @@ existing Starlette/httpx deprecation warning and a SQLite resource warning.
 
 **Next.** Save ordered assistant and tool exchanges so a later model call can
 rebuild its context after each step.
+
+## Step 4 — Persist ordered agent exchanges
+
+**Why this step exists.** A multi-step run needs to remember every assistant
+tool request and every tool result in the order they happened. The existing
+session transcript has room for the user's message and the final assistant
+answer, so intermediate work needs its own durable record.
+
+**What works now.** SQLite stores ordered assistant and tool messages for one
+run, each tool call's arguments and status, and an approval decision if one has
+been made. It also stores the normalized model request and response, including
+usage and opaque provider continuation items. The visible chat transcript still
+contains only the user message and final answer. Ordinary chat works as before;
+no local tool executes yet. If a provider asks the current text-only run for an
+unoffered tool, the run records that response and fails without showing its
+intermediate text as a final reply.
+
+**Follow the code.** SQLite migration 6 in
+`backend/app/infrastructure/database.py` adds `run_messages` and `tool_calls`.
+`record_assistant_message` saves the assistant item, its calls, and replayable
+events in one transaction. `record_tool_result` and
+`record_tool_approval_decision` update each call and event log atomically.
+`list_run_messages` rebuilds the ordered exchange, including opaque reasoning
+items. The repository methods are declared in
+`backend/app/application/ports.py`; their records and statuses are in
+`backend/app/domain/runtime.py`. `RunService` in
+`backend/app/application/runs.py` now saves full normalized model snapshots.
+
+**Verification.** The storage tests first failed for missing ordered records;
+new round-trip and model-record assertions then failed for lost continuation
+items and incomplete snapshots. A focused test also caught the text-only run
+incorrectly treating an unsolicited tool request as a final reply. After those
+changes, the final uv 0.12.5 `make check` passed Ruff formatting, Ruff linting,
+`ty`, and 136 backend tests with 90.08% coverage. Pytest reported the existing
+Starlette/httpx deprecation warning and a SQLite resource warning.
+
+**Next.** Attach an optional folder to a session so local tools have a clear
+workspace boundary.

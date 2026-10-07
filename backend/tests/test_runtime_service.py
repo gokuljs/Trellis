@@ -9,8 +9,10 @@ from app.application.runs import RunService
 from app.core.config import Settings
 from app.domain.models import ModelDescriptor, ProviderName
 from app.domain.runtime import (
+    ModelContinuationItem,
     ModelRequest,
     ModelStreamEvent,
+    ModelToolCall,
     RunEvent,
     RunEventType,
     RunSnapshot,
@@ -206,6 +208,12 @@ def test_run_service_streams_and_persists_a_provider_neutral_run(tmp_path: Path)
         (
             ModelStreamEvent(kind="text_delta", text="Hello"),
             ModelStreamEvent(
+                kind="continuation_item",
+                continuation_item=ModelContinuationItem(
+                    "openai", "openai:gpt-5.5", '{"encrypted_content":"opaque"}'
+                ),
+            ),
+            ModelStreamEvent(
                 kind="usage",
                 input_tokens=5,
                 output_tokens=1,
@@ -280,7 +288,75 @@ def test_run_service_streams_and_persists_a_provider_neutral_run(tmp_path: Path)
     assert (model_calls[0].input_tokens, model_calls[0].output_tokens) == (5, 1)
     assert model_calls[0].cached_tokens == 2
     assert model_calls[0].provider_response_id == "response-1"
+    assert model_calls[0].request_snapshot["system_instructions"] == ""
+    assert model_calls[0].request_snapshot["tools"] == []
+    assert model_calls[0].request_snapshot["messages"] == [
+        {"role": "user", "content": "Hello", "tool_calls": [], "continuation_items": []}
+    ]
+    assert model_calls[0].response_snapshot is not None
+    assert model_calls[0].response_snapshot["content"] == "Hello"
+    assert model_calls[0].response_snapshot["tool_calls"] == []
+    assert model_calls[0].response_snapshot["continuation_items"] == [
+        {
+            "provider_id": "openai",
+            "model_id": "openai:gpt-5.5",
+            "payload_json": '{"encrypted_content":"opaque"}',
+        }
+    ]
+    assert model_calls[0].response_snapshot["usage"] == {
+        "input_tokens": 5,
+        "output_tokens": 1,
+        "reasoning_tokens": None,
+        "cached_tokens": 2,
+    }
     assert b"sk-runtime-secret" not in settings.database_path.read_bytes()
+
+
+def test_run_service_rejects_an_unoffered_tool_call_without_a_final_reply(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    provider = RecordingProvider(
+        (
+            ModelStreamEvent(kind="text_delta", text="I will read that file."),
+            ModelStreamEvent(
+                kind="tool_call",
+                tool_call=ModelToolCall("call-1", "read_file", {"path": "a.py"}),
+            ),
+            ModelStreamEvent(kind="completed", finish_reason="tool_use"),
+        )
+    )
+
+    async def run():
+        await database.initialize()
+        session = await database.create_session()
+        await secret_store.set("openai", "sk-runtime-secret")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+        )
+        created = await service.create_run(session.id, "request-unoffered", "Read a.py")
+        await service.wait_for_run(created.id)
+        result = (
+            await database.get_run(created.id),
+            await database.list_messages(session.id),
+            await database.list_model_calls(created.id),
+        )
+        await service.close()
+        return result
+
+    persisted, messages, calls = asyncio.run(run())
+    assert persisted is not None and persisted.status is RunStatus.FAILED
+    assert persisted.error_code == "tool_execution_unavailable"
+    assert [message.role for message in messages] == ["user"]
+    assert calls[0].response_snapshot is not None
+    assert calls[0].response_snapshot["tool_calls"] == [
+        {"id": "call-1", "name": "read_file", "arguments": {"path": "a.py"}}
+    ]
 
 
 def test_provider_failure_keeps_partial_events_but_no_assistant_message(tmp_path: Path) -> None:

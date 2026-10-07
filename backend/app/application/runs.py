@@ -290,9 +290,38 @@ class RunService:
                 "model_id": request.model_id,
                 "adapter_kind": request.adapter_kind,
                 "upstream_model_id": request.upstream_model_id,
+                "system_instructions": request.system_instructions,
                 "messages": [
-                    {"role": message.role, "content": message.content}
+                    {
+                        "role": message.role,
+                        "content": message.content,
+                        **(
+                            {"tool_call_id": message.tool_call_id}
+                            if message.tool_call_id is not None
+                            else {}
+                        ),
+                        "tool_calls": [
+                            {"id": tool.id, "name": tool.name, "arguments": tool.arguments}
+                            for tool in message.tool_calls
+                        ],
+                        "continuation_items": [
+                            {
+                                "provider_id": item.provider_id,
+                                "model_id": item.model_id,
+                                "payload_json": item.payload_json,
+                            }
+                            for item in message.continuation_items
+                        ],
+                    }
                     for message in request.messages
+                ],
+                "tools": [
+                    {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": tool.input_schema,
+                    }
+                    for tool in request.tools
                 ],
                 "max_output_tokens": request.max_output_tokens,
             }
@@ -305,6 +334,8 @@ class RunService:
             call = await self._runs.update_model_call(call.id, ModelCallStatus.STREAMING)
 
             output_parts: list[str] = []
+            streamed_tool_calls: list[dict[str, object]] = []
+            continuation_items: list[dict[str, str]] = []
             usage: dict[str, int | None] = {
                 "input_tokens": None,
                 "output_tokens": None,
@@ -337,6 +368,32 @@ class RunService:
                                 run.id,
                                 RunEventType.ASSISTANT_DELTA,
                                 {"text": event.text},
+                            )
+                        elif event.kind == "tool_call":
+                            if event.tool_call is None:
+                                raise ProviderError(
+                                    "provider_invalid_response",
+                                    "The provider returned an invalid tool call.",
+                                )
+                            streamed_tool_calls.append(
+                                {
+                                    "id": event.tool_call.id,
+                                    "name": event.tool_call.name,
+                                    "arguments": event.tool_call.arguments,
+                                }
+                            )
+                        elif event.kind == "continuation_item":
+                            if event.continuation_item is None:
+                                raise ProviderError(
+                                    "provider_invalid_response",
+                                    "The provider returned invalid continuation data.",
+                                )
+                            continuation_items.append(
+                                {
+                                    "provider_id": event.continuation_item.provider_id,
+                                    "model_id": event.continuation_item.model_id,
+                                    "payload_json": event.continuation_item.payload_json,
+                                }
                             )
                         elif event.kind == "usage":
                             usage = {
@@ -396,7 +453,14 @@ class RunService:
             call = await self._runs.update_model_call(
                 call.id,
                 ModelCallStatus.COMPLETED,
-                response_snapshot={"finish_reason": finish_reason},
+                response_snapshot={
+                    "content": "".join(output_parts),
+                    "tool_calls": streamed_tool_calls,
+                    "continuation_items": continuation_items,
+                    "usage": usage,
+                    "finish_reason": finish_reason,
+                    "provider_response_id": provider_response_id,
+                },
                 provider_response_id=provider_response_id,
                 finish_reason=finish_reason,
                 input_tokens=usage["input_tokens"],
@@ -413,6 +477,11 @@ class RunService:
                     "finish_reason": finish_reason,
                 },
             )
+            if streamed_tool_calls:
+                raise ProviderError(
+                    "tool_execution_unavailable",
+                    "This run cannot execute tool requests yet.",
+                )
             _message, completion_events = await self._runs.complete_run(run.id, assistant_content)
             for event in completion_events:
                 await self._publish(event)

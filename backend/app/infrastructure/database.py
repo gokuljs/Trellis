@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from uuid import uuid4
 
 import aiosqlite
@@ -22,17 +22,24 @@ from app.domain.models import (
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
+    ModelContinuationItem,
+    ModelMessage,
+    ModelToolCall,
     RunEvent,
     RunEventType,
+    RunMessageRecord,
     RunSnapshot,
     RunStatus,
+    ToolApprovalDecision,
+    ToolCallRecord,
+    ToolCallStatus,
     is_lifecycle_event,
     is_terminal_run_status,
     transition_model_call,
     validate_run_event_transition,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 TURN_CLAIM_TTL = timedelta(minutes=5)
 
 MIGRATION_TABLE_SCHEMA = """
@@ -261,12 +268,56 @@ CREATE TABLE IF NOT EXISTS run_events (
 );
 """
 
+SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS run_messages (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+    role TEXT NOT NULL CHECK (role IN ('assistant', 'tool')),
+    content TEXT NOT NULL,
+    continuation_json TEXT NOT NULL DEFAULT '[]',
+    model_call_id TEXT REFERENCES model_calls(id),
+    tool_call_id TEXT REFERENCES tool_calls(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(run_id, ordinal),
+    UNIQUE(model_call_id),
+    UNIQUE(tool_call_id),
+    CHECK (
+        (role = 'assistant' AND model_call_id IS NOT NULL AND tool_call_id IS NULL)
+        OR (role = 'tool' AND model_call_id IS NULL AND tool_call_id IS NOT NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS tool_calls (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    assistant_message_id TEXT NOT NULL REFERENCES run_messages(id),
+    call_index INTEGER NOT NULL CHECK (call_index >= 0),
+    provider_call_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    arguments_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('pending', 'running', 'completed', 'failed', 'denied', 'cancelled', 'timed_out')
+    ),
+    approval_decision TEXT CHECK (approval_decision IN ('approved', 'denied')),
+    approval_decided_at TEXT,
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE(run_id, provider_call_id),
+    UNIQUE(assistant_message_id, call_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_messages_run_ordinal ON run_messages(run_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_run_message ON tool_calls(run_id, assistant_message_id);
+"""
+
 MIGRATIONS = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
     3: SCHEMA_V3,
     4: SCHEMA_V4,
     5: SCHEMA_V5,
+    6: SCHEMA_V6,
 }
 
 
@@ -1198,6 +1249,384 @@ class Database:
             rows = await cursor.fetchall()
         return [self._model_call_from_row(row) for row in rows]
 
+    async def record_assistant_message(
+        self,
+        run_id: str,
+        model_call_id: str,
+        message: ModelMessage,
+    ) -> tuple[RunMessageRecord, tuple[ToolCallRecord, ...], tuple[RunEvent, ...]]:
+        if message.role != "assistant" or message.tool_call_id is not None:
+            raise ValueError("an assistant run message is required")
+        if not message.content.strip() and not message.tool_calls:
+            raise ValueError("assistant run message cannot be empty")
+        provider_ids = [call.id for call in message.tool_calls]
+        if len(set(provider_ids)) != len(provider_ids):
+            raise ValueError("tool call IDs must be unique within an assistant message")
+        serialized_arguments = [
+            json.dumps(call.arguments, separators=(",", ":"), allow_nan=False)
+            for call in message.tool_calls
+        ]
+        continuation_json = json.dumps(
+            [
+                {
+                    "provider_id": item.provider_id,
+                    "model_id": item.model_id,
+                    "payload_json": item.payload_json,
+                }
+                for item in message.continuation_items
+            ],
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        if len(continuation_json.encode("utf-8")) > 4 * 1024 * 1024:
+            raise ValueError("assistant continuation exceeds the storage limit")
+        now = utc_now()
+        message_id = str(uuid4())
+        tool_call_ids = [str(uuid4()) for _call in message.tool_calls]
+        async with self._connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            run_cursor = await connection.execute(
+                "SELECT status, last_event_sequence FROM runs WHERE id = ?", (run_id,)
+            )
+            run_row = await run_cursor.fetchone()
+            if run_row is None:
+                raise ValueError("run not found")
+            if RunStatus(run_row["status"]) is not RunStatus.RUNNING:
+                raise ValueError("run is not running")
+            model_cursor = await connection.execute(
+                "SELECT run_id, status FROM model_calls WHERE id = ?", (model_call_id,)
+            )
+            model_row = await model_cursor.fetchone()
+            if (
+                model_row is None
+                or model_row["run_id"] != run_id
+                or ModelCallStatus(model_row["status"]) is not ModelCallStatus.COMPLETED
+            ):
+                raise ValueError("completed model call not found for run")
+            ordinal_cursor = await connection.execute(
+                "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM run_messages WHERE run_id = ?",
+                (run_id,),
+            )
+            ordinal_row = await ordinal_cursor.fetchone()
+            if ordinal_row is None:
+                raise RuntimeError("could not allocate a run message ordinal")
+            ordinal = int(ordinal_row[0])
+            await connection.execute(
+                """INSERT INTO run_messages(
+                       id, run_id, ordinal, role, content, continuation_json,
+                       model_call_id, created_at
+                   ) VALUES (?, ?, ?, 'assistant', ?, ?, ?, ?)""",
+                (
+                    message_id,
+                    run_id,
+                    ordinal,
+                    message.content,
+                    continuation_json,
+                    model_call_id,
+                    now,
+                ),
+            )
+            tool_records = tuple(
+                ToolCallRecord(
+                    id=tool_call_ids[index],
+                    run_id=run_id,
+                    assistant_message_id=message_id,
+                    call_index=index,
+                    provider_call_id=call.id,
+                    name=call.name,
+                    arguments=call.arguments,
+                    status=ToolCallStatus.PENDING,
+                    approval_decision=None,
+                    approval_decided_at=None,
+                    created_at=now,
+                    finished_at=None,
+                )
+                for index, call in enumerate(message.tool_calls)
+            )
+            for record, arguments_json in zip(tool_records, serialized_arguments, strict=True):
+                await connection.execute(
+                    """INSERT INTO tool_calls(
+                           id, run_id, assistant_message_id, call_index, provider_call_id,
+                           name, arguments_json, status, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                    (
+                        record.id,
+                        run_id,
+                        message_id,
+                        record.call_index,
+                        record.provider_call_id,
+                        record.name,
+                        arguments_json,
+                        now,
+                    ),
+                )
+            event_specs: list[tuple[RunEventType, dict[str, object]]] = [
+                (
+                    RunEventType.ASSISTANT_MESSAGE,
+                    {
+                        "message_id": message_id,
+                        "model_call_id": model_call_id,
+                        "content": message.content,
+                    },
+                )
+            ]
+            event_specs.extend(
+                (
+                    RunEventType.TOOL_CALL,
+                    {
+                        "tool_call_id": record.id,
+                        "provider_call_id": record.provider_call_id,
+                        "name": record.name,
+                        "arguments": record.arguments,
+                        "assistant_message_id": message_id,
+                    },
+                )
+                for record in tool_records
+            )
+            first_sequence = int(run_row["last_event_sequence"]) + 1
+            events: list[RunEvent] = []
+            for offset, (event_type, data) in enumerate(event_specs):
+                sequence = first_sequence + offset
+                await connection.execute(
+                    """INSERT INTO run_events(
+                           run_id, sequence, event_type, event_version, data, created_at
+                       ) VALUES (?, ?, ?, 1, ?, ?)""",
+                    (
+                        run_id,
+                        sequence,
+                        event_type.value,
+                        json.dumps(data, separators=(",", ":"), allow_nan=False),
+                        now,
+                    ),
+                )
+                events.append(RunEvent(run_id, sequence, event_type, 1, data, now))
+            await connection.execute(
+                "UPDATE runs SET last_event_sequence = ? WHERE id = ?",
+                (first_sequence + len(events) - 1, run_id),
+            )
+            await connection.commit()
+
+        assistant = RunMessageRecord(
+            id=message_id,
+            run_id=run_id,
+            ordinal=ordinal,
+            role="assistant",
+            content=message.content,
+            model_call_id=model_call_id,
+            tool_call_id=None,
+            created_at=now,
+            tool_calls=message.tool_calls,
+            continuation_items=message.continuation_items,
+        )
+        return assistant, tool_records, tuple(events)
+
+    async def record_tool_result(
+        self,
+        run_id: str,
+        tool_call_id: str,
+        content: str,
+        *,
+        status: ToolCallStatus = ToolCallStatus.COMPLETED,
+    ) -> tuple[RunMessageRecord, ToolCallRecord, RunEvent]:
+        if status not in {
+            ToolCallStatus.COMPLETED,
+            ToolCallStatus.FAILED,
+            ToolCallStatus.DENIED,
+            ToolCallStatus.CANCELLED,
+            ToolCallStatus.TIMED_OUT,
+        }:
+            raise ValueError("tool result requires a terminal status")
+        now = utc_now()
+        message_id = str(uuid4())
+        async with self._connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            run_cursor = await connection.execute(
+                "SELECT status, last_event_sequence FROM runs WHERE id = ?", (run_id,)
+            )
+            run_row = await run_cursor.fetchone()
+            if run_row is None:
+                raise ValueError("run not found")
+            if RunStatus(run_row["status"]) is not RunStatus.RUNNING:
+                raise ValueError("run is not running")
+            call_cursor = await connection.execute(
+                "SELECT * FROM tool_calls WHERE id = ? AND run_id = ?", (tool_call_id, run_id)
+            )
+            call_row = await call_cursor.fetchone()
+            if call_row is None:
+                raise ValueError("tool call not found for run")
+            if ToolCallStatus(call_row["status"]) not in {
+                ToolCallStatus.PENDING,
+                ToolCallStatus.RUNNING,
+            }:
+                raise ValueError("tool call already has a result")
+            if (
+                call_row["approval_decision"] == ToolApprovalDecision.DENIED.value
+                and status is not ToolCallStatus.DENIED
+            ):
+                raise ValueError("tool approval was denied")
+            ordinal_cursor = await connection.execute(
+                "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM run_messages WHERE run_id = ?",
+                (run_id,),
+            )
+            ordinal_row = await ordinal_cursor.fetchone()
+            if ordinal_row is None:
+                raise RuntimeError("could not allocate a run message ordinal")
+            ordinal = int(ordinal_row[0])
+            await connection.execute(
+                """INSERT INTO run_messages(
+                       id, run_id, ordinal, role, content, tool_call_id, created_at
+                   ) VALUES (?, ?, ?, 'tool', ?, ?, ?)""",
+                (message_id, run_id, ordinal, content, tool_call_id, now),
+            )
+            await connection.execute(
+                "UPDATE tool_calls SET status = ?, finished_at = ? WHERE id = ?",
+                (status.value, now, tool_call_id),
+            )
+            sequence = int(run_row["last_event_sequence"]) + 1
+            data: dict[str, object] = {
+                "tool_call_id": tool_call_id,
+                "message_id": message_id,
+                "status": status.value,
+                "content": content,
+            }
+            await connection.execute(
+                """INSERT INTO run_events(
+                       run_id, sequence, event_type, event_version, data, created_at
+                   ) VALUES (?, ?, ?, 1, ?, ?)""",
+                (
+                    run_id,
+                    sequence,
+                    RunEventType.TOOL_RESULT.value,
+                    json.dumps(data, separators=(",", ":"), allow_nan=False),
+                    now,
+                ),
+            )
+            await connection.execute(
+                "UPDATE runs SET last_event_sequence = ? WHERE id = ?", (sequence, run_id)
+            )
+            updated_cursor = await connection.execute(
+                "SELECT * FROM tool_calls WHERE id = ?", (tool_call_id,)
+            )
+            updated_row = await updated_cursor.fetchone()
+            await connection.commit()
+        if updated_row is None:
+            raise RuntimeError("updated tool call could not be loaded")
+        result = RunMessageRecord(
+            id=message_id,
+            run_id=run_id,
+            ordinal=ordinal,
+            role="tool",
+            content=content,
+            model_call_id=None,
+            tool_call_id=tool_call_id,
+            created_at=now,
+        )
+        event = RunEvent(run_id, sequence, RunEventType.TOOL_RESULT, 1, data, now)
+        return result, self._tool_call_from_row(updated_row), event
+
+    async def record_tool_approval_decision(
+        self,
+        run_id: str,
+        tool_call_id: str,
+        decision: ToolApprovalDecision,
+    ) -> tuple[ToolCallRecord, RunEvent | None]:
+        now = utc_now()
+        async with self._connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            run_cursor = await connection.execute(
+                "SELECT status, last_event_sequence FROM runs WHERE id = ?", (run_id,)
+            )
+            run_row = await run_cursor.fetchone()
+            if run_row is None:
+                raise ValueError("run not found")
+            call_cursor = await connection.execute(
+                "SELECT * FROM tool_calls WHERE id = ? AND run_id = ?", (tool_call_id, run_id)
+            )
+            call_row = await call_cursor.fetchone()
+            if call_row is None:
+                raise ValueError("tool call not found for run")
+            existing_decision = call_row["approval_decision"]
+            if existing_decision is not None:
+                if existing_decision != decision.value:
+                    raise ValueError("tool approval decision already differs")
+                await connection.commit()
+                return self._tool_call_from_row(call_row), None
+            if is_terminal_run_status(RunStatus(run_row["status"])):
+                raise ValueError("cannot decide approval for a terminal run")
+            if ToolCallStatus(call_row["status"]) is not ToolCallStatus.PENDING:
+                raise ValueError("tool call is no longer pending")
+            await connection.execute(
+                """UPDATE tool_calls SET approval_decision = ?, approval_decided_at = ?
+                   WHERE id = ?""",
+                (decision.value, now, tool_call_id),
+            )
+            sequence = int(run_row["last_event_sequence"]) + 1
+            data: dict[str, object] = {
+                "tool_call_id": tool_call_id,
+                "decision": decision.value,
+            }
+            await connection.execute(
+                """INSERT INTO run_events(
+                       run_id, sequence, event_type, event_version, data, created_at
+                   ) VALUES (?, ?, ?, 1, ?, ?)""",
+                (
+                    run_id,
+                    sequence,
+                    RunEventType.TOOL_APPROVAL_DECIDED.value,
+                    json.dumps(data, separators=(",", ":")),
+                    now,
+                ),
+            )
+            await connection.execute(
+                "UPDATE runs SET last_event_sequence = ? WHERE id = ?", (sequence, run_id)
+            )
+            updated_cursor = await connection.execute(
+                "SELECT * FROM tool_calls WHERE id = ?", (tool_call_id,)
+            )
+            updated_row = await updated_cursor.fetchone()
+            await connection.commit()
+        if updated_row is None:
+            raise RuntimeError("updated tool call could not be loaded")
+        event = RunEvent(run_id, sequence, RunEventType.TOOL_APPROVAL_DECIDED, 1, data, now)
+        return self._tool_call_from_row(updated_row), event
+
+    async def list_run_messages(self, run_id: str) -> list[RunMessageRecord]:
+        async with self._connect() as connection:
+            message_cursor = await connection.execute(
+                "SELECT * FROM run_messages WHERE run_id = ? ORDER BY ordinal", (run_id,)
+            )
+            message_rows = await message_cursor.fetchall()
+            call_cursor = await connection.execute(
+                """SELECT * FROM tool_calls WHERE run_id = ?
+                   ORDER BY assistant_message_id, call_index""",
+                (run_id,),
+            )
+            call_rows = await call_cursor.fetchall()
+        calls_by_message: dict[str, list[ModelToolCall]] = {}
+        for row in call_rows:
+            calls_by_message.setdefault(row["assistant_message_id"], []).append(
+                ModelToolCall(
+                    id=row["provider_call_id"],
+                    name=row["name"],
+                    arguments=cast(dict[str, object], json.loads(row["arguments_json"])),
+                )
+            )
+        return [
+            self._run_message_from_row(row, tuple(calls_by_message.get(row["id"], ())))
+            for row in message_rows
+        ]
+
+    async def list_tool_calls(self, run_id: str) -> list[ToolCallRecord]:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                """SELECT tc.* FROM tool_calls AS tc
+                   JOIN run_messages AS rm ON rm.id = tc.assistant_message_id
+                   WHERE tc.run_id = ? ORDER BY rm.ordinal, tc.call_index""",
+                (run_id,),
+            )
+            rows = await cursor.fetchall()
+        return [self._tool_call_from_row(row) for row in rows]
+
     async def create_session(self) -> Session:
         profile = await self.get_profile()
         session_id = str(uuid4())
@@ -1380,6 +1809,50 @@ class Database:
             await connection.commit()
         messages = await self.get_turn_messages(session_id, turn_id)
         return messages[-1]
+
+    @staticmethod
+    def _run_message_from_row(
+        row: aiosqlite.Row,
+        tool_calls: tuple[ModelToolCall, ...] = (),
+    ) -> RunMessageRecord:
+        continuation_items = tuple(
+            ModelContinuationItem(
+                provider_id=item["provider_id"],
+                model_id=item["model_id"],
+                payload_json=item["payload_json"],
+            )
+            for item in json.loads(row["continuation_json"])
+        )
+        return RunMessageRecord(
+            id=row["id"],
+            run_id=row["run_id"],
+            ordinal=row["ordinal"],
+            role=cast(Literal["assistant", "tool"], row["role"]),
+            content=row["content"],
+            model_call_id=row["model_call_id"],
+            tool_call_id=row["tool_call_id"],
+            created_at=row["created_at"],
+            tool_calls=tool_calls,
+            continuation_items=continuation_items,
+        )
+
+    @staticmethod
+    def _tool_call_from_row(row: aiosqlite.Row) -> ToolCallRecord:
+        decision = row["approval_decision"]
+        return ToolCallRecord(
+            id=row["id"],
+            run_id=row["run_id"],
+            assistant_message_id=row["assistant_message_id"],
+            call_index=row["call_index"],
+            provider_call_id=row["provider_call_id"],
+            name=row["name"],
+            arguments=cast(dict[str, object], json.loads(row["arguments_json"])),
+            status=ToolCallStatus(row["status"]),
+            approval_decision=None if decision is None else ToolApprovalDecision(decision),
+            approval_decided_at=row["approval_decided_at"],
+            created_at=row["created_at"],
+            finished_at=row["finished_at"],
+        )
 
     @staticmethod
     def _model_call_from_row(row: aiosqlite.Row) -> ModelCallRecord:

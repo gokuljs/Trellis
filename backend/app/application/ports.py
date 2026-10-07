@@ -13,12 +13,17 @@ from app.domain.models import (
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
+    ModelMessage,
     ModelRequest,
     ModelStreamEvent,
     RunEvent,
     RunEventType,
+    RunMessageRecord,
     RunSnapshot,
     RunStatus,
+    ToolApprovalDecision,
+    ToolCallRecord,
+    ToolCallStatus,
 )
 
 
@@ -140,6 +145,33 @@ class RunRepository(Protocol):
     ) -> ModelCallRecord: ...
 
     async def list_model_calls(self, run_id: str) -> list[ModelCallRecord]: ...
+
+    async def record_assistant_message(
+        self,
+        run_id: str,
+        model_call_id: str,
+        message: ModelMessage,
+    ) -> tuple[RunMessageRecord, tuple[ToolCallRecord, ...], tuple[RunEvent, ...]]: ...
+
+    async def record_tool_result(
+        self,
+        run_id: str,
+        tool_call_id: str,
+        content: str,
+        *,
+        status: ToolCallStatus = ToolCallStatus.COMPLETED,
+    ) -> tuple[RunMessageRecord, ToolCallRecord, RunEvent]: ...
+
+    async def record_tool_approval_decision(
+        self,
+        run_id: str,
+        tool_call_id: str,
+        decision: ToolApprovalDecision,
+    ) -> tuple[ToolCallRecord, RunEvent | None]: ...
+
+    async def list_run_messages(self, run_id: str) -> list[RunMessageRecord]: ...
+
+    async def list_tool_calls(self, run_id: str) -> list[ToolCallRecord]: ...
 
 
 class ChatRepository(ProfileRepository, SettingsRepository, SessionRepository, Protocol):

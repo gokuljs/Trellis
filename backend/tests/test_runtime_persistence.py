@@ -6,12 +6,223 @@ from pathlib import Path
 import pytest
 
 from app.core.config import Settings
-from app.domain.runtime import ModelCallStatus, RunEvent, RunEventType, RunSnapshot, RunStatus
+from app.domain.runtime import (
+    ModelCallStatus,
+    ModelContinuationItem,
+    ModelMessage,
+    ModelToolCall,
+    RunEvent,
+    RunEventType,
+    RunSnapshot,
+    RunStatus,
+    ToolApprovalDecision,
+    ToolCallStatus,
+)
 from app.infrastructure.database import Database
 
 
 def make_settings(data_dir: Path) -> Settings:
     return Settings(environment="test", data_dir=data_dir)
+
+
+def test_agent_messages_and_tool_results_keep_order_without_polluting_public_chat(
+    tmp_path: Path,
+) -> None:
+    database = Database(make_settings(tmp_path).database_path)
+
+    async def record() -> tuple[str, str]:
+        await database.initialize()
+        session = await database.create_session()
+        model = (await database.list_models())[0]
+        run = await database.create_run(session.id, "turn-1", "request-1", "Inspect files", model)
+        await database.transition_run_record(
+            run.id, RunStatus.RUNNING, RunEventType.STARTED, {"status": "running"}
+        )
+        model_call = await database.create_model_call(run.id, 1, model, {"messages": []})
+        await database.update_model_call(
+            model_call.id,
+            ModelCallStatus.COMPLETED,
+            response_snapshot={"text": "Checking", "tool_calls": ["provider-a", "provider-b"]},
+        )
+        assistant, calls, _events = await database.record_assistant_message(
+            run.id,
+            model_call.id,
+            ModelMessage(
+                role="assistant",
+                content="Checking both files.",
+                continuation_items=(
+                    ModelContinuationItem(
+                        "openai", model.id, '{"type":"reasoning","encrypted_content":"opaque"}'
+                    ),
+                ),
+                tool_calls=(
+                    ModelToolCall("provider-a", "read_file", {"path": "a.py"}),
+                    ModelToolCall("provider-b", "read_file", {"path": "b.py"}),
+                ),
+            ),
+        )
+        assert assistant.ordinal == 1
+        assert [call.provider_call_id for call in calls] == ["provider-a", "provider-b"]
+        await database.record_tool_result(run.id, calls[1].id, "contents of b")
+        await database.record_tool_result(run.id, calls[0].id, "contents of a")
+        with pytest.raises(ValueError, match="already has a result"):
+            await database.record_tool_result(run.id, calls[0].id, "duplicate")
+        second_model_call = await database.create_model_call(run.id, 2, model, {"messages": []})
+        await database.update_model_call(second_model_call.id, ModelCallStatus.COMPLETED)
+        await database.record_assistant_message(
+            run.id,
+            second_model_call.id,
+            ModelMessage(role="assistant", content="Both files are ready."),
+        )
+        await database.complete_run(run.id, "Both files are ready.")
+        return run.id, session.id
+
+    run_id, session_id = asyncio.run(record())
+    restarted = Database(make_settings(tmp_path).database_path)
+    agent_messages = asyncio.run(restarted.list_run_messages(run_id))
+    tool_calls = asyncio.run(restarted.list_tool_calls(run_id))
+    public_messages = asyncio.run(restarted.list_messages(session_id))
+    events = asyncio.run(restarted.list_run_events(run_id))
+    session = asyncio.run(restarted.get_session(session_id))
+
+    assert [(message.ordinal, message.role, message.content) for message in agent_messages] == [
+        (1, "assistant", "Checking both files."),
+        (2, "tool", "contents of b"),
+        (3, "tool", "contents of a"),
+        (4, "assistant", "Both files are ready."),
+    ]
+    assert [message.tool_call_id for message in agent_messages[1:3]] == [
+        tool_calls[1].id,
+        tool_calls[0].id,
+    ]
+    assert agent_messages[0].continuation_items == (
+        ModelContinuationItem(
+            "openai", "openai:gpt-5.5", '{"type":"reasoning","encrypted_content":"opaque"}'
+        ),
+    )
+    assert [call.name for call in tool_calls] == ["read_file", "read_file"]
+    assert [call.arguments for call in tool_calls] == [
+        {"path": "a.py"},
+        {"path": "b.py"},
+    ]
+    assert [call.status for call in tool_calls] == ["completed", "completed"]
+    assert [(message.role, message.content) for message in public_messages] == [
+        ("user", "Inspect files"),
+        ("assistant", "Both files are ready."),
+    ]
+    assert session is not None and session.message_count == 2
+    assert [(event.sequence, event.event_type.value) for event in events] == [
+        (1, "run.queued"),
+        (2, "run.started"),
+        (3, "assistant.message"),
+        (4, "tool.call"),
+        (5, "tool.call"),
+        (6, "tool.result"),
+        (7, "tool.result"),
+        (8, "assistant.message"),
+        (9, "assistant.completed"),
+        (10, "run.completed"),
+    ]
+
+
+def test_tool_approval_decision_is_durable_and_idempotent(tmp_path: Path) -> None:
+    database = Database(make_settings(tmp_path).database_path)
+
+    async def decide() -> tuple[str, str]:
+        await database.initialize()
+        session = await database.create_session()
+        model = (await database.list_models())[0]
+        run = await database.create_run(session.id, "turn-1", "request-1", "Edit a file", model)
+        await database.transition_run_record(
+            run.id, RunStatus.RUNNING, RunEventType.STARTED, {"status": "running"}
+        )
+        model_call = await database.create_model_call(run.id, 1, model, {"messages": []})
+        await database.update_model_call(model_call.id, ModelCallStatus.COMPLETED)
+        _assistant, calls, _events = await database.record_assistant_message(
+            run.id,
+            model_call.id,
+            ModelMessage(
+                role="assistant",
+                content="",
+                tool_calls=(ModelToolCall("provider-edit", "apply_patch", {"patch": "x"}),),
+            ),
+        )
+        first, first_event = await database.record_tool_approval_decision(
+            run.id, calls[0].id, ToolApprovalDecision.DENIED
+        )
+        repeated, repeated_event = await database.record_tool_approval_decision(
+            run.id, calls[0].id, ToolApprovalDecision.DENIED
+        )
+        assert first.approval_decision is ToolApprovalDecision.DENIED
+        assert first_event is not None and first_event.event_type.value == "tool.approval_decided"
+        assert repeated == first and repeated_event is None
+        with pytest.raises(ValueError, match="already differs"):
+            await database.record_tool_approval_decision(
+                run.id, calls[0].id, ToolApprovalDecision.APPROVED
+            )
+        with pytest.raises(ValueError, match="denied"):
+            await database.record_tool_result(run.id, calls[0].id, "Patch applied")
+        await database.record_tool_result(
+            run.id, calls[0].id, "User denied the edit", status=ToolCallStatus.DENIED
+        )
+        return run.id, calls[0].id
+
+    run_id, tool_call_id = asyncio.run(decide())
+    restarted = Database(make_settings(tmp_path).database_path)
+    calls = asyncio.run(restarted.list_tool_calls(run_id))
+    events = asyncio.run(restarted.list_run_events(run_id))
+    assert calls[0].id == tool_call_id
+    assert calls[0].approval_decision is ToolApprovalDecision.DENIED
+    assert calls[0].approval_decided_at is not None
+    assert [event.event_type.value for event in events].count("tool.approval_decided") == 1
+
+
+def test_duplicate_provider_tool_call_rolls_back_assistant_message_and_events(
+    tmp_path: Path,
+) -> None:
+    database = Database(make_settings(tmp_path).database_path)
+
+    async def exercise() -> str:
+        await database.initialize()
+        session = await database.create_session()
+        model = (await database.list_models())[0]
+        run = await database.create_run(session.id, "turn-1", "request-1", "Read files", model)
+        await database.transition_run_record(
+            run.id, RunStatus.RUNNING, RunEventType.STARTED, {"status": "running"}
+        )
+        first_call = await database.create_model_call(run.id, 1, model, {"messages": []})
+        await database.update_model_call(first_call.id, ModelCallStatus.COMPLETED)
+        await database.record_assistant_message(
+            run.id,
+            first_call.id,
+            ModelMessage(
+                role="assistant",
+                content="",
+                tool_calls=(ModelToolCall("same-provider-id", "read_file", {"path": "a.py"}),),
+            ),
+        )
+        second_call = await database.create_model_call(run.id, 2, model, {"messages": []})
+        await database.update_model_call(second_call.id, ModelCallStatus.COMPLETED)
+        with pytest.raises(sqlite3.IntegrityError):
+            await database.record_assistant_message(
+                run.id,
+                second_call.id,
+                ModelMessage(
+                    role="assistant",
+                    content="",
+                    tool_calls=(ModelToolCall("same-provider-id", "read_file", {"path": "b.py"}),),
+                ),
+            )
+        return run.id
+
+    run_id = asyncio.run(exercise())
+    assert [message.content for message in asyncio.run(database.list_run_messages(run_id))] == [""]
+    assert [event.event_type.value for event in asyncio.run(database.list_run_events(run_id))] == [
+        "run.queued",
+        "run.started",
+        "assistant.message",
+        "tool.call",
+    ]
 
 
 def test_run_creation_is_idempotent_and_rejects_changed_input(tmp_path: Path) -> None:
@@ -547,7 +758,13 @@ def test_model_call_snapshots_and_usage_survive_database_restart(tmp_path: Path)
             run.id,
             1,
             model,
-            {"messages": [{"role": "user", "content": "hello"}], "max_output_tokens": 512},
+            {
+                "snapshot_version": 1,
+                "system_instructions": "You are Trellis.",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{"name": "read_file", "input_schema": {"type": "object"}}],
+                "max_output_tokens": 512,
+            },
         )
         assert call.status is ModelCallStatus.PENDING
         streaming = await database.update_model_call(call.id, ModelCallStatus.STREAMING)
@@ -562,7 +779,24 @@ def test_model_call_snapshots_and_usage_survive_database_restart(tmp_path: Path)
         await database.update_model_call(
             call.id,
             ModelCallStatus.COMPLETED,
-            response_snapshot={"text": "hi"},
+            response_snapshot={
+                "snapshot_version": 1,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "hi",
+                        "tool_calls": [
+                            {
+                                "id": "provider-call-1",
+                                "name": "read_file",
+                                "arguments": {"path": "a.py"},
+                            }
+                        ],
+                    }
+                ],
+                "finish_reason": "tool_calls",
+                "usage": {"input_tokens": 5, "output_tokens": 2},
+            },
             provider_response_id="response-123",
             finish_reason="stop",
             input_tokens=5,
@@ -586,10 +820,30 @@ def test_model_call_snapshots_and_usage_survive_database_restart(tmp_path: Path)
     assert call.id == call_id
     assert call.status is ModelCallStatus.COMPLETED
     assert call.request_snapshot == {
+        "snapshot_version": 1,
+        "system_instructions": "You are Trellis.",
         "messages": [{"role": "user", "content": "hello"}],
+        "tools": [{"name": "read_file", "input_schema": {"type": "object"}}],
         "max_output_tokens": 512,
     }
-    assert call.response_snapshot == {"text": "hi"}
+    assert call.response_snapshot == {
+        "snapshot_version": 1,
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "hi",
+                "tool_calls": [
+                    {
+                        "id": "provider-call-1",
+                        "name": "read_file",
+                        "arguments": {"path": "a.py"},
+                    }
+                ],
+            }
+        ],
+        "finish_reason": "tool_calls",
+        "usage": {"input_tokens": 5, "output_tokens": 2},
+    }
     assert call.provider_response_id == "response-123"
     assert call.finish_reason == "stop"
     assert (call.input_tokens, call.output_tokens, call.reasoning_tokens, call.cached_tokens) == (
