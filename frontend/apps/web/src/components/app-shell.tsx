@@ -860,22 +860,40 @@ export function AppShell() {
       : configuredModels
   const modelLabel = selectedModel?.name ?? "Local chat"
 
+  const persistWorkspace = async (path: string) => {
+    if (activeSession) {
+      const updated = await api.setSessionWorkspace(activeSession.id, path)
+      setActiveSession(updated)
+      setSessions((current) => moveSessionToTop(current, updated))
+      return
+    }
+    const created = await api.createSession(path)
+    sessionLoadSequenceRef.current += 1
+    activeSessionIdRef.current = created.id
+    setActiveSession(created)
+    setSessions((current) => moveSessionToTop(current, created))
+    setActiveView("session")
+  }
+
   const saveWorkspace = async (path: string) => {
     workspaceSaveLockRef.current = true
     setWorkspaceSaving(true)
     try {
-      if (activeSession) {
-        const updated = await api.setSessionWorkspace(activeSession.id, path)
-        setActiveSession(updated)
-        setSessions((current) => moveSessionToTop(current, updated))
-        return
-      }
-      const created = await api.createSession(path)
-      sessionLoadSequenceRef.current += 1
-      activeSessionIdRef.current = created.id
-      setActiveSession(created)
-      setSessions((current) => moveSessionToTop(current, created))
-      setActiveView("session")
+      await persistWorkspace(path)
+    } finally {
+      workspaceSaveLockRef.current = false
+      setWorkspaceSaving(false)
+    }
+  }
+
+  const pickWorkspace = async () => {
+    workspaceSaveLockRef.current = true
+    setWorkspaceSaving(true)
+    try {
+      const { path } = await api.pickWorkspace()
+      if (path === null) return false
+      await persistWorkspace(path)
+      return true
     } finally {
       workspaceSaveLockRef.current = false
       setWorkspaceSaving(false)
@@ -1012,6 +1030,7 @@ export function AppShell() {
               key={activeSession?.id ?? "new-session"}
               workspacePath={activeSession?.workspace_path ?? null}
               disabled={pending || sessionLoading || workspaceSaving}
+              onPickWorkspace={pickWorkspace}
               onSave={saveWorkspace}
               onRemove={removeWorkspace}
             />

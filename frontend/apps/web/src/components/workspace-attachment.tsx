@@ -6,6 +6,7 @@ import { ApiError } from "@/lib/api"
 type WorkspaceAttachmentProps = {
   workspacePath: string | null
   disabled: boolean
+  onPickWorkspace: () => Promise<boolean>
   onSave: (path: string) => Promise<void>
   onRemove: () => Promise<void>
 }
@@ -13,14 +14,18 @@ type WorkspaceAttachmentProps = {
 export function WorkspaceAttachment({
   workspacePath,
   disabled,
+  onPickWorkspace,
   onSave,
   onRemove,
 }: WorkspaceAttachmentProps) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(workspacePath ?? "")
-  const [saving, setSaving] = useState(false)
+  const [busyAction, setBusyAction] = useState<
+    "pick" | "save" | "remove" | null
+  >(null)
   const [error, setError] = useState<string | null>(null)
-  const busy = disabled || saving
+  const [manualEntryAvailable, setManualEntryAvailable] = useState(false)
+  const busy = disabled || busyAction !== null
 
   const save = async () => {
     const path = draft.trim()
@@ -28,11 +33,12 @@ export function WorkspaceAttachment({
       setError("Enter an absolute folder path.")
       return
     }
-    setSaving(true)
+    setBusyAction("save")
     setError(null)
     try {
       await onSave(path)
       setEditing(false)
+      setManualEntryAvailable(false)
     } catch (saveError) {
       setError(
         saveError instanceof ApiError
@@ -40,17 +46,37 @@ export function WorkspaceAttachment({
           : "Trellis could not attach that folder."
       )
     } finally {
-      setSaving(false)
+      setBusyAction(null)
+    }
+  }
+
+  const pickWorkspace = async () => {
+    setBusyAction("pick")
+    setError(null)
+    setManualEntryAvailable(false)
+    try {
+      const saved = await onPickWorkspace()
+      if (saved) setEditing(false)
+    } catch (pickerError) {
+      setError(
+        pickerError instanceof ApiError
+          ? pickerError.message
+          : "Trellis could not open the folder picker."
+      )
+      setManualEntryAvailable(true)
+    } finally {
+      setBusyAction(null)
     }
   }
 
   const remove = async () => {
-    setSaving(true)
+    setBusyAction("remove")
     setError(null)
     try {
       await onRemove()
       setDraft("")
       setEditing(false)
+      setManualEntryAvailable(false)
     } catch (removeError) {
       setError(
         removeError instanceof ApiError
@@ -58,7 +84,7 @@ export function WorkspaceAttachment({
           : "Trellis could not remove that folder."
       )
     } finally {
-      setSaving(false)
+      setBusyAction(null)
     }
   }
 
@@ -76,14 +102,26 @@ export function WorkspaceAttachment({
         <button
           type="button"
           onClick={() => {
-            setDraft(workspacePath ?? "")
-            setError(null)
-            setEditing((current) => !current)
+            void pickWorkspace()
           }}
           disabled={busy}
         >
-          {workspacePath ? "Change workspace" : "Attach workspace"}
+          {busyAction === "pick"
+            ? "Opening folder…"
+            : workspacePath
+              ? "Change workspace"
+              : "Attach workspace"}
         </button>
+        {workspacePath ? (
+          <button
+            type="button"
+            className="workspace-attachment-remove"
+            onClick={() => void remove()}
+            disabled={busy}
+          >
+            Remove workspace
+          </button>
+        ) : null}
       </div>
       {editing ? (
         <form
@@ -120,18 +158,24 @@ export function WorkspaceAttachment({
               <X size={15} aria-hidden="true" />
             </button>
           </div>
-          {workspacePath ? (
-            <button
-              type="button"
-              className="workspace-attachment-remove"
-              onClick={() => void remove()}
-              disabled={busy}
-            >
-              Remove workspace
-            </button>
-          ) : null}
-          {error ? <div role="alert">{error}</div> : null}
         </form>
+      ) : null}
+      {error ? <div role="alert">{error}</div> : null}
+      {manualEntryAvailable ? (
+        <button
+          type="button"
+          className="workspace-attachment-manual"
+          onClick={() => {
+            setDraft((currentDraft) =>
+              editing ? currentDraft : (workspacePath ?? "")
+            )
+            setEditing(true)
+            setManualEntryAvailable(false)
+          }}
+          disabled={busy}
+        >
+          Enter path manually
+        </button>
       ) : null}
     </div>
   )

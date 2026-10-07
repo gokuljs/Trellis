@@ -800,7 +800,7 @@ describe("local-first chat", () => {
     )
   })
 
-  it("attaches an absolute folder to a new session before sending a message", async () => {
+  it("attaches a picked folder to a new session immediately", async () => {
     const workspacePath = "/tmp/trellis-project"
     const created = {
       ...recentSession,
@@ -810,6 +810,9 @@ describe("local-first chat", () => {
       workspace_path: workspacePath,
     }
     const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        return response({ path: workspacePath })
+      }
       if (url === "/api/sessions" && init?.method === "POST") {
         expect(JSON.parse(String(init.body))).toEqual({
           workspace_path: workspacePath,
@@ -824,13 +827,12 @@ describe("local-first chat", () => {
     renderApp()
     await screen.findByRole("textbox", { name: "Message" })
     await user.click(screen.getByRole("button", { name: "Attach workspace" }))
-    await user.type(
-      screen.getByRole("textbox", { name: "Workspace folder" }),
-      workspacePath
-    )
-    await user.click(screen.getByRole("button", { name: "Save workspace" }))
 
     expect(await screen.findByText(workspacePath)).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/workspaces/pick",
+      expect.objectContaining({ method: "POST" })
+    )
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/sessions",
       expect.objectContaining({ method: "POST" })
@@ -838,13 +840,17 @@ describe("local-first chat", () => {
     expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
   })
 
-  it("keeps the composer idle while a workspace attachment is saving", async () => {
-    const saveGate = deferred<void>()
+  it("keeps the composer idle while the folder picker and attachment are pending", async () => {
+    const pickGate = deferred<Response>()
     const workspacePath = "/tmp/trellis-project"
     const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        return pickGate.promise
+      }
       if (url === "/api/sessions" && init?.method === "POST") {
-        return saveGate.promise.then(() =>
-          response({ ...recentSession, workspace_path: workspacePath }, 201)
+        return response(
+          { ...recentSession, workspace_path: workspacePath },
+          201
         )
       }
       return undefined
@@ -855,28 +861,42 @@ describe("local-first chat", () => {
     renderApp()
     await screen.findByRole("textbox", { name: "Message" })
     await user.click(screen.getByRole("button", { name: "Attach workspace" }))
-    await user.type(
-      screen.getByRole("textbox", { name: "Workspace folder" }),
-      workspacePath
-    )
-    await user.click(screen.getByRole("button", { name: "Save workspace" }))
 
     expect(screen.getByRole("textbox", { name: "Message" })).toBeDisabled()
-    saveGate.resolve()
+    pickGate.resolve(response({ path: workspacePath }))
     expect(
       await screen.findByRole("button", { name: "Change workspace" })
     ).toBeEnabled()
     expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
   })
 
-  it("rejects a relative workspace path without creating a session", async () => {
-    const fetchMock = startupFetch(() => undefined)
+  it("offers manual path entry when the folder picker is unavailable", async () => {
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        return response(
+          {
+            error: {
+              code: "workspace_picker_unavailable",
+              message: "Trellis could not open the folder picker.",
+            },
+          },
+          503
+        )
+      }
+      return undefined
+    })
     vi.stubGlobal("fetch", fetchMock)
     const user = userEvent.setup()
 
     renderApp()
     await screen.findByRole("textbox", { name: "Message" })
     await user.click(screen.getByRole("button", { name: "Attach workspace" }))
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Trellis could not open the folder picker."
+    )
+    await user.click(
+      screen.getByRole("button", { name: "Enter path manually" })
+    )
     await user.type(
       screen.getByRole("textbox", { name: "Workspace folder" }),
       "relative/project"
@@ -892,11 +912,50 @@ describe("local-first chat", () => {
     )
   })
 
+  it("preserves a manual path draft when a picker retry fails", async () => {
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        return response(
+          {
+            error: {
+              code: "workspace_picker_unavailable",
+              message: "Trellis could not open the folder picker.",
+            },
+          },
+          503
+        )
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Attach workspace" }))
+    await user.click(
+      await screen.findByRole("button", { name: "Enter path manually" })
+    )
+    const pathInput = screen.getByRole("textbox", { name: "Workspace folder" })
+    await user.type(pathInput, "/tmp/manual-draft")
+    await user.click(screen.getByRole("button", { name: "Attach workspace" }))
+    await user.click(
+      await screen.findByRole("button", { name: "Enter path manually" })
+    )
+
+    expect(
+      screen.getByRole("textbox", { name: "Workspace folder" })
+    ).toHaveValue("/tmp/manual-draft")
+  })
+
   it("changes and removes the folder attached to an existing session", async () => {
     const current = { ...recentSession, workspace_path: "/tmp/first-project" }
     const replacement = "/tmp/second-project"
     const updates: Array<string | null> = []
     const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        return response({ path: replacement })
+      }
       if (url === "/api/sessions" && !init?.method) return response([current])
       if (url === `/api/sessions/${current.id}` && !init?.method) {
         return response({ session: current, messages: [] })
@@ -919,18 +978,32 @@ describe("local-first chat", () => {
     renderApp()
     expect(await screen.findByText("/tmp/first-project")).toBeInTheDocument()
     await user.click(screen.getByRole("button", { name: "Change workspace" }))
-    await user.clear(screen.getByRole("textbox", { name: "Workspace folder" }))
-    await user.type(
-      screen.getByRole("textbox", { name: "Workspace folder" }),
-      replacement
-    )
-    await user.click(screen.getByRole("button", { name: "Save workspace" }))
     expect(await screen.findByText(replacement)).toBeInTheDocument()
 
-    await user.click(screen.getByRole("button", { name: "Change workspace" }))
     await user.click(screen.getByRole("button", { name: "Remove workspace" }))
     expect(await screen.findByText("Chat without a folder")).toBeInTheDocument()
     expect(updates).toEqual([replacement, null])
+  })
+
+  it("leaves a new chat unchanged when the folder picker is cancelled", async () => {
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        return response({ path: null })
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Attach workspace" }))
+
+    expect(await screen.findByText("Chat without a folder")).toBeInTheDocument()
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/sessions",
+      expect.objectContaining({ method: "POST" })
+    )
   })
 
   it("shows onboarding before exposing the workspace on the first visit", async () => {
@@ -1004,7 +1077,7 @@ describe("local-first chat", () => {
     await user.click(screen.getByRole("button", { name: "Start Trellis" }))
 
     expect(
-      await screen.findByText("A workspace for ideas in motion")
+      await screen.findByRole("textbox", { name: "Message" })
     ).toBeInTheDocument()
     expect(calls).toEqual([
       "PUT /api/onboarding/steps/intro",
@@ -1276,7 +1349,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
-    await screen.findByText("A workspace for ideas in motion")
+    await screen.findByRole("textbox", { name: "Message" })
     expect(calls).toHaveLength(0)
 
     await user.type(
@@ -1387,7 +1460,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
-    await screen.findByText("A workspace for ideas in motion")
+    await screen.findByRole("textbox", { name: "Message" })
     await user.type(
       screen.getByRole("textbox", { name: "Message" }),
       "Stop this run"
@@ -1421,7 +1494,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
-    await screen.findByText("A workspace for ideas in motion")
+    await screen.findByRole("textbox", { name: "Message" })
     await user.type(
       screen.getByRole("textbox", { name: "Message" }),
       "Do not abandon this draft"
@@ -1517,7 +1590,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
-    await screen.findByText("A workspace for ideas in motion")
+    await screen.findByRole("textbox", { name: "Message" })
     await user.type(
       screen.getByRole("textbox", { name: "Message" }),
       "Retry this"
@@ -2774,7 +2847,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
-    await screen.findByText("A workspace for ideas in motion")
+    await screen.findByRole("textbox", { name: "Message" })
     await user.click(screen.getByRole("button", { name: "Settings" }))
 
     expect(screen.getByDisplayValue(profile.id)).toBeDisabled()
@@ -2844,7 +2917,7 @@ describe("local-first chat", () => {
     vi.stubGlobal("fetch", fetchMock)
 
     renderApp()
-    await screen.findByText("A workspace for ideas in motion")
+    await screen.findByRole("textbox", { name: "Message" })
     await userEvent.click(screen.getByRole("button", { name: "Settings" }))
     await userEvent.click(screen.getByRole("button", { name: "Save profile" }))
 

@@ -1814,14 +1814,22 @@ html.theme-ripple-fallback::before {
   }
 
   .workspace-attachment-summary button:hover:not(:disabled),
-  .workspace-attachment-remove:hover:not(:disabled) {
+  .workspace-attachment-remove:hover:not(:disabled),
+  .workspace-attachment-manual:hover:not(:disabled) {
     text-decoration: underline;
   }
 
   .workspace-attachment-summary button:disabled,
-  .workspace-attachment-editor button:disabled {
+  .workspace-attachment-editor button:disabled,
+  .workspace-attachment-manual:disabled {
     cursor: not-allowed;
     opacity: 0.55;
+  }
+
+  .workspace-attachment-manual {
+    margin-top: 6px;
+    color: var(--shell-accent);
+    font-weight: 600;
   }
 
   .workspace-attachment-editor {
@@ -1873,7 +1881,8 @@ html.theme-ripple-fallback::before {
     height: 28px;
   }
 
-  .workspace-attachment-editor [role="alert"] {
+  .workspace-attachment > [role="alert"] {
+    margin-top: 6px;
     color: var(--destructive);
   }
 

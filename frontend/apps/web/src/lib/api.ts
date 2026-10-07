@@ -105,6 +105,10 @@ export const api = {
       method: "DELETE",
     }),
   listSessions: () => request<Session[]>("/api/sessions"),
+  pickWorkspace: () =>
+    request<{ path: string | null }>("/api/workspaces/pick", {
+      method: "POST",
+    }),
   createSession: (workspacePath?: string) =>
     request<Session>("/api/sessions", {
       method: "POST",
