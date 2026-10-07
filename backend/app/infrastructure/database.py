@@ -971,6 +971,19 @@ class Database:
             row = await cursor.fetchone()
         return None if row is None else self._run_from_row(row)
 
+    async def list_runs_for_session(
+        self, session_id: str, offset: int, limit: int
+    ) -> list[RunSnapshot]:
+        if offset < 0 or not 1 <= limit <= 101:
+            raise ValueError("run offset and limit are outside the supported range")
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                "SELECT * FROM runs WHERE session_id = ? ORDER BY rowid LIMIT ? OFFSET ?",
+                (session_id, limit, offset),
+            )
+            rows = await cursor.fetchall()
+        return [self._run_from_row(row) for row in rows]
+
     async def append_run_event(
         self,
         run_id: str,

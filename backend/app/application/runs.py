@@ -273,6 +273,30 @@ class RunService:
             raise ApplicationError("session_not_found", "Session not found.")
         return await self._runs.get_latest_run_for_session(session_id)
 
+    async def list_session_runs(
+        self, session_id: str, offset: int, limit: int
+    ) -> tuple[list[RunSnapshot], int | None]:
+        if await self._sessions.get_session(session_id) is None:
+            raise ApplicationError("session_not_found", "Session not found.")
+        runs = await self._runs.list_runs_for_session(session_id, offset, limit + 1)
+        return runs[:limit], offset + limit if len(runs) > limit else None
+
+    async def list_session_run_events(
+        self, session_id: str, run_id: str, after_sequence: int, limit: int
+    ) -> tuple[list[RunEvent], int | None]:
+        if await self._sessions.get_session(session_id) is None:
+            raise ApplicationError("session_not_found", "Session not found.")
+        run = await self._runs.get_run(run_id)
+        if run is None or run.session_id != session_id:
+            raise ApplicationError("run_not_found", "Run not found.")
+        events = await self._runs.list_run_events(run_id, after_sequence, limit=limit)
+        next_sequence = (
+            events[-1].sequence
+            if events and events[-1].sequence < run.last_event_sequence
+            else None
+        )
+        return events, next_sequence
+
     async def list_run_events(
         self,
         run_id: str,

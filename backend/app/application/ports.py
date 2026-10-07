@@ -96,6 +96,10 @@ class RunRepository(Protocol):
 
     async def get_latest_run_for_session(self, session_id: str) -> RunSnapshot | None: ...
 
+    async def list_runs_for_session(
+        self, session_id: str, offset: int, limit: int
+    ) -> list[RunSnapshot]: ...
+
     async def append_run_event(
         self,
         run_id: str,

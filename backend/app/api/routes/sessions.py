@@ -1,6 +1,7 @@
+from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import ChatServiceDep, RunServiceDep, SessionServiceDep
@@ -40,6 +41,42 @@ class LatestRunResponse(BaseModel):
     turn_id: str
     status: str
     last_sequence: int
+
+
+class RunSummaryResponse(BaseModel):
+    run_id: str
+    turn_id: str
+    retry_of: str | None
+    status: str
+    budget_preset: str
+    max_model_calls: int
+    max_tool_calls: int
+    max_total_tokens: int
+    max_cost_usd: float
+    deadline_at: str
+    last_sequence: int
+    created_at: str
+    started_at: str | None
+    finished_at: str | None
+
+
+class RunSummariesResponse(BaseModel):
+    items: list[RunSummaryResponse]
+    next_offset: int | None
+
+
+class RunEventResponse(BaseModel):
+    run_id: str
+    sequence: int
+    event_type: str
+    event_version: int
+    data: dict[str, object]
+    created_at: str
+
+
+class RunEventsResponse(BaseModel):
+    items: list[RunEventResponse]
+    next_after_sequence: int | None
 
 
 class TurnRequest(BaseModel):
@@ -121,6 +158,65 @@ async def get_latest_run(session_id: str, service: RunServiceDep) -> LatestRunRe
             status=run.status.value,
             last_sequence=run.last_event_sequence,
         )
+    )
+
+
+@router.get("/{session_id}/runs")
+async def list_session_runs(
+    session_id: str,
+    service: RunServiceDep,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=100)] = 100,
+) -> RunSummariesResponse:
+    runs, next_offset = await service.list_session_runs(session_id, offset, limit)
+    return RunSummariesResponse(
+        items=[
+            RunSummaryResponse(
+                run_id=run.id,
+                turn_id=run.turn_id,
+                retry_of=run.retry_of,
+                status=run.status.value,
+                budget_preset=run.budget_preset,
+                max_model_calls=run.max_model_calls,
+                max_tool_calls=run.max_tool_calls,
+                max_total_tokens=run.max_total_tokens,
+                max_cost_usd=run.max_cost_usd,
+                deadline_at=run.deadline_at,
+                last_sequence=run.last_event_sequence,
+                created_at=run.created_at,
+                started_at=run.started_at,
+                finished_at=run.finished_at,
+            )
+            for run in runs
+        ],
+        next_offset=next_offset,
+    )
+
+
+@router.get("/{session_id}/runs/{run_id}/events")
+async def list_session_run_events(
+    session_id: str,
+    run_id: str,
+    service: RunServiceDep,
+    after_sequence: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=500)] = 500,
+) -> RunEventsResponse:
+    events, next_sequence = await service.list_session_run_events(
+        session_id, run_id, after_sequence, limit
+    )
+    return RunEventsResponse(
+        items=[
+            RunEventResponse(
+                run_id=event.run_id,
+                sequence=event.sequence,
+                event_type=event.event_type.value,
+                event_version=event.event_version,
+                data=event.data,
+                created_at=event.created_at,
+            )
+            for event in events
+        ],
+        next_after_sequence=next_sequence,
     )
 
 

@@ -37,6 +37,7 @@ WORKSPACE_PICKER_TIMEOUT_SECONDS = DEFAULT_WORKSPACE_PICKER_TIMEOUT_SECONDS
 ERROR_STATUS = {
     "model_not_available": 404,
     "session_not_found": 404,
+    "run_not_found": 404,
     "invalid_workspace": 422,
     "workspace_picker_unavailable": 503,
     "workspace_picker_timeout": 504,

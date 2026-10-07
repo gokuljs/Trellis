@@ -146,6 +146,91 @@ def receive_until(websocket, predicate):
             return received
 
 
+def start_completed_run(client: TestClient, session_id: str, request_id: str) -> str:
+    with client.websocket_connect("/api/runtime") as websocket:
+        websocket.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "run.start",
+                "params": {
+                    "sessionId": session_id,
+                    "clientRequestId": request_id,
+                    "content": f"Message {request_id}",
+                },
+            }
+        )
+        received = receive_until(
+            websocket,
+            lambda item: (
+                item.get("method") == "run.event"
+                and item["params"]["eventType"] == RunEventType.COMPLETED.value
+            ),
+        )
+    return next(item["result"]["runId"] for item in received if item.get("id") == request_id)
+
+
+def test_session_run_history_pages_summaries_and_events(tmp_path: Path) -> None:
+    with configured_client(tmp_path, StreamingProvider()) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-history"})
+        session_id = client.post("/api/sessions").json()["id"]
+        first_id = start_completed_run(client, session_id, "history-first")
+        second_id = start_completed_run(client, session_id, "history-second")
+
+        first_page = client.get(f"/api/sessions/{session_id}/runs", params={"limit": 1})
+        second_page = client.get(
+            f"/api/sessions/{session_id}/runs", params={"limit": 1, "offset": 1}
+        )
+        events_page = client.get(
+            f"/api/sessions/{session_id}/runs/{first_id}/events", params={"limit": 2}
+        )
+        remaining_events = client.get(
+            f"/api/sessions/{session_id}/runs/{first_id}/events",
+            params={"after_sequence": 2},
+        )
+
+    assert first_page.status_code == second_page.status_code == events_page.status_code == 200
+    assert first_page.json()["next_offset"] == 1
+    assert second_page.json()["next_offset"] is None
+    assert [first_page.json()["items"][0]["run_id"], second_page.json()["items"][0]["run_id"]] == [
+        first_id,
+        second_id,
+    ]
+    summary = first_page.json()["items"][0]
+    assert summary["status"] == "completed"
+    assert summary["created_at"] and summary["finished_at"]
+    assert summary["last_sequence"] == 7
+    assert summary["max_model_calls"] > 0
+    assert [item["sequence"] for item in events_page.json()["items"]] == [1, 2]
+    assert events_page.json()["next_after_sequence"] == 2
+    assert [item["sequence"] for item in remaining_events.json()["items"]] == [3, 4, 5, 6, 7]
+    assert remaining_events.json()["next_after_sequence"] is None
+    assert all(item["created_at"] for item in remaining_events.json()["items"])
+
+
+def test_session_run_history_rejects_other_sessions_and_invalid_pages(tmp_path: Path) -> None:
+    with configured_client(tmp_path, StreamingProvider()) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-history"})
+        owner_id = client.post("/api/sessions").json()["id"]
+        other_id = client.post("/api/sessions").json()["id"]
+        run_id = start_completed_run(client, owner_id, "owned-run")
+
+        assert client.get(f"/api/sessions/{other_id}/runs").json() == {
+            "items": [],
+            "next_offset": None,
+        }
+        assert client.get(f"/api/sessions/{other_id}/runs/{run_id}/events").status_code == 404
+        assert client.get("/api/sessions/missing/runs").status_code == 404
+        assert client.get(f"/api/sessions/{owner_id}/runs/missing/events").status_code == 404
+        assert client.get(f"/api/sessions/{owner_id}/runs", params={"limit": 0}).status_code == 422
+        assert (
+            client.get(
+                f"/api/sessions/{owner_id}/runs/{run_id}/events", params={"after_sequence": -1}
+            ).status_code
+            == 422
+        )
+
+
 def test_jsonrpc_run_respond_approves_exact_waiting_tool_and_resumes(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
