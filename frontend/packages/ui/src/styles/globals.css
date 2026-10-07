@@ -597,7 +597,7 @@ html.theme-ripple-fallback::before {
   }
 
   .session-row + .session-row {
-    margin-top: 0.25px;
+    margin-top: 0.25rem;
   }
 
   @media (hover: hover) and (pointer: fine) {
