@@ -17,6 +17,10 @@ from app.application.sessions import SessionService
 from app.application.settings import SettingsService
 from app.application.test_presets import TestPresetService
 from app.application.tools import ToolRegistry
+from app.application.workspaces import (
+    DEFAULT_WORKSPACE_PICKER_TIMEOUT_SECONDS,
+    WorkspacePickerService,
+)
 from app.core.config import Settings
 from app.domain.models import ProviderName
 from app.infrastructure.command_tools import LocalCommandToolExecutor
@@ -26,11 +30,16 @@ from app.infrastructure.local_tools import LocalReadToolExecutor, read_workspace
 from app.infrastructure.providers import AnthropicProvider, OpenAIProvider
 from app.infrastructure.runtime_events import RuntimeEventHub
 from app.infrastructure.secrets import SecretStore
+from app.infrastructure.workspace_picker import NativeFolderPicker
+
+WORKSPACE_PICKER_TIMEOUT_SECONDS = DEFAULT_WORKSPACE_PICKER_TIMEOUT_SECONDS
 
 ERROR_STATUS = {
     "model_not_available": 404,
     "session_not_found": 404,
     "invalid_workspace": 422,
+    "workspace_picker_unavailable": 503,
+    "workspace_picker_timeout": 504,
     "invalid_test_preset": 422,
     "workspace_required": 409,
     "too_many_test_presets": 409,
@@ -60,6 +69,7 @@ def create_app(
     *,
     streaming_provider_adapters: Mapping[str, StreamingProviderAdapter] | None = None,
     tool_registry: ToolRegistry | None = None,
+    workspace_picker: WorkspacePickerService | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings()
 
@@ -73,6 +83,10 @@ def create_app(
         application.state.secret_store = secret_store
         application.state.profile_service = ProfileService(database)
         application.state.session_service = SessionService(database)
+        application.state.workspace_picker = workspace_picker or WorkspacePickerService(
+            NativeFolderPicker(),
+            timeout_seconds=WORKSPACE_PICKER_TIMEOUT_SECONDS,
+        )
         application.state.test_preset_service = TestPresetService(database)
         application.state.settings_service = SettingsService(database, secret_store)
         application.state.onboarding_service = OnboardingService(

@@ -76,6 +76,10 @@ class SessionRepository(Protocol):
     async def list_messages(self, session_id: str) -> list[Message]: ...
 
 
+class WorkspaceDirectoryPicker(Protocol):
+    async def pick_directory(self) -> str | None: ...
+
+
 class RunRepository(Protocol):
     async def create_run(
         self,
