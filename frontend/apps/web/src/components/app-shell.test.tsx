@@ -442,6 +442,9 @@ describe("local-first chat", () => {
     )
     await user.click(screen.getByRole("button", { name: "Send" }))
 
+    await user.click(
+      await screen.findByRole("button", { name: "Needs approval" })
+    )
     const approval = await screen.findByRole("region", {
       name: "Approval required for apply_patch",
     })
@@ -604,6 +607,9 @@ describe("local-first chat", () => {
       "Run two commands"
     )
     await user.click(screen.getByRole("button", { name: "Send" }))
+    await user.click(
+      await screen.findByRole("button", { name: "Needs approval" })
+    )
     const firstApproval = await screen.findByRole("region", {
       name: "Approval required for run_command",
     })
@@ -714,11 +720,15 @@ describe("local-first chat", () => {
     await user.type(composer, "First prompt")
     await user.click(screen.getByRole("button", { name: "Send" }))
     expect(await screen.findByText("First answer")).toBeInTheDocument()
+    await user.click(screen.getByRole("button", { name: "Completed" }))
     expect(screen.getByText("First tool output")).toBeInTheDocument()
 
     await user.type(composer, "Second prompt")
     await user.click(screen.getByRole("button", { name: "Send" }))
     expect(await screen.findByText("Second answer")).toBeInTheDocument()
+    const toggles = screen.getAllByRole("button", { name: "Completed" })
+    expect(toggles).toHaveLength(2)
+    await user.click(toggles[0])
     const firstResult = screen.getByText("First tool output")
     const firstAnswer = screen.getByText("First answer")
     expect(
@@ -726,12 +736,12 @@ describe("local-first chat", () => {
         Node.DOCUMENT_POSITION_FOLLOWING
     ).toBeTruthy()
     const activities = screen.getAllByRole("region", { name: "Run activity" })
-    expect(activities).toHaveLength(2)
+    expect(activities).toHaveLength(1)
     expect(
       within(activities[0]).getByText("First tool output")
     ).toBeInTheDocument()
     expect(
-      firstAnswer.compareDocumentPosition(activities[1]) &
+      firstAnswer.compareDocumentPosition(toggles[1]) &
         Node.DOCUMENT_POSITION_FOLLOWING
     ).toBeTruthy()
   })
@@ -2778,6 +2788,9 @@ describe("local-first chat", () => {
 
     renderApp()
     await openSavedSession("Persisted conversation")
+    await user.click(
+      await screen.findByRole("button", { name: "Needs approval" })
+    )
     const approval = await screen.findByRole("region", {
       name: "Approval required for apply_patch",
     })
@@ -3180,6 +3193,9 @@ describe("local-first chat", () => {
 
     renderApp()
     await openSavedSession("Persisted conversation")
+    await user.click(
+      await screen.findByRole("button", { name: "Needs approval" })
+    )
     const approval = await screen.findByRole("region", {
       name: "Approval required for apply_patch",
     })
@@ -3197,10 +3213,16 @@ describe("local-first chat", () => {
     expect(
       await screen.findByRole("button", { name: "Reconnect" })
     ).toBeInTheDocument()
+    await user.click(screen.getByRole("button", { name: "Needs approval" }))
+    const staleApproval = screen.getByRole("region", {
+      name: "Approval required for apply_patch",
+    })
     expect(
-      within(approval).queryByRole("button", { name: "Approve" })
+      within(staleApproval).queryByRole("button", { name: "Approve" })
     ).toBeNull()
-    expect(within(approval).queryByRole("button", { name: "Deny" })).toBeNull()
+    expect(
+      within(staleApproval).queryByRole("button", { name: "Deny" })
+    ).toBeNull()
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
     expect(resumes).toBe(4)
   })

@@ -22,6 +22,7 @@ export type RuntimeRunInfo = {
 export type TurnRunActivity = {
   events: RuntimeRunEvent[]
   runInfo: RuntimeRunInfo | null
+  latestEvent?: RuntimeRunEvent
 }
 
 export type ToolApprovalDecision = "approved" | "denied"

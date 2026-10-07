@@ -1,4 +1,5 @@
 import { cleanup, render, screen } from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { ChatThread } from "@/components/chat-thread"
@@ -62,6 +63,91 @@ function renderThread(content: string) {
 afterEach(cleanup)
 
 describe("chat Markdown", () => {
+  it("shows one compact activity line at a time and closes it on outside click or Escape", async () => {
+    const user = userEvent.setup()
+    render(
+      <ChatThread
+        session={session}
+        messages={[
+          message("First answer"),
+          { ...message("Second answer"), id: "message-2", turn_id: "turn-2" },
+        ]}
+        pending={false}
+        streamingText={null}
+        error={null}
+        canRetry={false}
+        canCancel={false}
+        cancellationPending={false}
+        runActivities={{
+          "turn-1": {
+            runInfo: null,
+            events: [
+              {
+                runId: "run-1",
+                sequence: 1,
+                eventType: "run.queued",
+                eventVersion: 1,
+                data: {},
+                createdAt: "2026-10-07T12:00:00Z",
+              },
+              {
+                runId: "run-1",
+                sequence: 2,
+                eventType: "run.completed",
+                eventVersion: 1,
+                data: {},
+                createdAt: "2026-10-07T12:00:12Z",
+              },
+            ],
+          },
+          "turn-2": {
+            runInfo: null,
+            events: [
+              {
+                runId: "run-2",
+                sequence: 1,
+                eventType: "run.queued",
+                eventVersion: 1,
+                data: {},
+                createdAt: "2026-10-07T12:01:00Z",
+              },
+              {
+                runId: "run-2",
+                sequence: 2,
+                eventType: "run.completed",
+                eventVersion: 1,
+                data: {},
+                createdAt: "2026-10-07T12:01:09Z",
+              },
+            ],
+          },
+        }}
+        onRetry={() => undefined}
+        onCancel={() => undefined}
+      />
+    )
+
+    const toggles = screen.getAllByRole("button", { name: /Completed/ })
+    expect(toggles).toHaveLength(2)
+    expect(toggles[0]).toHaveTextContent("12s")
+    expect(toggles[1]).toHaveTextContent("9s")
+    expect(screen.queryByRole("region", { name: "Run activity" })).toBeNull()
+
+    await user.click(toggles[0])
+    expect(toggles[0]).toHaveAttribute("aria-expanded", "true")
+    expect(
+      screen.getByRole("region", { name: "Run activity" })
+    ).toBeInTheDocument()
+    await user.click(toggles[1])
+    expect(toggles[0]).toHaveAttribute("aria-expanded", "false")
+    expect(toggles[1]).toHaveAttribute("aria-expanded", "true")
+    await user.keyboard("{Escape}")
+    expect(toggles[1]).toHaveAttribute("aria-expanded", "false")
+    await user.click(toggles[0])
+    await user.click(screen.getByText("Second answer"))
+    expect(toggles[0]).toHaveAttribute("aria-expanded", "false")
+  })
+
   it("does not show provider or model metadata beside assistant replies", () => {
     render(
       <ChatThread
@@ -221,7 +307,7 @@ describe("chat Markdown", () => {
     expect(screen.queryByTestId("thinking-orb")).not.toBeInTheDocument()
   })
 
-  it("shows the approval request instead of a thinking pulse while paused", () => {
+  it("shows the approval request in the expanded activity while paused", async () => {
     render(
       <ChatThread
         session={session}
@@ -256,12 +342,18 @@ describe("chat Markdown", () => {
       />
     )
 
+    expect(screen.getByTestId("thinking-orb")).toHaveAttribute(
+      "data-state",
+      "listening"
+    )
+    await userEvent.click(
+      screen.getByRole("button", { name: "Needs approval" })
+    )
     expect(
       screen.getByRole("region", { name: "Approval required for run_command" })
     ).toBeInTheDocument()
     expect(
       screen.queryByLabelText("Assistant response pending")
     ).not.toBeInTheDocument()
-    expect(screen.queryByTestId("thinking-orb")).not.toBeInTheDocument()
   })
 })

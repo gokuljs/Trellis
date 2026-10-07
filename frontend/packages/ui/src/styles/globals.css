@@ -1206,10 +1206,97 @@ html.theme-ripple-fallback::before {
 
   .run-activity {
     min-width: 0;
-    border: 1px solid var(--shell-line);
-    border-radius: 14px;
-    padding: 14px 16px 8px;
-    background: var(--shell-card);
+    padding: 10px 0 4px 27px;
+    background: transparent;
+  }
+
+  .run-activity-disclosure {
+    min-width: 0;
+    margin: 7px 0 11px;
+  }
+
+  .run-activity-trigger {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    width: 100%;
+    min-height: 36px;
+    border: 0;
+    border-radius: 8px;
+    padding: 4px 7px 4px 2px;
+    color: var(--shell-text-muted);
+    background: transparent;
+    cursor: pointer;
+    text-align: left;
+    transition:
+      color 160ms ease,
+      background-color 160ms ease;
+  }
+
+  .run-activity-trigger:hover,
+  .run-activity-trigger:focus-visible {
+    color: var(--shell-text-strong);
+    background: color-mix(in srgb, var(--shell-text-strong) 5%, transparent);
+  }
+
+  .run-activity-trigger:focus-visible {
+    outline: 2px solid var(--shell-text-strong);
+    outline-offset: 2px;
+  }
+
+  .run-activity-trigger-main,
+  .run-activity-trigger-end {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    min-width: 0;
+  }
+
+  .run-activity-trigger-main {
+    font-size: 12px;
+    font-weight: 560;
+  }
+
+  .run-activity-trigger-end {
+    flex: none;
+    color: var(--shell-text-faint);
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .run-activity-trigger-end svg {
+    transition: transform 200ms ease;
+  }
+
+  .run-activity-trigger[aria-expanded="true"] .run-activity-trigger-end svg {
+    transform: rotate(180deg);
+  }
+
+  .run-activity-expanded {
+    animation: run-activity-reveal 180ms ease-out both;
+  }
+
+  @keyframes run-activity-reveal {
+    from {
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .run-activity-trigger,
+    .run-activity-trigger-end svg {
+      transition: none;
+    }
+    .run-activity-expanded {
+      animation: none;
+    }
   }
 
   .run-activity-header {

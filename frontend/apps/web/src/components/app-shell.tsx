@@ -132,6 +132,7 @@ export function AppShell() {
         [turnId]: {
           events: current[turnId]?.events ?? [],
           runInfo,
+          latestEvent: current[turnId]?.latestEvent,
         },
       })),
     []
@@ -139,23 +140,21 @@ export function AppShell() {
 
   const recordRunEvent = useCallback(
     (turnId: string, event: RuntimeRunEvent) => {
-      if (
-        event.eventType !== "assistant.delta" &&
-        event.eventType !== "assistant.completed"
-      ) {
-        setRunActivities((current) => {
-          const activity = current[turnId] ?? { events: [], runInfo: null }
-          if (activity.events.some((item) => item.sequence === event.sequence))
-            return current
-          return {
-            ...current,
-            [turnId]: {
-              ...activity,
-              events: [...activity.events, event],
-            },
-          }
-        })
-      }
+      setRunActivities((current) => {
+        const activity = current[turnId] ?? { events: [], runInfo: null }
+        const retain = !["assistant.delta", "assistant.completed"].includes(
+          event.eventType
+        )
+        const events =
+          retain &&
+          !activity.events.some((item) => item.sequence === event.sequence)
+            ? [...activity.events, event]
+            : activity.events
+        return {
+          ...current,
+          [turnId]: { ...activity, events, latestEvent: event },
+        }
+      })
       if (event.eventType === "tool.approval_decided") {
         const decidedToolCallId = event.data.tool_call_id
         if (typeof decidedToolCallId === "string") {

@@ -1,11 +1,11 @@
 import { RotateCcw, Square } from "lucide-react"
-import { Fragment } from "react"
+import { Fragment, useState } from "react"
 import Markdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { ThinkingOrb } from "thinking-orbs"
 
 import { TrellisMark } from "@/components/trellis-mark"
-import { RunActivity } from "@/components/run-activity"
+import { RunActivityDisclosure } from "@/components/run-activity-disclosure"
 import type { Message, Session } from "@/lib/app-types"
 import type {
   ToolApprovalDecision,
@@ -101,6 +101,9 @@ export function ChatThread({
   onReconnect = () => undefined,
   onCancel,
 }: ChatThreadProps) {
+  const [openActivityTurnId, setOpenActivityTurnId] = useState<string | null>(
+    null
+  )
   const firstAssistantByTurn = new Map<string, string>()
   for (const message of messages) {
     if (
@@ -125,13 +128,20 @@ export function ChatThread({
     latestApprovalState?.eventType === "tool.approval_requested"
   const activityForTurn = (turnId: string) => {
     const activity = runActivities[turnId]
-    if (!activity?.events.length) return null
     const active = activeRunTurnId === turnId
+    if (!activity || (!activity.events.length && !(active && pending)))
+      return null
     return (
-      <RunActivity
-        events={activity.events}
-        runInfo={activity.runInfo}
+      <RunActivityDisclosure
+        activity={activity}
         pending={pending && active}
+        expanded={openActivityTurnId === turnId}
+        onToggle={() =>
+          setOpenActivityTurnId((current) =>
+            current === turnId ? null : turnId
+          )
+        }
+        onClose={() => setOpenActivityTurnId(null)}
         approvalPendingToolId={active ? approvalPendingToolId : null}
         approvalError={active ? approvalError : null}
         onApprovalDecision={onApprovalDecision}
@@ -194,7 +204,7 @@ export function ChatThread({
               <MessageMarkdown content={streamingText} />
             </div>
           </article>
-        ) : pending && !waitingForApproval ? (
+        ) : pending && !waitingForApproval && !activeActivity ? (
           <article
             className="thread-message assistant pending"
             aria-label="Assistant response pending"
