@@ -10,10 +10,14 @@
 
 .welcome-dither {
   display: block;
-  width: clamp(128px, 17vw, 176px);
+  width: clamp(210px, 25vw, 280px);
   flex: 0 0 auto;
   overflow: visible;
   color: var(--shell-text-muted);
+}
+
+.welcome-dither__mask {
+  mask-type: luminance;
 }
 
 .welcome-dither__eye {
@@ -59,7 +63,7 @@
   }
 
   .welcome-dither {
-    width: 150px;
+    width: 210px;
   }
 
   .welcome-scene__copy {
