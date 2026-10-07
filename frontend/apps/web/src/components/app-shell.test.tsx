@@ -269,6 +269,20 @@ describe("local-first chat", () => {
     ).toBeInTheDocument()
   })
 
+  it("shows an upward send arrow while an empty draft remains disabled", async () => {
+    vi.stubGlobal(
+      "fetch",
+      startupFetch(() => undefined)
+    )
+
+    renderApp()
+
+    await screen.findByRole("textbox", { name: "Message" })
+    const sendButton = screen.getByRole("button", { name: "Send" })
+    expect(sendButton).toBeDisabled()
+    expect(sendButton.querySelector("svg.lucide-arrow-up")).toBeInTheDocument()
+  })
+
   it("shows an approval preview, answers it, and keeps the ordered tool result in chat", async () => {
     const created = {
       ...recentSession,

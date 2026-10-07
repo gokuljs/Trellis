@@ -1,6 +1,14 @@
-import type { KeyboardEvent } from "react"
-import { Send } from "lucide-react"
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react"
+import { ArrowUp } from "lucide-react"
+import { BEND, MetalFx, useMetalBend } from "metal-fx"
 
+import { useTheme } from "@/components/theme-provider"
 import { WorkspaceAttachment } from "@/components/workspace-attachment"
 
 type BudgetPreset = "conservative" | "longer"
@@ -20,6 +28,25 @@ type ComposerProps = {
   onBudgetChange: (preset: BudgetPreset) => void
 }
 
+function usePrefersReducedMotion() {
+  const [prefersReducedMotion, setPrefersReducedMotion] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  )
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia("(prefers-reduced-motion: reduce)")
+    const updatePreference = () => setPrefersReducedMotion(mediaQuery.matches)
+
+    updatePreference()
+    mediaQuery.addEventListener("change", updatePreference)
+    return () => mediaQuery.removeEventListener("change", updatePreference)
+  }, [])
+
+  return prefersReducedMotion
+}
+
 export function Composer({
   value,
   placeholder,
@@ -34,6 +61,20 @@ export function Composer({
   budgetPreset,
   onBudgetChange,
 }: ComposerProps) {
+  const { resolvedTheme } = useTheme()
+  const prefersReducedMotion = usePrefersReducedMotion()
+  const isSendable = Boolean(value.trim()) && !disabled
+  const sendRef = useRef<HTMLDivElement>(null)
+  const getBendConfig = useCallback(
+    () => ({
+      ...BEND,
+      enabled: isSendable && !prefersReducedMotion,
+    }),
+    [isSendable, prefersReducedMotion]
+  )
+
+  useMetalBend(sendRef, getBendConfig)
+
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault()
@@ -75,20 +116,26 @@ export function Composer({
               <option value="conservative">Standard</option>
               <option value="longer">Extended</option>
             </select>
-            <button
-              className={`send-button ${value.trim() && !disabled ? "ready" : ""}`}
-              aria-label="Send"
-              disabled={disabled || !value.trim()}
-              onClick={onSubmit}
+            <MetalFx
+              ref={sendRef}
+              className="send-button-metal"
+              variant="circle"
+              preset="chromatic"
+              strength={1}
+              innerShadow
+              theme={resolvedTheme}
+              paused={prefersReducedMotion || !isSendable}
+              disableGlow={prefersReducedMotion || !isSendable}
             >
-              {value.trim() ? (
-                <Send size={15} aria-hidden="true" />
-              ) : (
-                <span className="voice-orb" aria-hidden="true">
-                  ◔
-                </span>
-              )}
-            </button>
+              <button
+                className="send-button"
+                aria-label="Send"
+                disabled={!isSendable}
+                onClick={onSubmit}
+              >
+                <ArrowUp size={18} aria-hidden="true" />
+              </button>
+            </MetalFx>
           </div>
         </div>
       </div>

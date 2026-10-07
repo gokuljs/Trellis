@@ -1987,12 +1987,6 @@ html.theme-ripple-fallback::before {
     text-decoration: underline;
   }
 
-  .composer-box:focus-within {
-    border-color: var(--shell-accent);
-    outline: 1px solid color-mix(in srgb, var(--shell-focus) 55%, transparent);
-    outline-offset: 1px;
-  }
-
   .composer-add {
     width: 30px;
     height: 30px;
@@ -2028,7 +2022,7 @@ html.theme-ripple-fallback::before {
 
   .composer-tools {
     display: flex;
-    height: 32px;
+    height: 40px;
     align-items: center;
     gap: 13px;
   }
@@ -2069,31 +2063,31 @@ html.theme-ripple-fallback::before {
     color: var(--shell-text-muted);
   }
 
-  .send-button {
-    width: 32px;
-    height: 32px;
+  .send-button-metal {
+    display: inline-flex;
+    flex: 0 0 40px;
+    align-items: center;
+    justify-content: center;
     border-radius: 50%;
-    color: var(--shell-bg);
-    background: var(--shell-send);
   }
 
-  .send-button.ready {
-    color: var(--primary-foreground);
-    background: var(--shell-send-ready);
+  .send-button-metal:has(.send-button:focus-visible) {
+    outline: 2px solid var(--shell-focus);
+    outline-offset: 3px;
+  }
+
+  .send-button {
+    width: 40px;
+    height: 40px;
+    flex: 0 0 40px;
+    border-radius: 50%;
+    color: var(--shell-text-strong);
+    background: var(--shell-input);
   }
 
   .send-button:hover:not(:disabled) {
     color: var(--shell-text-strong);
     background: var(--shell-hover);
-  }
-
-  .send-button.ready:hover:not(:disabled) {
-    color: var(--primary-foreground);
-    background: var(--shell-accent-hover);
-  }
-
-  .send-button.ready:active:not(:disabled) {
-    background: var(--shell-accent-pressed);
   }
 
   .composer-box:has(textarea:disabled) {
@@ -2110,19 +2104,13 @@ html.theme-ripple-fallback::before {
   .send-button:disabled {
     cursor: not-allowed;
     color: var(--shell-disabled-text);
-    background: var(--shell-disabled-surface);
+    background: var(--shell-input);
   }
 
   .composer-add:disabled {
     cursor: not-allowed;
     color: var(--shell-disabled-text);
     opacity: 1;
-  }
-
-  .voice-orb {
-    font-size: 18px;
-    line-height: 1;
-    transform: rotate(25deg);
   }
 
   .composer-footnote {
