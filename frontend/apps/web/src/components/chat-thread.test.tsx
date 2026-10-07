@@ -62,6 +62,32 @@ function renderThread(content: string) {
 afterEach(cleanup)
 
 describe("chat Markdown", () => {
+  it("does not show provider or model metadata beside assistant replies", () => {
+    render(
+      <ChatThread
+        session={session}
+        messages={[
+          {
+            ...message("A response"),
+            provider: "openai",
+            model: "openai:gpt-5.5",
+          },
+        ]}
+        pending={false}
+        streamingText={null}
+        error={null}
+        canRetry={false}
+        canCancel={false}
+        cancellationPending={false}
+        onRetry={() => undefined}
+        onCancel={() => undefined}
+      />
+    )
+
+    expect(screen.queryByText("openai:gpt-5.5")).not.toBeInTheDocument()
+    expect(screen.queryByText("openai")).not.toBeInTheDocument()
+  })
+
   it("identifies a user message to assistive technology when its label is visually hidden", () => {
     render(
       <ChatThread

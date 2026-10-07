@@ -722,7 +722,7 @@ describe("local-first chat", () => {
     ).toBeTruthy()
   })
 
-  it("offers a per-run model choice with two configured models and sends the budget", async () => {
+  it("uses the Settings-selected model for runs and keeps the budget choice", async () => {
     const configuredSettings = {
       ...settings,
       providers: settings.providers.map((provider) => ({
@@ -755,7 +755,12 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
-    await screen.findByRole("combobox", { name: "Run model" })
+    await screen.findByRole("textbox", { name: "Message" })
+    expect(
+      screen.queryByRole("combobox", { name: "Run model" })
+    ).not.toBeInTheDocument()
+    expect(screen.queryByText("GPT-5.5")).not.toBeInTheDocument()
+    expect(screen.queryByText("Claude Sonnet 5")).not.toBeInTheDocument()
     const runBudgetSelect = screen.getByRole("combobox", { name: "Run budget" })
     expect(
       within(runBudgetSelect).getByRole("option", { name: "Standard" })
@@ -763,10 +768,6 @@ describe("local-first chat", () => {
     expect(
       within(runBudgetSelect).getByRole("option", { name: "Extended" })
     ).toBeInTheDocument()
-    await user.selectOptions(
-      screen.getByRole("combobox", { name: "Run model" }),
-      "anthropic:claude-sonnet-5"
-    )
     await user.selectOptions(
       screen.getByRole("combobox", { name: "Run budget" }),
       "longer"
@@ -778,20 +779,21 @@ describe("local-first chat", () => {
       expect(runtimeRequests[0]).toMatchObject({
         method: "run.start",
         params: {
-          modelId: "anthropic:claude-sonnet-5",
+          modelId: "openai:gpt-5.5",
           budgetPreset: "longer",
         },
       })
     )
   })
 
-  it("shows the selected model as text when only one model is configured", async () => {
+  it("does not show the selected model when only one model is configured", async () => {
     vi.stubGlobal(
       "fetch",
       startupFetch(() => undefined)
     )
     renderApp()
-    expect(await screen.findByText("GPT-5.5")).toBeInTheDocument()
+    await screen.findByRole("textbox", { name: "Message" })
+    expect(screen.queryByText("GPT-5.5")).not.toBeInTheDocument()
     expect(screen.queryByRole("combobox", { name: "Run model" })).toBeNull()
     expect(
       screen.getByRole("combobox", { name: "Run budget" })
@@ -2096,7 +2098,7 @@ describe("local-first chat", () => {
     ).toBeInTheDocument()
   })
 
-  it("does not create an empty session when the selected provider has no key", async () => {
+  it("does not expose provider identity or create a session when its key is missing", async () => {
     const fetchMock = startupFetch((url) => {
       if (url === "/api/settings") {
         return response({
@@ -2121,9 +2123,11 @@ describe("local-first chat", () => {
     )
     await user.click(screen.getByRole("button", { name: "Send" }))
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Add an API key for OpenAI in Settings."
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent(
+      "The selected model needs to be configured in Settings before starting a session."
     )
+    expect(alert).not.toHaveTextContent(/OpenAI|GPT-5\.5/)
     expect(fetchMock).not.toHaveBeenCalledWith(
       "/api/sessions",
       expect.objectContaining({ method: "POST" })

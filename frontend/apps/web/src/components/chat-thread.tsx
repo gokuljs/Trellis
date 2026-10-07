@@ -168,7 +168,6 @@ export function ChatThread({
                   <span>
                     {message.role === "assistant" ? "Trellis" : "You"}
                   </span>
-                  {message.model ? <span>{message.model}</span> : null}
                 </div>
                 <MessageMarkdown content={message.content} />
               </div>

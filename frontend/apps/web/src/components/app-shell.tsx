@@ -86,7 +86,6 @@ export function AppShell() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [composerValue, setComposerValue] = useState("")
-  const [runModelChoice, setRunModelChoice] = useState<string | null>(null)
   const [runBudgetChoice, setRunBudgetChoice] = useState<
     "conservative" | "longer" | null
   >(null)
@@ -780,7 +779,7 @@ export function AppShell() {
     if (!model || (model.requires_api_key && !configured)) {
       setError(
         model
-          ? `Add an API key for ${model.provider_name} in Settings.`
+          ? "The selected model needs to be configured in Settings before starting a session."
           : "Open Settings before starting a session."
       )
       return
@@ -855,21 +854,9 @@ export function AppShell() {
     (model) => model.configured || !model.requires_api_key
   )
   const selectedModelId =
-    configuredModels.find((model) => model.id === runModelChoice)?.id ??
-    settings?.selected_model_id ??
-    configuredModels[0]?.id ??
-    ""
+    settings?.selected_model_id ?? configuredModels[0]?.id ?? ""
   const selectedBudgetPreset =
     runBudgetChoice ?? settings?.default_budget_preset ?? "conservative"
-  const selectedModel = settings?.models?.find(
-    (model) => model.id === selectedModelId
-  )
-  const modelChoices =
-    selectedModel &&
-    !configuredModels.some((model) => model.id === selectedModel.id)
-      ? [selectedModel, ...configuredModels]
-      : configuredModels
-  const modelLabel = selectedModel?.name ?? "Local chat"
 
   const persistWorkspace = async (path: string) => {
     if (activeSession) {
@@ -1059,11 +1046,6 @@ export function AppShell() {
               onSaveWorkspace={saveWorkspace}
               onRemoveWorkspace={removeWorkspace}
               disabled={pending || sessionLoading || workspaceSaving}
-              modelLabel={modelLabel}
-              models={modelChoices}
-              showModelPicker={configuredModels.length >= 2}
-              selectedModelId={selectedModelId}
-              onModelChange={setRunModelChoice}
               budgetPreset={selectedBudgetPreset}
               onBudgetChange={setRunBudgetChoice}
             />

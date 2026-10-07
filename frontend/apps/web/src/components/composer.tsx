@@ -2,7 +2,6 @@ import type { KeyboardEvent } from "react"
 import { Send } from "lucide-react"
 
 import { WorkspaceAttachment } from "@/components/workspace-attachment"
-import type { ModelStatus } from "@/lib/app-types"
 
 type BudgetPreset = "conservative" | "longer"
 
@@ -17,11 +16,6 @@ type ComposerProps = {
   onSaveWorkspace: (path: string) => Promise<void>
   onRemoveWorkspace: () => Promise<void>
   disabled?: boolean
-  modelLabel: string
-  models: ModelStatus[]
-  showModelPicker: boolean
-  selectedModelId: string
-  onModelChange: (modelId: string) => void
   budgetPreset: BudgetPreset
   onBudgetChange: (preset: BudgetPreset) => void
 }
@@ -37,11 +31,6 @@ export function Composer({
   onSaveWorkspace,
   onRemoveWorkspace,
   disabled = false,
-  modelLabel,
-  models,
-  showModelPicker,
-  selectedModelId,
-  onModelChange,
   budgetPreset,
   onBudgetChange,
 }: ComposerProps) {
@@ -74,30 +63,6 @@ export function Composer({
         />
         <div className="composer-toolbar">
           <div className="composer-tools">
-            {showModelPicker ? (
-              <select
-                className="composer-select"
-                aria-label="Run model"
-                value={selectedModelId}
-                disabled={disabled}
-                onChange={(event) => onModelChange(event.target.value)}
-              >
-                {models.map((model) => (
-                  <option
-                    key={model.id}
-                    value={model.id}
-                    disabled={model.requires_api_key && !model.configured}
-                  >
-                    {model.name}
-                    {model.requires_api_key && !model.configured
-                      ? " — add API key in Settings"
-                      : ""}
-                  </option>
-                ))}
-              </select>
-            ) : (
-              <span className="model-label">{modelLabel}</span>
-            )}
             <select
               className="composer-select"
               aria-label="Run budget"
