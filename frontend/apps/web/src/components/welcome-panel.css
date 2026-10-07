@@ -16,6 +16,16 @@
   color: var(--shell-text-muted);
 }
 
+.welcome-dither__eye {
+  animation: welcome-dither-blink 5.8s ease-in-out infinite;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.welcome-dither__eye--right {
+  animation-delay: 80ms;
+}
+
 .welcome-scene__copy {
   max-width: 270px;
   margin: 0;
@@ -23,6 +33,23 @@
   font-size: clamp(15px, 1.25vw, 17px);
   line-height: 1.45;
   text-align: center;
+}
+
+@keyframes welcome-dither-blink {
+  0%,
+  94%,
+  100% {
+    transform: scaleY(1);
+  }
+
+  95%,
+  95.8% {
+    transform: scaleY(0.08);
+  }
+
+  97.2% {
+    transform: scaleY(1);
+  }
 }
 
 @media (max-width: 640px) {
@@ -37,5 +64,11 @@
 
   .welcome-scene__copy {
     max-width: 280px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .welcome-dither__eye {
+    animation: none;
   }
 }
