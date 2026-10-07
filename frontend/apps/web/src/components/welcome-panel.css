@@ -1,0 +1,41 @@
+.welcome-scene {
+  display: flex;
+  width: min(100%, 760px);
+  align-items: center;
+  justify-content: center;
+  gap: clamp(16px, 3vw, 30px);
+  margin: auto;
+  padding: 24px;
+}
+
+.welcome-dither {
+  display: block;
+  width: clamp(128px, 17vw, 176px);
+  flex: 0 0 auto;
+  overflow: visible;
+  color: var(--shell-text-muted);
+}
+
+.welcome-scene__copy {
+  max-width: 270px;
+  margin: 0;
+  color: var(--shell-text-muted);
+  font-size: clamp(15px, 1.25vw, 17px);
+  line-height: 1.45;
+  text-align: center;
+}
+
+@media (max-width: 640px) {
+  .welcome-scene {
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .welcome-dither {
+    width: 150px;
+  }
+
+  .welcome-scene__copy {
+    max-width: 280px;
+  }
+}
