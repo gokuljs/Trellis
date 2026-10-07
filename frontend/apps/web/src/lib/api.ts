@@ -97,7 +97,18 @@ export const api = {
       method: "DELETE",
     }),
   listSessions: () => request<Session[]>("/api/sessions"),
-  createSession: () => request<Session>("/api/sessions", { method: "POST" }),
+  createSession: (workspacePath?: string) =>
+    request<Session>("/api/sessions", {
+      method: "POST",
+      ...(workspacePath
+        ? { body: JSON.stringify({ workspace_path: workspacePath }) }
+        : {}),
+    }),
+  setSessionWorkspace: (sessionId: string, workspacePath: string | null) =>
+    request<Session>(`/api/sessions/${sessionId}/workspace`, {
+      method: "PUT",
+      body: JSON.stringify({ workspace_path: workspacePath }),
+    }),
   getSession: (sessionId: string) =>
     request<SessionDetail>(`/api/sessions/${sessionId}`),
 }

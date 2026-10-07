@@ -10,6 +10,7 @@ const session: Session = {
   created_at: "2026-10-03T10:00:00Z",
   updated_at: "2026-10-03T10:00:00Z",
   message_count: 1,
+  workspace_path: null,
 }
 
 function message(content: string): Message {

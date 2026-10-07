@@ -89,6 +89,7 @@ const recentSession = {
   created_at: "2026-08-24T10:00:00Z",
   updated_at: "2026-08-25T10:00:00Z",
   message_count: 2,
+  workspace_path: null,
 }
 
 const olderSession = {
@@ -97,6 +98,7 @@ const olderSession = {
   created_at: "2026-07-20T10:00:00Z",
   updated_at: "2026-07-20T10:00:00Z",
   message_count: 1,
+  workspace_path: null,
 }
 
 function response(body: unknown, status = 200) {
@@ -238,6 +240,139 @@ afterEach(() => {
 })
 
 describe("local-first chat", () => {
+  it("attaches an absolute folder to a new session before sending a message", async () => {
+    const workspacePath = "/tmp/trellis-project"
+    const created = {
+      ...recentSession,
+      id: "session-workspace",
+      title: "New session",
+      message_count: 0,
+      workspace_path: workspacePath,
+    }
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/sessions" && init?.method === "POST") {
+        expect(JSON.parse(String(init.body))).toEqual({
+          workspace_path: workspacePath,
+        })
+        return response(created, 201)
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Attach workspace" }))
+    await user.type(
+      screen.getByRole("textbox", { name: "Workspace folder" }),
+      workspacePath
+    )
+    await user.click(screen.getByRole("button", { name: "Save workspace" }))
+
+    expect(await screen.findByText(workspacePath)).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions",
+      expect.objectContaining({ method: "POST" })
+    )
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+  })
+
+  it("keeps the composer idle while a workspace attachment is saving", async () => {
+    const saveGate = deferred<void>()
+    const workspacePath = "/tmp/trellis-project"
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/sessions" && init?.method === "POST") {
+        return saveGate.promise.then(() =>
+          response({ ...recentSession, workspace_path: workspacePath }, 201)
+        )
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Attach workspace" }))
+    await user.type(
+      screen.getByRole("textbox", { name: "Workspace folder" }),
+      workspacePath
+    )
+    await user.click(screen.getByRole("button", { name: "Save workspace" }))
+
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeDisabled()
+    saveGate.resolve()
+    expect(
+      await screen.findByRole("button", { name: "Change workspace" })
+    ).toBeEnabled()
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+  })
+
+  it("rejects a relative workspace path without creating a session", async () => {
+    const fetchMock = startupFetch(() => undefined)
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Attach workspace" }))
+    await user.type(
+      screen.getByRole("textbox", { name: "Workspace folder" }),
+      "relative/project"
+    )
+    await user.click(screen.getByRole("button", { name: "Save workspace" }))
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Enter an absolute folder path."
+    )
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/sessions",
+      expect.objectContaining({ method: "POST" })
+    )
+  })
+
+  it("changes and removes the folder attached to an existing session", async () => {
+    const current = { ...recentSession, workspace_path: "/tmp/first-project" }
+    const replacement = "/tmp/second-project"
+    const updates: Array<string | null> = []
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/sessions" && !init?.method) return response([current])
+      if (url === `/api/sessions/${current.id}` && !init?.method) {
+        return response({ session: current, messages: [] })
+      }
+      if (
+        url === `/api/sessions/${current.id}/workspace` &&
+        init?.method === "PUT"
+      ) {
+        const payload = JSON.parse(String(init.body)) as {
+          workspace_path: string | null
+        }
+        updates.push(payload.workspace_path)
+        return response({ ...current, workspace_path: payload.workspace_path })
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    expect(await screen.findByText("/tmp/first-project")).toBeInTheDocument()
+    await user.click(screen.getByRole("button", { name: "Change workspace" }))
+    await user.clear(screen.getByRole("textbox", { name: "Workspace folder" }))
+    await user.type(
+      screen.getByRole("textbox", { name: "Workspace folder" }),
+      replacement
+    )
+    await user.click(screen.getByRole("button", { name: "Save workspace" }))
+    expect(await screen.findByText(replacement)).toBeInTheDocument()
+
+    await user.click(screen.getByRole("button", { name: "Change workspace" }))
+    await user.click(screen.getByRole("button", { name: "Remove workspace" }))
+    expect(await screen.findByText("Chat without a folder")).toBeInTheDocument()
+    expect(updates).toEqual([replacement, null])
+  })
+
   it("shows onboarding before exposing the workspace on the first visit", async () => {
     const fetchMock = startupFetch(() => undefined)
     vi.stubGlobal("fetch", fetchMock)

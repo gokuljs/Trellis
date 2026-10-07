@@ -13,6 +13,11 @@ class SessionResponse(BaseModel):
     created_at: str
     updated_at: str
     message_count: int
+    workspace_path: str | None
+
+
+class SessionWorkspaceRequest(BaseModel):
+    workspace_path: str | None = Field(default=None, max_length=4096)
 
 
 class MessageResponse(BaseModel):
@@ -51,6 +56,7 @@ def serialize_session(session: Session) -> SessionResponse:
         created_at=session.created_at,
         updated_at=session.updated_at,
         message_count=session.message_count,
+        workspace_path=session.workspace_path,
     )
 
 
@@ -72,8 +78,17 @@ async def list_sessions(service: SessionServiceDep) -> list[SessionResponse]:
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-async def create_session(service: SessionServiceDep) -> SessionResponse:
-    return serialize_session(await service.create())
+async def create_session(
+    service: SessionServiceDep, payload: SessionWorkspaceRequest | None = None
+) -> SessionResponse:
+    return serialize_session(await service.create(payload.workspace_path if payload else None))
+
+
+@router.put("/{session_id}/workspace")
+async def set_session_workspace(
+    session_id: str, payload: SessionWorkspaceRequest, service: SessionServiceDep
+) -> SessionResponse:
+    return serialize_session(await service.set_workspace(session_id, payload.workspace_path))
 
 
 @router.get("/{session_id}")

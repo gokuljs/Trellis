@@ -11,6 +11,7 @@ import { SettingsPage } from "@/components/settings-page"
 import { Sidebar } from "@/components/sidebar"
 import { WelcomePanel } from "@/components/welcome-panel"
 import { WorkspaceTopbar } from "@/components/workspace-topbar"
+import { WorkspaceAttachment } from "@/components/workspace-attachment"
 import { ApiError, api } from "@/lib/api"
 import { RuntimeError, cancelRun, streamRun } from "@/lib/runtime-client"
 import type {
@@ -65,6 +66,7 @@ export function AppShell() {
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState(true)
   const [sessionLoading, setSessionLoading] = useState(false)
+  const [workspaceSaving, setWorkspaceSaving] = useState(false)
   const [pending, setPending] = useState(false)
   const [streamingText, setStreamingText] = useState<string | null>(null)
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
@@ -74,6 +76,7 @@ export function AppShell() {
   const activeSessionIdRef = useRef<string | null>(null)
   const sessionLoadSequenceRef = useRef(0)
   const submissionLockRef = useRef(false)
+  const workspaceSaveLockRef = useRef(false)
   const activeRunRef = useRef<{ runId: string; lastSequence: number } | null>(
     null
   )
@@ -180,6 +183,7 @@ export function AppShell() {
   }
 
   const startNewSession = useCallback(() => {
+    if (workspaceSaveLockRef.current) return
     sessionLoadSequenceRef.current += 1
     activeSessionIdRef.current = null
     setComposerValue("")
@@ -199,6 +203,7 @@ export function AppShell() {
   }, [])
 
   const handleNavigate = (view: WorkspaceView) => {
+    if (workspaceSaveLockRef.current) return
     if (view === "New session") {
       startNewSession()
       return
@@ -208,7 +213,7 @@ export function AppShell() {
   }
 
   const selectSession = async (sessionId: string) => {
-    if (pending) return
+    if (pending || workspaceSaveLockRef.current) return
     const loadSequence = sessionLoadSequenceRef.current + 1
     sessionLoadSequenceRef.current = loadSequence
     activeSessionIdRef.current = sessionId
@@ -368,7 +373,13 @@ export function AppShell() {
 
   const submitComposer = async () => {
     const content = composerValue.trim()
-    if (!content || pending || sessionLoading || submissionLockRef.current)
+    if (
+      !content ||
+      pending ||
+      sessionLoading ||
+      submissionLockRef.current ||
+      workspaceSaveLockRef.current
+    )
       return
     const model = settings?.models?.find(
       (item) => item.id === settings.selected_model_id
@@ -433,6 +444,42 @@ export function AppShell() {
     (model) => model.id === settings.selected_model_id
   )
   const modelLabel = selectedModel?.name ?? "Local chat"
+
+  const saveWorkspace = async (path: string) => {
+    workspaceSaveLockRef.current = true
+    setWorkspaceSaving(true)
+    try {
+      if (activeSession) {
+        const updated = await api.setSessionWorkspace(activeSession.id, path)
+        setActiveSession(updated)
+        setSessions((current) => moveSessionToTop(current, updated))
+        return
+      }
+      const created = await api.createSession(path)
+      sessionLoadSequenceRef.current += 1
+      activeSessionIdRef.current = created.id
+      setActiveSession(created)
+      setSessions((current) => moveSessionToTop(current, created))
+      setActiveView("session")
+    } finally {
+      workspaceSaveLockRef.current = false
+      setWorkspaceSaving(false)
+    }
+  }
+
+  const removeWorkspace = async () => {
+    if (!activeSession) return
+    workspaceSaveLockRef.current = true
+    setWorkspaceSaving(true)
+    try {
+      const updated = await api.setSessionWorkspace(activeSession.id, null)
+      setActiveSession(updated)
+      setSessions((current) => moveSessionToTop(current, updated))
+    } finally {
+      workspaceSaveLockRef.current = false
+      setWorkspaceSaving(false)
+    }
+  }
 
   if (loading) {
     return (
@@ -536,18 +583,27 @@ export function AppShell() {
         </div>
 
         {activeView !== "Settings" ? (
-          <Composer
-            value={composerValue}
-            placeholder={
-              activeView === "New session"
-                ? "What are we building?"
-                : "Adjust or continue"
-            }
-            onChange={setComposerValue}
-            onSubmit={() => void submitComposer()}
-            disabled={pending || sessionLoading}
-            modelLabel={modelLabel}
-          />
+          <>
+            <WorkspaceAttachment
+              key={activeSession?.id ?? "new-session"}
+              workspacePath={activeSession?.workspace_path ?? null}
+              disabled={pending || sessionLoading || workspaceSaving}
+              onSave={saveWorkspace}
+              onRemove={removeWorkspace}
+            />
+            <Composer
+              value={composerValue}
+              placeholder={
+                activeView === "New session"
+                  ? "What are we building?"
+                  : "Adjust or continue"
+              }
+              onChange={setComposerValue}
+              onSubmit={() => void submitComposer()}
+              disabled={pending || sessionLoading || workspaceSaving}
+              modelLabel={modelLabel}
+            />
+          </>
         ) : null}
       </section>
     </main>

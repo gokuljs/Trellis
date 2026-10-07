@@ -153,3 +153,38 @@ Starlette/httpx deprecation warning and a SQLite resource warning.
 
 **Next.** Attach an optional folder to a session so local tools have a clear
 workspace boundary.
+
+## Step 5 — Attach workspaces to sessions
+
+**Why this step exists.** File and Git tools need one explicit folder boundary.
+A session owns that choice so the user can see and change it, while ordinary
+chat can continue without a folder.
+
+**What works now.** The chat UI accepts an absolute folder path, shows its
+canonical location, and lets the user change or remove it. Trellis checks that
+the folder exists and is a directory. A queued or active run prevents a folder
+change so one run cannot switch workspaces mid-flight. Sessions without a
+workspace still work normally. The current text-only run does not use the
+folder yet.
+
+**Follow the code.** `WorkspaceAttachment` in
+`frontend/apps/web/src/components/workspace-attachment.tsx` collects the path;
+`app-shell.tsx` saves it before allowing chat submission. `frontend/apps/web/src/lib/api.ts`
+sends it through the session API. `backend/app/api/routes/sessions.py` accepts
+the optional value, and `SessionService` in
+`backend/app/application/sessions.py` resolves it off the async event loop.
+SQLite migration 7 in `backend/app/infrastructure/database.py` saves the path
+and atomically rejects changes while a run can still use that session.
+
+**Verification.** Focused backend tests first failed for missing workspace
+storage and validation; focused frontend tests first failed for the missing
+control and for a submission racing with a folder save. After integration, the
+uv 0.12.5 backend `make check` passed Ruff formatting, Ruff linting, `ty`, and
+141 tests with 90.14% coverage. Frontend Prettier check, lint, typecheck, 35
+tests, and production build passed. The machine's default Node 20.11.1 could
+not start this Vite/Vitest version; the tests and build passed with its installed
+Node 24.13.0. Pytest reported the existing Starlette/httpx warning and SQLite
+resource warnings.
+
+**Next.** Add bounded workspace list, search, read, and Git inspection tools
+that can use this saved root.

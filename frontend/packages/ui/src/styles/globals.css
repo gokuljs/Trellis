@@ -1533,6 +1533,100 @@ html.theme-ripple-fallback::before {
     margin: 28px auto 0;
   }
 
+  .workspace-attachment {
+    flex: 0 0 auto;
+    width: min(760px, calc(100% - 64px));
+    margin: 0 auto 9px;
+    color: var(--shell-text-muted);
+    font-size: 12px;
+  }
+
+  .workspace-attachment-summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 24px;
+    padding: 0 4px;
+  }
+
+  .workspace-attachment-path {
+    overflow: hidden;
+    max-width: min(500px, 58vw);
+    color: var(--shell-text-strong);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .workspace-attachment-summary button,
+  .workspace-attachment-remove {
+    color: var(--shell-accent);
+    font-weight: 600;
+  }
+
+  .workspace-attachment-summary button:hover:not(:disabled),
+  .workspace-attachment-remove:hover:not(:disabled) {
+    text-decoration: underline;
+  }
+
+  .workspace-attachment-summary button:disabled,
+  .workspace-attachment-editor button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  .workspace-attachment-editor {
+    display: grid;
+    gap: 7px;
+    margin-top: 8px;
+    padding: 13px;
+    border: 1px solid var(--shell-line);
+    border-radius: 12px;
+    background: var(--shell-input);
+  }
+
+  .workspace-attachment-editor label {
+    color: var(--shell-text-strong);
+    font-weight: 600;
+  }
+
+  .workspace-attachment-input-row {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+
+  .workspace-attachment-input-row input {
+    flex: 1;
+    min-width: 0;
+    padding: 7px 9px;
+    border: 1px solid var(--shell-line);
+    border-radius: 7px;
+    outline-color: var(--shell-focus);
+    color: var(--shell-text-bright);
+    background: var(--shell-bg);
+    font: inherit;
+  }
+
+  .workspace-attachment-input-row button[type="submit"] {
+    padding: 8px 10px;
+    border-radius: 7px;
+    color: var(--primary-foreground);
+    background: var(--shell-accent);
+    font-weight: 600;
+  }
+
+  .workspace-attachment-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+  }
+
+  .workspace-attachment-editor [role="alert"] {
+    color: var(--destructive);
+  }
+
   .composer-wrap {
     flex: 0 0 auto;
     width: min(760px, calc(100% - 64px));

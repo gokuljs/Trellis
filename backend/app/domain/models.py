@@ -32,6 +32,11 @@ class Session:
     created_at: str
     updated_at: str
     message_count: int
+    workspace_path: str | None = None
+
+
+class SessionWorkspaceBusy(Exception):
+    """A session's workspace cannot change while a run can still use it."""
 
 
 @dataclass(frozen=True, slots=True)

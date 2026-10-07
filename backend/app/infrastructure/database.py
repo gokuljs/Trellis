@@ -17,6 +17,7 @@ from app.domain.models import (
     OnboardingStep,
     ProviderName,
     Session,
+    SessionWorkspaceBusy,
     UserProfile,
 )
 from app.domain.runtime import (
@@ -39,7 +40,7 @@ from app.domain.runtime import (
     validate_run_event_transition,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 TURN_CLAIM_TTL = timedelta(minutes=5)
 
 MIGRATION_TABLE_SCHEMA = """
@@ -311,6 +312,10 @@ CREATE INDEX IF NOT EXISTS idx_run_messages_run_ordinal ON run_messages(run_id, 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_run_message ON tool_calls(run_id, assistant_message_id);
 """
 
+SCHEMA_V7 = """
+ALTER TABLE sessions ADD COLUMN workspace_path TEXT;
+"""
+
 MIGRATIONS = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
@@ -318,6 +323,7 @@ MIGRATIONS = {
     4: SCHEMA_V4,
     5: SCHEMA_V5,
     6: SCHEMA_V6,
+    7: SCHEMA_V7,
 }
 
 
@@ -1627,17 +1633,17 @@ class Database:
             rows = await cursor.fetchall()
         return [self._tool_call_from_row(row) for row in rows]
 
-    async def create_session(self) -> Session:
+    async def create_session(self, workspace_path: str | None = None) -> Session:
         profile = await self.get_profile()
         session_id = str(uuid4())
         now = utc_now()
         async with self._connect() as connection:
             await connection.execute(
                 """
-                INSERT INTO sessions(id, user_id, title, created_at, updated_at)
-                VALUES (?, ?, 'New session', ?, ?)
+                INSERT INTO sessions(id, user_id, title, workspace_path, created_at, updated_at)
+                VALUES (?, ?, 'New session', ?, ?, ?)
                 """,
-                (session_id, profile.id, now, now),
+                (session_id, profile.id, workspace_path, now, now),
             )
             await connection.commit()
         session = await self.get_session(session_id)
@@ -1645,12 +1651,41 @@ class Database:
             raise RuntimeError("Created session could not be loaded")
         return session
 
+    async def set_session_workspace(
+        self, session_id: str, workspace_path: str | None
+    ) -> Session | None:
+        profile = await self.get_profile()
+        async with self._connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                "SELECT id FROM sessions WHERE id = ? AND user_id = ?",
+                (session_id, profile.id),
+            )
+            if await cursor.fetchone() is None:
+                await connection.rollback()
+                return None
+            active_cursor = await connection.execute(
+                """SELECT id FROM runs WHERE session_id = ?
+                   AND status IN ('queued', 'running', 'cancelling', 'waiting_for_approval')
+                   LIMIT 1""",
+                (session_id,),
+            )
+            if await active_cursor.fetchone() is not None:
+                await connection.rollback()
+                raise SessionWorkspaceBusy
+            await connection.execute(
+                "UPDATE sessions SET workspace_path = ?, updated_at = ? WHERE id = ?",
+                (workspace_path, utc_now(), session_id),
+            )
+            await connection.commit()
+        return await self.get_session(session_id)
+
     async def list_sessions(self) -> list[Session]:
         profile = await self.get_profile()
         async with self._connect() as connection:
             cursor = await connection.execute(
                 """
-                SELECT s.id, s.user_id, s.title, s.created_at, s.updated_at,
+                SELECT s.id, s.user_id, s.title, s.workspace_path, s.created_at, s.updated_at,
                        COUNT(m.id) AS message_count
                 FROM sessions AS s
                 LEFT JOIN messages AS m ON m.session_id = s.id
@@ -1668,7 +1703,7 @@ class Database:
         async with self._connect() as connection:
             cursor = await connection.execute(
                 """
-                SELECT s.id, s.user_id, s.title, s.created_at, s.updated_at,
+                SELECT s.id, s.user_id, s.title, s.workspace_path, s.created_at, s.updated_at,
                        COUNT(m.id) AS message_count
                 FROM sessions AS s
                 LEFT JOIN messages AS m ON m.session_id = s.id
@@ -1922,6 +1957,7 @@ class Database:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             message_count=row["message_count"],
+            workspace_path=row["workspace_path"],
         )
 
     @staticmethod
