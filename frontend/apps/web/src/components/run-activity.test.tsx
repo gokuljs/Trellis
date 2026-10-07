@@ -61,7 +61,7 @@ describe("run activity", () => {
       />
     )
 
-    expect(screen.getByText("Conservative budget")).toBeInTheDocument()
+    expect(screen.getByText("Standard budget")).toBeInTheDocument()
     expect(screen.getByText("1 / 8 model calls")).toBeInTheDocument()
     expect(screen.getByText("1 / 16 tools")).toBeInTheDocument()
     expect(screen.getByText("150 / 100,000 tokens")).toBeInTheDocument()
@@ -78,6 +78,21 @@ describe("run activity", () => {
     expect(screen.getByText("src/main.ts")).toBeInTheDocument()
     expect(screen.getByText("export const ready = true")).toBeInTheDocument()
     expect(screen.getByText("Run completed")).toBeInTheDocument()
+  })
+
+  it("shows the extended run budget label", () => {
+    render(
+      <RunActivity
+        events={[event(1, "run.started", { status: "running" })]}
+        runInfo={{ ...runInfo, budgetPreset: "longer" }}
+        pending={false}
+        approvalPendingToolId={null}
+        approvalError={null}
+        onApprovalDecision={vi.fn()}
+      />
+    )
+
+    expect(screen.getByText("Extended budget")).toBeInTheDocument()
   })
 
   it("shows a reviewable preview and sends only the selected approval decision", async () => {

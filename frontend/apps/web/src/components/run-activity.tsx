@@ -45,8 +45,8 @@ function estimatedCost(value: number) {
 }
 
 function budgetLabel(preset: string | undefined) {
-  if (preset === "conservative") return "Conservative budget"
-  if (preset === "longer") return "Longer coding run budget"
+  if (preset === "conservative") return "Standard budget"
+  if (preset === "longer") return "Extended budget"
   return "Run budget"
 }
 

@@ -272,8 +272,8 @@ export function SettingsPage({
                   )
                 }}
               >
-                <option value="conservative">Conservative</option>
-                <option value="longer">Longer coding run</option>
+                <option value="conservative">Standard</option>
+                <option value="longer">Extended</option>
               </select>
             </span>
           </label>

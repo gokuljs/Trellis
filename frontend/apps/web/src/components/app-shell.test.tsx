@@ -729,6 +729,13 @@ describe("local-first chat", () => {
 
     renderApp()
     await screen.findByRole("combobox", { name: "Run model" })
+    const runBudgetSelect = screen.getByRole("combobox", { name: "Run budget" })
+    expect(
+      within(runBudgetSelect).getByRole("option", { name: "Standard" })
+    ).toBeInTheDocument()
+    expect(
+      within(runBudgetSelect).getByRole("option", { name: "Extended" })
+    ).toBeInTheDocument()
     await user.selectOptions(
       screen.getByRole("combobox", { name: "Run model" }),
       "anthropic:claude-sonnet-5"
@@ -779,10 +786,16 @@ describe("local-first chat", () => {
 
     renderApp()
     await user.click(await screen.findByRole("button", { name: "Settings" }))
-    await user.selectOptions(
-      screen.getByRole("combobox", { name: "Default run budget" }),
-      "longer"
-    )
+    const defaultBudgetSelect = screen.getByRole("combobox", {
+      name: "Default run budget",
+    })
+    expect(
+      within(defaultBudgetSelect).getByRole("option", { name: "Standard" })
+    ).toBeInTheDocument()
+    expect(
+      within(defaultBudgetSelect).getByRole("option", { name: "Extended" })
+    ).toBeInTheDocument()
+    await user.selectOptions(defaultBudgetSelect, "longer")
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
         "/api/settings/budget",

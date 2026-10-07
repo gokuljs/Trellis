@@ -324,10 +324,10 @@ budget also gives the user an understandable choice instead of several hidden
 numbers.
 
 **What works now.** `run.start` accepts an optional `budgetPreset`; omitting it
-chooses Conservative. Conservative allows 8 model calls, 16 tool calls, 100,000
-reported tokens, 10 minutes, and a $2 estimated cost. Longer coding run allows
-15 model calls, 30 tool calls, 200,000 reported tokens, 20 minutes, and a $5
-estimate. The WebSocket start and resume responses include the chosen preset
+chooses Standard (`conservative`). Standard allows 8 model calls, 16 tool calls,
+100,000 reported tokens, 10 minutes, and a $2 estimated cost. Extended (`longer`)
+allows 15 model calls, 30 tool calls, 200,000 reported tokens, 20 minutes, and a
+$5 estimate. The WebSocket start and resume responses include the chosen preset
 and limits. The composer will offer this choice in Step 13; a client can use the
 WebSocket parameter now. A run stops when a limit is reached, before starting
 another tool or model step, and records a safe error code. If provider usage is
@@ -494,7 +494,7 @@ Settings providing defaults.
 
 **Why this step exists.** The two budget presets and configured model catalog
 already exist, but until now a user had to keep the model chosen in Settings
-and the browser always started the Conservative budget. A coding run needs a
+and the browser always started the Standard budget. A coding run needs a
 visible choice for that one request without changing every later run.
 
 **What works now.** Settings stores a default model and a default budget. The
