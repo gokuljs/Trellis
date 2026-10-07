@@ -1,5 +1,12 @@
 import { FolderClosed, Plus, X } from "lucide-react"
-import { useCallback, useEffect, useRef, useState } from "react"
+import { createPortal } from "react-dom"
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react"
 
 import { ApiError } from "@/lib/api"
 
@@ -33,12 +40,43 @@ export function WorkspaceAttachment({
   >(null)
   const [error, setError] = useState<string | null>(null)
   const [manualEntryAvailable, setManualEntryAvailable] = useState(false)
+  const [menuPosition, setMenuPosition] = useState<{
+    left: number
+    bottom: number
+  } | null>(null)
   const anchorRef = useRef<HTMLDivElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const workspaceItemRef = useRef<HTMLButtonElement>(null)
   const manualInputRef = useRef<HTMLInputElement>(null)
   const restoreFocusRef = useRef(false)
   const busy = disabled || busyAction !== null
+  const menuPositioned = menuOpen && menuPosition !== null
+
+  const updatePosition = useCallback(() => {
+    const anchor = anchorRef.current?.getBoundingClientRect()
+    if (!anchor) return
+
+    setMenuPosition({
+      left: anchor.left,
+      bottom: window.innerHeight - anchor.top + 9,
+    })
+  }, [])
+
+  const openMenu = useCallback(() => {
+    updatePosition()
+    setMenuOpen(true)
+  }, [updatePosition])
+
+  useLayoutEffect(() => {
+    if (!menuOpen) return
+    window.addEventListener("resize", updatePosition)
+    window.addEventListener("scroll", updatePosition, true)
+    return () => {
+      window.removeEventListener("resize", updatePosition)
+      window.removeEventListener("scroll", updatePosition, true)
+    }
+  }, [menuOpen, updatePosition])
 
   const closeMenuAndRestoreFocus = useCallback(() => {
     restoreFocusRef.current = true
@@ -51,7 +89,8 @@ export function WorkspaceAttachment({
     const closeOnOutsidePointer = (event: PointerEvent) => {
       if (
         busyAction === null &&
-        !anchorRef.current?.contains(event.target as Node)
+        !anchorRef.current?.contains(event.target as Node) &&
+        !menuRef.current?.contains(event.target as Node)
       ) {
         setMenuOpen(false)
       }
@@ -78,13 +117,13 @@ export function WorkspaceAttachment({
   }, [busy, menuOpen])
 
   useEffect(() => {
-    if (!menuOpen) return
+    if (!menuPositioned) return
     if (editing) {
       manualInputRef.current?.focus()
     } else {
       workspaceItemRef.current?.focus()
     }
-  }, [editing, menuOpen])
+  }, [editing, menuPositioned])
 
   const save = async () => {
     const path = draft.trim()
@@ -132,7 +171,7 @@ export function WorkspaceAttachment({
         pickerError instanceof ApiError &&
           pickerError.code === "workspace_picker_unavailable"
       )
-      setMenuOpen(true)
+      openMenu()
     } finally {
       setBusyAction(null)
     }
@@ -153,7 +192,7 @@ export function WorkspaceAttachment({
           ? removeError.message
           : "Trellis could not remove that folder."
       )
-      setMenuOpen(true)
+      openMenu()
     } finally {
       setBusyAction(null)
     }
@@ -187,7 +226,7 @@ export function WorkspaceAttachment({
               setMenuOpen(false)
             } else {
               setError(null)
-              setMenuOpen(true)
+              openMenu()
             }
           }}
           disabled={busy}
@@ -195,141 +234,151 @@ export function WorkspaceAttachment({
         >
           <Plus size={18} strokeWidth={1.6} aria-hidden="true" />
         </button>
-        {menuOpen ? (
-          <div
-            id={workspaceMenuId}
-            className="composer-workspace-menu"
-            role={editing ? "dialog" : "menu"}
-            aria-label={editing ? "Enter workspace path" : "Add to chat"}
-            aria-busy={busyAction !== null}
-            onKeyDown={(event) => {
-              if (editing) return
-              if (event.key === "Tab" && busyAction === null) {
-                event.preventDefault()
-                setMenuOpen(false)
-                anchorRef.current?.parentElement
-                  ?.querySelector<HTMLTextAreaElement>(
-                    'textarea[aria-label="Message"]'
+        {menuOpen && menuPosition
+          ? createPortal(
+              <div
+                id={workspaceMenuId}
+                ref={menuRef}
+                className="composer-workspace-menu"
+                style={{
+                  position: "fixed",
+                  left: menuPosition.left,
+                  bottom: menuPosition.bottom,
+                  zIndex: 60,
+                }}
+                role={editing ? "dialog" : "menu"}
+                aria-label={editing ? "Enter workspace path" : "Add to chat"}
+                aria-busy={busyAction !== null}
+                onKeyDown={(event) => {
+                  if (editing) return
+                  if (event.key === "Tab" && busyAction === null) {
+                    event.preventDefault()
+                    setMenuOpen(false)
+                    anchorRef.current?.parentElement
+                      ?.querySelector<HTMLTextAreaElement>(
+                        'textarea[aria-label="Message"]'
+                      )
+                      ?.focus()
+                    return
+                  }
+                  const items = Array.from(
+                    event.currentTarget.querySelectorAll<HTMLButtonElement>(
+                      '[role="menuitem"]:not(:disabled)'
+                    )
                   )
-                  ?.focus()
-                return
-              }
-              const items = Array.from(
-                event.currentTarget.querySelectorAll<HTMLButtonElement>(
-                  '[role="menuitem"]:not(:disabled)'
-                )
-              )
-              if (items.length === 0) return
+                  if (items.length === 0) return
 
-              const currentIndex = items.indexOf(
-                document.activeElement as HTMLButtonElement
-              )
-              let nextIndex: number | null = null
-              if (event.key === "ArrowDown") {
-                nextIndex = (currentIndex + 1) % items.length
-              } else if (event.key === "ArrowUp") {
-                nextIndex = (currentIndex - 1 + items.length) % items.length
-              } else if (event.key === "Home") {
-                nextIndex = 0
-              } else if (event.key === "End") {
-                nextIndex = items.length - 1
-              }
+                  const currentIndex = items.indexOf(
+                    document.activeElement as HTMLButtonElement
+                  )
+                  let nextIndex: number | null = null
+                  if (event.key === "ArrowDown") {
+                    nextIndex = (currentIndex + 1) % items.length
+                  } else if (event.key === "ArrowUp") {
+                    nextIndex = (currentIndex - 1 + items.length) % items.length
+                  } else if (event.key === "Home") {
+                    nextIndex = 0
+                  } else if (event.key === "End") {
+                    nextIndex = items.length - 1
+                  }
 
-              if (nextIndex !== null) {
-                event.preventDefault()
-                items[nextIndex]?.focus()
-              }
-            }}
-          >
-            {editing ? (
-              <form
-                className="composer-workspace-form"
-                onSubmit={(event) => {
-                  event.preventDefault()
-                  void save()
+                  if (nextIndex !== null) {
+                    event.preventDefault()
+                    items[nextIndex]?.focus()
+                  }
                 }}
               >
-                <label htmlFor="workspace-folder">Workspace folder</label>
-                <input
-                  id="workspace-folder"
-                  ref={manualInputRef}
-                  type="text"
-                  value={draft}
-                  onChange={(event) => setDraft(event.target.value)}
-                  placeholder="/absolute/path/to/project"
-                  autoCapitalize="off"
-                  autoComplete="off"
-                  spellCheck={false}
-                  maxLength={4096}
-                  disabled={busy}
-                />
-                <div className="composer-workspace-form-actions">
-                  <button type="submit" disabled={busy}>
-                    {busyAction === "save" ? "Saving…" : "Save workspace"}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setEditing(false)
-                      setError(null)
+                {editing ? (
+                  <form
+                    className="composer-workspace-form"
+                    onSubmit={(event) => {
+                      event.preventDefault()
+                      void save()
                     }}
-                    disabled={busy}
                   >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void pickWorkspace()}
-                    disabled={busy}
-                  >
-                    Choose folder…
-                  </button>
-                </div>
-              </form>
-            ) : (
-              <>
-                <button
-                  className="composer-workspace-menu-item"
-                  type="button"
-                  role="menuitem"
-                  onClick={() => void pickWorkspace()}
-                  disabled={busy}
-                  ref={workspaceItemRef}
-                >
-                  <FolderClosed size={16} aria-hidden="true" />
-                  <span>Workspace</span>
-                </button>
-                {manualEntryAvailable ? (
-                  <button
-                    className="composer-workspace-menu-item"
-                    type="button"
-                    role="menuitem"
-                    onClick={() => {
-                      setDraft(workspacePath ?? "")
-                      setEditing(true)
-                      setManualEntryAvailable(false)
-                      setError(null)
-                    }}
-                    disabled={busy}
-                  >
-                    <span>Enter path manually</span>
-                  </button>
+                    <label htmlFor="workspace-folder">Workspace folder</label>
+                    <input
+                      id="workspace-folder"
+                      ref={manualInputRef}
+                      type="text"
+                      value={draft}
+                      onChange={(event) => setDraft(event.target.value)}
+                      placeholder="/absolute/path/to/project"
+                      autoCapitalize="off"
+                      autoComplete="off"
+                      spellCheck={false}
+                      maxLength={4096}
+                      disabled={busy}
+                    />
+                    <div className="composer-workspace-form-actions">
+                      <button type="submit" disabled={busy}>
+                        {busyAction === "save" ? "Saving…" : "Save workspace"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditing(false)
+                          setError(null)
+                        }}
+                        disabled={busy}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void pickWorkspace()}
+                        disabled={busy}
+                      >
+                        Choose folder…
+                      </button>
+                    </div>
+                  </form>
+                ) : (
+                  <>
+                    <button
+                      className="composer-workspace-menu-item"
+                      type="button"
+                      role="menuitem"
+                      onClick={() => void pickWorkspace()}
+                      disabled={busy}
+                      ref={workspaceItemRef}
+                    >
+                      <FolderClosed size={16} aria-hidden="true" />
+                      <span>Workspace</span>
+                    </button>
+                    {manualEntryAvailable ? (
+                      <button
+                        className="composer-workspace-menu-item"
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setDraft(workspacePath ?? "")
+                          setEditing(true)
+                          setManualEntryAvailable(false)
+                          setError(null)
+                        }}
+                        disabled={busy}
+                      >
+                        <span>Enter path manually</span>
+                      </button>
+                    ) : null}
+                  </>
+                )}
+                {busyAction === "pick" ? (
+                  <div className="composer-workspace-status" role="status">
+                    Opening folder…
+                  </div>
                 ) : null}
-              </>
-            )}
-            {busyAction === "pick" ? (
-              <div className="composer-workspace-status" role="status">
-                Opening folder…
-              </div>
-            ) : null}
-            {busyAction === "save" ? (
-              <div className="composer-workspace-status" role="status">
-                Saving workspace…
-              </div>
-            ) : null}
-            {error ? <div role="alert">{error}</div> : null}
-          </div>
-        ) : null}
+                {busyAction === "save" ? (
+                  <div className="composer-workspace-status" role="status">
+                    Saving workspace…
+                  </div>
+                ) : null}
+                {error ? <div role="alert">{error}</div> : null}
+              </div>,
+              document.body
+            )
+          : null}
       </div>
     </>
   )

@@ -1105,8 +1105,8 @@ describe("local-first chat", () => {
   it("preserves, replaces, and removes a workspace on an existing session", async () => {
     const current = { ...recentSession, workspace_path: "/tmp/first-project" }
     const replacement = "/tmp/second-project"
-    let pickerCalls = 0
     const updates: Array<string | null> = []
+    let pickerCalls = 0
     const fetchMock = startupFetch((url, init) => {
       if (url === "/api/workspaces/pick" && init?.method === "POST") {
         pickerCalls += 1
@@ -1152,6 +1152,72 @@ describe("local-first chat", () => {
     await user.click(screen.getByRole("button", { name: "Remove workspace" }))
     expect(screen.queryByText("second-project")).not.toBeInTheDocument()
     expect(updates).toEqual([replacement, null])
+  })
+
+  it("changes and removes the folder attached to an existing session", async () => {
+    const current = { ...olderSession, workspace_path: "/tmp/first-project" }
+    const replacement = "/tmp/second-project"
+    const updates: Array<string | null> = []
+    let pickerCalls = 0
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/sessions" && !init?.method)
+        return response([recentSession, current])
+      if (url === "/api/sessions/session-recent")
+        return response({ session: recentSession, messages: [] })
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        pickerCalls += 1
+        return response({ path: pickerCalls === 1 ? null : replacement })
+      }
+      if (url === `/api/sessions/${current.id}` && !init?.method) {
+        return response({ session: current, messages: [] })
+      }
+      if (
+        url === `/api/sessions/${current.id}/workspace` &&
+        init?.method === "PUT"
+      ) {
+        const payload = JSON.parse(String(init.body)) as {
+          workspace_path: string | null
+        }
+        updates.push(payload.workspace_path)
+        return response({ ...current, workspace_path: payload.workspace_path })
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Earlier notes" }))
+    const currentChip = await screen.findByText("first-project")
+    expect(sidebarSessionTitles()).toEqual([
+      "Persisted conversation",
+      "Earlier notes",
+    ])
+    expect(currentChip.closest(".composer-box")).not.toBeNull()
+    expect(screen.queryByText(current.workspace_path!)).not.toBeInTheDocument()
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+    expect(screen.getByText("first-project")).toBeInTheDocument()
+    expect(updates).toEqual([])
+
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+    const replacementChip = await screen.findByText("second-project")
+    expect(replacementChip.closest(".composer-box")).not.toBeNull()
+    expect(screen.queryByText(replacement)).not.toBeInTheDocument()
+    expect(sidebarSessionTitles()).toEqual([
+      "Persisted conversation",
+      "Earlier notes",
+    ])
+
+    await user.click(screen.getByRole("button", { name: "Remove workspace" }))
+    expect(screen.queryByText("second-project")).not.toBeInTheDocument()
+    expect(updates).toEqual([replacement, null])
+    expect(sidebarSessionTitles()).toEqual([
+      "Persisted conversation",
+      "Earlier notes",
+    ])
   })
 
   it("leaves a new chat unchanged when the folder picker is cancelled", async () => {
