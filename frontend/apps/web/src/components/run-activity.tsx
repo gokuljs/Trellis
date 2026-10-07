@@ -3,6 +3,7 @@ import type {
   RuntimeRunInfo,
   ToolApprovalDecision,
 } from "@/lib/runtime-client"
+import { groupRunEvents } from "@/lib/run-event-groups"
 
 type RunActivityProps = {
   events: RuntimeRunEvent[]
@@ -100,10 +101,7 @@ export function RunActivity({
   const ordered = [...events].sort(
     (left, right) => left.sequence - right.sequence
   )
-  const visible = ordered.filter(
-    (event) =>
-      !["assistant.delta", "assistant.completed"].includes(event.eventType)
-  )
+  const groups = groupRunEvents(ordered)
   const toolNames = new Map<string, string>()
   for (const event of ordered) {
     if (event.eventType !== "tool.call") continue
@@ -190,173 +188,191 @@ export function RunActivity({
         ) : null}
       </div>
       <ol className="run-activity-list" aria-label="Run activity timeline">
-        {visible.map((event) => {
-          const toolCallId = textField(event.data, "tool_call_id")
-          const toolName =
-            textField(event.data, "name") ??
-            (toolCallId ? toolNames.get(toolCallId) : null) ??
-            "tool"
-          let title: string
-          let detail: React.ReactNode = null
-          let tone = "normal"
+        {groups.map((group) => (
+          <li className={`run-activity-group ${group.kind}`} key={group.key}>
+            <h3 className="run-activity-group-title">{group.title}</h3>
+            <ol className="run-activity-group-events">
+              {group.events.map((event) => {
+                const toolCallId = textField(event.data, "tool_call_id")
+                const toolName =
+                  textField(event.data, "name") ??
+                  (toolCallId ? toolNames.get(toolCallId) : null) ??
+                  "tool"
+                let title: string
+                let detail: React.ReactNode = null
+                let tone = "normal"
 
-          switch (event.eventType) {
-            case "run.queued":
-              title = "Run queued"
-              break
-            case "run.started":
-              title = "Run started"
-              break
-            case "run.resumed":
-              title = "Run resumed"
-              break
-            case "model.usage": {
-              title = "Model usage"
-              const input = numberField(event.data, "input_tokens")
-              const output = numberField(event.data, "output_tokens")
-              detail = (
-                <span>
-                  {input === null ? "—" : numberFormat.format(input)} input ·{" "}
-                  {output === null ? "—" : numberFormat.format(output)} output
-                  tokens
-                </span>
-              )
-              break
-            }
-            case "model.completed":
-              title = `Model step ${ordered.filter((item) => item.eventType === "model.completed" && item.sequence <= event.sequence).length} complete`
-              break
-            case "assistant.message": {
-              title = "Working note"
-              const content = textField(event.data, "content")
-              detail = content ? <p>{content}</p> : null
-              break
-            }
-            case "tool.call": {
-              title = `Tool requested · ${toolName}`
-              const summary = argumentSummary(
-                recordField(event.data, "arguments")
-              )
-              detail = summary ? <code>{summary}</code> : null
-              break
-            }
-            case "tool.approval_requested": {
-              title = "Approval needed"
-              tone = "approval"
-              const canAnswer =
-                pending &&
-                !approvalClosed &&
-                !!toolCallId &&
-                !decided.has(toolCallId)
-              const preview = recordField(event.data, "preview")
-              const requestArguments = recordField(event.data, "arguments")
-              detail = (
-                <div
-                  className="run-approval"
-                  role="region"
-                  aria-label={`Approval required for ${toolName}`}
-                >
-                  <div className="run-approval-tool">{toolName}</div>
-                  {previewDetails(preview)}
-                  {requestArguments ? (
-                    <details className="run-approval-arguments" open={!preview}>
-                      <summary>Request arguments</summary>
-                      <pre>{JSON.stringify(requestArguments, null, 2)}</pre>
-                    </details>
-                  ) : null}
-                  {canAnswer ? (
-                    <div className="run-approval-actions">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          onApprovalDecision(toolCallId, "approved")
-                        }
-                        disabled={approvalPendingToolId === toolCallId}
+                switch (event.eventType) {
+                  case "run.queued":
+                    title = "Run queued"
+                    break
+                  case "run.started":
+                    title = "Run started"
+                    break
+                  case "run.resumed":
+                    title = "Run resumed"
+                    break
+                  case "model.usage": {
+                    title = "Model usage"
+                    const input = numberField(event.data, "input_tokens")
+                    const output = numberField(event.data, "output_tokens")
+                    detail = (
+                      <span>
+                        {input === null ? "—" : numberFormat.format(input)}{" "}
+                        input ·{" "}
+                        {output === null ? "—" : numberFormat.format(output)}{" "}
+                        output tokens
+                      </span>
+                    )
+                    break
+                  }
+                  case "model.completed":
+                    title = `Model step ${ordered.filter((item) => item.eventType === "model.completed" && item.sequence <= event.sequence).length} complete`
+                    break
+                  case "assistant.message": {
+                    title = "Working note"
+                    const content = textField(event.data, "content")
+                    detail = content ? <p>{content}</p> : null
+                    break
+                  }
+                  case "tool.call": {
+                    title = `Tool requested · ${toolName}`
+                    const summary = argumentSummary(
+                      recordField(event.data, "arguments")
+                    )
+                    detail = summary ? <code>{summary}</code> : null
+                    break
+                  }
+                  case "tool.approval_requested": {
+                    title = "Approval needed"
+                    tone = "approval"
+                    const canAnswer =
+                      pending &&
+                      !approvalClosed &&
+                      !!toolCallId &&
+                      !decided.has(toolCallId)
+                    const preview = recordField(event.data, "preview")
+                    const requestArguments = recordField(
+                      event.data,
+                      "arguments"
+                    )
+                    detail = (
+                      <div
+                        className="run-approval"
+                        role="region"
+                        aria-label={`Approval required for ${toolName}`}
                       >
-                        Approve
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => onApprovalDecision(toolCallId, "denied")}
-                        disabled={approvalPendingToolId === toolCallId}
-                      >
-                        Deny
-                      </button>
+                        <div className="run-approval-tool">{toolName}</div>
+                        {previewDetails(preview)}
+                        {requestArguments ? (
+                          <details
+                            className="run-approval-arguments"
+                            open={!preview}
+                          >
+                            <summary>Request arguments</summary>
+                            <pre>
+                              {JSON.stringify(requestArguments, null, 2)}
+                            </pre>
+                          </details>
+                        ) : null}
+                        {canAnswer ? (
+                          <div className="run-approval-actions">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                onApprovalDecision(toolCallId, "approved")
+                              }
+                              disabled={approvalPendingToolId === toolCallId}
+                            >
+                              Approve
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                onApprovalDecision(toolCallId, "denied")
+                              }
+                              disabled={approvalPendingToolId === toolCallId}
+                            >
+                              Deny
+                            </button>
+                          </div>
+                        ) : null}
+                        {canAnswer && approvalError ? (
+                          <p role="alert">{approvalError}</p>
+                        ) : null}
+                      </div>
+                    )
+                    break
+                  }
+                  case "tool.approval_decided":
+                    title =
+                      textField(event.data, "decision") === "approved"
+                        ? "Approved"
+                        : "Denied"
+                    tone = title === "Denied" ? "warning" : "normal"
+                    detail = <span>{toolName}</span>
+                    break
+                  case "tool.result": {
+                    const status = textField(event.data, "status")
+                    title =
+                      status === "denied"
+                        ? "Tool denied"
+                        : status === "completed"
+                          ? "Tool completed"
+                          : status === "cancelled"
+                            ? "Tool cancelled"
+                            : "Tool failed"
+                    tone = status === "completed" ? "normal" : "warning"
+                    const content = textField(event.data, "content")
+                    detail = content ? (
+                      <pre className="run-tool-result">{content}</pre>
+                    ) : null
+                    break
+                  }
+                  case "run.cancellation_requested":
+                    title = "Stopping run"
+                    break
+                  case "run.completed":
+                    title = "Run completed"
+                    break
+                  case "run.cancelled":
+                    title = "Run cancelled"
+                    tone = "warning"
+                    break
+                  case "run.interrupted":
+                    title = "Run interrupted"
+                    tone = "warning"
+                    break
+                  case "run.failed": {
+                    title = failureTitle(textField(event.data, "code"))
+                    tone = "warning"
+                    const message = textField(event.data, "message")
+                    detail = message ? <p>{message}</p> : null
+                    break
+                  }
+                  default:
+                    return null
+                }
+
+                return (
+                  <li
+                    className={`run-activity-entry ${tone}`}
+                    data-run-sequence={event.sequence}
+                    key={event.sequence}
+                  >
+                    <span className="run-activity-marker" aria-hidden="true" />
+                    <div className="run-activity-entry-copy">
+                      <div className="run-activity-title">{title}</div>
+                      {detail ? (
+                        <div className="run-activity-detail">{detail}</div>
+                      ) : null}
                     </div>
-                  ) : null}
-                  {canAnswer && approvalError ? (
-                    <p role="alert">{approvalError}</p>
-                  ) : null}
-                </div>
-              )
-              break
-            }
-            case "tool.approval_decided":
-              title =
-                textField(event.data, "decision") === "approved"
-                  ? "Approved"
-                  : "Denied"
-              tone = title === "Denied" ? "warning" : "normal"
-              detail = <span>{toolName}</span>
-              break
-            case "tool.result": {
-              const status = textField(event.data, "status")
-              title =
-                status === "denied"
-                  ? "Tool denied"
-                  : status === "completed"
-                    ? "Tool completed"
-                    : status === "cancelled"
-                      ? "Tool cancelled"
-                      : "Tool failed"
-              tone = status === "completed" ? "normal" : "warning"
-              const content = textField(event.data, "content")
-              detail = content ? (
-                <pre className="run-tool-result">{content}</pre>
-              ) : null
-              break
-            }
-            case "run.cancellation_requested":
-              title = "Stopping run"
-              break
-            case "run.completed":
-              title = "Run completed"
-              break
-            case "run.cancelled":
-              title = "Run cancelled"
-              tone = "warning"
-              break
-            case "run.interrupted":
-              title = "Run interrupted"
-              tone = "warning"
-              break
-            case "run.failed": {
-              title = failureTitle(textField(event.data, "code"))
-              tone = "warning"
-              const message = textField(event.data, "message")
-              detail = message ? <p>{message}</p> : null
-              break
-            }
-            default:
-              return null
-          }
-
-          return (
-            <li
-              className={`run-activity-entry ${tone}`}
-              data-run-sequence={event.sequence}
-              key={event.sequence}
-            >
-              <span className="run-activity-marker" aria-hidden="true" />
-              <div className="run-activity-entry-copy">
-                <div className="run-activity-title">{title}</div>
-                {detail ? (
-                  <div className="run-activity-detail">{detail}</div>
-                ) : null}
-              </div>
-            </li>
-          )
-        })}
+                  </li>
+                )
+              })}
+            </ol>
+          </li>
+        ))}
       </ol>
     </section>
   )

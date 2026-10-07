@@ -1339,16 +1339,41 @@ html.theme-ripple-fallback::before {
   }
 
   .run-activity-list {
-    margin: 0 0 0 5px;
+    display: grid;
+    gap: 12px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .run-activity-group {
+    min-width: 0;
     border-left: 1px solid var(--shell-line);
-    padding: 0 0 0 18px;
+    padding-left: 14px;
+  }
+
+  .run-activity-group-title {
+    margin: 0 0 4px;
+    color: var(--shell-text-muted);
+    font-size: 10px;
+    font-weight: 650;
+    letter-spacing: 0.035em;
+  }
+
+  .run-activity-group.tool .run-activity-group-title {
+    color: var(--shell-text-strong);
+  }
+
+  .run-activity-group-events {
+    margin: 0;
+    padding: 0;
     list-style: none;
   }
 
   .run-activity-entry {
     position: relative;
     min-width: 0;
-    padding: 3px 0 15px;
+    padding: 3px 0 9px 11px;
   }
 
   .run-activity-entry:last-child {
@@ -1358,13 +1383,12 @@ html.theme-ripple-fallback::before {
   .run-activity-marker {
     position: absolute;
     top: 8px;
-    left: -23px;
-    width: 9px;
-    height: 9px;
-    border: 2px solid var(--shell-card);
+    left: -18px;
+    width: 7px;
+    height: 7px;
+    border: 1px solid var(--shell-line);
     border-radius: 50%;
     background: var(--shell-text-faint);
-    box-shadow: 0 0 0 1px var(--shell-line);
   }
 
   .run-activity-entry.approval .run-activity-marker {
@@ -1417,7 +1441,7 @@ html.theme-ripple-fallback::before {
     border: 1px solid color-mix(in srgb, var(--warning) 38%, var(--shell-line));
     border-radius: 9px;
     padding: 10px;
-    background: color-mix(in srgb, var(--warning) 6%, var(--shell-card));
+    background: transparent;
   }
 
   .run-approval-tool {
@@ -1458,7 +1482,7 @@ html.theme-ripple-fallback::before {
     border-radius: 6px;
     padding: 8px;
     color: var(--shell-text-bright);
-    background: var(--shell-card);
+    background: transparent;
     font-family: var(
       --font-mono,
       ui-monospace,
@@ -1486,7 +1510,7 @@ html.theme-ripple-fallback::before {
     border-radius: 6px;
     padding: 8px;
     color: var(--shell-text-bright);
-    background: var(--shell-card);
+    background: transparent;
     line-height: 1.5;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
@@ -1505,7 +1529,7 @@ html.theme-ripple-fallback::before {
     border-radius: 7px;
     padding: 0 10px;
     color: var(--shell-text-strong);
-    background: var(--shell-card);
+    background: transparent;
     font-size: 11px;
     font-weight: 600;
   }
