@@ -580,13 +580,14 @@ html.theme-ripple-fallback::before {
     display: flex;
     flex-direction: column;
     gap: 0.25rem;
+    padding-inline: 4px;
   }
 
   .session-row {
     position: relative;
     display: flex;
     width: 100%;
-    height: 34px;
+    height: 32px;
     align-items: center;
     gap: 7px;
     overflow: hidden;
@@ -595,6 +596,7 @@ html.theme-ripple-fallback::before {
     padding: 0 12px;
     color: var(--shell-text);
     background: transparent;
+    font-size: 13px;
     text-align: left;
     transition:
       background-color 140ms ease,
