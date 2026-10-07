@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import aiosqlite
 
+from app.application.budgets import BudgetPreset, limits_for_preset
 from app.domain.models import (
     Message,
     ModelDescriptor,
@@ -40,7 +41,7 @@ from app.domain.runtime import (
     validate_run_event_transition,
 )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 TURN_CLAIM_TTL = timedelta(minutes=5)
 
 MIGRATION_TABLE_SCHEMA = """
@@ -321,6 +322,14 @@ UPDATE models SET supports_tools = 1
 WHERE id IN ('openai:gpt-5.5', 'anthropic:claude-sonnet-5');
 """
 
+SCHEMA_V9 = """
+ALTER TABLE runs ADD COLUMN budget_preset TEXT NOT NULL DEFAULT 'legacy'
+    CHECK (budget_preset IN ('legacy', 'conservative', 'longer'));
+ALTER TABLE runs ADD COLUMN max_total_tokens INTEGER NOT NULL DEFAULT 100000;
+ALTER TABLE runs ADD COLUMN max_cost_usd REAL NOT NULL DEFAULT 2.0;
+ALTER TABLE model_calls ADD COLUMN cache_creation_tokens INTEGER;
+"""
+
 MIGRATIONS = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
@@ -330,6 +339,7 @@ MIGRATIONS = {
     6: SCHEMA_V6,
     7: SCHEMA_V7,
     8: SCHEMA_V8,
+    9: SCHEMA_V9,
 }
 
 
@@ -698,6 +708,8 @@ class Database:
         client_request_id: str,
         content: str,
         model: ModelDescriptor,
+        *,
+        budget_preset: BudgetPreset = "conservative",
     ) -> RunSnapshot:
         normalized_content = content.strip()
         if not normalized_content:
@@ -705,8 +717,13 @@ class Database:
         if not client_request_id or len(client_request_id) > 200:
             raise ValueError("client request ID must contain 1 to 200 characters")
 
+        limits = limits_for_preset(budget_preset)
         now = utc_now()
-        deadline = (datetime.now(UTC) + timedelta(seconds=180)).isoformat().replace("+00:00", "Z")
+        deadline = (
+            (datetime.now(UTC) + timedelta(seconds=limits.max_seconds))
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
         run_id = str(uuid4())
         async with self._connect() as connection:
             await connection.execute("BEGIN IMMEDIATE")
@@ -735,6 +752,7 @@ class Database:
                     or existing["model_id"] != model.id
                     or existing["adapter_kind"] != model.adapter_kind
                     or existing["upstream_model_id"] != model.upstream_model_id
+                    or existing["budget_preset"] != budget_preset
                 ):
                     await connection.rollback()
                     raise ValueError("run request conflicts with a previous payload")
@@ -823,9 +841,10 @@ class Database:
                 """INSERT INTO runs(
                    id, session_id, turn_id, input_message_id, client_request_id,
                    retry_of, status, provider_id, model_id, adapter_kind,
-                   upstream_model_id, max_model_calls, max_tool_calls, deadline_at,
+                   upstream_model_id, budget_preset, max_model_calls, max_tool_calls,
+                   max_total_tokens, max_cost_usd, deadline_at,
                        last_event_sequence, created_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, 8, 16, ?, 1, ?)""",
+                   ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
                 (
                     run_id,
                     session_id,
@@ -837,6 +856,11 @@ class Database:
                     model.id,
                     model.adapter_kind,
                     model.upstream_model_id,
+                    budget_preset,
+                    limits.max_model_calls,
+                    limits.max_tool_calls,
+                    limits.max_total_tokens,
+                    limits.max_cost_usd,
                     deadline,
                     now,
                 ),
@@ -1241,6 +1265,7 @@ class Database:
         output_tokens: int | None = None,
         reasoning_tokens: int | None = None,
         cached_tokens: int | None = None,
+        cache_creation_tokens: int | None = None,
         estimated_cost: float | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
@@ -1275,6 +1300,7 @@ class Database:
                    output_tokens = COALESCE(?, output_tokens),
                    reasoning_tokens = COALESCE(?, reasoning_tokens),
                    cached_tokens = COALESCE(?, cached_tokens),
+                   cache_creation_tokens = COALESCE(?, cache_creation_tokens),
                    estimated_cost = COALESCE(?, estimated_cost),
                    error_code = COALESCE(?, error_code),
                    error_message = COALESCE(?, error_message), finished_at = ?
@@ -1288,6 +1314,7 @@ class Database:
                     output_tokens,
                     reasoning_tokens,
                     cached_tokens,
+                    cache_creation_tokens,
                     estimated_cost,
                     error_code,
                     error_message,
@@ -1972,6 +1999,7 @@ class Database:
             output_tokens=row["output_tokens"],
             reasoning_tokens=row["reasoning_tokens"],
             cached_tokens=row["cached_tokens"],
+            cache_creation_tokens=row["cache_creation_tokens"],
             estimated_cost=row["estimated_cost"],
             error_code=row["error_code"],
             error_message=row["error_message"],
@@ -1995,6 +2023,9 @@ class Database:
             client_request_id=row["client_request_id"],
             max_model_calls=row["max_model_calls"],
             max_tool_calls=row["max_tool_calls"],
+            budget_preset=row["budget_preset"],
+            max_total_tokens=row["max_total_tokens"],
+            max_cost_usd=row["max_cost_usd"],
             deadline_at=row["deadline_at"],
             cancel_requested_at=row["cancel_requested_at"],
             lease_expires_at=row["lease_expires_at"],

@@ -5,8 +5,18 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
+from app.application.budgets import (
+    BudgetExceeded,
+    BudgetPreset,
+    PricingUnavailable,
+    RunLimits,
+    check_resource_budget,
+    check_step_budget,
+    count_total_tokens,
+    estimate_model_cost,
+)
 from app.application.context import build_model_context
 from app.application.errors import ApplicationError, ProviderError
 from app.application.ports import (
@@ -51,6 +61,41 @@ class _ModelStep:
     usage: dict[str, int | None]
     provider_response_id: str | None
     finish_reason: str | None
+
+
+def _usage_measure(model_id: str, usage: dict[str, int | None]) -> tuple[int | None, float | None]:
+    try:
+        tokens = count_total_tokens(
+            model_id,
+            usage["input_tokens"],
+            usage["output_tokens"],
+            usage["cached_tokens"],
+            usage["cache_creation_tokens"],
+        )
+        cost = estimate_model_cost(
+            model_id,
+            usage["input_tokens"],
+            usage["output_tokens"],
+            usage["cached_tokens"],
+            usage["cache_creation_tokens"],
+        )
+    except PricingUnavailable:
+        input_tokens = usage["input_tokens"]
+        output_tokens = usage["output_tokens"]
+        if input_tokens is None or output_tokens is None:
+            return None, None
+        cached_tokens = usage["cached_tokens"] or 0
+        cache_creation_tokens = usage["cache_creation_tokens"] or 0
+        if min(input_tokens, output_tokens, cached_tokens, cache_creation_tokens) < 0:
+            raise ProviderError(
+                "provider_invalid_response", "The provider returned invalid usage."
+            ) from None
+        return input_tokens + output_tokens + cached_tokens + cache_creation_tokens, None
+    except ValueError:
+        raise ProviderError(
+            "provider_invalid_response", "The provider returned invalid usage."
+        ) from None
+    return tokens, cost
 
 
 def _prepare_tool_calls(
@@ -130,6 +175,7 @@ class RunService:
         content: str,
         *,
         turn_id: str | None = None,
+        budget_preset: BudgetPreset = "conservative",
     ) -> RunSnapshot:
         session = await self._sessions.get_session(session_id)
         if session is None:
@@ -143,6 +189,8 @@ class RunService:
         model = next((item for item in models if item.id == selected_model_id), None)
         if model is None:
             raise ApplicationError("model_not_available", "The selected model is unavailable.")
+        if budget_preset not in {"conservative", "longer"}:
+            raise ApplicationError("invalid_budget_preset", "Choose an available run budget.")
         self._require_provider(model)
         api_key = await self._secret_store.get(model.provider_id)
         if model.requires_api_key and api_key is None:
@@ -161,6 +209,7 @@ class RunService:
                     client_request_id,
                     normalized_content,
                     model,
+                    budget_preset=budget_preset,
                 )
             except ValueError as error:
                 message = str(error)
@@ -366,6 +415,16 @@ class RunService:
             for step_index in range(1, run.max_model_calls + 1):
                 run_messages = await self._runs.list_run_messages(run.id)
                 prior_tool_calls = await self._runs.list_tool_calls(run.id)
+                prior_model_calls = await self._runs.list_model_calls(run.id)
+                prior_tokens, prior_cost = self._budget_totals(run.model_id, prior_model_calls)
+                self._check_budget(
+                    run,
+                    kind="model",
+                    model_calls=len(prior_model_calls),
+                    tool_calls=len(prior_tool_calls),
+                    tokens=prior_tokens,
+                    cost_usd=prior_cost,
+                )
                 context = build_model_context(
                     visible_messages,
                     run_messages,
@@ -380,7 +439,7 @@ class RunService:
                     adapter_kind=run.adapter_kind,
                     upstream_model_id=run.upstream_model_id,
                     messages=context.messages,
-                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                    max_output_tokens=min(MAX_OUTPUT_TOKENS, run.max_total_tokens - prior_tokens),
                     system_instructions=context.system_instructions,
                     tools=context.tools,
                 )
@@ -389,7 +448,14 @@ class RunService:
                 )
                 call = await self._runs.update_model_call(call.id, ModelCallStatus.STREAMING)
                 step = await self._stream_model_step(
-                    run, call, request, provider, api_key or "", profile.id
+                    run,
+                    call,
+                    request,
+                    provider,
+                    api_key or "",
+                    profile.id,
+                    prior_tokens,
+                    prior_cost,
                 )
                 if not step.content.strip() and not step.tool_calls:
                     raise ProviderError(
@@ -397,6 +463,7 @@ class RunService:
                     )
                 safe_calls, preflight_errors = _prepare_tool_calls(step.tool_calls)
                 step = replace(step, content=redact_secrets(step.content), tool_calls=safe_calls)
+                _step_tokens, step_cost = _usage_measure(run.model_id, step.usage)
                 call = await self._runs.update_model_call(
                     call.id,
                     ModelCallStatus.COMPLETED,
@@ -407,6 +474,8 @@ class RunService:
                     output_tokens=step.usage["output_tokens"],
                     reasoning_tokens=step.usage["reasoning_tokens"],
                     cached_tokens=step.usage["cached_tokens"],
+                    cache_creation_tokens=step.usage["cache_creation_tokens"],
+                    estimated_cost=step_cost,
                 )
                 await self._append_and_publish(
                     run.id,
@@ -416,6 +485,17 @@ class RunService:
                         "provider_response_id": step.provider_response_id,
                         "finish_reason": step.finish_reason,
                     },
+                )
+                total_tokens, total_cost = self._budget_totals(
+                    run.model_id, [*prior_model_calls, call]
+                )
+                self._check_budget(
+                    run,
+                    kind=None,
+                    model_calls=step_index,
+                    tool_calls=len(prior_tool_calls),
+                    tokens=total_tokens,
+                    cost_usd=total_cost,
                 )
                 if not step.tool_calls:
                     final_content = redact_secrets(step.content).strip()
@@ -454,6 +534,14 @@ class RunService:
                     raise ProviderError("tool_call_limit", "The run reached its tool-call limit.")
                 if step_index >= run.max_model_calls:
                     raise ProviderError("model_call_limit", "The run reached its model-call limit.")
+                self._check_budget(
+                    run,
+                    kind="tool",
+                    model_calls=step_index,
+                    tool_calls=len(prior_tool_calls),
+                    tokens=total_tokens,
+                    cost_usd=total_cost,
+                )
                 assistant_message = ModelMessage(
                     role="assistant",
                     content=redact_secrets(step.content),
@@ -465,7 +553,15 @@ class RunService:
                 )
                 for event in stored_events:
                     await self._publish(event)
-                for stored_call in stored_calls:
+                for call_index, stored_call in enumerate(stored_calls):
+                    self._check_budget(
+                        run,
+                        kind="tool",
+                        model_calls=step_index,
+                        tool_calls=len(prior_tool_calls) + call_index,
+                        tokens=total_tokens,
+                        cost_usd=total_cost,
+                    )
                     remaining_seconds = self._remaining_seconds(run)
                     if remaining_seconds <= 0:
                         raise ProviderError("provider_timeout", "The run deadline was reached.")
@@ -605,6 +701,8 @@ class RunService:
         provider: StreamingProviderAdapter,
         api_key: str,
         user_id: str,
+        prior_tokens: int,
+        prior_cost: float | None,
     ) -> _ModelStep:
         output_parts: list[str] = []
         output_bytes = 0
@@ -616,6 +714,7 @@ class RunService:
             "output_tokens": None,
             "reasoning_tokens": None,
             "cached_tokens": None,
+            "cache_creation_tokens": None,
         }
         provider_response_id: str | None = None
         finish_reason: str | None = None
@@ -667,16 +766,25 @@ class RunService:
                             )
                         continuation_items.append(item)
                     elif event.kind == "usage":
-                        usage = {
+                        incoming_usage = {
                             "input_tokens": event.input_tokens,
                             "output_tokens": event.output_tokens,
                             "reasoning_tokens": event.reasoning_tokens,
                             "cached_tokens": event.cached_tokens,
+                            "cache_creation_tokens": event.cache_creation_tokens,
                         }
+                        usage.update(
+                            {
+                                key: value
+                                for key, value in incoming_usage.items()
+                                if value is not None
+                            }
+                        )
                         provider_response_id = (
                             self._safe_provider_metadata(event.provider_response_id)
                             or provider_response_id
                         )
+                        step_tokens, step_cost = _usage_measure(run.model_id, usage)
                         call = await self._runs.update_model_call(
                             call.id,
                             ModelCallStatus.STREAMING,
@@ -685,12 +793,23 @@ class RunService:
                             output_tokens=usage["output_tokens"],
                             reasoning_tokens=usage["reasoning_tokens"],
                             cached_tokens=usage["cached_tokens"],
+                            cache_creation_tokens=usage["cache_creation_tokens"],
+                            estimated_cost=step_cost,
                         )
                         await self._append_and_publish(
                             run.id,
                             RunEventType.MODEL_USAGE,
                             {
                                 **{key: value for key, value in usage.items() if value is not None},
+                                "estimated_cost_usd": step_cost,
+                                "total_estimated_cost_usd": (
+                                    prior_cost + step_cost
+                                    if step_cost is not None and prior_cost is not None
+                                    else None
+                                ),
+                                "total_tokens": (
+                                    prior_tokens + step_tokens if step_tokens is not None else None
+                                ),
                                 **(
                                     {"provider_response_id": provider_response_id}
                                     if provider_response_id is not None
@@ -735,6 +854,84 @@ class RunService:
     def _remaining_seconds(run: RunSnapshot) -> float:
         deadline = datetime.fromisoformat(run.deadline_at.replace("Z", "+00:00"))
         return (deadline - datetime.now(UTC)).total_seconds()
+
+    @staticmethod
+    def _limits(run: RunSnapshot) -> RunLimits:
+        return RunLimits(
+            run.max_model_calls,
+            run.max_tool_calls,
+            run.max_total_tokens,
+            0,
+            run.max_cost_usd,
+        )
+
+    @staticmethod
+    def _budget_totals(model_id: str, calls: list[ModelCallRecord]) -> tuple[int, float | None]:
+        tokens = 0
+        cost = 0.0
+        missing_price = False
+        for call in calls:
+            if call.status is not ModelCallStatus.COMPLETED:
+                continue
+            call_tokens, call_cost = _usage_measure(
+                model_id,
+                {
+                    "input_tokens": call.input_tokens,
+                    "output_tokens": call.output_tokens,
+                    "reasoning_tokens": call.reasoning_tokens,
+                    "cached_tokens": call.cached_tokens,
+                    "cache_creation_tokens": call.cache_creation_tokens,
+                },
+            )
+            if call_tokens is None:
+                raise ProviderError(
+                    "provider_usage_unavailable",
+                    "The provider did not report enough usage to enforce this run's budget.",
+                )
+            tokens += call_tokens
+            if call_cost is None:
+                missing_price = True
+            else:
+                cost += call.estimated_cost if call.estimated_cost is not None else call_cost
+        return tokens, None if missing_price else cost
+
+    @staticmethod
+    def _check_budget(
+        run: RunSnapshot,
+        *,
+        kind: Literal["model", "tool"] | None,
+        model_calls: int,
+        tool_calls: int,
+        tokens: int,
+        cost_usd: float | None,
+    ) -> None:
+        deadline = datetime.fromisoformat(run.deadline_at.replace("Z", "+00:00"))
+        if cost_usd is None and kind is not None:
+            raise ProviderError(
+                "pricing_unavailable",
+                "This model has no price estimate for a multi-step run.",
+            )
+        checked_cost = 0.0 if cost_usd is None else cost_usd
+        try:
+            if kind is None:
+                check_resource_budget(
+                    RunService._limits(run),
+                    tokens=tokens,
+                    cost_usd=checked_cost,
+                    deadline=deadline,
+                )
+            else:
+                check_step_budget(
+                    RunService._limits(run),
+                    kind=kind,
+                    model_calls=model_calls,
+                    tool_calls=tool_calls,
+                    tokens=tokens,
+                    cost_usd=checked_cost,
+                    deadline=deadline,
+                )
+        except BudgetExceeded as error:
+            raise ProviderError(error.reason, "The run reached its budget limit.") from None
 
     async def _get_run_model(self, run: RunSnapshot) -> ModelDescriptor:
         models = await self._settings.list_models()

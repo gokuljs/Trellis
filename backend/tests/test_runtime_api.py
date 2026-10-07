@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from app.core.config import Settings
 from app.domain.models import ProviderName
-from app.domain.runtime import ModelRequest, ModelStreamEvent, RunEvent, RunEventType
+from app.domain.runtime import ModelRequest, ModelStreamEvent, ModelToolCall, RunEvent, RunEventType
 from app.infrastructure.runtime_events import RuntimeEventHub
 from app.main import create_app
 
@@ -159,6 +159,50 @@ def test_jsonrpc_websocket_streams_a_durable_run(tmp_path: Path) -> None:
         "Stream this",
         "Streaming works",
     ]
+
+
+def test_jsonrpc_start_selects_a_budget_preset_and_rejects_unknown_names(tmp_path: Path) -> None:
+    provider = StreamingProvider()
+    with configured_client(tmp_path, provider) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-budget-test"})
+        session_id = client.post("/api/sessions").json()["id"]
+        with client.websocket_connect("/api/runtime") as websocket:
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "budget-start",
+                    "method": "run.start",
+                    "params": {
+                        "sessionId": session_id,
+                        "clientRequestId": "budget-request",
+                        "content": "Answer",
+                        "budgetPreset": "longer",
+                    },
+                }
+            )
+            received = receive_until(websocket, lambda item: item.get("id") == "budget-start")
+            response = next(item for item in received if item.get("id") == "budget-start")
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "bad-budget",
+                    "method": "run.start",
+                    "params": {
+                        "sessionId": session_id,
+                        "clientRequestId": "another-request",
+                        "content": "Answer",
+                        "budgetPreset": "unlimited",
+                    },
+                }
+            )
+            rejected = receive_until(websocket, lambda item: item.get("id") == "bad-budget")
+            error = next(item for item in rejected if item.get("id") == "bad-budget")
+        persisted = asyncio.run(client.app.state.database.get_run(response["result"]["runId"]))
+
+    assert response["result"]["budgetPreset"] == "longer"
+    assert response["result"]["limits"]["maxTotalTokens"] == 200_000
+    assert persisted is not None and persisted.budget_preset == "longer"
+    assert error["error"] == {"code": -32602, "message": "Invalid params: budgetPreset"}
 
 
 def test_jsonrpc_resume_replays_persisted_events_after_disconnect(tmp_path: Path) -> None:
@@ -366,6 +410,84 @@ def test_custom_model_uses_registered_adapter_without_provider_specific_runtime_
     assert provider.request.upstream_model_id == "weights/model-v4"
     assert messages[-1]["provider"] == "self-hosted"
     assert messages[-1]["model"] == "weights:v4"
+
+
+def test_unpriced_custom_model_stops_before_a_tool_continuation(tmp_path: Path) -> None:
+    class ToolingProvider(StreamingProvider):
+        def stream(
+            self, request: ModelRequest, api_key: str, user_id: str
+        ) -> AsyncGenerator[ModelStreamEvent]:
+            self.request = request
+
+            async def generate() -> AsyncGenerator[ModelStreamEvent]:
+                yield ModelStreamEvent(
+                    kind="tool_call", tool_call=ModelToolCall("custom-call", "list_files", {})
+                )
+                yield ModelStreamEvent(kind="usage", input_tokens=5, output_tokens=2)
+                yield ModelStreamEvent(kind="completed", finish_reason="tool_use")
+
+            return generate()
+
+    settings = Settings(environment="test", data_dir=tmp_path / "data")
+    provider = ToolingProvider()
+    app = create_app(settings, streaming_provider_adapters={"openai-compatible": provider})
+    with TestClient(app) as client:
+        with sqlite3.connect(settings.database_path) as connection:
+            connection.execute(
+                """INSERT INTO models(
+                       id, provider_id, provider_name, adapter_kind, upstream_model_id,
+                       name, requires_api_key, supports_streaming, supports_tools, enabled,
+                       created_at, updated_at
+                   ) VALUES (
+                       'weights:tooling', 'self-hosted', 'Self hosted', 'openai-compatible',
+                       'weights/tooling', 'Tooling', 0, 1, 1, 1,
+                       '2026-01-01', '2026-01-01'
+                   )"""
+            )
+            connection.execute(
+                "UPDATE app_settings SET selected_provider = ?, selected_model_id = ? WHERE id = 1",
+                ("self-hosted", "weights:tooling"),
+            )
+        session_id = client.post("/api/sessions", json={"workspace_path": str(tmp_path)}).json()[
+            "id"
+        ]
+        with client.websocket_connect("/api/runtime") as websocket:
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "custom-tool-run",
+                    "method": "run.start",
+                    "params": {
+                        "sessionId": session_id,
+                        "clientRequestId": "custom-tool-request",
+                        "content": "Inspect files",
+                    },
+                }
+            )
+            events = receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.FAILED.value
+                ),
+            )
+        run_id = next(item["result"]["runId"] for item in events if item.get("id"))
+        run = asyncio.run(client.app.state.database.get_run(run_id))
+        calls = asyncio.run(client.app.state.database.list_model_calls(run_id))
+        tools = asyncio.run(client.app.state.database.list_tool_calls(run_id))
+
+    assert run is not None and run.error_code == "pricing_unavailable"
+    assert len(calls) == 1 and calls[0].estimated_cost is None
+    assert tools == []
+    assert (
+        next(
+            item["params"]["data"]["estimated_cost_usd"]
+            for item in events
+            if item.get("method") == "run.event"
+            and item["params"]["eventType"] == RunEventType.MODEL_USAGE.value
+        )
+        is None
+    )
 
 
 def test_jsonrpc_run_start_rejects_invalid_session_with_protocol_error(tmp_path: Path) -> None:

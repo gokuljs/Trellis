@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from app.application.budgets import BudgetPreset
 from app.application.errors import ApplicationError, ProviderError
 from app.application.runs import RunService
 from app.application.tools import ToolRegistry
@@ -34,8 +35,11 @@ class RecordingProvider:
     name: ProviderName = "openai"
     model = "test-model"
 
-    def __init__(self, events: tuple[ModelStreamEvent, ...]) -> None:
+    def __init__(
+        self, events: tuple[ModelStreamEvent, ...], *, emit_default_usage: bool = True
+    ) -> None:
         self.events = events
+        self.emit_default_usage = emit_default_usage
         self.request: ModelRequest | None = None
         self.api_key: str | None = None
         self.user_id: str | None = None
@@ -51,7 +55,12 @@ class RecordingProvider:
         self.user_id = user_id
 
         async def generate() -> AsyncGenerator[ModelStreamEvent]:
+            saw_usage = False
             for event in self.events:
+                if event.kind == "usage":
+                    saw_usage = True
+                if event.kind == "completed" and not saw_usage and self.emit_default_usage:
+                    yield ModelStreamEvent(kind="usage", input_tokens=1, output_tokens=1)
                 yield event
 
         return generate()
@@ -73,7 +82,12 @@ class SequencedProvider(RecordingProvider):
         round_index = len(self.requests) - 1
 
         async def generate() -> AsyncGenerator[ModelStreamEvent]:
+            saw_usage = False
             for event in self.rounds[round_index]:
+                if event.kind == "usage":
+                    saw_usage = True
+                if event.kind == "completed" and not saw_usage and self.emit_default_usage:
+                    yield ModelStreamEvent(kind="usage", input_tokens=1, output_tokens=1)
                 yield event
 
         return generate()
@@ -196,6 +210,8 @@ class SlowCreateRunDatabase(Database):
         client_request_id: str,
         content: str,
         model: ModelDescriptor,
+        *,
+        budget_preset: BudgetPreset = "conservative",
     ) -> RunSnapshot:
         self.create_started.set()
         await self.allow_create.wait()
@@ -205,6 +221,7 @@ class SlowCreateRunDatabase(Database):
             client_request_id,
             content,
             model,
+            budget_preset=budget_preset,
         )
 
 
@@ -310,6 +327,9 @@ def test_run_service_streams_and_persists_a_provider_neutral_run(tmp_path: Path)
     assert model_calls[0].status.value == "completed"
     assert (model_calls[0].input_tokens, model_calls[0].output_tokens) == (5, 1)
     assert model_calls[0].cached_tokens == 2
+    assert model_calls[0].estimated_cost == pytest.approx(0.000046)
+    assert events[2].data["estimated_cost_usd"] == pytest.approx(0.000046)
+    assert events[2].data["total_tokens"] == 6
     assert model_calls[0].provider_response_id == "response-1"
     assert "agent-foundation-v1" in model_calls[0].request_snapshot["system_instructions"]
     assert "No workspace is attached" in model_calls[0].request_snapshot["system_instructions"]
@@ -332,6 +352,7 @@ def test_run_service_streams_and_persists_a_provider_neutral_run(tmp_path: Path)
         "output_tokens": 1,
         "reasoning_tokens": None,
         "cached_tokens": 2,
+        "cache_creation_tokens": None,
     }
     assert b"sk-runtime-secret" not in settings.database_path.read_bytes()
 
@@ -430,6 +451,124 @@ def test_run_service_persists_read_tool_exchange_before_a_second_model_call(
     assert [
         event.data["text"] for event in events if event.event_type is RunEventType.ASSISTANT_DELTA
     ] == ["The README says hello."]
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected_error"),
+    [
+        (ModelStreamEvent(kind="usage", input_tokens=100_000, output_tokens=1), "token_limit"),
+        (None, "provider_usage_unavailable"),
+    ],
+)
+def test_budget_blocks_tool_execution_after_exhausted_or_missing_usage(
+    tmp_path: Path, usage: ModelStreamEvent | None, expected_error: str
+) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    (tmp_path / "note.txt").write_text("Read me\n", encoding="utf-8")
+    events = [
+        ModelStreamEvent(
+            kind="tool_call",
+            tool_call=ModelToolCall("call-budget", "read_file", {"path": "note.txt"}),
+        ),
+    ]
+    if usage is not None:
+        events.append(usage)
+    events.append(ModelStreamEvent(kind="completed", finish_reason="tool_use"))
+    provider = RecordingProvider(tuple(events), emit_default_usage=usage is not None)
+
+    async def run():
+        await database.initialize()
+        session = await database.create_session(str(tmp_path))
+        await secret_store.set("openai", "sk-runtime-secret")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+            tool_registry=ToolRegistry(LocalReadToolExecutor()),
+        )
+        created = await service.create_run(session.id, "request-budget-block", "Read note")
+        await service.wait_for_run(created.id)
+        result = (
+            await database.get_run(created.id),
+            await database.list_model_calls(created.id),
+            await database.list_tool_calls(created.id),
+        )
+        await service.close()
+        return result
+
+    run, model_calls, tool_calls = asyncio.run(run())
+    assert run is not None and run.status is RunStatus.FAILED
+    assert run.error_code == expected_error
+    assert len(model_calls) == 1
+    assert tool_calls == []
+
+
+def test_estimated_cost_limit_stops_before_publishing_a_final_answer(tmp_path: Path) -> None:
+    class TinyCostDatabase(Database):
+        async def create_run(
+            self,
+            session_id: str,
+            turn_id: str,
+            client_request_id: str,
+            content: str,
+            model: ModelDescriptor,
+            *,
+            budget_preset: BudgetPreset = "conservative",
+        ) -> RunSnapshot:
+            created = await super().create_run(
+                session_id,
+                turn_id,
+                client_request_id,
+                content,
+                model,
+                budget_preset=budget_preset,
+            )
+            async with self._connect() as connection:
+                await connection.execute(
+                    "UPDATE runs SET max_cost_usd = ? WHERE id = ?", (0.00004, created.id)
+                )
+                await connection.commit()
+            refreshed = await self.get_run(created.id)
+            assert refreshed is not None
+            return refreshed
+
+    settings = make_settings(tmp_path)
+    database = TinyCostDatabase(settings.database_path)
+    secret_store = SecretStore(settings.secrets_path)
+    provider = RecordingProvider(
+        (
+            ModelStreamEvent(kind="text_delta", text="Expensive answer"),
+            ModelStreamEvent(kind="usage", input_tokens=5, output_tokens=1, cached_tokens=2),
+            ModelStreamEvent(kind="completed", finish_reason="stop"),
+        )
+    )
+
+    async def run():
+        await database.initialize()
+        session = await database.create_session()
+        await secret_store.set("openai", "sk-runtime-secret")
+        service = RunService(
+            database, database, database, database, secret_store, {"openai": provider}
+        )
+        created = await service.create_run(session.id, "request-small-cost", "Answer")
+        await service.wait_for_run(created.id)
+        result = (
+            await database.get_run(created.id),
+            await database.list_model_calls(created.id),
+            await database.list_messages(session.id),
+        )
+        await service.close()
+        return result
+
+    run, calls, visible = asyncio.run(run())
+    assert run is not None and run.error_code == "cost_limit"
+    assert calls[0].estimated_cost == pytest.approx(0.000046)
+    assert [message.content for message in visible] == ["Answer"]
 
 
 def test_tool_only_response_records_two_results_before_continuing(tmp_path: Path) -> None:
@@ -675,9 +814,16 @@ def test_a_tool_cannot_run_past_the_run_deadline(tmp_path: Path) -> None:
             client_request_id: str,
             content: str,
             model: ModelDescriptor,
+            *,
+            budget_preset: BudgetPreset = "conservative",
         ) -> RunSnapshot:
             created = await super().create_run(
-                session_id, turn_id, client_request_id, content, model
+                session_id,
+                turn_id,
+                client_request_id,
+                content,
+                model,
+                budget_preset=budget_preset,
             )
             deadline = (datetime.now(UTC) + timedelta(milliseconds=150)).isoformat()
             async with self._connect() as connection:
@@ -1031,6 +1177,7 @@ def test_second_model_failure_keeps_the_first_tool_exchange(tmp_path: Path) -> N
                     yield ModelStreamEvent(
                         kind="tool_call", tool_call=ModelToolCall("call-1", "list_files", {})
                     )
+                    yield ModelStreamEvent(kind="usage", input_tokens=1, output_tokens=1)
                     yield ModelStreamEvent(kind="completed", finish_reason="tool_use")
                 else:
                     yield ModelStreamEvent(kind="text_delta", text="partial")

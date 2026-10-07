@@ -984,6 +984,7 @@ def test_anthropic_stream_normalizes_sse_events_and_cumulative_usage() -> None:
                                 "usage": {
                                     "input_tokens": 7,
                                     "cache_read_input_tokens": 2,
+                                    "cache_creation_input_tokens": 3,
                                 },
                             },
                         },
@@ -1033,6 +1034,7 @@ def test_anthropic_stream_normalizes_sse_events_and_cumulative_usage() -> None:
             input_tokens=7,
             output_tokens=4,
             cached_tokens=2,
+            cache_creation_tokens=3,
             provider_response_id="msg_456",
         ),
         ModelStreamEvent(
@@ -1183,7 +1185,12 @@ def test_anthropic_stream_replays_tool_exchange_and_assembles_mixed_blocks() -> 
             kind="tool_call",
             tool_call=ModelToolCall(id="toolu_2", name="inspect_git", arguments={}),
         ),
-        ModelStreamEvent(kind="usage", output_tokens=19, provider_response_id="msg_tools"),
+        ModelStreamEvent(
+            kind="usage",
+            output_tokens=19,
+            cache_creation_tokens=0,
+            provider_response_id="msg_tools",
+        ),
         ModelStreamEvent(
             kind="completed", finish_reason="tool_use", provider_response_id="msg_tools"
         ),

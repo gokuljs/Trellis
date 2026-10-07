@@ -6,6 +6,7 @@ from typing import cast
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from app.application.budgets import BudgetPreset
 from app.application.errors import ApplicationError
 from app.application.runs import RunService
 from app.domain.runtime import RunEvent, RunEventType, is_terminal_run_status
@@ -104,6 +105,22 @@ def _event_notification(event: RunEvent) -> dict[str, object]:
             "eventVersion": event.event_version,
             "data": event.data,
             "createdAt": event.created_at,
+        },
+    }
+
+
+def _run_result(run) -> dict[str, object]:
+    return {
+        "runId": run.id,
+        "status": run.status.value,
+        "lastSequence": run.last_event_sequence,
+        "budgetPreset": run.budget_preset,
+        "limits": {
+            "maxModelCalls": run.max_model_calls,
+            "maxToolCalls": run.max_tool_calls,
+            "maxTotalTokens": run.max_total_tokens,
+            "maxCostUsd": run.max_cost_usd,
+            "deadlineAt": run.deadline_at,
         },
     }
 
@@ -221,18 +238,18 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             turn_id = params.get("turnId")
             if turn_id is not None and not isinstance(turn_id, str):
                 raise RpcFault(-32602, "Invalid params: turnId")
+            budget_preset = params.get("budgetPreset", "conservative")
+            if budget_preset not in ("conservative", "longer"):
+                raise RpcFault(-32602, "Invalid params: budgetPreset")
             run = await service.create_run(
                 session_id,
                 client_request_id,
                 content,
                 turn_id=turn_id,
+                budget_preset=cast(BudgetPreset, budget_preset),
             )
             await subscribe(run.id, 0)
-            result = {
-                "runId": run.id,
-                "status": run.status.value,
-                "lastSequence": run.last_event_sequence,
-            }
+            result = _run_result(run)
         elif method == "run.resume":
             run_id = _required_string(params, "runId", maximum=200)
             after_sequence = params.get("afterSequence", 0)
@@ -248,11 +265,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             if after_sequence > run.last_event_sequence:
                 raise RpcFault(-32602, "Invalid params: afterSequence exceeds the run cursor")
             await subscribe(run.id, after_sequence)
-            result = {
-                "runId": run.id,
-                "status": run.status.value,
-                "lastSequence": run.last_event_sequence,
-            }
+            result = _run_result(run)
         elif method == "run.cancel":
             run_id = _required_string(params, "runId", maximum=200)
             after_sequence = params.get("afterSequence", 0)
@@ -269,11 +282,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                 raise RpcFault(-32602, "Invalid params: afterSequence exceeds the run cursor")
             run = await service.cancel_run(run_id)
             await subscribe(run.id, after_sequence)
-            result = {
-                "runId": run.id,
-                "status": run.status.value,
-                "lastSequence": run.last_event_sequence,
-            }
+            result = _run_result(run)
         else:
             raise RpcFault(-32601, "Method not found")
 

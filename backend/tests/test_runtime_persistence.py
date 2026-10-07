@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -280,6 +281,58 @@ def test_run_creation_is_idempotent_and_rejects_changed_input(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="run request conflicts"):
         asyncio.run(conflicting_input())
+
+
+def test_run_persists_selected_budget_and_rejects_changed_budget(tmp_path: Path) -> None:
+    database = Database(make_settings(tmp_path).database_path)
+
+    async def create() -> tuple[RunSnapshot, RunSnapshot]:
+        await database.initialize()
+        session = await database.create_session()
+        model = (await database.list_models())[0]
+        first = await database.create_run(
+            session.id,
+            "turn-budget",
+            "request-budget",
+            "Inspect",
+            model,
+            budget_preset="longer",
+        )
+        duplicate = await database.create_run(
+            session.id,
+            "turn-budget",
+            "request-budget",
+            "Inspect",
+            model,
+            budget_preset="longer",
+        )
+        with pytest.raises(ValueError, match="run request conflicts"):
+            await database.create_run(
+                session.id,
+                "turn-budget",
+                "request-budget",
+                "Inspect",
+                model,
+                budget_preset="conservative",
+            )
+        return first, duplicate
+
+    first, duplicate = asyncio.run(create())
+    persisted = asyncio.run(database.get_run(first.id))
+
+    assert first.id == duplicate.id
+    assert persisted is not None
+    assert persisted.budget_preset == "longer"
+    assert (persisted.max_model_calls, persisted.max_tool_calls) == (15, 30)
+    assert (persisted.max_total_tokens, persisted.max_cost_usd) == (200_000, 5.0)
+    assert (
+        1190
+        <= (
+            datetime.fromisoformat(persisted.deadline_at.replace("Z", "+00:00"))
+            - datetime.fromisoformat(persisted.created_at.replace("Z", "+00:00"))
+        ).total_seconds()
+        <= 1201
+    )
 
 
 def test_failed_run_can_be_retried_with_a_new_request_id_and_same_user_message(

@@ -1,6 +1,7 @@
 from collections.abc import AsyncGenerator, Sequence
 from typing import Protocol
 
+from app.application.budgets import BudgetPreset
 from app.domain.models import (
     Message,
     ModelDescriptor,
@@ -79,6 +80,8 @@ class RunRepository(Protocol):
         client_request_id: str,
         content: str,
         model: ModelDescriptor,
+        *,
+        budget_preset: BudgetPreset = "conservative",
     ) -> RunSnapshot: ...
 
     async def get_run(self, run_id: str) -> RunSnapshot | None: ...
@@ -143,6 +146,7 @@ class RunRepository(Protocol):
         output_tokens: int | None = None,
         reasoning_tokens: int | None = None,
         cached_tokens: int | None = None,
+        cache_creation_tokens: int | None = None,
         estimated_cost: float | None = None,
         error_code: str | None = None,
         error_message: str | None = None,

@@ -30,6 +30,8 @@ ERROR_STATUS = {
     "invalid_workspace": 422,
     "session_workspace_busy": 409,
     "provider_not_configured": 409,
+    "pricing_unavailable": 409,
+    "invalid_budget_preset": 422,
     "provider_not_available": 503,
     "provider_invalid_response": 502,
     "provider_auth_failed": 502,

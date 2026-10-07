@@ -315,3 +315,52 @@ Pytest reported the existing Starlette/httpx deprecation and SQLite resource
 warnings.
 
 **Next.** Give each run a named budget with clear limits and estimated cost.
+
+## Step 9 — Enforce run budgets and record cost
+
+**Why this step exists.** The multi-step loop needs a clear stopping point before
+another model call or local tool can spend more time, tokens, or money. A named
+budget also gives the user an understandable choice instead of several hidden
+numbers.
+
+**What works now.** `run.start` accepts an optional `budgetPreset`; omitting it
+chooses Conservative. Conservative allows 8 model calls, 16 tool calls, 100,000
+reported tokens, 10 minutes, and a $2 estimated cost. Longer coding run allows
+15 model calls, 30 tool calls, 200,000 reported tokens, 20 minutes, and a $5
+estimate. The WebSocket start and resume responses include the chosen preset
+and limits. The composer will offer this choice in Step 13; a client can use the
+WebSocket parameter now. A run stops when a limit is reached, before starting
+another tool or model step, and records a safe error code. If provider usage is
+missing, the run stops rather than continuing without a token or cost check.
+
+**Follow the code.** `backend/app/application/budgets.py` defines the two
+presets, current catalog prices, token counting, and cost estimates.
+`RunService` in `backend/app/application/runs.py` checks the saved deadline and
+totals before each step, stores each model call's usage and estimated cost, and
+publishes totals with `model.usage` events. `backend/app/infrastructure/providers.py`
+normalizes Anthropic cache-creation tokens in addition to ordinary input,
+cached reads, and output. SQLite migration 9 saves the selected preset and
+limits on each run and tags older runs as `legacy` so their original limits are
+not relabeled. `backend/app/api/routes/runtime.py` validates the optional
+`budgetPreset` and returns the saved limits.
+
+**Cost limits.** The calculation uses the published [GPT-5.5 price](https://developers.openai.com/api/docs/models/gpt-5.5)
+and [Claude Sonnet 5 price](https://platform.claude.com/docs/en/models/sonnet-5/overview)
+as of 2026-10-07. Anthropic cache creation uses its higher one-hour rate when
+the provider's usage does not state the cache lifetime; this makes the estimate
+conservative. These are estimates, not billing records. Usage usually arrives
+at the end of a response, so one response can exceed a limit before Trellis can
+stop the next step. A custom model without a known price can still give a
+one-step text answer with a null cost; it cannot continue into a tool step.
+
+**Verification.** Focused tests first failed for missing preset persistence,
+provider-aware cache pricing, unmetered continuation, and cost-limit handling.
+After the implementation, the pinned uv 0.12.5 `make check` passed Ruff
+formatting, Ruff linting, `ty`, and 199 backend tests with 90.46% coverage.
+The tests cover both presets, migration of older runs, cumulative usage, missing
+usage, a cost cap, custom-model compatibility, and rejection of an unpriced
+multi-step run. Pytest reported the existing Starlette/httpx deprecation and
+SQLite resource warnings.
+
+**Next.** Add a durable approval pause so a run can wait for a user decision
+before a tool with side effects executes.

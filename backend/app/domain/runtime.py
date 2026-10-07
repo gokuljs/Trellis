@@ -230,6 +230,7 @@ class ModelStreamEvent:
     output_tokens: int | None = None
     reasoning_tokens: int | None = None
     cached_tokens: int | None = None
+    cache_creation_tokens: int | None = None
     finish_reason: str | None = None
     provider_response_id: str | None = None
 
@@ -246,6 +247,7 @@ class ModelStreamEvent:
                 self.output_tokens,
                 self.reasoning_tokens,
                 self.cached_tokens,
+                self.cache_creation_tokens,
             ):
                 if token_count is not None and token_count < 0:
                     raise ValueError("token counts cannot be negative")
@@ -276,6 +278,9 @@ class RunSnapshot:
     client_request_id: str
     max_model_calls: int
     max_tool_calls: int
+    budget_preset: str
+    max_total_tokens: int
+    max_cost_usd: float
     deadline_at: str
     cancel_requested_at: str | None
     lease_expires_at: str | None
@@ -306,6 +311,7 @@ class ModelCallRecord:
     output_tokens: int | None
     reasoning_tokens: int | None
     cached_tokens: int | None
+    cache_creation_tokens: int | None
     estimated_cost: float | None
     error_code: str | None
     error_message: str | None

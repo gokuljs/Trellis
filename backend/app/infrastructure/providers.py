@@ -760,6 +760,7 @@ async def _stream_anthropic(
     input_tokens: int | None = None
     output_tokens: int | None = None
     cached_tokens: int | None = None
+    cache_creation_tokens = 0
     finish_reason: str | None = None
     saw_text = False
     completed = False
@@ -786,6 +787,7 @@ async def _stream_anthropic(
             usage = _mapping(message.get("usage"))
             input_tokens = _optional_integer(usage.get("input_tokens"))
             cached_tokens = _optional_integer(usage.get("cache_read_input_tokens"))
+            cache_creation_tokens = _optional_integer(usage.get("cache_creation_input_tokens", 0))
         elif event_type == "content_block_start":
             index = payload.get("index")
             block = _mapping(payload.get("content_block"))
@@ -873,6 +875,8 @@ async def _stream_anthropic(
             finish_reason = stop_reason if isinstance(stop_reason, str) else finish_reason
             usage = _mapping(payload.get("usage"))
             output_tokens = _optional_integer(usage.get("output_tokens"))
+            if "cache_creation_input_tokens" in usage:
+                cache_creation_tokens = _optional_integer(usage["cache_creation_input_tokens"])
         elif event_type == "message_stop":
             if block_types.keys() - stopped_blocks or (tool_uses and finish_reason != "tool_use"):
                 raise _anthropic_invalid_stream()
@@ -888,6 +892,7 @@ async def _stream_anthropic(
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cached_tokens=cached_tokens,
+                    cache_creation_tokens=cache_creation_tokens,
                     provider_response_id=response_id,
                 )
             completed = True
