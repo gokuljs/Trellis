@@ -3,14 +3,14 @@
   width: min(100%, 760px);
   align-items: center;
   justify-content: center;
-  gap: clamp(16px, 3vw, 30px);
+  gap: clamp(10px, 1.5vw, 18px);
   margin: auto;
   padding: 24px;
 }
 
 .welcome-dither {
   display: block;
-  width: clamp(210px, 25vw, 280px);
+  width: clamp(28px, 2.5vw, 36px);
   flex: 0 0 auto;
   overflow: visible;
   color: var(--shell-text-muted);
@@ -31,12 +31,12 @@
 }
 
 .welcome-scene__copy {
-  max-width: 270px;
+  max-width: 520px;
   margin: 0;
   color: var(--shell-text-muted);
   font-size: clamp(15px, 1.25vw, 17px);
   line-height: 1.45;
-  text-align: center;
+  text-align: left;
 }
 
 @keyframes welcome-dither-blink {
@@ -58,16 +58,16 @@
 
 @media (max-width: 640px) {
   .welcome-scene {
-    flex-direction: column;
-    gap: 10px;
+    gap: 12px;
+    padding: 16px;
   }
 
   .welcome-dither {
-    width: 210px;
+    width: 30px;
   }
 
   .welcome-scene__copy {
-    max-width: 280px;
+    max-width: 100%;
   }
 }
 

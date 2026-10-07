@@ -93,8 +93,8 @@ export function WelcomePanel({
 
   return (
     <div className="welcome-scene">
-      <DitherFace />
       <p className="welcome-scene__copy">What would you like to work on?</p>
+      <DitherFace />
     </div>
   );
 }
