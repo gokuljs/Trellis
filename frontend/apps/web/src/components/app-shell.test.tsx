@@ -135,6 +135,12 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
+function sidebarSessionTitles() {
+  return Array.from(document.querySelectorAll(".session-row")).map((row) =>
+    row.getAttribute("aria-label")
+  )
+}
+
 class TestWebSocket {
   static instances: TestWebSocket[] = []
   static onSend: (
@@ -1208,6 +1214,392 @@ describe("local-first chat", () => {
       "/api/sessions/session-older",
       expect.anything()
     )
+  })
+
+  it("keeps sidebar order when selecting a session with a completed run", async () => {
+    const resumeMethods: string[] = []
+    installRuntimeServer((socket, request) => {
+      resumeMethods.push(String(request.method))
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-older-complete",
+          status: "completed",
+          lastSequence: 2,
+        },
+      })
+      runtimeEvent(socket, "run-older-complete", 1, "run.queued", {
+        status: "queued",
+      })
+      runtimeEvent(socket, "run-older-complete", 2, "run.started", {
+        status: "running",
+      })
+      runtimeEvent(socket, "run-older-complete", 3, "run.completed", {
+        status: "completed",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions")
+          return response([recentSession, olderSession])
+        if (url === "/api/sessions/session-older/runs/latest")
+          return response({
+            run_id: "run-older-complete",
+            turn_id: "older-turn",
+            status: "completed",
+            last_sequence: 2,
+          })
+        if (url === "/api/sessions/session-older")
+          return response({
+            session: olderSession,
+            messages: [
+              {
+                id: "older-answer",
+                turn_id: "older-turn",
+                role: "assistant",
+                content: "Older context",
+                provider: "openai",
+                model: "gpt-5.5",
+                created_at: "2026-07-20T10:00:01Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+
+    renderApp()
+    expect(
+      await screen.findByRole("button", { name: "Earlier notes" })
+    ).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole("button", { name: "Earlier notes" }))
+    expect(await screen.findByText("Older context")).toBeInTheDocument()
+
+    await waitFor(() =>
+      expect(
+        Array.from(document.querySelectorAll(".session-row")).map((row) =>
+          row.getAttribute("aria-label")
+        )
+      ).toEqual(["Persisted conversation", "Earlier notes"])
+    )
+    expect(resumeMethods).toEqual([])
+  })
+
+  it("keeps sidebar order when selection refreshes a missing run transcript", async () => {
+    let olderDetailLoads = 0
+    const latestTurnId = "latest-older-turn"
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions")
+          return response([recentSession, olderSession])
+        if (url === "/api/sessions/session-recent")
+          return response({
+            session: recentSession,
+            messages: [
+              {
+                id: "recent-answer",
+                turn_id: "recent-turn",
+                role: "assistant",
+                content: "Recent context",
+                provider: "openai",
+                model: "gpt-5.5",
+                created_at: "2026-08-25T10:00:01Z",
+              },
+            ],
+          })
+        if (url === "/api/sessions/session-older/runs/latest")
+          return response({
+            run_id: "run-older-complete",
+            turn_id: latestTurnId,
+            status: "completed",
+            last_sequence: 3,
+          })
+        if (url === "/api/sessions/session-older") {
+          olderDetailLoads += 1
+          const messages: TestMessage[] = [
+            {
+              id: "older-context",
+              turn_id: "older-context-turn",
+              role: "assistant",
+              content: "Older context",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-07-20T10:00:00Z",
+            },
+          ]
+          if (olderDetailLoads > 1)
+            messages.push({
+              id: "latest-older-answer",
+              turn_id: latestTurnId,
+              role: "assistant",
+              content: "Recovered older answer",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-07-20T10:00:01Z",
+            })
+          return response({ session: olderSession, messages })
+        }
+        return undefined
+      })
+    )
+
+    renderApp()
+    await screen.findByRole("button", { name: "Earlier notes" })
+    await userEvent.click(screen.getByRole("button", { name: "Earlier notes" }))
+
+    expect(
+      await screen.findByText("Recovered older answer")
+    ).toBeInTheDocument()
+    expect(olderDetailLoads).toBe(2)
+    expect(sidebarSessionTitles()).toEqual([
+      "Persisted conversation",
+      "Earlier notes",
+    ])
+  })
+
+  it("keeps sidebar order when a selected chat's recovered run finishes", async () => {
+    const activeTurnId = "older-active-turn"
+    let runtimeSocket: TestWebSocket | null = null
+    installRuntimeServer((socket, request) => {
+      expect(request.method).toBe("run.resume")
+      runtimeSocket = socket
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "older-active-run",
+          status: "running",
+          lastSequence: 2,
+        },
+      })
+      runtimeEvent(socket, "older-active-run", 1, "run.queued", {
+        status: "queued",
+      })
+      runtimeEvent(socket, "older-active-run", 2, "run.started", {
+        status: "running",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions")
+          return response([recentSession, olderSession])
+        if (url === "/api/sessions/session-recent")
+          return response({ session: recentSession, messages: [] })
+        if (url === "/api/sessions/session-older/runs/latest")
+          return response({
+            run_id: "older-active-run",
+            turn_id: activeTurnId,
+            status: "running",
+            last_sequence: 2,
+          })
+        if (url === "/api/sessions/session-older")
+          return response({
+            session: olderSession,
+            messages: [
+              {
+                id: "older-active-user",
+                turn_id: activeTurnId,
+                role: "user",
+                content: "Continue the older chat",
+                provider: null,
+                model: null,
+                created_at: "2026-07-20T10:00:00Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+
+    renderApp()
+    await screen.findByRole("button", { name: "Earlier notes" })
+    await userEvent.click(screen.getByRole("button", { name: "Earlier notes" }))
+    expect(
+      await screen.findByRole("button", { name: "Stop generating" })
+    ).toBeInTheDocument()
+
+    await act(async () => {
+      if (!runtimeSocket) throw new Error("the older run was not resumed")
+      runtimeEvent(runtimeSocket, "older-active-run", 3, "run.completed", {
+        status: "completed",
+      })
+    })
+
+    await waitFor(() =>
+      expect(sidebarSessionTitles()).toEqual([
+        "Persisted conversation",
+        "Earlier notes",
+      ])
+    )
+  })
+
+  it("keeps a chat in place when a new message is sent", async () => {
+    installRuntimeServer((socket, request) => {
+      expect(request.method).toBe("run.start")
+      expect(request.params).toMatchObject({ content: "A new message" })
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "new-older-turn", status: "running", lastSequence: 2 },
+      })
+      runtimeEvent(socket, "new-older-turn", 1, "run.queued", {
+        status: "queued",
+      })
+      runtimeEvent(socket, "new-older-turn", 2, "run.started", {
+        status: "running",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions")
+          return response([recentSession, olderSession])
+        if (url === "/api/sessions/session-recent")
+          return response({ session: recentSession, messages: [] })
+        if (url === "/api/sessions/session-older")
+          return response({
+            session: olderSession,
+            messages: [
+              {
+                id: "older-context",
+                turn_id: "older-context-turn",
+                role: "assistant",
+                content: "Older context",
+                provider: "openai",
+                model: "gpt-5.5",
+                created_at: "2026-07-20T10:00:00Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("button", { name: "Earlier notes" })
+    await user.click(screen.getByRole("button", { name: "Earlier notes" }))
+    await screen.findByText("Older context")
+    await user.type(
+      screen.getByRole("textbox", { name: "Message" }),
+      "A new message"
+    )
+    await user.click(screen.getByRole("button", { name: "Send" }))
+
+    expect(
+      await screen.findByRole("button", { name: "Stop generating" })
+    ).toBeInTheDocument()
+    expect(sidebarSessionTitles()).toEqual([
+      "Persisted conversation",
+      "Earlier notes",
+    ])
+  })
+
+  it("keeps a retried older chat in place", async () => {
+    const failedTurnId = "older-failed-turn"
+    let retryCount = 0
+    installRuntimeServer((socket, request) => {
+      expect(request.method).toBe("run.start")
+      expect(request.params).toMatchObject({
+        sessionId: "session-older",
+        turnId: failedTurnId,
+        content: "Retry the older request",
+      })
+      retryCount += 1
+      completeRuntimeRun(socket, request, "older-retry", "Recovered response")
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions")
+          return response([recentSession, olderSession])
+        if (url === "/api/sessions/session-recent")
+          return response({ session: recentSession, messages: [] })
+        if (url === "/api/sessions/session-older/runs/latest")
+          return response(null)
+        if (url === "/api/sessions/session-older") {
+          const messages: TestMessage[] = [
+            {
+              id: "older-failed-user",
+              turn_id: failedTurnId,
+              role: "user",
+              content: "Retry the older request",
+              provider: null,
+              model: null,
+              created_at: "2026-07-20T10:00:00Z",
+            },
+          ]
+          if (retryCount > 0) {
+            messages.push({
+              id: "older-retried-answer",
+              turn_id: failedTurnId,
+              role: "assistant",
+              content: "Recovered response",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-07-20T10:00:01Z",
+            })
+          }
+          return response({ session: olderSession, messages })
+        }
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("button", { name: "Earlier notes" })
+    await user.click(screen.getByRole("button", { name: "Earlier notes" }))
+    const alert = await screen.findByRole("alert")
+    await user.click(within(alert).getByRole("button", { name: "Retry" }))
+
+    expect(await screen.findByText("Recovered response")).toBeInTheDocument()
+    expect(retryCount).toBe(1)
+    expect(sidebarSessionTitles()).toEqual([
+      "Persisted conversation",
+      "Earlier notes",
+    ])
+  })
+
+  it("keeps an older chat in place when its workspace changes", async () => {
+    const current = { ...olderSession, workspace_path: "/tmp/first-project" }
+    const updated = { ...current, workspace_path: "/tmp/second-project" }
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/sessions" && !init?.method)
+        return response([recentSession, current])
+      if (url === "/api/sessions/session-recent")
+        return response({ session: recentSession, messages: [] })
+      if (url === `/api/sessions/${current.id}` && !init?.method)
+        return response({ session: current, messages: [] })
+      if (url === "/api/workspaces/pick" && init?.method === "POST")
+        return response({ path: updated.workspace_path })
+      if (
+        url === `/api/sessions/${current.id}/workspace` &&
+        init?.method === "PUT"
+      )
+        return response(updated)
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Earlier notes" }))
+    await screen.findByText("first-project")
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+
+    expect(await screen.findByText("second-project")).toBeInTheDocument()
+    expect(sidebarSessionTitles()).toEqual([
+      "Persisted conversation",
+      "Earlier notes",
+    ])
   })
 
   it("ignores a stale session response after a newer session is selected", async () => {
@@ -2688,46 +3080,23 @@ describe("local-first chat", () => {
     ).toBeInTheDocument()
   })
 
-  it("replays the latest completed run for a restored session timeline", async () => {
+  it("starts new work without replaying a completed run from the restored timeline", async () => {
     const turnId = "bc3f4014-2e95-424e-988d-3060d7087fc3"
     const methods: string[] = []
-    let previousSocket: TestWebSocket | null = null
     installRuntimeServer((socket, request) => {
       methods.push(String(request.method))
-      if (request.method === "run.start") {
-        expect(request.params).toMatchObject({
-          sessionId: "session-recent",
-          content: "Next request",
-        })
-        socket.reply({
-          jsonrpc: "2.0",
-          id: request.id,
-          result: { runId: "run-new", status: "running", lastSequence: 2 },
-        })
-        runtimeEvent(socket, "run-new", 1, "run.queued", { status: "queued" })
-        runtimeEvent(socket, "run-new", 2, "run.started", {
-          status: "running",
-        })
-        return
-      }
-      expect(request).toMatchObject({
-        method: "run.resume",
-        params: { runId: "run-complete", afterSequence: 0 },
+      expect(request.method).toBe("run.start")
+      expect(request.params).toMatchObject({
+        sessionId: "session-recent",
+        content: "Next request",
       })
-      previousSocket = socket
       socket.reply({
         jsonrpc: "2.0",
         id: request.id,
-        result: {
-          runId: "run-complete",
-          status: "completed",
-          lastSequence: 3,
-        },
+        result: { runId: "run-new", status: "running", lastSequence: 2 },
       })
-      runtimeEvent(socket, "run-complete", 1, "run.queued", {
-        status: "queued",
-      })
-      runtimeEvent(socket, "run-complete", 2, "run.started", {
+      runtimeEvent(socket, "run-new", 1, "run.queued", { status: "queued" })
+      runtimeEvent(socket, "run-new", 2, "run.started", {
         status: "running",
       })
     })
@@ -2773,7 +3142,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
     renderApp()
     expect(await screen.findByText("Saved answer")).toBeInTheDocument()
-    await waitFor(() => expect(methods).toEqual(["run.resume"]))
+    expect(methods).toEqual([])
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
 
     await user.type(
@@ -2784,15 +3153,7 @@ describe("local-first chat", () => {
     expect(
       await screen.findByRole("button", { name: "Stop generating" })
     ).toBeInTheDocument()
-    expect(methods).toEqual(["run.resume", "run.start"])
-
-    await act(async () => {
-      if (!previousSocket) throw new Error("previous run was not replayed")
-      runtimeEvent(previousSocket, "run-complete", 3, "run.completed", {
-        status: "completed",
-      })
-      await Promise.resolve()
-    })
+    expect(methods).toEqual(["run.start"])
     expect(
       screen.getByRole("button", { name: "Stop generating" })
     ).toBeInTheDocument()
