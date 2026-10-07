@@ -3,14 +3,14 @@
   width: min(100%, 760px);
   align-items: center;
   justify-content: center;
-  gap: clamp(10px, 1.5vw, 18px);
+  gap: clamp(5px, 0.75vw, 10px);
   margin: auto;
   padding: 24px;
 }
 
 .welcome-dither {
   display: block;
-  width: clamp(28px, 2.5vw, 36px);
+  width: clamp(18px, 1.6vw, 24px);
   flex: 0 0 auto;
   overflow: visible;
   color: var(--shell-text-muted);
@@ -68,12 +68,12 @@
 
 @media (max-width: 640px) {
   .welcome-scene {
-    gap: 12px;
+    gap: 6px;
     padding: 16px;
   }
 
   .welcome-dither {
-    width: 30px;
+    width: 20px;
   }
 
   .welcome-scene__copy {
