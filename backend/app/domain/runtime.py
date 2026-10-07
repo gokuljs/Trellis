@@ -2,8 +2,6 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
-from app.domain.models import MessageRole
-
 
 class RunStatus(StrEnum):
     QUEUED = "queued"
@@ -142,9 +140,29 @@ def transition_model_call(
 
 
 @dataclass(frozen=True, slots=True)
+class ModelToolSpec:
+    name: str
+    description: str
+    input_schema: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class ModelToolCall:
+    id: str
+    name: str
+    arguments: dict[str, object]
+
+    def __post_init__(self) -> None:
+        if not self.id or not self.name:
+            raise ValueError("tool call ID and name cannot be empty")
+
+
+@dataclass(frozen=True, slots=True)
 class ModelMessage:
-    role: MessageRole
+    role: Literal["user", "assistant", "tool"]
     content: str
+    tool_call_id: str | None = None
+    tool_calls: tuple[ModelToolCall, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,12 +173,15 @@ class ModelRequest:
     upstream_model_id: str
     messages: tuple[ModelMessage, ...]
     max_output_tokens: int
+    system_instructions: str = ""
+    tools: tuple[ModelToolSpec, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class ModelStreamEvent:
-    kind: Literal["text_delta", "usage", "completed"]
+    kind: Literal["text_delta", "tool_call", "usage", "completed"]
     text: str | None = None
+    tool_call: ModelToolCall | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
     reasoning_tokens: int | None = None
@@ -171,6 +192,8 @@ class ModelStreamEvent:
     def __post_init__(self) -> None:
         if self.kind == "text_delta" and self.text is None:
             raise ValueError("text_delta events require text")
+        if self.kind == "tool_call" and self.tool_call is None:
+            raise ValueError("tool_call events require a tool call")
         if self.kind == "usage":
             for token_count in (
                 self.input_tokens,
