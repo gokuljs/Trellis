@@ -837,6 +837,11 @@ describe("local-first chat", () => {
     await user.click(screen.getByRole("button", { name: "Attach" }))
     await user.keyboard("{Escape}")
     expect(screen.queryByRole("menu")).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.keyboard("{Tab}")
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument()
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveFocus()
   })
 
   it("supports arrow-key navigation in the composer attachment menu", async () => {
@@ -1127,6 +1132,7 @@ describe("local-first chat", () => {
     await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
 
     expect(screen.queryByRole("menu")).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Attach" })).toHaveFocus()
     expect(screen.queryByText("trellis-project")).not.toBeInTheDocument()
     expect(fetchMock).not.toHaveBeenCalledWith(
       "/api/sessions",

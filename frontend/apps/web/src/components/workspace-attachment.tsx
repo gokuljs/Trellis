@@ -1,5 +1,5 @@
 import { FolderClosed, Plus, X } from "lucide-react"
-import { useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 
 import { ApiError } from "@/lib/api"
 
@@ -37,7 +37,13 @@ export function WorkspaceAttachment({
   const triggerRef = useRef<HTMLButtonElement>(null)
   const workspaceItemRef = useRef<HTMLButtonElement>(null)
   const manualInputRef = useRef<HTMLInputElement>(null)
+  const restoreFocusRef = useRef(false)
   const busy = disabled || busyAction !== null
+
+  const closeMenuAndRestoreFocus = useCallback(() => {
+    restoreFocusRef.current = true
+    setMenuOpen(false)
+  }, [])
 
   useEffect(() => {
     if (!menuOpen) return
@@ -52,8 +58,7 @@ export function WorkspaceAttachment({
     }
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && busyAction === null) {
-        setMenuOpen(false)
-        triggerRef.current?.focus()
+        closeMenuAndRestoreFocus()
       }
     }
 
@@ -63,7 +68,14 @@ export function WorkspaceAttachment({
       document.removeEventListener("pointerdown", closeOnOutsidePointer)
       document.removeEventListener("keydown", closeOnEscape)
     }
-  }, [busyAction, menuOpen])
+  }, [busyAction, closeMenuAndRestoreFocus, menuOpen])
+
+  useEffect(() => {
+    if (!menuOpen && !busy && restoreFocusRef.current) {
+      triggerRef.current?.focus()
+      restoreFocusRef.current = false
+    }
+  }, [busy, menuOpen])
 
   useEffect(() => {
     if (!menuOpen) return
@@ -86,7 +98,7 @@ export function WorkspaceAttachment({
       await onSave(path)
       setEditing(false)
       setManualEntryAvailable(false)
-      setMenuOpen(false)
+      closeMenuAndRestoreFocus()
     } catch (saveError) {
       setError(
         saveError instanceof ApiError
@@ -106,9 +118,9 @@ export function WorkspaceAttachment({
       if (saved) {
         setEditing(false)
         setManualEntryAvailable(false)
-        setMenuOpen(false)
+        closeMenuAndRestoreFocus()
       } else if (!editing) {
-        setMenuOpen(false)
+        closeMenuAndRestoreFocus()
       }
     } catch (pickerError) {
       setError(
@@ -134,7 +146,7 @@ export function WorkspaceAttachment({
       setDraft("")
       setEditing(false)
       setManualEntryAvailable(false)
-      setMenuOpen(false)
+      closeMenuAndRestoreFocus()
     } catch (removeError) {
       setError(
         removeError instanceof ApiError
@@ -192,6 +204,16 @@ export function WorkspaceAttachment({
             aria-busy={busyAction !== null}
             onKeyDown={(event) => {
               if (editing) return
+              if (event.key === "Tab" && busyAction === null) {
+                event.preventDefault()
+                setMenuOpen(false)
+                anchorRef.current?.parentElement
+                  ?.querySelector<HTMLTextAreaElement>(
+                    'textarea[aria-label="Message"]'
+                  )
+                  ?.focus()
+                return
+              }
               const items = Array.from(
                 event.currentTarget.querySelectorAll<HTMLButtonElement>(
                   '[role="menuitem"]:not(:disabled)'
