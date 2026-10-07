@@ -9,32 +9,8 @@
 }
 
 .welcome-dither {
-  display: block;
   width: clamp(18px, 1.6vw, 24px);
-  flex: 0 0 auto;
-  overflow: visible;
   color: var(--shell-text-muted);
-}
-
-.welcome-dither__mask {
-  mask-type: luminance;
-}
-
-.welcome-dither__eye {
-  fill: currentColor;
-}
-
-.welcome-dither__eyelid {
-  animation: welcome-dither-blink 3.6s ease-in-out infinite;
-  fill: none;
-  opacity: 0;
-  stroke: currentColor;
-  stroke-linecap: round;
-  stroke-width: 0;
-}
-
-.welcome-dither__eyelid--right {
-  animation-delay: 80ms;
 }
 
 .welcome-scene__copy {
@@ -44,26 +20,6 @@
   font-size: clamp(15px, 1.25vw, 17px);
   line-height: 1.45;
   text-align: left;
-}
-
-@keyframes welcome-dither-blink {
-  0%,
-  88%,
-  100% {
-    opacity: 0;
-    stroke-width: 0;
-  }
-
-  90%,
-  92% {
-    opacity: 1;
-    stroke-width: 12;
-  }
-
-  95% {
-    opacity: 0;
-    stroke-width: 0;
-  }
 }
 
 @media (max-width: 640px) {
@@ -78,11 +34,5 @@
 
   .welcome-scene__copy {
     max-width: 100%;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .welcome-dither__eyelid {
-    animation: none;
   }
 }
