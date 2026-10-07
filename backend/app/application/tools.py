@@ -2,6 +2,7 @@
 
 import json
 import re
+import shlex
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -11,6 +12,8 @@ from app.domain.runtime import ModelToolCall, ModelToolSpec, ToolResult
 
 MAX_ARGUMENT_BYTES = 16_384
 MAX_RESULT_BYTES = 20_000
+MAX_COMMAND_BYTES = 2_048
+MAX_COMMAND_ARGUMENTS = 64
 _BEARER_TOKEN = re.compile(r"(?i)\b(Bearer\s+)([A-Za-z0-9._~+/-]{6,})")
 _KEY_ASSIGNMENT = re.compile(
     r"(?i)\b([A-Za-z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)"
@@ -80,6 +83,20 @@ class _ApplyPatchArguments(_StrictArguments):
     new_text: str = Field(max_length=8192)
 
 
+class _RunCommandArguments(_StrictArguments):
+    command: str = Field(min_length=1, max_length=MAX_COMMAND_BYTES)
+    cwd: str = Field(default=".", min_length=1, max_length=4096)
+    timeout_seconds: int = Field(default=120, ge=1, le=120)
+
+
+class _RunTestArguments(_StrictArguments):
+    name: str = Field(min_length=1, max_length=64)
+
+
+class _ListTestPresetsArguments(_StrictArguments):
+    pass
+
+
 _DEFINITIONS: tuple[tuple[str, str, type[_StrictArguments]], ...] = (
     (
         "list_files",
@@ -108,6 +125,25 @@ _PATCH_DEFINITION = (
     _ApplyPatchArguments,
 )
 
+_COMMAND_DEFINITIONS: tuple[tuple[str, str, type[_StrictArguments]], ...] = (
+    (
+        "list_test_presets",
+        "List the names of test commands the user saved for this workspace.",
+        _ListTestPresetsArguments,
+    ),
+    (
+        "run_test",
+        "Run one exact user-saved test by name without approval, using Trellis's OS permissions.",
+        _RunTestArguments,
+    ),
+    (
+        "run_command",
+        "Run one executable from a workspace folder after approval, using Trellis's OS "
+        "permissions. Shell operators are unavailable.",
+        _RunCommandArguments,
+    ),
+)
+
 
 class ReadToolExecutor(Protocol):
     async def execute(
@@ -128,6 +164,12 @@ class PatchToolExecutor(Protocol):
     ) -> tuple[str, bool]: ...
 
 
+class CommandToolExecutor(Protocol):
+    async def execute(
+        self, name: str, arguments: dict[str, object], workspace_root: Path
+    ) -> tuple[str, bool]: ...
+
+
 class ToolExecutionError(Exception):
     """A safe error code and message that may be returned to the model."""
 
@@ -137,24 +179,54 @@ class ToolExecutionError(Exception):
         self.message = message
 
 
+def parse_command(command: str) -> tuple[str, ...]:
+    """Accept one executable and arguments; never invoke a shell."""
+    if (
+        not command
+        or len(command.encode("utf-8")) > MAX_COMMAND_BYTES
+        or any(character in command for character in ("\x00", "\r", "\n"))
+    ):
+        raise ToolExecutionError("invalid_command", "Enter one bounded command.")
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        arguments = tuple(lexer)
+    except ValueError:
+        raise ToolExecutionError("invalid_command", "The command syntax is invalid.") from None
+    if (
+        not arguments
+        or len(arguments) > MAX_COMMAND_ARGUMENTS
+        or any(argument and set(argument) <= set("|&;<>()") for argument in arguments)
+    ):
+        raise ToolExecutionError("invalid_command", "Enter one executable without shell operators.")
+    return arguments
+
+
 class ToolRegistry:
     def __init__(
         self,
         executor: ReadToolExecutor,
         *,
         patch_executor: PatchToolExecutor | None = None,
+        command_executor: CommandToolExecutor | None = None,
         approval_required_names: frozenset[str] | set[str] = frozenset(),
     ) -> None:
         self._executor = executor
         self._patch_executor = patch_executor
+        self._command_executor = command_executor
         self._available_definitions = (
-            (*_DEFINITIONS, _PATCH_DEFINITION) if patch_executor is not None else _DEFINITIONS
+            *_DEFINITIONS,
+            *((_PATCH_DEFINITION,) if patch_executor is not None else ()),
+            *(_COMMAND_DEFINITIONS if command_executor is not None else ()),
         )
         self._definitions = {
             name: model for name, _description, model in self._available_definitions
         }
-        self._approval_required_names = frozenset(approval_required_names) | (
-            {"apply_patch"} if patch_executor is not None else set()
+        self._approval_required_names = (
+            frozenset(approval_required_names)
+            | ({"apply_patch"} if patch_executor is not None else set())
+            | ({"run_command"} if command_executor is not None else set())
         )
 
     def requires_approval(self, call: ModelToolCall, workspace_root: Path | None = None) -> bool:
@@ -164,11 +236,19 @@ class ToolRegistry:
     async def approval_preview(
         self, call: ModelToolCall, workspace_root: Path
     ) -> dict[str, object] | None:
-        if call.name != "apply_patch" or self._patch_executor is None:
-            return None
-        return await self._patch_executor.approval_preview(
-            self._validated_arguments(call), workspace_root
-        )
+        if call.name == "apply_patch" and self._patch_executor is not None:
+            return await self._patch_executor.approval_preview(
+                self._validated_arguments(call), workspace_root
+            )
+        if call.name == "run_command" and self._command_executor is not None:
+            arguments = self._validated_arguments(call)
+            parse_command(str(arguments["command"]))
+            return {
+                "command": arguments["command"],
+                "cwd": arguments["cwd"],
+                "timeout_seconds": arguments["timeout_seconds"],
+            }
+        return None
 
     def specs(self) -> tuple[ModelToolSpec, ...]:
         return tuple(
@@ -190,6 +270,15 @@ class ToolRegistry:
                 "invalid_tool_arguments", "Tool arguments are invalid."
             ) from None
 
+    @staticmethod
+    def _safe_error(call: ModelToolCall, error: ToolExecutionError) -> ToolResult:
+        content = redact_secrets(error.message)
+        encoded = content.encode("utf-8")
+        truncated = len(encoded) > MAX_RESULT_BYTES
+        if truncated:
+            content = encoded[:MAX_RESULT_BYTES].decode("utf-8", errors="ignore")
+        return ToolResult(call.id, call.name, content, True, error.code, truncated)
+
     async def execute(
         self,
         call: ModelToolCall,
@@ -208,8 +297,14 @@ class ToolRegistry:
             )
         try:
             arguments = self._validated_arguments(call)
+            if call.name == "run_command" and approval_preview != await self.approval_preview(
+                call, workspace_root
+            ):
+                raise ToolExecutionError(
+                    "approval_changed", "The approved command no longer matches this request."
+                )
         except ToolExecutionError as error:
-            return ToolResult(call.id, call.name, error.message, True, error.code)
+            return self._safe_error(call, error)
         try:
             if call.name == "apply_patch":
                 if self._patch_executor is None:
@@ -217,12 +312,18 @@ class ToolRegistry:
                 content, truncated = await self._patch_executor.execute(
                     arguments, workspace_root, approval_preview
                 )
+            elif call.name in {"run_command", "run_test", "list_test_presets"}:
+                if self._command_executor is None:
+                    raise ToolExecutionError("unknown_tool", "This tool is not available.")
+                content, truncated = await self._command_executor.execute(
+                    call.name, arguments, workspace_root
+                )
             else:
                 content, truncated = await self._executor.execute(
                     call.name, arguments, workspace_root
                 )
         except ToolExecutionError as error:
-            return ToolResult(call.id, call.name, error.message, True, error.code)
+            return self._safe_error(call, error)
         except Exception:
             return ToolResult(
                 call.id, call.name, "The tool could not complete.", True, "tool_failed"

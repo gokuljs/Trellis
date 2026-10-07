@@ -5,6 +5,7 @@ import type {
   Session,
   SessionDetail,
   Settings,
+  TestPreset,
 } from "@/lib/app-types"
 
 type ErrorPayload = {
@@ -53,6 +54,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     )
   }
 
+  if (response.status === 204) return undefined as T
   return (await response.json()) as T
 }
 
@@ -111,4 +113,16 @@ export const api = {
     }),
   getSession: (sessionId: string) =>
     request<SessionDetail>(`/api/sessions/${sessionId}`),
+  listTestPresets: (sessionId: string) =>
+    request<TestPreset[]>(`/api/sessions/${sessionId}/test-presets`),
+  saveTestPreset: (sessionId: string, preset: TestPreset) =>
+    request<TestPreset>(`/api/sessions/${sessionId}/test-presets`, {
+      method: "POST",
+      body: JSON.stringify(preset),
+    }),
+  deleteTestPreset: (sessionId: string, name: string) =>
+    request<void>(
+      `/api/sessions/${sessionId}/test-presets/${encodeURIComponent(name)}`,
+      { method: "DELETE" }
+    ),
 }

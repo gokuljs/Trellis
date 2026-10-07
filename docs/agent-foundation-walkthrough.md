@@ -442,3 +442,50 @@ coverage.
 
 **Next.** Add a bounded command tool and saved test commands, using the same
 approval boundary for arbitrary commands.
+
+## Step 12 — Run bounded commands and test presets
+
+**Why this step exists.** Reading and patching files is not enough to check a
+code change. The agent needs to run a command after the user sees and approves
+it, and it needs a way to rerun a test command the user has already chosen for
+that workspace.
+
+**What works now.** With a workspace attached, `run_command` requests approval
+with its command, working folder, and timeout. `run_test` accepts only the name
+of an exact test command saved by the user for that workspace, so it can run
+without another approval; `list_test_presets` lets the model discover those
+names. The workspace UI lets a user add, inspect, and remove up to ten saved
+test commands. Trellis runs one executable and its arguments without a shell,
+limits arbitrary commands to 120 seconds and saved tests to 180 seconds, caps
+captured output at 20 KB, and stops the process group on timeout or run
+cancellation. It passes a small environment without inherited API keys.
+
+**Follow the code.** `backend/app/application/tools.py` defines and validates
+the three tool calls. `backend/app/application/test_presets.py` checks user
+input before saving a named command. Migration 11 and repository methods in
+`backend/app/infrastructure/database.py` keep presets by canonical workspace
+path. `backend/app/api/routes/test_presets.py` exposes session-scoped management
+to `frontend/apps/web/src/components/test-presets.tsx`. For execution,
+`backend/app/infrastructure/command_tools.py` opens the workspace working
+directory without following symlinks, starts a small Python launcher
+with that directory handle, then replaces it with the requested executable.
+The registry checks the saved approval preview again before `run_command`.
+`RunService` records the result as another tool step before asking the model to
+continue.
+
+**Command boundary.** The opened directory handle prevents a swapped path from
+changing the command's starting folder. Once launched, an executable has the
+local Trellis process's operating-system file permissions. The working-folder
+check is not a filesystem sandbox: an approved command or user-saved test can
+read or write other host paths if those permissions allow it. The preset UI
+states this before the user saves a command.
+
+**Verification.** Focused failing tests caught missing preset management,
+approval flow, cancellation of child processes, a working-directory symlink
+swap, and an invalid secret-bearing command echoed by API validation. The
+pinned uv 0.12.5 `make check` passed Ruff formatting, Ruff linting, `ty`, and
+245 backend tests with 90.22% coverage. Frontend format, lint, typecheck, 36
+tests, and build passed.
+
+**Next.** Let the user choose the model and run budget in the composer, with
+Settings providing defaults.

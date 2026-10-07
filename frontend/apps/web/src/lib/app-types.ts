@@ -78,6 +78,12 @@ export type SessionDetail = {
   messages: Message[]
 }
 
+export type TestPreset = {
+  name: string
+  command: string
+  cwd: string
+}
+
 export type TurnResult = {
   session: Session
   user_message: Message

@@ -40,6 +40,13 @@ class SessionWorkspaceBusy(Exception):
 
 
 @dataclass(frozen=True, slots=True)
+class TestPreset:
+    name: str
+    command: str
+    cwd: str
+
+
+@dataclass(frozen=True, slots=True)
 class Message:
     id: str
     session_id: str

@@ -1627,6 +1627,91 @@ html.theme-ripple-fallback::before {
     color: var(--destructive);
   }
 
+  .test-presets {
+    flex: 0 0 auto;
+    width: min(760px, calc(100% - 64px));
+    margin: 0 auto 9px;
+    color: var(--shell-text-muted);
+    font-size: 12px;
+  }
+
+  .test-presets > button,
+  .test-presets li button {
+    color: var(--shell-accent);
+    font-weight: 600;
+  }
+
+  .test-presets > button:disabled,
+  .test-presets-panel button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  .test-presets-panel {
+    display: grid;
+    gap: 10px;
+    margin-top: 8px;
+    padding: 13px;
+    border: 1px solid var(--shell-line);
+    border-radius: 12px;
+    background: var(--shell-input);
+  }
+
+  .test-presets-panel ul {
+    display: grid;
+    gap: 8px;
+  }
+
+  .test-presets-panel li {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .test-presets-panel li span {
+    display: flex;
+    min-width: 0;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: baseline;
+  }
+
+  .test-presets-panel code {
+    overflow-wrap: anywhere;
+    color: var(--shell-text-strong);
+  }
+
+  .test-presets-panel form {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    align-items: center;
+    gap: 8px;
+  }
+
+  .test-presets-panel input {
+    min-width: 0;
+    padding: 7px 9px;
+    border: 1px solid var(--shell-line);
+    border-radius: 7px;
+    outline-color: var(--shell-focus);
+    color: var(--shell-text-bright);
+    background: var(--shell-bg);
+  }
+
+  .test-presets-panel form button {
+    grid-column: 2;
+    justify-self: start;
+    padding: 8px 10px;
+    border-radius: 7px;
+    color: var(--primary-foreground);
+    background: var(--shell-accent);
+    font-weight: 600;
+  }
+
+  .test-presets-panel [role="alert"] {
+    color: var(--destructive);
+  }
+
   .composer-wrap {
     flex: 0 0 auto;
     width: min(760px, calc(100% - 64px));

@@ -1,5 +1,7 @@
 import asyncio
+import shlex
 import sqlite3
+import sys
 import threading
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -95,9 +97,12 @@ class GappedStreamingProvider(StreamingProvider):
 
 
 class ApprovalStreamingProvider(StreamingProvider):
-    def __init__(self) -> None:
+    def __init__(self, tool_call: ModelToolCall | None = None) -> None:
         super().__init__()
         self.calls = 0
+        self.tool_call = tool_call or ModelToolCall(
+            "provider-read", "read_file", {"path": "note.txt"}
+        )
 
     def stream(
         self, request: ModelRequest, api_key: str, user_id: str
@@ -111,7 +116,7 @@ class ApprovalStreamingProvider(StreamingProvider):
             if call_number == 1:
                 yield ModelStreamEvent(
                     kind="tool_call",
-                    tool_call=ModelToolCall("provider-read", "read_file", {"path": "note.txt"}),
+                    tool_call=self.tool_call,
                 )
                 yield ModelStreamEvent(kind="usage", input_tokens=1, output_tokens=1)
                 yield ModelStreamEvent(kind="completed", finish_reason="tool_use")
@@ -233,6 +238,72 @@ def test_jsonrpc_run_respond_approves_exact_waiting_tool_and_resumes(tmp_path: P
         "Read the note",
         "The note was read.",
     ]
+    assert provider.calls == 2
+
+
+def test_command_waits_for_approval_then_runs_in_workspace(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    script = "open('marker', 'w').write('ran'); print('ran')"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    provider = ApprovalStreamingProvider(
+        ModelToolCall("provider-command", "run_command", {"command": command})
+    )
+    app = create_app(
+        Settings(environment="test", data_dir=tmp_path / "data"),
+        provider_adapters={"openai": provider},
+    )
+    with TestClient(app) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-approval-test"})
+        session_id = client.post("/api/sessions", json={"workspace_path": str(project)}).json()[
+            "id"
+        ]
+        with client.websocket_connect("/api/runtime") as websocket:
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "start-command",
+                    "method": "run.start",
+                    "params": {
+                        "sessionId": session_id,
+                        "clientRequestId": "command-request",
+                        "content": "Run the command",
+                    },
+                }
+            )
+            waiting = receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.TOOL_APPROVAL_REQUESTED.value
+                ),
+            )
+            run_id = next(item["result"]["runId"] for item in waiting if item.get("id"))
+            tool_call_id = waiting[-1]["params"]["data"]["tool_call_id"]
+            assert not (project / "marker").exists()
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "approve-command",
+                    "method": "run.respond",
+                    "params": {
+                        "runId": run_id,
+                        "toolCallId": tool_call_id,
+                        "decision": "approved",
+                    },
+                }
+            )
+            receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.COMPLETED.value
+                ),
+            )
+        tool_calls = asyncio.run(app.state.database.list_tool_calls(run_id))
+
+    assert (project / "marker").read_text() == "ran"
+    assert len(tool_calls) == 1 and tool_calls[0].name == "run_command"
     assert provider.calls == 2
 
 

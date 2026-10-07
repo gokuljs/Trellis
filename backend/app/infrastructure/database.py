@@ -19,6 +19,7 @@ from app.domain.models import (
     ProviderName,
     Session,
     SessionWorkspaceBusy,
+    TestPreset,
     UserProfile,
 )
 from app.domain.runtime import (
@@ -41,7 +42,7 @@ from app.domain.runtime import (
     validate_run_event_transition,
 )
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 TURN_CLAIM_TTL = timedelta(minutes=5)
 
 MIGRATION_TABLE_SCHEMA = """
@@ -335,6 +336,17 @@ ALTER TABLE runs ADD COLUMN waiting_tool_call_id TEXT REFERENCES tool_calls(id);
 ALTER TABLE tool_calls ADD COLUMN approval_preview_json TEXT;
 """
 
+SCHEMA_V11 = """
+CREATE TABLE IF NOT EXISTS workspace_test_presets (
+    workspace_path TEXT NOT NULL,
+    name TEXT NOT NULL,
+    command TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(workspace_path, name)
+);
+"""
+
 MIGRATIONS = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
@@ -346,6 +358,7 @@ MIGRATIONS = {
     8: SCHEMA_V8,
     9: SCHEMA_V9,
     10: SCHEMA_V10,
+    11: SCHEMA_V11,
 }
 
 
@@ -1907,6 +1920,49 @@ class Database:
         if session is None:
             raise RuntimeError("Created session could not be loaded")
         return session
+
+    async def list_test_presets(self, workspace_path: str) -> list[TestPreset]:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                """SELECT name, command, cwd FROM workspace_test_presets
+                   WHERE workspace_path = ? ORDER BY name COLLATE NOCASE""",
+                (workspace_path,),
+            )
+            rows = await cursor.fetchall()
+        return [TestPreset(row["name"], row["command"], row["cwd"]) for row in rows]
+
+    async def get_test_preset(self, workspace_path: str, name: str) -> TestPreset | None:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                """SELECT name, command, cwd FROM workspace_test_presets
+                   WHERE workspace_path = ? AND name = ?""",
+                (workspace_path, name),
+            )
+            row = await cursor.fetchone()
+        return None if row is None else TestPreset(row["name"], row["command"], row["cwd"])
+
+    async def save_test_preset(self, workspace_path: str, preset: TestPreset) -> None:
+        async with self._connect() as connection:
+            await connection.execute(
+                """INSERT INTO workspace_test_presets(
+                       workspace_path, name, command, cwd, updated_at
+                   ) VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(workspace_path, name) DO UPDATE SET
+                       command = excluded.command,
+                       cwd = excluded.cwd,
+                       updated_at = excluded.updated_at""",
+                (workspace_path, preset.name, preset.command, preset.cwd, utc_now()),
+            )
+            await connection.commit()
+
+    async def delete_test_preset(self, workspace_path: str, name: str) -> bool:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                "DELETE FROM workspace_test_presets WHERE workspace_path = ? AND name = ?",
+                (workspace_path, name),
+            )
+            await connection.commit()
+            return bool(cursor.rowcount)
 
     async def set_session_workspace(
         self, session_id: str, workspace_path: str | None

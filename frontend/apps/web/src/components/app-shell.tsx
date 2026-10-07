@@ -12,6 +12,7 @@ import { Sidebar } from "@/components/sidebar"
 import { WelcomePanel } from "@/components/welcome-panel"
 import { WorkspaceTopbar } from "@/components/workspace-topbar"
 import { WorkspaceAttachment } from "@/components/workspace-attachment"
+import { TestPresets } from "@/components/test-presets"
 import { ApiError, api } from "@/lib/api"
 import { RuntimeError, cancelRun, streamRun } from "@/lib/runtime-client"
 import type {
@@ -591,6 +592,13 @@ export function AppShell() {
               onSave={saveWorkspace}
               onRemove={removeWorkspace}
             />
+            {activeSession?.workspace_path ? (
+              <TestPresets
+                key={`${activeSession.id}:${activeSession.workspace_path}`}
+                sessionId={activeSession.id}
+                disabled={pending || sessionLoading || workspaceSaving}
+              />
+            ) : null}
             <Composer
               value={composerValue}
               placeholder={
