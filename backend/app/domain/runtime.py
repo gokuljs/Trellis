@@ -190,6 +190,16 @@ class ModelContinuationItem:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolResult:
+    call_id: str
+    name: str
+    content: str
+    is_error: bool = False
+    error_code: str | None = None
+    truncated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class ModelMessage:
     role: Literal["user", "assistant", "tool"]
     content: str

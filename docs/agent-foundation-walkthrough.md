@@ -188,3 +188,37 @@ resource warnings.
 
 **Next.** Add bounded workspace list, search, read, and Git inspection tools
 that can use this saved root.
+
+## Step 6 — Add workspace read and Git tools
+
+**Why this step exists.** Once a session has a folder, the agent needs a small
+set of safe ways to inspect it. These tools establish the workspace boundary,
+argument checks, output limits, and error shape before the run loop uses them.
+
+**What works now.** The backend can list workspace files, search literal text,
+read numbered lines, and inspect Git status, unstaged diff, or recent commits.
+Each call returns a bounded `ToolResult` with a safe error code when it fails.
+Generated folders and common credential files are skipped. Chat still makes
+one model call; these tools are not offered to that call yet.
+
+**Follow the code.** `ToolResult` in `backend/app/domain/runtime.py` is the
+provider-neutral result. `ToolRegistry` in `backend/app/application/tools.py`
+publishes four strict JSON schemas, validates a completed `ModelToolCall`,
+redacts common secret patterns, and caps its result. `LocalReadToolExecutor`
+in `backend/app/infrastructure/local_tools.py` resolves the saved root and
+dispatches a tool. File traversal uses directory descriptors and rejects
+symlinks and protected paths; search and read cap scanned bytes, lines, time,
+and output. Git runs only fixed inspection commands in a separate process
+group, with a minimal environment, timeout, and output cap. A caller receives
+the shared result and can later save it before asking the model to continue.
+
+**Verification.** Focused tests covered each tool, schema rejection, path
+confinement, secret filtering, Git failures, timeouts, and output bounds. The
+first integrated aggregate run passed the tests but found only 89.42%
+coverage; additional boundary tests brought it above the required floor. The
+final uv 0.12.5 `make check` passed Ruff formatting, Ruff linting, `ty`, and
+163 backend tests with 90.24% coverage. Pytest reported the existing
+Starlette/httpx deprecation and SQLite resource warnings.
+
+**Next.** Build one deterministic model context from the visible transcript,
+saved agent exchange, workspace guidance, and these tool definitions.
