@@ -90,9 +90,14 @@ green, amber, and red distinguish status.
 
 ## Layout
 
-The application fills the viewport and places a 248px navigation rail beside a
+The application fills the viewport and places a 224px navigation rail beside a
 flexible workspace. The workspace contains the top bar, conversation or settings
 content, and the composer. On narrow screens, navigation becomes an overlay.
+
+The rail uses 8px outer gutters and 8px row insets, aligning navigation icons,
+section labels, and session markers at 16px. The Chat section starts 16px below
+primary navigation. Session rows retain 13px text and 32px desktop targets;
+coarse-pointer and mobile targets expand to at least 40px.
 
 The shared stylesheet has no semantic spacing-token scale; components use
 Tailwind's spacing utilities and local values. The user's stated preference is
