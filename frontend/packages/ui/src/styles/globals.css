@@ -3112,15 +3112,18 @@ html.theme-ripple-fallback::before {
 .trellis-toast[data-sonner-toast][data-styled="true"] {
   --toast-signal: var(--shell-blue);
 
-  min-height: 64px;
+  min-height: 60px;
   align-items: center;
-  gap: 11px;
+  gap: 9px;
   border: 1px solid var(--shell-line);
-  border-left: 3px solid var(--toast-signal);
   border-radius: 12px;
-  padding: 12px 42px 12px 12px;
+  padding: 10px 42px 10px 12px;
   color: var(--shell-text-bright);
-  background: color-mix(in srgb, var(--shell-card) 94%, transparent);
+  background: linear-gradient(
+    to bottom right,
+    color-mix(in srgb, var(--toast-signal) 14%, var(--shell-card)) 0%,
+    var(--shell-card) 82%
+  );
   font-family: var(--font-sans);
   transition:
     transform 220ms cubic-bezier(0.22, 1, 0.36, 1),
@@ -3159,15 +3162,15 @@ html.theme-ripple-fallback::before {
 .trellis-toast[data-sonner-toast][data-styled="true"]
   [data-icon].trellis-toast-icon {
   display: grid;
-  width: 22px;
-  height: 22px;
-  flex: 0 0 22px;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
   place-items: center;
   margin: 0;
-  border: 0;
-  border-radius: 7px;
+  border: 1px solid color-mix(in srgb, var(--toast-signal) 20%, transparent);
+  border-radius: 8px;
   color: var(--toast-signal);
-  background: transparent;
+  background: color-mix(in srgb, var(--toast-signal) 12%, var(--shell-card));
   line-height: 0;
 }
 
@@ -3178,7 +3181,7 @@ html.theme-ripple-fallback::before {
 
 .trellis-toast .trellis-toast-title {
   color: var(--shell-text-strong);
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 650;
   letter-spacing: -0.01em;
   line-height: 1.35;
