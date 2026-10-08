@@ -9,6 +9,17 @@ to the requested area and preserve the existing frontend toolchain. Backend
 work lives under `backend/`; read its nested `AGENTS.md` before editing files
 there.
 
+## Frontend design workflow
+
+- Use the project-local `impeccable` skill as the default workflow for frontend
+  design, layout, and spacing work. It takes precedence over generic global
+  design guidance for this repository.
+- Use the project-local `web-design-guidelines` skill for requested UI,
+  accessibility, and UX audits.
+- Preserve Trellis's existing visual system unless a redesign is requested.
+  Use Impeccable's layout workflow to improve spacing and rhythm; do not reduce
+  padding indiscriminately or make the interface cramped.
+
 ## Backend architecture boundaries
 
 - Keep FastAPI routing and HTTP serialization in `backend/app/api`.
