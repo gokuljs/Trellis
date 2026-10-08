@@ -133,7 +133,7 @@ export function Composer({
                 disabled={!isSendable}
                 onClick={onSubmit}
               >
-                <ArrowUp size={18} aria-hidden="true" />
+                <ArrowUp size={14} aria-hidden="true" />
               </button>
             </MetalFx>
           </div>

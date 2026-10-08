@@ -2054,7 +2054,7 @@ html.theme-ripple-fallback::before {
   .composer-workspace-anchor {
     position: absolute;
     z-index: 30;
-    bottom: 11px;
+    bottom: 16px;
     left: 13px;
   }
 
@@ -2232,7 +2232,7 @@ html.theme-ripple-fallback::before {
 
   .send-button-metal {
     display: inline-flex;
-    flex: 0 0 40px;
+    flex: 0 0 24px;
     align-items: center;
     justify-content: center;
     border-radius: 50%;
@@ -2244,12 +2244,24 @@ html.theme-ripple-fallback::before {
   }
 
   .send-button {
-    width: 40px;
-    height: 40px;
-    flex: 0 0 40px;
+    width: 24px;
+    height: 24px;
+    flex: 0 0 24px;
     border-radius: 50%;
     color: var(--shell-text-strong);
     background: var(--shell-input);
+  }
+
+  @media (pointer: coarse) {
+    .send-button-metal {
+      flex-basis: 40px;
+    }
+
+    .send-button {
+      width: 40px;
+      height: 40px;
+      flex-basis: 40px;
+    }
   }
 
   .send-button:hover:not(:disabled) {
