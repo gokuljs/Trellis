@@ -3167,16 +3167,14 @@ html.theme-ripple-fallback::before {
   flex: 0 0 24px;
   place-items: center;
   margin: 0;
-  border: 1px solid color-mix(in srgb, var(--toast-signal) 20%, transparent);
-  border-radius: 8px;
+  border: 0;
   color: var(--toast-signal);
-  background: color-mix(in srgb, var(--toast-signal) 12%, var(--shell-card));
+  background: transparent;
   line-height: 0;
 }
 
 .trellis-toast .trellis-toast-content {
   gap: 3px;
-  padding-top: 1px;
 }
 
 .trellis-toast .trellis-toast-title {
