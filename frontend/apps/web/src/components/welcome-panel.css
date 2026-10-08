@@ -1,0 +1,38 @@
+.welcome-scene {
+  display: flex;
+  width: min(100%, 760px);
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-control);
+  margin: auto;
+  padding: var(--space-component);
+}
+
+.welcome-dither {
+  width: clamp(18px, 1.6vw, 24px);
+  color: var(--shell-text-muted);
+}
+
+.welcome-scene__copy {
+  max-width: 520px;
+  margin: 0;
+  color: var(--shell-text-muted);
+  font-size: clamp(15px, 1.25vw, 17px);
+  line-height: 1.45;
+  text-align: left;
+}
+
+@media (max-width: 640px) {
+  .welcome-scene {
+    gap: var(--space-control);
+    padding: var(--space-component);
+  }
+
+  .welcome-dither {
+    width: 20px;
+  }
+
+  .welcome-scene__copy {
+    max-width: 100%;
+  }
+}

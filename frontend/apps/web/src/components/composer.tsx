@@ -1,23 +1,80 @@
-import type { KeyboardEvent } from "react"
-import { ChevronDown, Plus, Send } from "lucide-react"
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react"
+import { ArrowUp } from "lucide-react"
+import { BEND, MetalFx, useMetalBend } from "metal-fx"
+
+import { useTheme } from "@/components/theme-provider"
+import { WorkspaceAttachment } from "@/components/workspace-attachment"
+
+type BudgetPreset = "conservative" | "longer"
 
 type ComposerProps = {
   value: string
   placeholder: string
+  workspacePath: string | null
+  workspaceSessionKey: string
   onChange: (value: string) => void
   onSubmit: () => void
+  onPickWorkspace: () => Promise<boolean>
+  onSaveWorkspace: (path: string) => Promise<void>
+  onRemoveWorkspace: () => Promise<void>
   disabled?: boolean
-  modelLabel: string
+  budgetPreset: BudgetPreset
+  onBudgetChange: (preset: BudgetPreset) => void
+}
+
+function usePrefersReducedMotion() {
+  const [prefersReducedMotion, setPrefersReducedMotion] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  )
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia("(prefers-reduced-motion: reduce)")
+    const updatePreference = () => setPrefersReducedMotion(mediaQuery.matches)
+
+    updatePreference()
+    mediaQuery.addEventListener("change", updatePreference)
+    return () => mediaQuery.removeEventListener("change", updatePreference)
+  }, [])
+
+  return prefersReducedMotion
 }
 
 export function Composer({
   value,
   placeholder,
+  workspacePath,
+  workspaceSessionKey,
   onChange,
   onSubmit,
+  onPickWorkspace,
+  onSaveWorkspace,
+  onRemoveWorkspace,
   disabled = false,
-  modelLabel,
+  budgetPreset,
+  onBudgetChange,
 }: ComposerProps) {
+  const { resolvedTheme } = useTheme()
+  const prefersReducedMotion = usePrefersReducedMotion()
+  const isSendable = Boolean(value.trim()) && !disabled
+  const sendRef = useRef<HTMLDivElement>(null)
+  const getBendConfig = useCallback(
+    () => ({
+      ...BEND,
+      enabled: isSendable && !prefersReducedMotion,
+    }),
+    [isSendable, prefersReducedMotion]
+  )
+
+  useMetalBend(sendRef, getBendConfig)
+
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault()
@@ -28,6 +85,14 @@ export function Composer({
   return (
     <div className="composer-wrap">
       <div className="composer-box">
+        <WorkspaceAttachment
+          key={workspaceSessionKey}
+          workspacePath={workspacePath}
+          disabled={disabled}
+          onPickWorkspace={onPickWorkspace}
+          onSave={onSaveWorkspace}
+          onRemove={onRemoveWorkspace}
+        />
         <textarea
           aria-label="Message"
           value={value}
@@ -38,31 +103,39 @@ export function Composer({
           disabled={disabled}
         />
         <div className="composer-toolbar">
-          <button
-            className="composer-add"
-            aria-label="Attach"
-            disabled={disabled}
-          >
-            <Plus size={18} strokeWidth={1.6} aria-hidden="true" />
-          </button>
           <div className="composer-tools">
-            <span className="model-label">
-              {modelLabel} <ChevronDown size={13} aria-hidden="true" />
-            </span>
-            <button
-              className={`send-button ${value.trim() && !disabled ? "ready" : ""}`}
-              aria-label="Send"
-              disabled={disabled || !value.trim()}
-              onClick={onSubmit}
+            <select
+              className="composer-select"
+              aria-label="Run budget"
+              value={budgetPreset}
+              disabled={disabled}
+              onChange={(event) =>
+                onBudgetChange(event.target.value as BudgetPreset)
+              }
             >
-              {value.trim() ? (
-                <Send size={15} aria-hidden="true" />
-              ) : (
-                <span className="voice-orb" aria-hidden="true">
-                  ◔
-                </span>
-              )}
-            </button>
+              <option value="conservative">Standard</option>
+              <option value="longer">Extended</option>
+            </select>
+            <MetalFx
+              ref={sendRef}
+              className="send-button-metal"
+              variant="circle"
+              preset="chromatic"
+              strength={1}
+              innerShadow
+              theme={resolvedTheme}
+              paused={prefersReducedMotion || !isSendable}
+              disableGlow={prefersReducedMotion || !isSendable}
+            >
+              <button
+                className="send-button"
+                aria-label="Send"
+                disabled={!isSendable}
+                onClick={onSubmit}
+              >
+                <ArrowUp size={14} aria-hidden="true" />
+              </button>
+            </MetalFx>
           </div>
         </div>
       </div>

@@ -32,6 +32,18 @@ class Session:
     created_at: str
     updated_at: str
     message_count: int
+    workspace_path: str | None = None
+
+
+class SessionWorkspaceBusy(Exception):
+    """A session's workspace cannot change while a run can still use it."""
+
+
+@dataclass(frozen=True, slots=True)
+class TestPreset:
+    name: str
+    command: str
+    cwd: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +110,7 @@ class AppSettings:
     providers: list[ProviderStatus]
     selected_model_id: ModelId
     models: list[ModelStatus]
+    default_budget_preset: Literal["conservative", "longer"] = "conservative"
 
 
 @dataclass(frozen=True, slots=True)

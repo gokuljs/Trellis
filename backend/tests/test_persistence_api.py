@@ -9,14 +9,25 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
-from app.domain.runtime import RunEventType, RunStatus
-from app.infrastructure.database import SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, Database
+from app.domain.runtime import ModelCallStatus, ModelMessage, ModelToolCall, RunEventType, RunStatus
+from app.infrastructure.database import (
+    SCHEMA_V1,
+    SCHEMA_V2,
+    SCHEMA_V3,
+    SCHEMA_V4,
+    SCHEMA_V5,
+    SCHEMA_VERSION,
+    Database,
+)
 from app.infrastructure.secrets import SecretStore
 from app.main import create_app
 
 
 def make_settings(data_dir: Path) -> Settings:
     return Settings(environment="test", data_dir=data_dir)
+
+
+EXPECTED_SCHEMA_VERSIONS = [(version,) for version in range(1, SCHEMA_VERSION + 1)]
 
 
 def test_installation_profile_id_survives_application_restart(tmp_path: Path) -> None:
@@ -184,6 +195,24 @@ def test_model_selection_rejects_an_unregistered_model_id(tmp_path: Path) -> Non
     assert response.json()["error"]["code"] == "model_not_available"
 
 
+def test_default_run_budget_can_be_changed_and_survives_restart(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+
+    with TestClient(create_app(settings)) as client:
+        initial = client.get("/api/settings")
+        changed = client.put("/api/settings/budget", json={"budget_preset": "longer"})
+        invalid = client.put("/api/settings/budget", json={"budget_preset": "unlimited"})
+
+    with TestClient(create_app(settings)) as restarted_client:
+        restored = restarted_client.get("/api/settings")
+
+    assert initial.json()["default_budget_preset"] == "conservative"
+    assert changed.status_code == 200
+    assert changed.json()["default_budget_preset"] == "longer"
+    assert restored.json()["default_budget_preset"] == "longer"
+    assert invalid.status_code == 422
+
+
 def test_onboarding_progress_and_answers_are_saved_after_each_step(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
 
@@ -319,7 +348,74 @@ def test_database_records_all_schema_migrations(tmp_path: Path) -> None:
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,)]
+    assert versions == EXPECTED_SCHEMA_VERSIONS
+
+
+def test_fresh_database_keeps_one_continuation_column_after_restart(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+
+    asyncio.run(database.initialize())
+    asyncio.run(database.initialize())
+
+    with closing(sqlite3.connect(settings.database_path)) as connection:
+        columns = [row[1] for row in connection.execute("PRAGMA table_info(run_messages)")]
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+
+    assert columns.count("continuation_json") == 1
+    assert versions == [(version,) for version in range(1, 14)]
+
+
+def test_database_repairs_v12_run_messages_without_losing_rows(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+
+    async def create_existing_message() -> str:
+        await database.initialize()
+        session = await database.create_session()
+        model = (await database.list_models())[0]
+        run = await database.create_run(session.id, "turn-1", "request-1", "Inspect files", model)
+        await database.transition_run_record(
+            run.id, RunStatus.RUNNING, RunEventType.STARTED, {"status": "running"}
+        )
+        model_call = await database.create_model_call(run.id, 1, model, {"messages": []})
+        await database.update_model_call(model_call.id, ModelCallStatus.COMPLETED)
+        await database.record_assistant_message(
+            run.id, model_call.id, ModelMessage(role="assistant", content="Kept before repair")
+        )
+        return run.id
+
+    run_id = asyncio.run(create_existing_message())
+    with closing(sqlite3.connect(settings.database_path)) as connection:
+        connection.execute("ALTER TABLE run_messages DROP COLUMN continuation_json")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 13")
+        connection.commit()
+
+    asyncio.run(database.initialize())
+
+    async def append_new_message() -> list[str]:
+        model = (await database.list_models())[0]
+        model_call = await database.create_model_call(run_id, 2, model, {"messages": []})
+        await database.update_model_call(model_call.id, ModelCallStatus.COMPLETED)
+        await database.record_assistant_message(
+            run_id,
+            model_call.id,
+            ModelMessage(
+                role="assistant",
+                content="Checking files",
+                tool_calls=(ModelToolCall("file-call", "list_files", {"path": "."}),),
+            ),
+        )
+        return [message.content for message in await database.list_run_messages(run_id)]
+
+    assert asyncio.run(append_new_message()) == ["Kept before repair", "Checking files"]
+    with closing(sqlite3.connect(settings.database_path)) as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+    assert versions == [(version,) for version in range(1, 14)]
 
 
 def test_database_upgrades_an_existing_v1_schema(tmp_path: Path) -> None:
@@ -338,9 +434,70 @@ def test_database_upgrades_an_existing_v1_schema(tmp_path: Path) -> None:
         claim_table = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'turn_claims'"
         ).fetchone()
+        default_budget = connection.execute(
+            "SELECT default_budget_preset FROM app_settings WHERE id = 1"
+        ).fetchone()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,)]
+    assert versions == EXPECTED_SCHEMA_VERSIONS
     assert claim_table == ("turn_claims",)
+    assert default_budget == ("conservative",)
+
+
+def test_database_upgrades_v5_runs_without_changing_public_messages(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    with closing(sqlite3.connect(settings.database_path)) as connection:
+        for schema in (SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5):
+            connection.executescript(schema)
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, 'old')",
+            [(1,), (2,), (3,), (4,), (5,)],
+        )
+        connection.execute(
+            """INSERT INTO users(id, created_at, updated_at)
+               VALUES ('user-1', 'old', 'old')"""
+        )
+        connection.execute(
+            """INSERT INTO sessions(id, user_id, title, created_at, updated_at)
+               VALUES ('session-1', 'user-1', 'Old chat', 'old', 'old')"""
+        )
+        connection.execute(
+            """INSERT INTO messages(
+                   id, session_id, turn_id, ordinal, role, content, created_at
+               ) VALUES ('message-1', 'session-1', 'turn-1', 1, 'user', 'Old request', 'old')"""
+        )
+        connection.execute(
+            """INSERT INTO runs(
+                   id, session_id, turn_id, input_message_id, client_request_id, status,
+                   provider_id, model_id, adapter_kind, upstream_model_id, max_model_calls,
+                   max_tool_calls, deadline_at, created_at
+               ) VALUES (
+                   'run-1', 'session-1', 'turn-1', 'message-1', 'request-1', 'completed',
+                   'openai', 'openai:gpt-5.5', 'openai', 'gpt-5.5', 1, 0, 'old', 'old'
+               )"""
+        )
+        connection.commit()
+
+    database = Database(settings.database_path)
+    asyncio.run(database.initialize())
+    messages = asyncio.run(database.list_messages("session-1"))
+    run = asyncio.run(database.get_run("run-1"))
+    with closing(sqlite3.connect(settings.database_path)) as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+        projection_tables = connection.execute(
+            """SELECT name FROM sqlite_master
+               WHERE name IN ('run_messages', 'tool_calls') ORDER BY name"""
+        ).fetchall()
+
+    assert versions == EXPECTED_SCHEMA_VERSIONS
+    assert [message.content for message in messages] == ["Old request"]
+    assert run is not None and run.status is RunStatus.COMPLETED
+    assert run.budget_preset == "legacy"
+    assert (run.max_model_calls, run.max_tool_calls) == (1, 0)
+    assert foreign_key_errors == []
+    assert projection_tables == [("run_messages",), ("tool_calls",)]
 
 
 def test_database_rejects_a_schema_from_a_newer_trellis_version(tmp_path: Path) -> None:

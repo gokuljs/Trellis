@@ -2,12 +2,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
-from app.domain.models import MessageRole
-
 
 class RunStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
+    WAITING_FOR_APPROVAL = "waiting_for_approval"
     CANCELLING = "cancelling"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -20,6 +19,11 @@ class RunEventType(StrEnum):
     STARTED = "run.started"
     CANCELLATION_REQUESTED = "run.cancellation_requested"
     ASSISTANT_DELTA = "assistant.delta"
+    ASSISTANT_MESSAGE = "assistant.message"
+    TOOL_CALL = "tool.call"
+    TOOL_APPROVAL_REQUESTED = "tool.approval_requested"
+    TOOL_RESULT = "tool.result"
+    TOOL_APPROVAL_DECIDED = "tool.approval_decided"
     MODEL_USAGE = "model.usage"
     MODEL_COMPLETED = "model.completed"
     ASSISTANT_COMPLETED = "assistant.completed"
@@ -27,6 +31,7 @@ class RunEventType(StrEnum):
     FAILED = "run.failed"
     CANCELLED = "run.cancelled"
     INTERRUPTED = "run.interrupted"
+    RESUMED = "run.resumed"
 
 
 class ModelCallStatus(StrEnum):
@@ -38,12 +43,28 @@ class ModelCallStatus(StrEnum):
     TIMED_OUT = "timed_out"
 
 
+class ToolCallStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    DENIED = "denied"
+    CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
+
+
+class ToolApprovalDecision(StrEnum):
+    APPROVED = "approved"
+    DENIED = "denied"
+
+
 _TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.QUEUED: frozenset(
         {RunStatus.RUNNING, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.INTERRUPTED}
     ),
     RunStatus.RUNNING: frozenset(
         {
+            RunStatus.WAITING_FOR_APPROVAL,
             RunStatus.CANCELLING,
             RunStatus.COMPLETED,
             RunStatus.FAILED,
@@ -51,6 +72,7 @@ _TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
             RunStatus.INTERRUPTED,
         }
     ),
+    RunStatus.WAITING_FOR_APPROVAL: frozenset({RunStatus.RUNNING, RunStatus.CANCELLING}),
     RunStatus.CANCELLING: frozenset({RunStatus.CANCELLED, RunStatus.FAILED, RunStatus.INTERRUPTED}),
     RunStatus.COMPLETED: frozenset(),
     RunStatus.FAILED: frozenset(),
@@ -64,6 +86,9 @@ _TRANSITION_EVENTS: dict[tuple[RunStatus, RunStatus], RunEventType] = {
     (RunStatus.QUEUED, RunStatus.CANCELLED): RunEventType.CANCELLED,
     (RunStatus.QUEUED, RunStatus.INTERRUPTED): RunEventType.INTERRUPTED,
     (RunStatus.RUNNING, RunStatus.CANCELLING): RunEventType.CANCELLATION_REQUESTED,
+    (RunStatus.RUNNING, RunStatus.WAITING_FOR_APPROVAL): RunEventType.TOOL_APPROVAL_REQUESTED,
+    (RunStatus.WAITING_FOR_APPROVAL, RunStatus.RUNNING): RunEventType.RESUMED,
+    (RunStatus.WAITING_FOR_APPROVAL, RunStatus.CANCELLING): RunEventType.CANCELLATION_REQUESTED,
     (RunStatus.RUNNING, RunStatus.COMPLETED): RunEventType.COMPLETED,
     (RunStatus.RUNNING, RunStatus.FAILED): RunEventType.FAILED,
     (RunStatus.RUNNING, RunStatus.CANCELLED): RunEventType.CANCELLED,
@@ -77,6 +102,8 @@ _LIFECYCLE_EVENT_TYPES = frozenset(
         RunEventType.QUEUED,
         RunEventType.STARTED,
         RunEventType.CANCELLATION_REQUESTED,
+        RunEventType.TOOL_APPROVAL_REQUESTED,
+        RunEventType.RESUMED,
         RunEventType.COMPLETED,
         RunEventType.FAILED,
         RunEventType.CANCELLED,
@@ -142,9 +169,53 @@ def transition_model_call(
 
 
 @dataclass(frozen=True, slots=True)
-class ModelMessage:
-    role: MessageRole
+class ModelToolSpec:
+    name: str
+    description: str
+    input_schema: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class ModelToolCall:
+    id: str
+    name: str
+    arguments: dict[str, object]
+
+    def __post_init__(self) -> None:
+        if not self.id or not self.name:
+            raise ValueError("tool call ID and name cannot be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class ModelContinuationItem:
+    """Provider-owned state carried opaquely between model calls."""
+
+    provider_id: str
+    model_id: str
+    payload_json: str
+
+    def __post_init__(self) -> None:
+        if not self.provider_id or not self.model_id or not self.payload_json:
+            raise ValueError("continuation source and payload cannot be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResult:
+    call_id: str
+    name: str
     content: str
+    is_error: bool = False
+    error_code: str | None = None
+    truncated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ModelMessage:
+    role: Literal["user", "assistant", "tool"]
+    content: str
+    tool_call_id: str | None = None
+    tool_calls: tuple[ModelToolCall, ...] = ()
+    continuation_items: tuple[ModelContinuationItem, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,28 +226,38 @@ class ModelRequest:
     upstream_model_id: str
     messages: tuple[ModelMessage, ...]
     max_output_tokens: int
+    system_instructions: str = ""
+    tools: tuple[ModelToolSpec, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class ModelStreamEvent:
-    kind: Literal["text_delta", "usage", "completed"]
+    kind: Literal["text_delta", "tool_call", "continuation_item", "usage", "completed"]
     text: str | None = None
+    tool_call: ModelToolCall | None = None
+    continuation_item: ModelContinuationItem | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
     reasoning_tokens: int | None = None
     cached_tokens: int | None = None
+    cache_creation_tokens: int | None = None
     finish_reason: str | None = None
     provider_response_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind == "text_delta" and self.text is None:
             raise ValueError("text_delta events require text")
+        if self.kind == "tool_call" and self.tool_call is None:
+            raise ValueError("tool_call events require a tool call")
+        if self.kind == "continuation_item" and self.continuation_item is None:
+            raise ValueError("continuation_item events require a continuation item")
         if self.kind == "usage":
             for token_count in (
                 self.input_tokens,
                 self.output_tokens,
                 self.reasoning_tokens,
                 self.cached_tokens,
+                self.cache_creation_tokens,
             ):
                 if token_count is not None and token_count < 0:
                     raise ValueError("token counts cannot be negative")
@@ -207,6 +288,9 @@ class RunSnapshot:
     client_request_id: str
     max_model_calls: int
     max_tool_calls: int
+    budget_preset: str
+    max_total_tokens: int
+    max_cost_usd: float
     deadline_at: str
     cancel_requested_at: str | None
     lease_expires_at: str | None
@@ -237,8 +321,40 @@ class ModelCallRecord:
     output_tokens: int | None
     reasoning_tokens: int | None
     cached_tokens: int | None
+    cache_creation_tokens: int | None
     estimated_cost: float | None
     error_code: str | None
     error_message: str | None
     started_at: str
     finished_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RunMessageRecord:
+    id: str
+    run_id: str
+    ordinal: int
+    role: Literal["assistant", "tool"]
+    content: str
+    model_call_id: str | None
+    tool_call_id: str | None
+    created_at: str
+    tool_calls: tuple[ModelToolCall, ...] = ()
+    continuation_items: tuple[ModelContinuationItem, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallRecord:
+    id: str
+    run_id: str
+    assistant_message_id: str
+    call_index: int
+    provider_call_id: str
+    name: str
+    arguments: dict[str, object]
+    status: ToolCallStatus
+    approval_decision: ToolApprovalDecision | None
+    approval_decided_at: str | None
+    created_at: str
+    finished_at: str | None
+    approval_preview: dict[str, object] | None = None

@@ -1,13 +1,13 @@
 import {
   Check,
   CircleAlert,
-  Info,
   LoaderCircle,
   TriangleAlert,
   X,
 } from "lucide-react"
 import { Toaster } from "sonner"
 
+import { TrellisMark } from "@/components/trellis-mark"
 import { useTheme } from "@/components/theme-provider"
 
 const iconProps = {
@@ -35,7 +35,7 @@ export function GlobalToaster() {
       icons={{
         success: <Check {...iconProps} />,
         error: <CircleAlert {...iconProps} />,
-        info: <Info {...iconProps} />,
+        info: <TrellisMark animated size={24} />,
         warning: <TriangleAlert {...iconProps} />,
         loading: <LoaderCircle {...iconProps} />,
         close: <X size={12} strokeWidth={1.8} aria-hidden="true" />,

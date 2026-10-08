@@ -1,15 +1,21 @@
 import asyncio
+import shlex
 import sqlite3
+import sys
 import threading
 from collections.abc import AsyncGenerator
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
+from app.application.tools import ToolRegistry
 from app.core.config import Settings
 from app.domain.models import ProviderName
-from app.domain.runtime import ModelRequest, ModelStreamEvent, RunEvent, RunEventType
+from app.domain.runtime import ModelRequest, ModelStreamEvent, ModelToolCall, RunEvent, RunEventType
+from app.infrastructure.local_tools import LocalReadToolExecutor
 from app.infrastructure.runtime_events import RuntimeEventHub
 from app.main import create_app
 
@@ -40,6 +46,7 @@ class StreamingProvider:
                 kind="usage",
                 input_tokens=4,
                 output_tokens=2,
+                cache_creation_tokens=0,
                 provider_response_id="resp-jsonrpc",
             )
             yield ModelStreamEvent(kind="completed", finish_reason="stop")
@@ -48,6 +55,10 @@ class StreamingProvider:
 
 
 class BlockingStreamingProvider(StreamingProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+
     def stream(
         self,
         request: ModelRequest,
@@ -58,6 +69,7 @@ class BlockingStreamingProvider(StreamingProvider):
 
         async def generate() -> AsyncGenerator[ModelStreamEvent]:
             yield ModelStreamEvent(kind="text_delta", text="Working")
+            self.started.set()
             await asyncio.Event().wait()
 
         return generate()
@@ -79,9 +91,42 @@ class GappedStreamingProvider(StreamingProvider):
 
         async def generate() -> AsyncGenerator[ModelStreamEvent]:
             yield ModelStreamEvent(kind="text_delta", text="dropped delta")
+            yield ModelStreamEvent(kind="usage", input_tokens=1, output_tokens=1)
             await asyncio.to_thread(self.continue_stream.wait)
             yield ModelStreamEvent(kind="text_delta", text="replayed delta")
             yield ModelStreamEvent(kind="completed", finish_reason="stop")
+
+        return generate()
+
+
+class ApprovalStreamingProvider(StreamingProvider):
+    def __init__(self, tool_call: ModelToolCall | None = None) -> None:
+        super().__init__()
+        self.calls = 0
+        self.tool_call = tool_call or ModelToolCall(
+            "provider-read", "read_file", {"path": "note.txt"}
+        )
+
+    def stream(
+        self, request: ModelRequest, api_key: str, user_id: str
+    ) -> AsyncGenerator[ModelStreamEvent]:
+        self.request = request
+        self.calls += 1
+        call_number = self.calls
+        del api_key, user_id
+
+        async def generate() -> AsyncGenerator[ModelStreamEvent]:
+            if call_number == 1:
+                yield ModelStreamEvent(
+                    kind="tool_call",
+                    tool_call=self.tool_call,
+                )
+                yield ModelStreamEvent(kind="usage", input_tokens=1, output_tokens=1)
+                yield ModelStreamEvent(kind="completed", finish_reason="tool_use")
+            else:
+                yield ModelStreamEvent(kind="text_delta", text="The note was read.")
+                yield ModelStreamEvent(kind="usage", input_tokens=1, output_tokens=1)
+                yield ModelStreamEvent(kind="completed", finish_reason="stop")
 
         return generate()
 
@@ -101,6 +146,276 @@ def receive_until(websocket, predicate):
         received.append(message)
         if predicate(message):
             return received
+
+
+def start_completed_run(client: TestClient, session_id: str, request_id: str) -> str:
+    with client.websocket_connect("/api/runtime") as websocket:
+        websocket.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "run.start",
+                "params": {
+                    "sessionId": session_id,
+                    "clientRequestId": request_id,
+                    "content": f"Message {request_id}",
+                },
+            }
+        )
+        received = receive_until(
+            websocket,
+            lambda item: (
+                item.get("method") == "run.event"
+                and item["params"]["eventType"] == RunEventType.COMPLETED.value
+            ),
+        )
+    return next(item["result"]["runId"] for item in received if item.get("id") == request_id)
+
+
+def test_session_run_history_pages_summaries_and_events(tmp_path: Path) -> None:
+    with configured_client(tmp_path, StreamingProvider()) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-history"})
+        session_id = client.post("/api/sessions").json()["id"]
+        first_id = start_completed_run(client, session_id, "history-first")
+        second_id = start_completed_run(client, session_id, "history-second")
+
+        first_page = client.get(f"/api/sessions/{session_id}/runs", params={"limit": 1})
+        second_page = client.get(
+            f"/api/sessions/{session_id}/runs", params={"limit": 1, "offset": 1}
+        )
+        events_page = client.get(
+            f"/api/sessions/{session_id}/runs/{first_id}/events", params={"limit": 2}
+        )
+        remaining_events = client.get(
+            f"/api/sessions/{session_id}/runs/{first_id}/events",
+            params={"after_sequence": 2},
+        )
+
+    assert first_page.status_code == second_page.status_code == events_page.status_code == 200
+    assert first_page.json()["next_offset"] == 1
+    assert second_page.json()["next_offset"] is None
+    assert [first_page.json()["items"][0]["run_id"], second_page.json()["items"][0]["run_id"]] == [
+        first_id,
+        second_id,
+    ]
+    summary = first_page.json()["items"][0]
+    assert summary["status"] == "completed"
+    assert summary["created_at"] and summary["finished_at"]
+    assert summary["last_sequence"] == 7
+    assert summary["max_model_calls"] > 0
+    assert [item["sequence"] for item in events_page.json()["items"]] == [1, 2]
+    assert events_page.json()["next_after_sequence"] == 2
+    assert [item["sequence"] for item in remaining_events.json()["items"]] == [3, 4, 5, 6, 7]
+    assert remaining_events.json()["next_after_sequence"] is None
+    assert all(item["created_at"] for item in remaining_events.json()["items"])
+
+
+def test_run_event_cursor_uses_page_lookahead_when_snapshot_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with configured_client(tmp_path, StreamingProvider()) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-history"})
+        session_id = client.post("/api/sessions").json()["id"]
+        run_id = start_completed_run(client, session_id, "stale-snapshot")
+        database = client.app.state.database
+        original_get_run = database.get_run
+
+        async def stale_get_run(requested_run_id: str):
+            snapshot = await original_get_run(requested_run_id)
+            assert snapshot is not None
+            return replace(snapshot, last_event_sequence=2)
+
+        monkeypatch.setattr(database, "get_run", stale_get_run)
+        page = client.get(f"/api/sessions/{session_id}/runs/{run_id}/events", params={"limit": 2})
+
+    assert page.status_code == 200
+    assert [item["sequence"] for item in page.json()["items"]] == [1, 2]
+    assert page.json()["next_after_sequence"] == 2
+
+
+def test_session_run_history_rejects_other_sessions_and_invalid_pages(tmp_path: Path) -> None:
+    with configured_client(tmp_path, StreamingProvider()) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-history"})
+        owner_id = client.post("/api/sessions").json()["id"]
+        other_id = client.post("/api/sessions").json()["id"]
+        run_id = start_completed_run(client, owner_id, "owned-run")
+
+        assert client.get(f"/api/sessions/{other_id}/runs").json() == {
+            "items": [],
+            "next_offset": None,
+        }
+        assert client.get(f"/api/sessions/{other_id}/runs/{run_id}/events").status_code == 404
+        assert client.get("/api/sessions/missing/runs").status_code == 404
+        assert client.get(f"/api/sessions/{owner_id}/runs/missing/events").status_code == 404
+        assert client.get(f"/api/sessions/{owner_id}/runs", params={"limit": 0}).status_code == 422
+        assert (
+            client.get(
+                f"/api/sessions/{owner_id}/runs/{run_id}/events", params={"after_sequence": -1}
+            ).status_code
+            == 422
+        )
+
+
+def test_jsonrpc_run_respond_approves_exact_waiting_tool_and_resumes(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "note.txt").write_text("safe contents\n", encoding="utf-8")
+    provider = ApprovalStreamingProvider()
+    app = create_app(
+        Settings(environment="test", data_dir=tmp_path / "data"),
+        provider_adapters={"openai": provider},
+        tool_registry=ToolRegistry(LocalReadToolExecutor(), approval_required_names={"read_file"}),
+    )
+    with TestClient(app) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-approval-test"})
+        session_id = client.post("/api/sessions", json={"workspace_path": str(project)}).json()[
+            "id"
+        ]
+        with client.websocket_connect("/api/runtime") as websocket:
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "start",
+                    "method": "run.start",
+                    "params": {
+                        "sessionId": session_id,
+                        "clientRequestId": "approval-request",
+                        "content": "Read the note",
+                    },
+                }
+            )
+            waiting_events = receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.TOOL_APPROVAL_REQUESTED.value
+                ),
+            )
+            run_id = next(
+                item["result"]["runId"] for item in waiting_events if item.get("id") == "start"
+            )
+            request = waiting_events[-1]["params"]
+            call_id = request["data"]["tool_call_id"]
+            assert (
+                client.put(
+                    f"/api/sessions/{session_id}/workspace", json={"workspace_path": None}
+                ).status_code
+                == 409
+            )
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "wrong",
+                    "method": "run.respond",
+                    "params": {"runId": run_id, "toolCallId": "wrong-tool", "decision": "approved"},
+                }
+            )
+            wrong = websocket.receive_json()
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "invalid",
+                    "method": "run.respond",
+                    "params": {"runId": run_id, "toolCallId": call_id, "decision": "maybe"},
+                }
+            )
+            invalid = websocket.receive_json()
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "approve",
+                    "method": "run.respond",
+                    "params": {"runId": run_id, "toolCallId": call_id, "decision": "approved"},
+                }
+            )
+            resumed = receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.COMPLETED.value
+                ),
+            )
+            if not any(item.get("id") == "approve" for item in resumed):
+                resumed.append(websocket.receive_json())
+        detail = client.get(f"/api/sessions/{session_id}").json()
+
+    assert wrong["error"]["data"]["code"] == "tool_call_not_found"
+    assert invalid["error"]["code"] == -32602
+    assert (
+        next(item["result"]["toolCallId"] for item in resumed if item.get("id") == "approve")
+        == call_id
+    )
+    assert [message["content"] for message in detail["messages"]] == [
+        "Read the note",
+        "The note was read.",
+    ]
+    assert provider.calls == 2
+
+
+def test_command_waits_for_approval_then_runs_in_workspace(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    script = "open('marker', 'w').write('ran'); print('ran')"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    provider = ApprovalStreamingProvider(
+        ModelToolCall("provider-command", "run_command", {"command": command})
+    )
+    app = create_app(
+        Settings(environment="test", data_dir=tmp_path / "data"),
+        provider_adapters={"openai": provider},
+    )
+    with TestClient(app) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-approval-test"})
+        session_id = client.post("/api/sessions", json={"workspace_path": str(project)}).json()[
+            "id"
+        ]
+        with client.websocket_connect("/api/runtime") as websocket:
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "start-command",
+                    "method": "run.start",
+                    "params": {
+                        "sessionId": session_id,
+                        "clientRequestId": "command-request",
+                        "content": "Run the command",
+                    },
+                }
+            )
+            waiting = receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.TOOL_APPROVAL_REQUESTED.value
+                ),
+            )
+            run_id = next(item["result"]["runId"] for item in waiting if item.get("id"))
+            tool_call_id = waiting[-1]["params"]["data"]["tool_call_id"]
+            assert not (project / "marker").exists()
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "approve-command",
+                    "method": "run.respond",
+                    "params": {
+                        "runId": run_id,
+                        "toolCallId": tool_call_id,
+                        "decision": "approved",
+                    },
+                }
+            )
+            receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.COMPLETED.value
+                ),
+            )
+        tool_calls = asyncio.run(app.state.database.list_tool_calls(run_id))
+
+    assert (project / "marker").read_text() == "ran"
+    assert len(tool_calls) == 1 and tool_calls[0].name == "run_command"
+    assert provider.calls == 2
 
 
 def test_jsonrpc_websocket_streams_a_durable_run(tmp_path: Path) -> None:
@@ -142,18 +457,157 @@ def test_jsonrpc_websocket_streams_a_durable_run(tmp_path: Path) -> None:
     assert [item["eventType"] for item in notifications] == [
         RunEventType.QUEUED.value,
         RunEventType.STARTED.value,
-        RunEventType.ASSISTANT_DELTA.value,
-        RunEventType.ASSISTANT_DELTA.value,
         RunEventType.MODEL_USAGE.value,
         RunEventType.MODEL_COMPLETED.value,
+        RunEventType.ASSISTANT_DELTA.value,
         RunEventType.ASSISTANT_COMPLETED.value,
         RunEventType.COMPLETED.value,
     ]
-    assert [item["sequence"] for item in notifications] == list(range(1, 9))
+    assert [item["sequence"] for item in notifications] == list(range(1, 8))
     assert [message["content"] for message in detail["messages"]] == [
         "Stream this",
         "Streaming works",
     ]
+
+
+def test_jsonrpc_start_selects_a_budget_preset_and_rejects_unknown_names(tmp_path: Path) -> None:
+    provider = StreamingProvider()
+    with configured_client(tmp_path, provider) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-budget-test"})
+        session_id = client.post("/api/sessions").json()["id"]
+        with client.websocket_connect("/api/runtime") as websocket:
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "budget-start",
+                    "method": "run.start",
+                    "params": {
+                        "sessionId": session_id,
+                        "clientRequestId": "budget-request",
+                        "content": "Answer",
+                        "budgetPreset": "longer",
+                    },
+                }
+            )
+            received = receive_until(websocket, lambda item: item.get("id") == "budget-start")
+            response = next(item for item in received if item.get("id") == "budget-start")
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "bad-budget",
+                    "method": "run.start",
+                    "params": {
+                        "sessionId": session_id,
+                        "clientRequestId": "another-request",
+                        "content": "Answer",
+                        "budgetPreset": "unlimited",
+                    },
+                }
+            )
+            rejected = receive_until(websocket, lambda item: item.get("id") == "bad-budget")
+            error = next(item for item in rejected if item.get("id") == "bad-budget")
+        persisted = asyncio.run(client.app.state.database.get_run(response["result"]["runId"]))
+
+    assert response["result"]["budgetPreset"] == "longer"
+    assert response["result"]["limits"]["maxTotalTokens"] == 200_000
+    assert persisted is not None and persisted.budget_preset == "longer"
+    assert error["error"] == {"code": -32602, "message": "Invalid params: budgetPreset"}
+
+
+def test_jsonrpc_start_uses_settings_budget_default_when_unspecified(tmp_path: Path) -> None:
+    with configured_client(tmp_path, StreamingProvider()) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-budget"})
+        client.put("/api/settings/budget", json={"budget_preset": "longer"})
+        session_id = client.post("/api/sessions").json()["id"]
+        with client.websocket_connect("/api/runtime") as websocket:
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "default-budget",
+                    "method": "run.start",
+                    "params": {
+                        "sessionId": session_id,
+                        "clientRequestId": "default-budget-request",
+                        "content": "Answer",
+                    },
+                }
+            )
+            received = receive_until(websocket, lambda item: item.get("id") == "default-budget")
+        result = next(item["result"] for item in received if item.get("id") == "default-budget")
+
+    assert result["budgetPreset"] == "longer"
+
+
+def test_jsonrpc_start_selects_a_model_for_one_run_without_changing_settings(
+    tmp_path: Path,
+) -> None:
+    provider = StreamingProvider()
+    app = create_app(
+        Settings(environment="test", data_dir=tmp_path),
+        provider_adapters={"openai": provider, "anthropic": provider},
+    )
+    with TestClient(app) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-default"})
+        client.put("/api/settings/providers/anthropic/api-key", json={"api_key": "sk-model-test"})
+        session_id = client.post("/api/sessions").json()["id"]
+        with client.websocket_connect("/api/runtime") as websocket:
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "model-start",
+                    "method": "run.start",
+                    "params": {
+                        "sessionId": session_id,
+                        "clientRequestId": "model-request",
+                        "content": "Answer",
+                        "modelId": "anthropic:claude-sonnet-5",
+                    },
+                }
+            )
+            received = receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.COMPLETED.value
+                ),
+            )
+        result = next(item["result"] for item in received if item.get("id") == "model-start")
+        selected = client.get("/api/settings").json()["selected_model_id"]
+
+    assert result["modelId"] == "anthropic:claude-sonnet-5"
+    assert provider.request is not None
+    assert provider.request.model_id == "anthropic:claude-sonnet-5"
+    assert selected == "openai:gpt-5.5"
+
+
+def test_jsonrpc_start_rejects_invalid_or_unknown_model_choice(tmp_path: Path) -> None:
+    with configured_client(tmp_path, StreamingProvider()) as client:
+        session_id = client.post("/api/sessions").json()["id"]
+        with client.websocket_connect("/api/runtime") as websocket:
+            for request_id, model_id in (("bad-type", 42), ("unknown", "missing:model")):
+                websocket.send_json(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "run.start",
+                        "params": {
+                            "sessionId": session_id,
+                            "clientRequestId": request_id,
+                            "content": "Answer",
+                            "modelId": model_id,
+                        },
+                    }
+                )
+                response = receive_until(
+                    websocket, lambda item, target=request_id: item.get("id") == target
+                )[-1]
+                if request_id == "bad-type":
+                    assert response["error"] == {
+                        "code": -32602,
+                        "message": "Invalid params: modelId",
+                    }
+                else:
+                    assert response["error"]["data"]["code"] == "model_not_available"
 
 
 def test_jsonrpc_resume_replays_persisted_events_after_disconnect(tmp_path: Path) -> None:
@@ -205,7 +659,7 @@ def test_jsonrpc_resume_replays_persisted_events_after_disconnect(tmp_path: Path
     acknowledgement = next(item for item in resumed if item.get("id") == 2)
     events = [item["params"] for item in resumed if item.get("method") == "run.event"]
     assert acknowledgement["result"]["runId"] == run_id
-    assert [event["sequence"] for event in events] == list(range(5, 9))
+    assert [event["sequence"] for event in events] == list(range(5, 8))
 
 
 def test_jsonrpc_replays_when_a_live_event_sequence_has_a_gap(tmp_path: Path) -> None:
@@ -218,18 +672,18 @@ def test_jsonrpc_replays_when_a_live_event_sequence_has_a_gap(tmp_path: Path) ->
         event_hub: RuntimeEventHub = client.app.state.runtime_event_hub
         dropped = threading.Event()
 
-        class DropFirstDelta:
+        class DropFirstUsage:
             def __init__(self) -> None:
                 self.has_dropped = False
 
             async def publish(self, event: RunEvent) -> None:
-                if event.event_type is RunEventType.ASSISTANT_DELTA and not self.has_dropped:
+                if event.event_type is RunEventType.MODEL_USAGE and not self.has_dropped:
                     self.has_dropped = True
                     dropped.set()
                     return
                 await event_hub.publish(event)
 
-        client.app.state.run_service._event_publisher = DropFirstDelta()
+        client.app.state.run_service._event_publisher = DropFirstUsage()
         session_id = client.post("/api/sessions").json()["id"]
         with client.websocket_connect("/api/runtime") as websocket:
             websocket.send_json(
@@ -363,6 +817,84 @@ def test_custom_model_uses_registered_adapter_without_provider_specific_runtime_
     assert messages[-1]["model"] == "weights:v4"
 
 
+def test_unpriced_custom_model_stops_before_a_tool_continuation(tmp_path: Path) -> None:
+    class ToolingProvider(StreamingProvider):
+        def stream(
+            self, request: ModelRequest, api_key: str, user_id: str
+        ) -> AsyncGenerator[ModelStreamEvent]:
+            self.request = request
+
+            async def generate() -> AsyncGenerator[ModelStreamEvent]:
+                yield ModelStreamEvent(
+                    kind="tool_call", tool_call=ModelToolCall("custom-call", "list_files", {})
+                )
+                yield ModelStreamEvent(kind="usage", input_tokens=5, output_tokens=2)
+                yield ModelStreamEvent(kind="completed", finish_reason="tool_use")
+
+            return generate()
+
+    settings = Settings(environment="test", data_dir=tmp_path / "data")
+    provider = ToolingProvider()
+    app = create_app(settings, streaming_provider_adapters={"openai-compatible": provider})
+    with TestClient(app) as client:
+        with sqlite3.connect(settings.database_path) as connection:
+            connection.execute(
+                """INSERT INTO models(
+                       id, provider_id, provider_name, adapter_kind, upstream_model_id,
+                       name, requires_api_key, supports_streaming, supports_tools, enabled,
+                       created_at, updated_at
+                   ) VALUES (
+                       'weights:tooling', 'self-hosted', 'Self hosted', 'openai-compatible',
+                       'weights/tooling', 'Tooling', 0, 1, 1, 1,
+                       '2026-01-01', '2026-01-01'
+                   )"""
+            )
+            connection.execute(
+                "UPDATE app_settings SET selected_provider = ?, selected_model_id = ? WHERE id = 1",
+                ("self-hosted", "weights:tooling"),
+            )
+        session_id = client.post("/api/sessions", json={"workspace_path": str(tmp_path)}).json()[
+            "id"
+        ]
+        with client.websocket_connect("/api/runtime") as websocket:
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "custom-tool-run",
+                    "method": "run.start",
+                    "params": {
+                        "sessionId": session_id,
+                        "clientRequestId": "custom-tool-request",
+                        "content": "Inspect files",
+                    },
+                }
+            )
+            events = receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.FAILED.value
+                ),
+            )
+        run_id = next(item["result"]["runId"] for item in events if item.get("id"))
+        run = asyncio.run(client.app.state.database.get_run(run_id))
+        calls = asyncio.run(client.app.state.database.list_model_calls(run_id))
+        tools = asyncio.run(client.app.state.database.list_tool_calls(run_id))
+
+    assert run is not None and run.error_code == "pricing_unavailable"
+    assert len(calls) == 1 and calls[0].estimated_cost is None
+    assert tools == []
+    assert (
+        next(
+            item["params"]["data"]["estimated_cost_usd"]
+            for item in events
+            if item.get("method") == "run.event"
+            and item["params"]["eventType"] == RunEventType.MODEL_USAGE.value
+        )
+        is None
+    )
+
+
 def test_jsonrpc_run_start_rejects_invalid_session_with_protocol_error(tmp_path: Path) -> None:
     with (
         configured_client(tmp_path, StreamingProvider()) as client,
@@ -427,9 +959,10 @@ def test_jsonrpc_can_cancel_a_streaming_run(tmp_path: Path) -> None:
                 websocket,
                 lambda item: (
                     item.get("method") == "run.event"
-                    and item["params"]["eventType"] == RunEventType.ASSISTANT_DELTA.value
+                    and item["params"]["eventType"] == RunEventType.STARTED.value
                 ),
             )
+            assert provider.started.wait(timeout=5)
             run_id = next(
                 item["result"]["runId"] for item in started if item.get("id") == "start-cancel"
             )
@@ -458,6 +991,157 @@ def test_jsonrpc_can_cancel_a_streaming_run(tmp_path: Path) -> None:
         and item["params"]["eventType"] == RunEventType.CANCELLATION_REQUESTED.value
         for item in cancelled
     )
+
+
+def test_session_latest_run_lookup_tracks_active_and_terminal_runs(tmp_path: Path) -> None:
+    provider = BlockingStreamingProvider()
+    with configured_client(tmp_path, provider) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-lookup-test"})
+        session_id = client.post("/api/sessions").json()["id"]
+        latest_url = f"/api/sessions/{session_id}/runs/latest"
+        assert client.get(latest_url).json() is None
+        assert client.get("/api/sessions/missing/runs/latest").status_code == 404
+        with client.websocket_connect("/api/runtime") as websocket:
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "start-lookup",
+                    "method": "run.start",
+                    "params": {
+                        "sessionId": session_id,
+                        "turnId": "turn-lookup",
+                        "clientRequestId": "request-lookup",
+                        "content": "Keep working",
+                    },
+                }
+            )
+            started = receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.STARTED.value
+                ),
+            )
+            assert provider.started.wait(timeout=5)
+            run_id = next(
+                item["result"]["runId"] for item in started if item.get("id") == "start-lookup"
+            )
+            active = client.get(latest_url)
+            assert active.status_code == 200
+            assert active.json() == {
+                "run_id": run_id,
+                "turn_id": "turn-lookup",
+                "status": "running",
+                "last_sequence": 2,
+            }
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "cancel-lookup",
+                    "method": "run.cancel",
+                    "params": {"runId": run_id},
+                }
+            )
+            receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.CANCELLED.value
+                ),
+            )
+        terminal = client.get(latest_url)
+        assert terminal.status_code == 200
+        assert terminal.json()["run_id"] == run_id
+        assert terminal.json()["status"] == "cancelled"
+        assert terminal.json()["last_sequence"] > active.json()["last_sequence"]
+
+
+def test_waiting_approval_is_discoverable_and_replayed_after_socket_refresh(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "note.txt").write_text("review this\n", encoding="utf-8")
+    provider = ApprovalStreamingProvider()
+    app = create_app(
+        Settings(environment="test", data_dir=tmp_path / "data"),
+        provider_adapters={"openai": provider},
+        tool_registry=ToolRegistry(LocalReadToolExecutor(), approval_required_names={"read_file"}),
+    )
+    with TestClient(app) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-replay-test"})
+        session_id = client.post("/api/sessions", json={"workspace_path": str(workspace)}).json()[
+            "id"
+        ]
+        with client.websocket_connect("/api/runtime") as websocket:
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "start-waiting",
+                    "method": "run.start",
+                    "params": {
+                        "sessionId": session_id,
+                        "turnId": "waiting-turn",
+                        "clientRequestId": "waiting-request",
+                        "content": "Read the note",
+                    },
+                }
+            )
+            waiting = receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.TOOL_APPROVAL_REQUESTED.value
+                ),
+            )
+            run_id = next(
+                item["result"]["runId"] for item in waiting if item.get("id") == "start-waiting"
+            )
+            tool_call_id = waiting[-1]["params"]["data"]["tool_call_id"]
+
+        discovered = client.get(f"/api/sessions/{session_id}/runs/latest").json()
+        assert discovered == {
+            "run_id": run_id,
+            "turn_id": "waiting-turn",
+            "status": "waiting_for_approval",
+            "last_sequence": waiting[-1]["params"]["sequence"],
+        }
+
+        with client.websocket_connect("/api/runtime") as websocket:
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "resume-waiting",
+                    "method": "run.resume",
+                    "params": {"runId": run_id, "afterSequence": 0},
+                }
+            )
+            replayed = receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.TOOL_APPROVAL_REQUESTED.value
+                ),
+            )
+            events = [item["params"] for item in replayed if item.get("method") == "run.event"]
+            assert [event["sequence"] for event in events] == list(
+                range(1, discovered["last_sequence"] + 1)
+            )
+            assert events[-1]["data"]["tool_call_id"] == tool_call_id
+            assert provider.calls == 1
+            websocket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "cancel-waiting",
+                    "method": "run.cancel",
+                    "params": {"runId": run_id},
+                }
+            )
+            receive_until(
+                websocket,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.CANCELLED.value
+                ),
+            )
 
 
 def test_jsonrpc_rejects_resume_cursor_ahead_of_current_run(tmp_path: Path) -> None:

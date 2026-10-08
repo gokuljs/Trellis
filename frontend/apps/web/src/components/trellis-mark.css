@@ -1,0 +1,53 @@
+.trellis-mark {
+  display: block;
+  height: auto;
+  flex: 0 0 auto;
+  overflow: visible;
+}
+
+.trellis-mark__mask {
+  mask-type: luminance;
+}
+
+.trellis-mark__eye {
+  fill: currentColor;
+}
+
+.trellis-mark__eyelid {
+  animation: trellis-mark-blink 3.6s ease-in-out infinite;
+  fill: none;
+  opacity: 0;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-width: 0;
+}
+
+.trellis-mark__eyelid--right {
+  animation-delay: 80ms;
+}
+
+@keyframes trellis-mark-blink {
+  0%,
+  88%,
+  100% {
+    opacity: 0;
+    stroke-width: 0;
+  }
+
+  90%,
+  92% {
+    opacity: 1;
+    stroke-width: 12;
+  }
+
+  95% {
+    opacity: 0;
+    stroke-width: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .trellis-mark__eyelid {
+    animation: none;
+  }
+}

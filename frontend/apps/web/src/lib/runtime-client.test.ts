@@ -1,6 +1,33 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { cancelRun, streamRun } from "@/lib/runtime-client"
+import {
+  cancelRun,
+  mergeRunEvents,
+  resumeRun,
+  respondToToolApproval,
+  streamRun,
+} from "@/lib/runtime-client"
+
+it("keeps newer live events when saved history overlaps a running stream", () => {
+  const event = (sequence: number, eventType: string) => ({
+    runId: "run-1",
+    sequence,
+    eventType,
+    eventVersion: 1,
+    data: {},
+  })
+  expect(
+    mergeRunEvents(
+      "run-1",
+      [event(1, "run.queued"), event(2, "run.started")],
+      [
+        { ...event(4, "run.failed"), runId: "another-attempt" },
+        event(2, "run.started"),
+        event(3, "tool.call"),
+      ]
+    ).map((item) => item.sequence)
+  ).toEqual([1, 2, 3])
+})
 
 type SocketMessage = { data: string }
 
@@ -67,6 +94,54 @@ afterEach(() => {
 })
 
 describe("streamRun", () => {
+  it("reports the selected run limits from the start response", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-budget",
+          status: "running",
+          lastSequence: 0,
+          budgetPreset: "conservative",
+          limits: {
+            maxModelCalls: 8,
+            maxToolCalls: 16,
+            maxTotalTokens: 100000,
+            maxCostUsd: 2,
+            deadlineAt: "2026-10-07T12:10:00Z",
+          },
+        },
+      })
+      socket.reply(event("run-budget", 1, "run.completed", {}))
+    }
+    const onRunInfo = vi.fn()
+
+    await streamRun(
+      {
+        sessionId: "session-1",
+        turnId: "turn-budget",
+        clientRequestId: "request-budget",
+        content: "Hello",
+      },
+      { onRunInfo }
+    )
+
+    expect(onRunInfo).toHaveBeenCalledWith({
+      runId: "run-budget",
+      budgetPreset: "conservative",
+      limits: {
+        maxModelCalls: 8,
+        maxToolCalls: 16,
+        maxTotalTokens: 100000,
+        maxCostUsd: 2,
+        deadlineAt: "2026-10-07T12:10:00Z",
+      },
+    })
+  })
+
   it("starts a run and delivers ordered events through terminal completion", async () => {
     vi.stubGlobal("WebSocket", MockWebSocket)
     MockWebSocket.onSend = (socket, payload) => {
@@ -238,6 +313,127 @@ describe("streamRun", () => {
   })
 })
 
+describe("resumeRun", () => {
+  it("replays again when replay_required arrives before the resume response", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    let resumes = 0
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      expect(request).toMatchObject({
+        method: "run.resume",
+        params: { runId: "run-early-replay", afterSequence: 0 },
+      })
+      resumes += 1
+      if (resumes === 1) {
+        socket.reply({
+          jsonrpc: "2.0",
+          method: "run.replay_required",
+          params: { runId: "run-early-replay", afterSequence: 0 },
+        })
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-early-replay",
+            status: "running",
+            lastSequence: 0,
+          },
+        })
+        return
+      }
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-early-replay",
+          status: "running",
+          lastSequence: 2,
+        },
+      })
+      socket.reply(
+        event("run-early-replay", 1, "run.queued", { status: "queued" })
+      )
+      socket.reply(
+        event("run-early-replay", 2, "run.completed", { status: "completed" })
+      )
+    }
+    const onEvent = vi.fn()
+
+    await expect(resumeRun("run-early-replay", { onEvent })).resolves.toEqual({
+      runId: "run-early-replay",
+    })
+    expect(resumes).toBe(2)
+    expect(onEvent.mock.calls.map(([runEvent]) => runEvent.sequence)).toEqual([
+      1, 2,
+    ])
+  })
+
+  it("replays a discovered run from the beginning without starting another run", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      expect(request).toMatchObject({
+        method: "run.resume",
+        params: { runId: "run-restored", afterSequence: 0 },
+      })
+      socket.reply(event("run-restored", 1, "run.queued", { status: "queued" }))
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "run-restored", status: "running", lastSequence: 2 },
+      })
+      socket.reply(
+        event("run-restored", 2, "assistant.delta", { text: "Restored" })
+      )
+      socket.reply(
+        event("run-restored", 3, "run.completed", { status: "completed" })
+      )
+    }
+    const onEvent = vi.fn()
+    const onRunId = vi.fn()
+
+    await expect(
+      resumeRun("run-restored", { onEvent, onRunId })
+    ).resolves.toEqual({ runId: "run-restored" })
+
+    expect(onRunId).toHaveBeenCalledOnce()
+    expect(onRunId).toHaveBeenCalledWith("run-restored")
+    expect(onEvent.mock.calls.map(([runEvent]) => runEvent.sequence)).toEqual([
+      1, 2, 3,
+    ])
+    expect(MockWebSocket.instances).toHaveLength(1)
+  })
+
+  it("resumes from the last delivered event after a later connection loss", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      expect(request).toMatchObject({
+        method: "run.resume",
+        params: { runId: "run-reconnect", afterSequence: 3 },
+      })
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "run-reconnect", status: "running", lastSequence: 4 },
+      })
+      socket.reply(
+        event("run-reconnect", 4, "assistant.delta", { text: "Done" })
+      )
+      socket.reply(
+        event("run-reconnect", 5, "run.completed", { status: "completed" })
+      )
+    }
+    const onEvent = vi.fn()
+
+    await resumeRun("run-reconnect", { onEvent }, 3)
+
+    expect(onEvent.mock.calls.map(([runEvent]) => runEvent.sequence)).toEqual([
+      4, 5,
+    ])
+  })
+})
+
 describe("cancelRun", () => {
   it("cancels a run at the last event cursor", async () => {
     vi.stubGlobal("WebSocket", MockWebSocket)
@@ -259,5 +455,62 @@ describe("cancelRun", () => {
       runId: "run-stop",
       status: "cancelling",
     })
+  })
+})
+
+describe("respondToToolApproval", () => {
+  it("answers the exact waiting call at the current event cursor", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      expect(request).toMatchObject({
+        jsonrpc: "2.0",
+        method: "run.respond",
+        params: {
+          runId: "run-edit",
+          toolCallId: "tool-7",
+          decision: "approved",
+          afterSequence: 12,
+        },
+      })
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-edit",
+          status: "waiting_for_approval",
+          toolCallId: "tool-7",
+          decision: "approved",
+        },
+      })
+    }
+
+    await expect(
+      respondToToolApproval("run-edit", "tool-7", "approved", 12)
+    ).resolves.toEqual({
+      runId: "run-edit",
+      toolCallId: "tool-7",
+      decision: "approved",
+    })
+  })
+
+  it("surfaces a late decision as a retryable local error", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: {
+          code: -32000,
+          message: "This tool call is not waiting for approval.",
+          data: { code: "approval_not_pending" },
+        },
+      })
+    }
+
+    await expect(
+      respondToToolApproval("run-edit", "tool-7", "denied", 12)
+    ).rejects.toMatchObject({ code: "approval_not_pending" })
   })
 })

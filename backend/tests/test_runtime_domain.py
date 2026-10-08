@@ -1,6 +1,15 @@
 import pytest
 
-from app.domain.runtime import ModelStreamEvent, RunStatus, transition_run
+from app.domain.runtime import (
+    ModelContinuationItem,
+    ModelMessage,
+    ModelRequest,
+    ModelStreamEvent,
+    ModelToolCall,
+    ModelToolSpec,
+    RunStatus,
+    transition_run,
+)
 
 
 def test_run_state_transitions_allow_only_lifecycle_progression() -> None:
@@ -8,6 +17,17 @@ def test_run_state_transitions_allow_only_lifecycle_progression() -> None:
     assert transition_run(RunStatus.RUNNING, RunStatus.COMPLETED) is RunStatus.COMPLETED
     assert transition_run(RunStatus.QUEUED, RunStatus.CANCELLED) is RunStatus.CANCELLED
     assert transition_run(RunStatus.RUNNING, RunStatus.INTERRUPTED) is RunStatus.INTERRUPTED
+
+
+def test_run_can_pause_for_approval_and_resume_or_cancel() -> None:
+    assert (
+        transition_run(RunStatus.RUNNING, RunStatus.WAITING_FOR_APPROVAL)
+        is RunStatus.WAITING_FOR_APPROVAL
+    )
+    assert transition_run(RunStatus.WAITING_FOR_APPROVAL, RunStatus.RUNNING) is RunStatus.RUNNING
+    assert (
+        transition_run(RunStatus.WAITING_FOR_APPROVAL, RunStatus.CANCELLING) is RunStatus.CANCELLING
+    )
 
 
 @pytest.mark.parametrize(
@@ -57,3 +77,51 @@ def test_normalized_model_usage_rejects_negative_optional_counts(field: str) -> 
             ModelStreamEvent(kind="usage", reasoning_tokens=-1)
         else:
             ModelStreamEvent(kind="usage", cached_tokens=-1)
+
+
+def test_model_request_carries_tools_and_their_round_trip_messages() -> None:
+    call = ModelToolCall(id="call-1", name="read_file", arguments={"path": "README.md"})
+    tool = ModelToolSpec(
+        name="read_file",
+        description="Read a workspace file",
+        input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
+    )
+    request = ModelRequest(
+        provider_id="openai",
+        model_id="openai:test",
+        adapter_kind="openai",
+        upstream_model_id="test",
+        messages=(
+            ModelMessage(role="assistant", content="I'll read it.", tool_calls=(call,)),
+            ModelMessage(role="tool", content="File contents", tool_call_id="call-1"),
+        ),
+        max_output_tokens=256,
+        system_instructions="Follow the workspace rules.",
+        tools=(tool,),
+    )
+
+    assert request.messages[0].tool_calls == (call,)
+    assert request.messages[1].tool_call_id == "call-1"
+    assert request.tools == (tool,)
+    assert request.system_instructions == "Follow the workspace rules."
+    assert ModelStreamEvent(kind="tool_call", tool_call=call).tool_call == call
+
+
+def test_stream_rejects_tool_call_event_without_a_complete_call() -> None:
+    with pytest.raises(ValueError, match="tool_call events require a tool call"):
+        ModelStreamEvent(kind="tool_call")
+
+
+def test_opaque_model_continuation_can_move_from_stream_to_next_request() -> None:
+    continuation = ModelContinuationItem(
+        provider_id="openai",
+        model_id="openai:gpt-5.5",
+        payload_json='{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}',
+    )
+    event = ModelStreamEvent(kind="continuation_item", continuation_item=continuation)
+    message = ModelMessage(role="assistant", content="", continuation_items=(continuation,))
+
+    assert event.continuation_item == message.continuation_items[0]
+
+    with pytest.raises(ValueError, match="continuation_item events require"):
+        ModelStreamEvent(kind="continuation_item")

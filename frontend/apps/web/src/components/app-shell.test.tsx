@@ -25,6 +25,7 @@ const profile = {
 const settings = {
   selected_provider: "openai",
   selected_model_id: "openai:gpt-5.5",
+  default_budget_preset: "conservative",
   providers: [
     {
       id: "openai",
@@ -89,6 +90,7 @@ const recentSession = {
   created_at: "2026-08-24T10:00:00Z",
   updated_at: "2026-08-25T10:00:00Z",
   message_count: 2,
+  workspace_path: null,
 }
 
 const olderSession = {
@@ -97,6 +99,7 @@ const olderSession = {
   created_at: "2026-07-20T10:00:00Z",
   updated_at: "2026-07-20T10:00:00Z",
   message_count: 1,
+  workspace_path: null,
 }
 
 function response(body: unknown, status = 200) {
@@ -130,6 +133,16 @@ function deferred<T>() {
     resolve = promiseResolve
   })
   return { promise, resolve }
+}
+
+function sidebarSessionTitles() {
+  return Array.from(document.querySelectorAll(".session-row")).map((row) =>
+    row.getAttribute("aria-label")
+  )
+}
+
+async function openSavedSession(title: string) {
+  await userEvent.click(await screen.findByRole("button", { name: title }))
 }
 
 class TestWebSocket {
@@ -225,6 +238,9 @@ function startupFetch(
     if (url === "/api/onboarding" && method === "GET")
       return response(onboardingState)
     if (url === "/api/sessions" && method === "GET") return response([])
+    if (url.endsWith("/runs/latest") && method === "GET") return response(null)
+    if (url.includes("/runs?") && method === "GET")
+      return response({ items: [], next_offset: null })
     throw new Error(`Unhandled request: ${method} ${url}`)
   })
 }
@@ -238,6 +254,1229 @@ afterEach(() => {
 })
 
 describe("local-first chat", () => {
+  it("reports saved activity lookup failures and retries the chat load", async () => {
+    const session = {
+      ...recentSession,
+      id: "session-history-error",
+      message_count: 2,
+    }
+    let lookups = 0
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([session])
+        if (url === `/api/sessions/${session.id}`)
+          return response({
+            session,
+            messages: [
+              {
+                id: "user-error",
+                turn_id: "turn-error",
+                role: "user",
+                content: "Prompt",
+                provider: null,
+                model: null,
+                created_at: "2026-10-07T12:00:00Z",
+              },
+              {
+                id: "answer-error",
+                turn_id: "turn-error",
+                role: "assistant",
+                content: "Answer",
+                provider: "openai",
+                model: "gpt-5.5",
+                created_at: "2026-10-07T12:00:02Z",
+              },
+            ],
+          })
+        if (url === `/api/sessions/${session.id}/runs?offset=0&limit=100`) {
+          lookups += 1
+          if (lookups === 1) throw new Error("History unavailable")
+          return response({
+            items: [
+              {
+                run_id: "run-recovered-history",
+                turn_id: "turn-error",
+                retry_of: null,
+                status: "completed",
+                budget_preset: "conservative",
+                max_model_calls: 8,
+                max_tool_calls: 16,
+                max_total_tokens: 100000,
+                max_cost_usd: 2,
+                deadline_at: "2026-10-07T12:10:00Z",
+                last_sequence: 2,
+                created_at: "2026-10-07T12:00:00Z",
+                started_at: "2026-10-07T12:00:01Z",
+                finished_at: "2026-10-07T12:00:02Z",
+              },
+            ],
+            next_offset: null,
+          })
+        }
+        return undefined
+      })
+    )
+    renderApp()
+    await openSavedSession(session.title)
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("Saved activity could not be loaded")
+    await userEvent.click(
+      within(alert).getByRole("button", { name: "Retry activity" })
+    )
+    expect(
+      await screen.findByRole("button", { name: /^Completed/ })
+    ).toBeInTheDocument()
+    expect(screen.queryByText("Saved activity could not be loaded")).toBeNull()
+    expect(lookups).toBe(2)
+  })
+
+  it("loads paged saved attempts and fetches their events only when expanded", async () => {
+    const session = {
+      ...recentSession,
+      id: "session-saved-activity",
+      message_count: 2,
+    }
+    const turnId = "turn-saved-activity"
+    const runSummary = (runId: string, status: string, finishedAt: string) => ({
+      run_id: runId,
+      turn_id: turnId,
+      retry_of: runId === "attempt-2" ? "attempt-1" : null,
+      status,
+      budget_preset: "conservative",
+      max_model_calls: 8,
+      max_tool_calls: 16,
+      max_total_tokens: 100000,
+      max_cost_usd: 2,
+      deadline_at: "2026-10-07T12:10:00Z",
+      last_sequence: runId === "attempt-2" ? 3 : 2,
+      created_at: "2026-10-07T12:00:00Z",
+      started_at: "2026-10-07T12:00:01Z",
+      finished_at: finishedAt,
+    })
+    const fetchedEvents: string[] = []
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([session])
+        if (url === `/api/sessions/${session.id}`)
+          return response({
+            session,
+            messages: [
+              {
+                id: "user-saved",
+                turn_id: turnId,
+                role: "user",
+                content: "Try this",
+                provider: null,
+                model: null,
+                created_at: "2026-10-07T12:00:00Z",
+              },
+              {
+                id: "assistant-saved",
+                turn_id: turnId,
+                role: "assistant",
+                content: "Done",
+                provider: "openai",
+                model: "gpt-5.5",
+                created_at: "2026-10-07T12:00:05Z",
+              },
+            ],
+          })
+        if (url === `/api/sessions/${session.id}/runs?offset=0&limit=100`)
+          return response({
+            items: [runSummary("attempt-1", "failed", "2026-10-07T12:00:02Z")],
+            next_offset: 1,
+          })
+        if (url === `/api/sessions/${session.id}/runs?offset=1&limit=100`)
+          return response({
+            items: [
+              runSummary("attempt-2", "completed", "2026-10-07T12:00:05Z"),
+            ],
+            next_offset: null,
+          })
+        if (url.includes("/runs/attempt-1/events")) {
+          fetchedEvents.push(url)
+          return response({
+            items: [
+              {
+                run_id: "attempt-1",
+                sequence: 1,
+                event_type: "run.queued",
+                event_version: 1,
+                data: {},
+                created_at: "2026-10-07T12:00:00Z",
+              },
+              {
+                run_id: "attempt-1",
+                sequence: 2,
+                event_type: "run.failed",
+                event_version: 1,
+                data: { message: "First attempt failed" },
+                created_at: "2026-10-07T12:00:02Z",
+              },
+            ],
+            next_after_sequence: null,
+          })
+        }
+        if (url.includes("/runs/attempt-2/events")) {
+          fetchedEvents.push(url)
+          if (url.includes("after_sequence=0"))
+            return response({
+              items: [
+                {
+                  run_id: "attempt-2",
+                  sequence: 1,
+                  event_type: "run.queued",
+                  event_version: 1,
+                  data: {},
+                  created_at: "2026-10-07T12:00:00Z",
+                },
+                {
+                  run_id: "attempt-2",
+                  sequence: 2,
+                  event_type: "model.usage",
+                  event_version: 1,
+                  data: { input_tokens: 2, output_tokens: 1 },
+                  created_at: "2026-10-07T12:00:03Z",
+                },
+              ],
+              next_after_sequence: 2,
+            })
+          return response({
+            items: [
+              {
+                run_id: "attempt-2",
+                sequence: 3,
+                event_type: "run.completed",
+                event_version: 1,
+                data: {},
+                created_at: "2026-10-07T12:00:05Z",
+              },
+            ],
+            next_after_sequence: null,
+          })
+        }
+        return undefined
+      })
+    )
+    renderApp()
+    await openSavedSession(session.title)
+    const activity = await screen.findByRole("button", { name: /Completed/ })
+    expect(activity).toHaveTextContent("5s")
+    expect(fetchedEvents).toEqual([])
+    await userEvent.click(activity)
+    expect(await screen.findByText("First attempt failed")).toBeInTheDocument()
+    expect(screen.getByText("Model usage")).toBeInTheDocument()
+    expect(fetchedEvents).toHaveLength(3)
+    expect(screen.getByText("Attempt 1")).toBeInTheDocument()
+    await userEvent.click(activity)
+    await userEvent.click(activity)
+    expect(fetchedEvents).toHaveLength(3)
+  })
+
+  it("omits Capabilities navigation and keeps the new-session welcome view", async () => {
+    vi.stubGlobal(
+      "fetch",
+      startupFetch(() => undefined)
+    )
+
+    renderApp()
+
+    await screen.findByRole("textbox", { name: "Message" })
+    expect(
+      screen.queryByRole("button", { name: "Capabilities" })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.getByText("What would you like to work on?")
+    ).toBeInTheDocument()
+  })
+
+  it("shows an upward send arrow while an empty draft remains disabled", async () => {
+    vi.stubGlobal(
+      "fetch",
+      startupFetch(() => undefined)
+    )
+
+    renderApp()
+
+    await screen.findByRole("textbox", { name: "Message" })
+    const sendButton = screen.getByRole("button", { name: "Send" })
+    expect(sendButton).toBeDisabled()
+    expect(sendButton.querySelector("svg.lucide-arrow-up")).toBeInTheDocument()
+  })
+
+  it("shows an approval preview, answers it, and keeps the ordered tool result in chat", async () => {
+    const created = {
+      ...recentSession,
+      id: "session-approval",
+      message_count: 0,
+      workspace_path: "/tmp/trellis-project",
+    }
+    let runSocket: TestWebSocket | null = null
+    let turnId = ""
+    const decisionGate = deferred<void>()
+    const requests: Record<string, unknown>[] = []
+    installRuntimeServer((socket, request) => {
+      requests.push(request)
+      if (request.method === "run.start") {
+        runSocket = socket
+        turnId = String((request.params as Record<string, unknown>).turnId)
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-approval",
+            status: "running",
+            lastSequence: 0,
+            budgetPreset: "conservative",
+            limits: {
+              maxModelCalls: 8,
+              maxToolCalls: 16,
+              maxTotalTokens: 100000,
+              maxCostUsd: 2,
+              deadlineAt: "2026-10-07T12:10:00Z",
+            },
+          },
+        })
+        runtimeEvent(socket, "run-approval", 1, "run.queued", {
+          status: "queued",
+        })
+        runtimeEvent(socket, "run-approval", 2, "run.started", {
+          status: "running",
+        })
+        runtimeEvent(socket, "run-approval", 3, "model.usage", {
+          input_tokens: 20,
+          output_tokens: 10,
+          total_tokens: 30,
+          total_estimated_cost_usd: 0.001,
+        })
+        runtimeEvent(socket, "run-approval", 4, "model.completed", {})
+        runtimeEvent(socket, "run-approval", 5, "tool.call", {
+          tool_call_id: "tool-patch",
+          name: "apply_patch",
+          arguments: { path: "src/main.ts" },
+        })
+        runtimeEvent(socket, "run-approval", 6, "tool.approval_requested", {
+          tool_call_id: "tool-patch",
+          name: "apply_patch",
+          preview: { path: "src/main.ts", diff: "-old\n+new" },
+        })
+      } else if (request.method === "run.respond") {
+        expect(request.params).toMatchObject({
+          runId: "run-approval",
+          toolCallId: "tool-patch",
+          decision: "approved",
+          afterSequence: 6,
+        })
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-approval",
+            status: "waiting_for_approval",
+            toolCallId: "tool-patch",
+            decision: "approved",
+          },
+        })
+        if (!runSocket) throw new Error("Run socket missing")
+        const eventSocket = runSocket
+        void decisionGate.promise.then(() => {
+          runtimeEvent(
+            eventSocket,
+            "run-approval",
+            7,
+            "tool.approval_decided",
+            {
+              tool_call_id: "tool-patch",
+              decision: "approved",
+            }
+          )
+          runtimeEvent(eventSocket, "run-approval", 8, "run.resumed", {
+            tool_call_id: "tool-patch",
+          })
+          runtimeEvent(eventSocket, "run-approval", 9, "tool.result", {
+            tool_call_id: "tool-patch",
+            status: "completed",
+            content: "Patch applied.",
+          })
+          runtimeEvent(eventSocket, "run-approval", 10, "model.usage", {
+            input_tokens: 40,
+            output_tokens: 10,
+            total_tokens: 80,
+            total_estimated_cost_usd: 0.002,
+          })
+          runtimeEvent(eventSocket, "run-approval", 11, "model.completed", {})
+          runtimeEvent(eventSocket, "run-approval", 12, "assistant.delta", {
+            text: "Updated.",
+          })
+          runtimeEvent(eventSocket, "run-approval", 13, "assistant.completed", {
+            content: "Updated.",
+          })
+          runtimeEvent(eventSocket, "run-approval", 14, "run.completed", {
+            status: "completed",
+          })
+        })
+      }
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url, init) => {
+        if (url === "/api/sessions" && init?.method === "POST")
+          return response(created, 201)
+        if (
+          url === "/api/sessions/session-approval" &&
+          (init?.method ?? "GET") === "GET"
+        ) {
+          return response({
+            session: { ...created, message_count: 2 },
+            messages: [
+              {
+                id: "user-approval",
+                turn_id: turnId,
+                role: "user",
+                content: "Update it",
+                provider: null,
+                model: null,
+                created_at: "2026-10-07T12:00:00Z",
+              },
+              {
+                id: "assistant-approval",
+                turn_id: turnId,
+                role: "assistant",
+                content: "Updated.",
+                provider: "openai",
+                model: "gpt-5.5",
+                created_at: "2026-10-07T12:00:01Z",
+              },
+            ],
+          })
+        }
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.type(
+      screen.getByRole("textbox", { name: "Message" }),
+      "Update it"
+    )
+    await user.click(screen.getByRole("button", { name: "Send" }))
+
+    await user.click(
+      await screen.findByRole("button", { name: "Needs approval" })
+    )
+    const approval = await screen.findByRole("region", {
+      name: "Approval required for apply_patch",
+    })
+    expect(within(approval).getByText(/\+new/)).toBeInTheDocument()
+    expect(screen.getByText("30 / 100,000 tokens")).toBeInTheDocument()
+    await user.click(within(approval).getByRole("button", { name: "Approve" }))
+    await waitFor(() =>
+      expect(
+        within(approval).getByRole("button", { name: "Approve" })
+      ).toBeDisabled()
+    )
+    decisionGate.resolve()
+
+    expect(await screen.findByText("Patch applied.")).toBeInTheDocument()
+    expect(await screen.findByText("Updated.")).toBeInTheDocument()
+    expect(screen.getByText("80 / 100,000 tokens")).toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: "Approve" })
+    ).not.toBeInTheDocument()
+    expect(requests.map((request) => request.method)).toEqual([
+      "run.start",
+      "run.respond",
+    ])
+  })
+
+  it("accepts a second approval before the first response RPC returns", async () => {
+    const created = {
+      ...recentSession,
+      id: "session-two-approvals",
+      message_count: 0,
+    }
+    let runSocket: TestWebSocket | null = null
+    let turnId = ""
+    let firstResponse: {
+      socket: TestWebSocket
+      request: Record<string, unknown>
+    } | null = null
+    const decisions: Record<string, unknown>[] = []
+    installRuntimeServer((socket, request) => {
+      if (request.method === "run.start") {
+        runSocket = socket
+        turnId = String((request.params as Record<string, unknown>).turnId)
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-two-approvals",
+            status: "running",
+            lastSequence: 0,
+          },
+        })
+        runtimeEvent(
+          socket,
+          "run-two-approvals",
+          1,
+          "tool.approval_requested",
+          {
+            tool_call_id: "tool-1",
+            name: "run_command",
+            preview: { command: "git status" },
+          }
+        )
+        return
+      }
+      if (request.method !== "run.respond") return
+      decisions.push(request)
+      if (decisions.length === 1) {
+        firstResponse = { socket, request }
+        if (!runSocket) throw new Error("Run socket missing")
+        runtimeEvent(
+          runSocket,
+          "run-two-approvals",
+          2,
+          "tool.approval_decided",
+          {
+            tool_call_id: "tool-1",
+            decision: "approved",
+          }
+        )
+        runtimeEvent(runSocket, "run-two-approvals", 3, "tool.result", {
+          tool_call_id: "tool-1",
+          status: "completed",
+          content: "First command done.",
+        })
+        runtimeEvent(
+          runSocket,
+          "run-two-approvals",
+          4,
+          "tool.approval_requested",
+          {
+            tool_call_id: "tool-2",
+            name: "run_command",
+            preview: { command: "git diff" },
+          }
+        )
+        return
+      }
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "run-two-approvals", status: "waiting_for_approval" },
+      })
+      if (!runSocket || !firstResponse)
+        throw new Error("Approval sockets missing")
+      firstResponse.socket.reply({
+        jsonrpc: "2.0",
+        id: firstResponse.request.id,
+        result: { runId: "run-two-approvals", status: "waiting_for_approval" },
+      })
+      runtimeEvent(runSocket, "run-two-approvals", 5, "tool.approval_decided", {
+        tool_call_id: "tool-2",
+        decision: "approved",
+      })
+      runtimeEvent(runSocket, "run-two-approvals", 6, "assistant.delta", {
+        text: "Done.",
+      })
+      runtimeEvent(runSocket, "run-two-approvals", 7, "assistant.completed", {
+        content: "Done.",
+      })
+      runtimeEvent(runSocket, "run-two-approvals", 8, "run.completed", {
+        status: "completed",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url, init) => {
+        if (url === "/api/sessions" && init?.method === "POST")
+          return response(created, 201)
+        if (url === "/api/sessions/session-two-approvals")
+          return response({
+            session: { ...created, message_count: 2 },
+            messages: [
+              {
+                id: "user-two-approvals",
+                turn_id: turnId,
+                role: "user",
+                content: "Run two commands",
+                provider: null,
+                model: null,
+                created_at: "2026-10-07T12:00:00Z",
+              },
+              {
+                id: "assistant-two-approvals",
+                turn_id: turnId,
+                role: "assistant",
+                content: "Done.",
+                provider: "openai",
+                model: "gpt-5.5",
+                created_at: "2026-10-07T12:00:01Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+    renderApp()
+    await user.type(
+      await screen.findByRole("textbox", { name: "Message" }),
+      "Run two commands"
+    )
+    await user.click(screen.getByRole("button", { name: "Send" }))
+    await user.click(
+      await screen.findByRole("button", { name: "Needs approval" })
+    )
+    const firstApproval = await screen.findByRole("region", {
+      name: "Approval required for run_command",
+    })
+    await user.click(
+      within(firstApproval).getByRole("button", { name: "Approve" })
+    )
+    const secondApproval = (
+      await screen.findByText("git diff")
+    ).closest<HTMLElement>('[role="region"]')
+    if (!secondApproval) throw new Error("Second approval missing")
+    await user.click(
+      within(secondApproval).getByRole("button", { name: "Approve" })
+    )
+    await waitFor(() => expect(decisions).toHaveLength(2))
+    expect(
+      decisions.map(
+        (item) => (item.params as Record<string, unknown>).toolCallId
+      )
+    ).toEqual(["tool-1", "tool-2"])
+    expect(await screen.findByText("Done.")).toBeInTheDocument()
+  })
+
+  it("keeps earlier turn activity beside its answer after another run", async () => {
+    const created = {
+      ...recentSession,
+      id: "session-history",
+      message_count: 0,
+    }
+    const turnIds: string[] = []
+    let completedRuns = 0
+    installRuntimeServer((socket, request) => {
+      if (request.method !== "run.start") return
+      turnIds.push(String((request.params as Record<string, unknown>).turnId))
+      const runNumber = turnIds.length
+      const runId = `run-${runNumber}`
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId, status: "running", lastSequence: 0 },
+      })
+      if (runNumber === 1) {
+        runtimeEvent(socket, runId, 1, "tool.call", {
+          tool_call_id: "tool-1",
+          name: "read_file",
+          arguments: { path: "src/main.ts" },
+        })
+        runtimeEvent(socket, runId, 2, "tool.result", {
+          tool_call_id: "tool-1",
+          status: "completed",
+          content: "First tool output",
+        })
+      }
+      completedRuns = runNumber
+      runtimeEvent(socket, runId, runNumber === 1 ? 3 : 1, "assistant.delta", {
+        text: runNumber === 1 ? "First answer" : "Second answer",
+      })
+      runtimeEvent(
+        socket,
+        runId,
+        runNumber === 1 ? 4 : 2,
+        "assistant.completed",
+        {
+          content: runNumber === 1 ? "First answer" : "Second answer",
+        }
+      )
+      runtimeEvent(socket, runId, runNumber === 1 ? 5 : 3, "run.completed", {
+        status: "completed",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url, init) => {
+        if (url === "/api/sessions" && init?.method === "POST")
+          return response(created, 201)
+        if (url === "/api/sessions/session-history") {
+          const messages: TestMessage[] = []
+          for (let index = 0; index < completedRuns; index += 1) {
+            messages.push({
+              id: `user-${index}`,
+              turn_id: turnIds[index],
+              role: "user",
+              content: index === 0 ? "First prompt" : "Second prompt",
+              provider: null,
+              model: null,
+              created_at: "2026-10-07T12:00:00Z",
+            })
+            messages.push({
+              id: `assistant-${index}`,
+              turn_id: turnIds[index],
+              role: "assistant",
+              content: index === 0 ? "First answer" : "Second answer",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-10-07T12:00:01Z",
+            })
+          }
+          return response({
+            session: { ...created, message_count: messages.length },
+            messages,
+          })
+        }
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+    renderApp()
+    const composer = await screen.findByRole("textbox", { name: "Message" })
+    await user.type(composer, "First prompt")
+    await user.click(screen.getByRole("button", { name: "Send" }))
+    expect(await screen.findByText("First answer")).toBeInTheDocument()
+    await user.click(screen.getByRole("button", { name: "Completed" }))
+    expect(screen.getByText("First tool output")).toBeInTheDocument()
+
+    await user.type(composer, "Second prompt")
+    await user.click(screen.getByRole("button", { name: "Send" }))
+    expect(await screen.findByText("Second answer")).toBeInTheDocument()
+    const toggles = screen.getAllByRole("button", { name: "Completed" })
+    expect(toggles).toHaveLength(2)
+    await user.click(toggles[0])
+    const firstResult = screen.getByText("First tool output")
+    const firstAnswer = screen.getByText("First answer")
+    expect(
+      firstResult.compareDocumentPosition(firstAnswer) &
+        Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
+    const activities = screen.getAllByRole("region", { name: "Run activity" })
+    expect(activities).toHaveLength(1)
+    expect(
+      within(activities[0]).getByText("First tool output")
+    ).toBeInTheDocument()
+    expect(
+      firstAnswer.compareDocumentPosition(toggles[1]) &
+        Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
+  })
+
+  it("uses the Settings-selected model for runs and keeps the budget choice", async () => {
+    const configuredSettings = {
+      ...settings,
+      providers: settings.providers.map((provider) => ({
+        ...provider,
+        configured: true,
+      })),
+      models: settings.models.map((model) => ({ ...model, configured: true })),
+      default_budget_preset: "conservative",
+    }
+    const runtimeRequests: Record<string, unknown>[] = []
+    installRuntimeServer((socket, request) => {
+      runtimeRequests.push(request)
+      if (request.method === "run.start") {
+        completeRuntimeRun(socket, request, "run-selected-model", "Done")
+      }
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url, init) => {
+        if (url === "/api/settings") return response(configuredSettings)
+        if (url === "/api/sessions" && init?.method === "POST") {
+          return response(recentSession, 201)
+        }
+        if (url === `/api/sessions/${recentSession.id}`) {
+          return response({ session: recentSession, messages: [] })
+        }
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    expect(
+      screen.queryByRole("combobox", { name: "Run model" })
+    ).not.toBeInTheDocument()
+    expect(screen.queryByText("GPT-5.5")).not.toBeInTheDocument()
+    expect(screen.queryByText("Claude Sonnet 5")).not.toBeInTheDocument()
+    const runBudgetSelect = screen.getByRole("combobox", { name: "Run budget" })
+    expect(
+      within(runBudgetSelect).getByRole("option", { name: "Standard" })
+    ).toBeInTheDocument()
+    expect(
+      within(runBudgetSelect).getByRole("option", { name: "Extended" })
+    ).toBeInTheDocument()
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Run budget" }),
+      "longer"
+    )
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "Answer")
+    await user.click(screen.getByRole("button", { name: "Send" }))
+
+    await waitFor(() =>
+      expect(runtimeRequests[0]).toMatchObject({
+        method: "run.start",
+        params: {
+          modelId: "openai:gpt-5.5",
+          budgetPreset: "longer",
+        },
+      })
+    )
+  })
+
+  it("does not show the selected model when only one model is configured", async () => {
+    vi.stubGlobal(
+      "fetch",
+      startupFetch(() => undefined)
+    )
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    expect(screen.queryByText("GPT-5.5")).not.toBeInTheDocument()
+    expect(screen.queryByRole("combobox", { name: "Run model" })).toBeNull()
+    expect(
+      screen.getByRole("combobox", { name: "Run budget" })
+    ).toBeInTheDocument()
+  })
+
+  it("saves a default budget in Settings and uses it in the composer", async () => {
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/settings/budget" && init?.method === "PUT") {
+        expect(JSON.parse(String(init.body))).toEqual({
+          budget_preset: "longer",
+        })
+        return response({ ...settings, default_budget_preset: "longer" })
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await user.click(await screen.findByRole("button", { name: "Settings" }))
+    const defaultBudgetSelect = screen.getByRole("combobox", {
+      name: "Default run budget",
+    })
+    expect(
+      within(defaultBudgetSelect).getByRole("option", { name: "Standard" })
+    ).toBeInTheDocument()
+    expect(
+      within(defaultBudgetSelect).getByRole("option", { name: "Extended" })
+    ).toBeInTheDocument()
+    await user.selectOptions(defaultBudgetSelect, "longer")
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/settings/budget",
+        expect.objectContaining({ method: "PUT" })
+      )
+    )
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Default run budget" })
+      ).toHaveValue("longer")
+    )
+    await user.click(screen.getByRole("button", { name: /New session/ }))
+    expect(screen.getByRole("combobox", { name: "Run budget" })).toHaveValue(
+      "longer"
+    )
+  })
+
+  it("opens and dismisses the composer attachment menu", async () => {
+    vi.stubGlobal(
+      "fetch",
+      startupFetch(() => undefined)
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    expect(await screen.findByRole("menu")).toBeInTheDocument()
+
+    await user.click(screen.getByRole("textbox", { name: "Message" }))
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.keyboard("{Escape}")
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.keyboard("{Tab}")
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument()
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveFocus()
+  })
+
+  it("supports arrow-key navigation in the composer attachment menu", async () => {
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        return response(
+          {
+            error: {
+              code: "workspace_picker_unavailable",
+              message: "Trellis could not open the folder picker.",
+            },
+          },
+          503
+        )
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    const workspaceItem = await screen.findByRole("menuitem", {
+      name: "Workspace",
+    })
+    await user.click(workspaceItem)
+    const manualEntry = await screen.findByRole("menuitem", {
+      name: "Enter path manually",
+    })
+
+    await user.keyboard("{ArrowDown}")
+    expect(manualEntry).toHaveFocus()
+    await user.keyboard("{ArrowUp}")
+    expect(workspaceItem).toHaveFocus()
+  })
+
+  it("attaches a picked folder to a new session immediately", async () => {
+    const workspacePath = "/tmp/trellis-project"
+    const created = {
+      ...recentSession,
+      id: "session-workspace",
+      title: "New session",
+      message_count: 0,
+      workspace_path: workspacePath,
+    }
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        return response({ path: workspacePath })
+      }
+      if (url === "/api/sessions" && init?.method === "POST") {
+        expect(JSON.parse(String(init.body))).toEqual({
+          workspace_path: workspacePath,
+        })
+        return response(created, 201)
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+
+    const workspaceChip = await screen.findByText("trellis-project")
+    expect(workspaceChip.closest(".composer-box")).not.toBeNull()
+    expect(screen.queryByText(workspacePath)).not.toBeInTheDocument()
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("")
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/workspaces/pick",
+      expect.objectContaining({ method: "POST" })
+    )
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions",
+      expect.objectContaining({ method: "POST" })
+    )
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument()
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+  })
+
+  it("keeps the composer idle while the folder picker and attachment are pending", async () => {
+    const pickGate = deferred<Response>()
+    const workspacePath = "/tmp/trellis-project"
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        return pickGate.promise
+      }
+      if (url === "/api/sessions" && init?.method === "POST") {
+        return response(
+          { ...recentSession, workspace_path: workspacePath },
+          201
+        )
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeDisabled()
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Opening folder…"
+    )
+    pickGate.resolve(response({ path: workspacePath }))
+    expect(await screen.findByText("trellis-project")).toBeInTheDocument()
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument()
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+  })
+
+  it("offers manual path entry when the folder picker is unavailable", async () => {
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        return response(
+          {
+            error: {
+              code: "workspace_picker_unavailable",
+              message: "Trellis could not open the folder picker.",
+            },
+          },
+          503
+        )
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Trellis could not open the folder picker."
+    )
+    await user.click(
+      screen.getByRole("menuitem", { name: "Enter path manually" })
+    )
+    await user.type(
+      screen.getByRole("textbox", { name: "Workspace folder" }),
+      "relative/project"
+    )
+    await user.click(screen.getByRole("button", { name: "Save workspace" }))
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Enter an absolute folder path."
+    )
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/sessions",
+      expect.objectContaining({ method: "POST" })
+    )
+  })
+
+  it("does not offer manual entry when the folder picker times out", async () => {
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        return response(
+          {
+            error: {
+              code: "workspace_picker_timeout",
+              message: "The folder picker took too long to respond.",
+            },
+          },
+          504
+        )
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The folder picker took too long to respond."
+    )
+    expect(
+      screen.queryByRole("menuitem", { name: "Enter path manually" })
+    ).not.toBeInTheDocument()
+  })
+
+  it("preserves a manual path draft when a picker retry fails", async () => {
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        return response(
+          {
+            error: {
+              code: "workspace_picker_unavailable",
+              message: "Trellis could not open the folder picker.",
+            },
+          },
+          503
+        )
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+    await user.click(
+      await screen.findByRole("menuitem", { name: "Enter path manually" })
+    )
+    const pathInput = screen.getByRole("textbox", { name: "Workspace folder" })
+    await user.type(pathInput, "/tmp/manual-draft")
+    await user.click(screen.getByRole("button", { name: "Choose folder…" }))
+
+    expect(
+      screen.getByRole("textbox", { name: "Workspace folder" })
+    ).toHaveValue("/tmp/manual-draft")
+  })
+
+  it("preserves, replaces, and removes a workspace on an existing session", async () => {
+    const current = { ...recentSession, workspace_path: "/tmp/first-project" }
+    const replacement = "/tmp/second-project"
+    const updates: Array<string | null> = []
+    let pickerCalls = 0
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        pickerCalls += 1
+        return response({ path: pickerCalls === 1 ? null : replacement })
+      }
+      if (url === "/api/sessions" && !init?.method) return response([current])
+      if (url === `/api/sessions/${current.id}` && !init?.method) {
+        return response({ session: current, messages: [] })
+      }
+      if (
+        url === `/api/sessions/${current.id}/workspace` &&
+        init?.method === "PUT"
+      ) {
+        const payload = JSON.parse(String(init.body)) as {
+          workspace_path: string | null
+        }
+        updates.push(payload.workspace_path)
+        return response({ ...current, workspace_path: payload.workspace_path })
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await openSavedSession("Persisted conversation")
+    await screen.findByRole("textbox", { name: "Message" })
+    const currentChip = await screen.findByText("first-project")
+    expect(currentChip.closest(".composer-box")).not.toBeNull()
+    expect(screen.queryByText(current.workspace_path!)).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+    expect(screen.getByText("first-project")).toBeInTheDocument()
+    expect(updates).toEqual([])
+
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+    const replacementChip = await screen.findByText("second-project")
+    expect(replacementChip.closest(".composer-box")).not.toBeNull()
+    expect(screen.queryByText(replacement)).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole("button", { name: "Remove workspace" }))
+    expect(screen.queryByText("second-project")).not.toBeInTheDocument()
+    expect(updates).toEqual([replacement, null])
+  })
+
+  it("changes and removes the folder attached to an existing session", async () => {
+    const current = { ...olderSession, workspace_path: "/tmp/first-project" }
+    const replacement = "/tmp/second-project"
+    const updates: Array<string | null> = []
+    let pickerCalls = 0
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/sessions" && !init?.method)
+        return response([recentSession, current])
+      if (url === "/api/sessions/session-recent")
+        return response({ session: recentSession, messages: [] })
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        pickerCalls += 1
+        return response({ path: pickerCalls === 1 ? null : replacement })
+      }
+      if (url === `/api/sessions/${current.id}` && !init?.method) {
+        return response({ session: current, messages: [] })
+      }
+      if (
+        url === `/api/sessions/${current.id}/workspace` &&
+        init?.method === "PUT"
+      ) {
+        const payload = JSON.parse(String(init.body)) as {
+          workspace_path: string | null
+        }
+        updates.push(payload.workspace_path)
+        return response({ ...current, workspace_path: payload.workspace_path })
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Earlier notes" }))
+    const currentChip = await screen.findByText("first-project")
+    expect(sidebarSessionTitles()).toEqual([
+      "Persisted conversation",
+      "Earlier notes",
+    ])
+    expect(currentChip.closest(".composer-box")).not.toBeNull()
+    expect(screen.queryByText(current.workspace_path!)).not.toBeInTheDocument()
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+    expect(screen.getByText("first-project")).toBeInTheDocument()
+    expect(updates).toEqual([])
+
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+    const replacementChip = await screen.findByText("second-project")
+    expect(replacementChip.closest(".composer-box")).not.toBeNull()
+    expect(screen.queryByText(replacement)).not.toBeInTheDocument()
+    expect(sidebarSessionTitles()).toEqual([
+      "Persisted conversation",
+      "Earlier notes",
+    ])
+
+    await user.click(screen.getByRole("button", { name: "Remove workspace" }))
+    expect(screen.queryByText("second-project")).not.toBeInTheDocument()
+    expect(updates).toEqual([replacement, null])
+    expect(sidebarSessionTitles()).toEqual([
+      "Persisted conversation",
+      "Earlier notes",
+    ])
+  })
+
+  it("leaves a new chat unchanged when the folder picker is cancelled", async () => {
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/workspaces/pick" && init?.method === "POST") {
+        return response({ path: null })
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Attach" })).toHaveFocus()
+    expect(screen.queryByText("trellis-project")).not.toBeInTheDocument()
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/sessions",
+      expect.objectContaining({ method: "POST" })
+    )
+  })
+
   it("shows onboarding before exposing the workspace on the first visit", async () => {
     const fetchMock = startupFetch(() => undefined)
     vi.stubGlobal("fetch", fetchMock)
@@ -309,7 +1548,7 @@ describe("local-first chat", () => {
     await user.click(screen.getByRole("button", { name: "Start Trellis" }))
 
     expect(
-      await screen.findByText("A workspace for ideas in motion")
+      await screen.findByRole("textbox", { name: "Message" })
     ).toBeInTheDocument()
     expect(calls).toEqual([
       "PUT /api/onboarding/steps/intro",
@@ -352,7 +1591,83 @@ describe("local-first chat", () => {
     ).toBeInTheDocument()
   })
 
-  it("restores the most recent complete transcript and switches sessions by ID", async () => {
+  it("opens a blank chat when saved sessions exist", async () => {
+    const fetchMock = startupFetch((url) => {
+      if (url === "/api/sessions")
+        return response([recentSession, olderSession])
+      if (url === "/api/sessions/session-recent")
+        return response({ session: recentSession, messages: [] })
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    renderApp()
+
+    expect(
+      await screen.findByRole("button", { name: "Persisted conversation" })
+    ).not.toHaveAttribute("aria-current")
+    expect(
+      screen.getByText("What would you like to work on?")
+    ).toBeInTheDocument()
+    expect(
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByText(
+        "New session"
+      )
+    ).toBeInTheDocument()
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/sessions/session-recent",
+      expect.anything()
+    )
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/sessions",
+      expect.objectContaining({ method: "POST" })
+    )
+  })
+
+  it("returns to a blank chat after reloading a saved session", async () => {
+    const fetchMock = startupFetch((url) => {
+      if (url === "/api/sessions") return response([recentSession])
+      if (url === "/api/sessions/session-recent")
+        return response({
+          session: recentSession,
+          messages: [
+            {
+              id: "saved-answer",
+              turn_id: "saved-turn",
+              role: "assistant",
+              content: "Saved response",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-08-25T10:00:01Z",
+            },
+          ],
+        })
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    const firstLoad = renderApp()
+    await openSavedSession("Persisted conversation")
+    expect(await screen.findByText("Saved response")).toBeInTheDocument()
+
+    firstLoad.unmount()
+    fetchMock.mockClear()
+    renderApp()
+
+    expect(
+      await screen.findByRole("button", { name: "Persisted conversation" })
+    ).not.toHaveAttribute("aria-current")
+    expect(
+      screen.getByText("What would you like to work on?")
+    ).toBeInTheDocument()
+    expect(screen.queryByText("Saved response")).not.toBeInTheDocument()
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/sessions/session-recent",
+      expect.anything()
+    )
+  })
+
+  it("opens a saved transcript when selected and switches sessions by ID", async () => {
     const fetchMock = startupFetch((url) => {
       if (url === "/api/sessions")
         return response([recentSession, olderSession])
@@ -402,6 +1717,7 @@ describe("local-first chat", () => {
     vi.stubGlobal("fetch", fetchMock)
 
     renderApp()
+    await openSavedSession("Persisted conversation")
 
     expect(
       await screen.findByText("What survived the restart?")
@@ -427,6 +1743,392 @@ describe("local-first chat", () => {
       "/api/sessions/session-older",
       expect.anything()
     )
+  })
+
+  it("keeps sidebar order when selecting a session with a completed run", async () => {
+    const resumeMethods: string[] = []
+    installRuntimeServer((socket, request) => {
+      resumeMethods.push(String(request.method))
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-older-complete",
+          status: "completed",
+          lastSequence: 2,
+        },
+      })
+      runtimeEvent(socket, "run-older-complete", 1, "run.queued", {
+        status: "queued",
+      })
+      runtimeEvent(socket, "run-older-complete", 2, "run.started", {
+        status: "running",
+      })
+      runtimeEvent(socket, "run-older-complete", 3, "run.completed", {
+        status: "completed",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions")
+          return response([recentSession, olderSession])
+        if (url === "/api/sessions/session-older/runs/latest")
+          return response({
+            run_id: "run-older-complete",
+            turn_id: "older-turn",
+            status: "completed",
+            last_sequence: 2,
+          })
+        if (url === "/api/sessions/session-older")
+          return response({
+            session: olderSession,
+            messages: [
+              {
+                id: "older-answer",
+                turn_id: "older-turn",
+                role: "assistant",
+                content: "Older context",
+                provider: "openai",
+                model: "gpt-5.5",
+                created_at: "2026-07-20T10:00:01Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+
+    renderApp()
+    expect(
+      await screen.findByRole("button", { name: "Earlier notes" })
+    ).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole("button", { name: "Earlier notes" }))
+    expect(await screen.findByText("Older context")).toBeInTheDocument()
+
+    await waitFor(() =>
+      expect(
+        Array.from(document.querySelectorAll(".session-row")).map((row) =>
+          row.getAttribute("aria-label")
+        )
+      ).toEqual(["Persisted conversation", "Earlier notes"])
+    )
+    expect(resumeMethods).toEqual([])
+  })
+
+  it("keeps sidebar order when selection refreshes a missing run transcript", async () => {
+    let olderDetailLoads = 0
+    const latestTurnId = "latest-older-turn"
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions")
+          return response([recentSession, olderSession])
+        if (url === "/api/sessions/session-recent")
+          return response({
+            session: recentSession,
+            messages: [
+              {
+                id: "recent-answer",
+                turn_id: "recent-turn",
+                role: "assistant",
+                content: "Recent context",
+                provider: "openai",
+                model: "gpt-5.5",
+                created_at: "2026-08-25T10:00:01Z",
+              },
+            ],
+          })
+        if (url === "/api/sessions/session-older/runs/latest")
+          return response({
+            run_id: "run-older-complete",
+            turn_id: latestTurnId,
+            status: "completed",
+            last_sequence: 3,
+          })
+        if (url === "/api/sessions/session-older") {
+          olderDetailLoads += 1
+          const messages: TestMessage[] = [
+            {
+              id: "older-context",
+              turn_id: "older-context-turn",
+              role: "assistant",
+              content: "Older context",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-07-20T10:00:00Z",
+            },
+          ]
+          if (olderDetailLoads > 1)
+            messages.push({
+              id: "latest-older-answer",
+              turn_id: latestTurnId,
+              role: "assistant",
+              content: "Recovered older answer",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-07-20T10:00:01Z",
+            })
+          return response({ session: olderSession, messages })
+        }
+        return undefined
+      })
+    )
+
+    renderApp()
+    await screen.findByRole("button", { name: "Earlier notes" })
+    await userEvent.click(screen.getByRole("button", { name: "Earlier notes" }))
+
+    expect(
+      await screen.findByText("Recovered older answer")
+    ).toBeInTheDocument()
+    expect(olderDetailLoads).toBe(2)
+    expect(sidebarSessionTitles()).toEqual([
+      "Persisted conversation",
+      "Earlier notes",
+    ])
+  })
+
+  it("keeps sidebar order when a selected chat's recovered run finishes", async () => {
+    const activeTurnId = "older-active-turn"
+    let runtimeSocket: TestWebSocket | null = null
+    installRuntimeServer((socket, request) => {
+      expect(request.method).toBe("run.resume")
+      runtimeSocket = socket
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "older-active-run",
+          status: "running",
+          lastSequence: 2,
+        },
+      })
+      runtimeEvent(socket, "older-active-run", 1, "run.queued", {
+        status: "queued",
+      })
+      runtimeEvent(socket, "older-active-run", 2, "run.started", {
+        status: "running",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions")
+          return response([recentSession, olderSession])
+        if (url === "/api/sessions/session-recent")
+          return response({ session: recentSession, messages: [] })
+        if (url === "/api/sessions/session-older/runs/latest")
+          return response({
+            run_id: "older-active-run",
+            turn_id: activeTurnId,
+            status: "running",
+            last_sequence: 2,
+          })
+        if (url === "/api/sessions/session-older")
+          return response({
+            session: olderSession,
+            messages: [
+              {
+                id: "older-active-user",
+                turn_id: activeTurnId,
+                role: "user",
+                content: "Continue the older chat",
+                provider: null,
+                model: null,
+                created_at: "2026-07-20T10:00:00Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+
+    renderApp()
+    await screen.findByRole("button", { name: "Earlier notes" })
+    await userEvent.click(screen.getByRole("button", { name: "Earlier notes" }))
+    expect(
+      await screen.findByRole("button", { name: "Stop generating" })
+    ).toBeInTheDocument()
+
+    await act(async () => {
+      if (!runtimeSocket) throw new Error("the older run was not resumed")
+      runtimeEvent(runtimeSocket, "older-active-run", 3, "run.completed", {
+        status: "completed",
+      })
+    })
+
+    await waitFor(() =>
+      expect(sidebarSessionTitles()).toEqual([
+        "Persisted conversation",
+        "Earlier notes",
+      ])
+    )
+  })
+
+  it("keeps a chat in place when a new message is sent", async () => {
+    installRuntimeServer((socket, request) => {
+      expect(request.method).toBe("run.start")
+      expect(request.params).toMatchObject({ content: "A new message" })
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "new-older-turn", status: "running", lastSequence: 2 },
+      })
+      runtimeEvent(socket, "new-older-turn", 1, "run.queued", {
+        status: "queued",
+      })
+      runtimeEvent(socket, "new-older-turn", 2, "run.started", {
+        status: "running",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions")
+          return response([recentSession, olderSession])
+        if (url === "/api/sessions/session-recent")
+          return response({ session: recentSession, messages: [] })
+        if (url === "/api/sessions/session-older")
+          return response({
+            session: olderSession,
+            messages: [
+              {
+                id: "older-context",
+                turn_id: "older-context-turn",
+                role: "assistant",
+                content: "Older context",
+                provider: "openai",
+                model: "gpt-5.5",
+                created_at: "2026-07-20T10:00:00Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("button", { name: "Earlier notes" })
+    await user.click(screen.getByRole("button", { name: "Earlier notes" }))
+    await screen.findByText("Older context")
+    await user.type(
+      screen.getByRole("textbox", { name: "Message" }),
+      "A new message"
+    )
+    await user.click(screen.getByRole("button", { name: "Send" }))
+
+    expect(
+      await screen.findByRole("button", { name: "Stop generating" })
+    ).toBeInTheDocument()
+    expect(sidebarSessionTitles()).toEqual([
+      "Persisted conversation",
+      "Earlier notes",
+    ])
+  })
+
+  it("keeps a retried older chat in place", async () => {
+    const failedTurnId = "older-failed-turn"
+    let retryCount = 0
+    installRuntimeServer((socket, request) => {
+      expect(request.method).toBe("run.start")
+      expect(request.params).toMatchObject({
+        sessionId: "session-older",
+        turnId: failedTurnId,
+        content: "Retry the older request",
+      })
+      retryCount += 1
+      completeRuntimeRun(socket, request, "older-retry", "Recovered response")
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions")
+          return response([recentSession, olderSession])
+        if (url === "/api/sessions/session-recent")
+          return response({ session: recentSession, messages: [] })
+        if (url === "/api/sessions/session-older/runs/latest")
+          return response(null)
+        if (url === "/api/sessions/session-older") {
+          const messages: TestMessage[] = [
+            {
+              id: "older-failed-user",
+              turn_id: failedTurnId,
+              role: "user",
+              content: "Retry the older request",
+              provider: null,
+              model: null,
+              created_at: "2026-07-20T10:00:00Z",
+            },
+          ]
+          if (retryCount > 0) {
+            messages.push({
+              id: "older-retried-answer",
+              turn_id: failedTurnId,
+              role: "assistant",
+              content: "Recovered response",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-07-20T10:00:01Z",
+            })
+          }
+          return response({ session: olderSession, messages })
+        }
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("button", { name: "Earlier notes" })
+    await user.click(screen.getByRole("button", { name: "Earlier notes" }))
+    const alert = await screen.findByRole("alert")
+    await user.click(within(alert).getByRole("button", { name: "Retry" }))
+
+    expect(await screen.findByText("Recovered response")).toBeInTheDocument()
+    expect(retryCount).toBe(1)
+    expect(sidebarSessionTitles()).toEqual([
+      "Persisted conversation",
+      "Earlier notes",
+    ])
+  })
+
+  it("keeps an older chat in place when its workspace changes", async () => {
+    const current = { ...olderSession, workspace_path: "/tmp/first-project" }
+    const updated = { ...current, workspace_path: "/tmp/second-project" }
+    const fetchMock = startupFetch((url, init) => {
+      if (url === "/api/sessions" && !init?.method)
+        return response([recentSession, current])
+      if (url === "/api/sessions/session-recent")
+        return response({ session: recentSession, messages: [] })
+      if (url === `/api/sessions/${current.id}` && !init?.method)
+        return response({ session: current, messages: [] })
+      if (url === "/api/workspaces/pick" && init?.method === "POST")
+        return response({ path: updated.workspace_path })
+      if (
+        url === `/api/sessions/${current.id}/workspace` &&
+        init?.method === "PUT"
+      )
+        return response(updated)
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const user = userEvent.setup()
+
+    renderApp()
+    await screen.findByRole("textbox", { name: "Message" })
+    await user.click(screen.getByRole("button", { name: "Earlier notes" }))
+    await screen.findByText("first-project")
+    await user.click(screen.getByRole("button", { name: "Attach" }))
+    await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
+
+    expect(await screen.findByText("second-project")).toBeInTheDocument()
+    expect(sidebarSessionTitles()).toEqual([
+      "Persisted conversation",
+      "Earlier notes",
+    ])
   })
 
   it("ignores a stale session response after a newer session is selected", async () => {
@@ -475,6 +2177,7 @@ describe("local-first chat", () => {
     vi.stubGlobal("fetch", fetchMock)
 
     renderApp()
+    await openSavedSession("Persisted conversation")
     expect(
       await screen.findByText("Current session content")
     ).toBeInTheDocument()
@@ -581,7 +2284,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
-    await screen.findByText("A workspace for ideas in motion")
+    await screen.findByRole("textbox", { name: "Message" })
     expect(calls).toHaveLength(0)
 
     await user.type(
@@ -692,7 +2395,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
-    await screen.findByText("A workspace for ideas in motion")
+    await screen.findByRole("textbox", { name: "Message" })
     await user.type(
       screen.getByRole("textbox", { name: "Message" }),
       "Stop this run"
@@ -708,7 +2411,7 @@ describe("local-first chat", () => {
     ).toBeInTheDocument()
   })
 
-  it("does not create an empty session when the selected provider has no key", async () => {
+  it("does not expose provider identity or create a session when its key is missing", async () => {
     const fetchMock = startupFetch((url) => {
       if (url === "/api/settings") {
         return response({
@@ -726,16 +2429,18 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
-    await screen.findByText("A workspace for ideas in motion")
+    await screen.findByRole("textbox", { name: "Message" })
     await user.type(
       screen.getByRole("textbox", { name: "Message" }),
       "Do not abandon this draft"
     )
     await user.click(screen.getByRole("button", { name: "Send" }))
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Add an API key for OpenAI in Settings."
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent(
+      "The selected model needs to be configured in Settings before starting a session."
     )
+    expect(alert).not.toHaveTextContent(/OpenAI|GPT-5\.5/)
     expect(fetchMock).not.toHaveBeenCalledWith(
       "/api/sessions",
       expect.objectContaining({ method: "POST" })
@@ -822,7 +2527,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
-    await screen.findByText("A workspace for ideas in motion")
+    await screen.findByRole("textbox", { name: "Message" })
     await user.type(
       screen.getByRole("textbox", { name: "Message" }),
       "Retry this"
@@ -836,6 +2541,9 @@ describe("local-first chat", () => {
     await user.click(within(alert).getByRole("button", { name: "Retry" }))
 
     expect(await screen.findByText("Recovered response")).toBeInTheDocument()
+    await user.click(screen.getByRole("button", { name: "Completed" }))
+    expect(screen.getByText("Attempt 1")).toBeInTheDocument()
+    expect(screen.getByText("The provider timed out.")).toBeInTheDocument()
     expect(attempts).toBe(2)
     expect(requestIds[0]).not.toBe(requestIds[1])
   })
@@ -894,12 +2602,1151 @@ describe("local-first chat", () => {
     vi.stubGlobal("fetch", fetchMock)
 
     renderApp()
+    await openSavedSession("Persisted conversation")
     expect(await screen.findByText("Recover after restart")).toBeInTheDocument()
     await userEvent.click(screen.getByRole("button", { name: "Retry" }))
 
     expect(
       await screen.findByText("Recovered after restart")
     ).toBeInTheDocument()
+  })
+
+  it("discovers and replays an active run before offering Retry after refresh", async () => {
+    const turnId = "8a7fb1b8-8280-4a02-9292-487fd605e81e"
+    let completed = false
+    let runtimeSocket: TestWebSocket | null = null
+    const methods: string[] = []
+    installRuntimeServer((socket, request) => {
+      methods.push(String(request.method))
+      expect(request).toMatchObject({
+        method: "run.resume",
+        params: { runId: "run-already-active", afterSequence: 0 },
+      })
+      runtimeSocket = socket
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-already-active",
+          status: "running",
+          lastSequence: 3,
+        },
+      })
+      runtimeEvent(socket, "run-already-active", 1, "run.queued", {
+        status: "queued",
+      })
+      runtimeEvent(socket, "run-already-active", 2, "run.started", {
+        status: "running",
+      })
+      runtimeEvent(socket, "run-already-active", 3, "assistant.delta", {
+        text: "Working",
+      })
+    })
+    const fetchMock = startupFetch((url, init) => {
+      const method = init?.method ?? "GET"
+      if (url === "/api/sessions") return response([recentSession])
+      if (url === "/api/sessions/session-recent/runs/latest")
+        return response({
+          run_id: "run-already-active",
+          turn_id: turnId,
+          status: "running",
+          last_sequence: 3,
+        })
+      if (url === "/api/sessions/session-recent" && method === "GET") {
+        const messages: TestMessage[] = [
+          {
+            id: "persisted-user",
+            turn_id: turnId,
+            role: "user",
+            content: "Continue this run",
+            provider: null,
+            model: null,
+            created_at: "2026-08-25T10:00:00Z",
+          },
+        ]
+        if (completed)
+          messages.push({
+            id: "persisted-answer",
+            turn_id: turnId,
+            role: "assistant",
+            content: "Done after refresh",
+            provider: "openai",
+            model: "gpt-5.5",
+            created_at: "2026-08-25T10:00:01Z",
+          })
+        return response({
+          session: { ...recentSession, message_count: messages.length },
+          messages,
+        })
+      }
+      return undefined
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    renderApp()
+    await screen.findByRole("button", { name: "Persisted conversation" })
+    expect(
+      screen.getByText("What would you like to work on?")
+    ).toBeInTheDocument()
+    expect(methods).toEqual([])
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/sessions/session-recent/runs/latest",
+      expect.anything()
+    )
+    await openSavedSession("Persisted conversation")
+    expect(await screen.findByText("Working")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+    expect(
+      screen.getByRole("button", { name: "Stop generating" })
+    ).toBeInTheDocument()
+    expect(methods).toEqual(["run.resume"])
+
+    completed = true
+    act(() => {
+      if (!runtimeSocket) throw new Error("run was not resumed")
+      runtimeEvent(runtimeSocket, "run-already-active", 4, "run.completed", {
+        status: "completed",
+      })
+    })
+
+    expect(await screen.findByText("Done after refresh")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+  })
+
+  it("blocks duplicate runs when the first latest-run lookup fails", async () => {
+    const turnId = "049a301b-eb21-4fc9-bf73-a0dc3ab3bd0a"
+    let lookupUnavailable = true
+    let completed = false
+    const methods: string[] = []
+    installRuntimeServer((socket, request) => {
+      methods.push(String(request.method))
+      expect(request.method).toBe("run.resume")
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-lookup-recovery",
+          status: "running",
+          lastSequence: 2,
+        },
+      })
+      runtimeEvent(socket, "run-lookup-recovery", 1, "run.queued", {
+        status: "queued",
+      })
+      completed = true
+      runtimeEvent(socket, "run-lookup-recovery", 2, "run.completed", {
+        status: "completed",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest") {
+          if (lookupUnavailable) throw new Error("Local service is offline")
+          return response({
+            run_id: "run-lookup-recovery",
+            turn_id: turnId,
+            status: completed ? "completed" : "running",
+            last_sequence: completed ? 2 : 0,
+          })
+        }
+        if (url === "/api/sessions/session-recent") {
+          const messages: TestMessage[] = [
+            {
+              id: "persisted-user",
+              turn_id: turnId,
+              role: "user",
+              content: "Resume after lookup failure",
+              provider: null,
+              model: null,
+              created_at: "2026-10-07T12:00:00Z",
+            },
+          ]
+          if (completed)
+            messages.push({
+              id: "persisted-answer",
+              turn_id: turnId,
+              role: "assistant",
+              content: "Recovered after lookup failure",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-10-07T12:00:01Z",
+            })
+          return response({
+            session: { ...recentSession, message_count: messages.length },
+            messages,
+          })
+        }
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await openSavedSession("Persisted conversation")
+    const reconnect = await screen.findByRole("button", {
+      name: "Reconnect",
+    })
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Stop generating" })).toBeNull()
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeDisabled()
+    expect(methods).toEqual([])
+
+    lookupUnavailable = false
+    await user.click(reconnect)
+    expect(
+      await screen.findByText("Recovered after lookup failure")
+    ).toBeInTheDocument()
+    expect(methods).toEqual(["run.resume"])
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+  })
+
+  it("offers Retry after reconnection confirms no run exists", async () => {
+    const turnId = "58cf8d40-0ac7-4bef-89a6-461461d27879"
+    let lookupUnavailable = true
+    installRuntimeServer(() => {
+      throw new Error("No run should be resumed")
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest") {
+          if (lookupUnavailable) throw new Error("Local service is offline")
+          return response(null)
+        }
+        if (url === "/api/sessions/session-recent")
+          return response({
+            session: { ...recentSession, message_count: 1 },
+            messages: [
+              {
+                id: "persisted-user",
+                turn_id: turnId,
+                role: "user",
+                content: "No run started",
+                provider: null,
+                model: null,
+                created_at: "2026-10-07T12:00:00Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await openSavedSession("Persisted conversation")
+    const reconnect = await screen.findByRole("button", {
+      name: "Reconnect",
+    })
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+    lookupUnavailable = false
+    await user.click(reconnect)
+
+    expect(
+      await screen.findByRole("button", { name: "Retry" })
+    ).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Reconnect" })).toBeNull()
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+  })
+
+  it("restores an actionable approval and its ordered result after refresh", async () => {
+    const turnId = "c345edbf-f3a4-4a0a-8067-c408d15bed55"
+    let completed = false
+    let detailLoads = 0
+    let runSocket: TestWebSocket | null = null
+    const methods: string[] = []
+    installRuntimeServer((socket, request) => {
+      methods.push(String(request.method))
+      if (request.method === "run.resume") {
+        expect(request.params).toMatchObject({
+          runId: "run-refresh-approval",
+          afterSequence: 0,
+        })
+        runSocket = socket
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-refresh-approval",
+            status: "waiting_for_approval",
+            lastSequence: 4,
+            budgetPreset: "conservative",
+            limits: {
+              maxModelCalls: 8,
+              maxToolCalls: 16,
+              maxTotalTokens: 100000,
+              maxCostUsd: 2,
+              deadlineAt: "2026-10-07T12:10:00Z",
+            },
+          },
+        })
+        runtimeEvent(socket, "run-refresh-approval", 1, "run.queued", {
+          status: "queued",
+        })
+        runtimeEvent(socket, "run-refresh-approval", 2, "run.started", {
+          status: "running",
+        })
+        runtimeEvent(socket, "run-refresh-approval", 3, "tool.call", {
+          tool_call_id: "tool-refresh-patch",
+          name: "apply_patch",
+          arguments: { path: "src/main.ts" },
+        })
+        runtimeEvent(
+          socket,
+          "run-refresh-approval",
+          4,
+          "tool.approval_requested",
+          {
+            tool_call_id: "tool-refresh-patch",
+            name: "apply_patch",
+            preview: { path: "src/main.ts", diff: "-old\n+new" },
+          }
+        )
+      } else if (request.method === "run.respond") {
+        expect(request.params).toMatchObject({
+          runId: "run-refresh-approval",
+          toolCallId: "tool-refresh-patch",
+          decision: "approved",
+          afterSequence: 4,
+        })
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-refresh-approval",
+            status: "waiting_for_approval",
+            toolCallId: "tool-refresh-patch",
+            decision: "approved",
+          },
+        })
+        if (!runSocket) throw new Error("Restored run socket missing")
+        runtimeEvent(
+          runSocket,
+          "run-refresh-approval",
+          5,
+          "tool.approval_decided",
+          { tool_call_id: "tool-refresh-patch", decision: "approved" }
+        )
+        runtimeEvent(runSocket, "run-refresh-approval", 6, "run.resumed", {
+          tool_call_id: "tool-refresh-patch",
+        })
+        runtimeEvent(runSocket, "run-refresh-approval", 7, "tool.result", {
+          tool_call_id: "tool-refresh-patch",
+          status: "completed",
+          content: "Patch applied after refresh.",
+        })
+        completed = true
+        runtimeEvent(runSocket, "run-refresh-approval", 8, "run.completed", {
+          status: "completed",
+        })
+      }
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs?offset=0&limit=100")
+          return response({
+            items: [
+              {
+                run_id: "run-previous-attempt",
+                turn_id: turnId,
+                retry_of: null,
+                status: "failed",
+                budget_preset: "conservative",
+                max_model_calls: 8,
+                max_tool_calls: 16,
+                max_total_tokens: 100000,
+                max_cost_usd: 2,
+                deadline_at: "2026-10-07T12:10:00Z",
+                last_sequence: 2,
+                created_at: "2026-10-07T12:00:00Z",
+                started_at: "2026-10-07T12:00:01Z",
+                finished_at: "2026-10-07T12:00:02Z",
+              },
+            ],
+            next_offset: null,
+          })
+        if (url.includes("/runs/run-previous-attempt/events"))
+          return response({
+            items: [
+              {
+                run_id: "run-previous-attempt",
+                sequence: 1,
+                event_type: "run.queued",
+                event_version: 1,
+                data: {},
+                created_at: "2026-10-07T12:00:00Z",
+              },
+              {
+                run_id: "run-previous-attempt",
+                sequence: 2,
+                event_type: "run.failed",
+                event_version: 1,
+                data: { message: "Previous attempt failed" },
+                created_at: "2026-10-07T12:00:02Z",
+              },
+            ],
+            next_after_sequence: null,
+          })
+        if (url === "/api/sessions/session-recent/runs/latest")
+          return response({
+            run_id: "run-refresh-approval",
+            turn_id: turnId,
+            status: completed ? "completed" : "waiting_for_approval",
+            last_sequence: completed ? 8 : 4,
+          })
+        if (url === "/api/sessions/session-recent") {
+          detailLoads += 1
+          if (detailLoads === 1)
+            return response({
+              session: { ...recentSession, message_count: 2 },
+              messages: [
+                {
+                  id: "earlier-user",
+                  turn_id: "earlier-turn",
+                  role: "user",
+                  content: "Earlier request",
+                  provider: null,
+                  model: null,
+                  created_at: "2026-10-07T11:00:00Z",
+                },
+                {
+                  id: "earlier-answer",
+                  turn_id: "earlier-turn",
+                  role: "assistant",
+                  content: "Earlier answer",
+                  provider: "openai",
+                  model: "gpt-5.5",
+                  created_at: "2026-10-07T11:00:01Z",
+                },
+              ],
+            })
+          const messages: TestMessage[] = [
+            {
+              id: "persisted-user",
+              turn_id: turnId,
+              role: "user",
+              content: "Patch this file",
+              provider: null,
+              model: null,
+              created_at: "2026-10-07T12:00:00Z",
+            },
+          ]
+          if (completed)
+            messages.push({
+              id: "persisted-answer",
+              turn_id: turnId,
+              role: "assistant",
+              content: "Patch complete.",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-10-07T12:00:01Z",
+            })
+          return response({
+            session: { ...recentSession, message_count: messages.length },
+            messages,
+          })
+        }
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await openSavedSession("Persisted conversation")
+    await user.click(
+      await screen.findByRole("button", { name: "Needs approval" })
+    )
+    const approval = await screen.findByRole("region", {
+      name: "Approval required for apply_patch",
+    })
+    expect(
+      await screen.findByText("Previous attempt failed")
+    ).toBeInTheDocument()
+    expect(screen.getByText("Attempt 1")).toBeInTheDocument()
+    expect(detailLoads).toBeGreaterThanOrEqual(2)
+    expect(within(approval).getByText(/\+new/)).toBeInTheDocument()
+    expect(screen.getAllByText("0 / 8 model calls")).toHaveLength(2)
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+    await user.click(within(approval).getByRole("button", { name: "Approve" }))
+
+    expect(
+      await screen.findByText("Patch applied after refresh.")
+    ).toBeInTheDocument()
+    expect(await screen.findByText("Patch complete.")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull()
+    expect(methods).toEqual(["run.resume", "run.respond"])
+  })
+
+  it("reconnects a discovered active run after its first replay connection fails", async () => {
+    const turnId = "7087cb08-dd55-4405-a928-2f23c15848df"
+    let attempts = 0
+    let completed = false
+    installRuntimeServer((socket, request) => {
+      expect(request.method).toBe("run.resume")
+      expect(request.params).toMatchObject({
+        runId: "run-recovery",
+        afterSequence: 0,
+      })
+      attempts += 1
+      if (attempts === 1) {
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          error: {
+            code: -32000,
+            message: "Connection to Trellis was lost.",
+            data: { code: "connection_lost" },
+          },
+        })
+        return
+      }
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "run-recovery", status: "running", lastSequence: 3 },
+      })
+      runtimeEvent(socket, "run-recovery", 1, "run.queued", {
+        status: "queued",
+      })
+      runtimeEvent(socket, "run-recovery", 2, "assistant.delta", {
+        text: "Recovered",
+      })
+      completed = true
+      runtimeEvent(socket, "run-recovery", 3, "run.completed", {
+        status: "completed",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest")
+          return response({
+            run_id: "run-recovery",
+            turn_id: turnId,
+            status: completed ? "completed" : "running",
+            last_sequence: completed ? 3 : 1,
+          })
+        if (url === "/api/sessions/session-recent") {
+          const messages: TestMessage[] = [
+            {
+              id: "persisted-user",
+              turn_id: turnId,
+              role: "user",
+              content: "Recover this",
+              provider: null,
+              model: null,
+              created_at: "2026-08-25T10:00:00Z",
+            },
+          ]
+          if (completed)
+            messages.push({
+              id: "persisted-answer",
+              turn_id: turnId,
+              role: "assistant",
+              content: "Recovered answer",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-08-25T10:00:01Z",
+            })
+          return response({
+            session: { ...recentSession, message_count: messages.length },
+            messages,
+          })
+        }
+        return undefined
+      })
+    )
+
+    renderApp()
+    await openSavedSession("Persisted conversation")
+    expect(await screen.findByText("Recovered answer")).toBeInTheDocument()
+    expect(attempts).toBe(2)
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Stop generating" })).toBeNull()
+  })
+
+  it("finishes cancellation after a restored stream loses its connection", async () => {
+    const turnId = "b502668b-7d27-4298-89b2-4e18864aae0a"
+    const retryLookup = deferred<Response>()
+    let lookups = 0
+    let resumeAttempts = 0
+    let cancelled = false
+    installRuntimeServer((socket, request) => {
+      if (request.method === "run.cancel") {
+        expect(request.params).toMatchObject({
+          runId: "run-cancel-after-loss",
+          afterSequence: 0,
+        })
+        cancelled = true
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: { runId: "run-cancel-after-loss", status: "cancelling" },
+        })
+        return
+      }
+      expect(request.method).toBe("run.resume")
+      resumeAttempts += 1
+      if (resumeAttempts === 1) {
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          error: {
+            code: -32000,
+            message: "Connection to Trellis was lost.",
+            data: { code: "connection_lost" },
+          },
+        })
+        return
+      }
+      expect(cancelled).toBe(true)
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-cancel-after-loss",
+          status: "cancelled",
+          lastSequence: 2,
+        },
+      })
+      runtimeEvent(socket, "run-cancel-after-loss", 1, "run.queued", {
+        status: "queued",
+      })
+      runtimeEvent(socket, "run-cancel-after-loss", 2, "run.cancelled", {
+        code: "user_cancelled",
+        message: "The run was cancelled.",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest") {
+          lookups += 1
+          if (lookups === 2) return retryLookup.promise
+          return response({
+            run_id: "run-cancel-after-loss",
+            turn_id: turnId,
+            status: cancelled ? "cancelled" : "running",
+            last_sequence: cancelled ? 2 : 0,
+          })
+        }
+        if (url === "/api/sessions/session-recent")
+          return response({
+            session: { ...recentSession, message_count: 1 },
+            messages: [
+              {
+                id: "persisted-user",
+                turn_id: turnId,
+                role: "user",
+                content: "Stop after connection loss",
+                provider: null,
+                model: null,
+                created_at: "2026-08-25T10:00:00Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await openSavedSession("Persisted conversation")
+    await screen.findByText("Reconnecting to Trellis…")
+    await user.click(screen.getByRole("button", { name: "Stop generating" }))
+    expect(cancelled).toBe(true)
+    retryLookup.resolve(
+      response({
+        run_id: "run-cancel-after-loss",
+        turn_id: turnId,
+        status: "cancelled",
+        last_sequence: 2,
+      })
+    )
+
+    const alert = await screen.findByRole("alert")
+    await waitFor(() =>
+      expect(alert).toHaveTextContent("The run was cancelled.")
+    )
+    expect(within(alert).getByRole("button", { name: "Retry" })).toBeEnabled()
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+    expect(resumeAttempts).toBe(2)
+  })
+
+  it("offers manual reconnection after a bounded restored-run outage", async () => {
+    const turnId = "187819a4-3696-4b45-a242-39d3bf3939a7"
+    let attempts = 0
+    let serviceReturned = false
+    let lookupUnavailable = false
+    let completed = false
+    installRuntimeServer((socket, request) => {
+      expect(request.method).toBe("run.resume")
+      attempts += 1
+      if (!serviceReturned) {
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          error: {
+            code: -32000,
+            message: "Connection to Trellis was lost.",
+            data: { code: "connection_lost" },
+          },
+        })
+        return
+      }
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          runId: "run-outage",
+          status: "running",
+          lastSequence: 2,
+        },
+      })
+      runtimeEvent(socket, "run-outage", 1, "run.queued", {
+        status: "queued",
+      })
+      completed = true
+      runtimeEvent(socket, "run-outage", 2, "run.completed", {
+        status: "completed",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest") {
+          if (lookupUnavailable) throw new Error("Local service is offline")
+          return response({
+            run_id: "run-outage",
+            turn_id: turnId,
+            status: completed ? "completed" : "running",
+            last_sequence: completed ? 2 : 0,
+          })
+        }
+        if (url === "/api/sessions/session-recent") {
+          const messages: TestMessage[] = [
+            {
+              id: "persisted-user",
+              turn_id: turnId,
+              role: "user",
+              content: "Recover after an outage",
+              provider: null,
+              model: null,
+              created_at: "2026-08-25T10:00:00Z",
+            },
+          ]
+          if (completed)
+            messages.push({
+              id: "persisted-answer",
+              turn_id: turnId,
+              role: "assistant",
+              content: "Recovered after outage",
+              provider: "openai",
+              model: "gpt-5.5",
+              created_at: "2026-08-25T10:00:01Z",
+            })
+          return response({
+            session: { ...recentSession, message_count: messages.length },
+            messages,
+          })
+        }
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await openSavedSession("Persisted conversation")
+    const reconnect = await screen.findByRole(
+      "button",
+      { name: "Reconnect" },
+      { timeout: 3_000 }
+    )
+    expect(attempts).toBe(4)
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeDisabled()
+    lookupUnavailable = true
+    await user.click(reconnect)
+    expect(
+      await screen.findByRole("button", { name: "Reconnect" })
+    ).toBeInTheDocument()
+    serviceReturned = true
+    lookupUnavailable = false
+    await user.click(screen.getByRole("button", { name: "Reconnect" }))
+    expect(
+      await screen.findByText("Recovered after outage")
+    ).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Reconnect" })).toBeNull()
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+  })
+
+  it("hides stale approval actions while rediscovering a run", async () => {
+    const turnId = "bb03fa3a-65fd-4190-bb76-045b8d5fcda0"
+    let resumes = 0
+    let lookupUnavailable = false
+    installRuntimeServer((socket, request) => {
+      expect(request.method).toBe("run.resume")
+      resumes += 1
+      if (resumes === 1) {
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-stale-approval",
+            status: "waiting_for_approval",
+            lastSequence: 3,
+          },
+        })
+        runtimeEvent(socket, "run-stale-approval", 1, "run.queued", {
+          status: "queued",
+        })
+        runtimeEvent(socket, "run-stale-approval", 2, "tool.call", {
+          tool_call_id: "tool-stale",
+          name: "apply_patch",
+        })
+        runtimeEvent(
+          socket,
+          "run-stale-approval",
+          3,
+          "tool.approval_requested",
+          { tool_call_id: "tool-stale", name: "apply_patch" }
+        )
+        setTimeout(() => socket.close(), 50)
+        return
+      }
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: {
+          code: -32000,
+          message: "Connection to Trellis was lost.",
+          data: { code: "connection_lost" },
+        },
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest") {
+          if (lookupUnavailable) throw new Error("Local service is offline")
+          return response({
+            run_id: "run-stale-approval",
+            turn_id: turnId,
+            status: "waiting_for_approval",
+            last_sequence: 3,
+          })
+        }
+        if (url === "/api/sessions/session-recent")
+          return response({
+            session: { ...recentSession, message_count: 1 },
+            messages: [
+              {
+                id: "persisted-user",
+                turn_id: turnId,
+                role: "user",
+                content: "Patch this file",
+                provider: null,
+                model: null,
+                created_at: "2026-10-07T12:00:00Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+
+    renderApp()
+    await openSavedSession("Persisted conversation")
+    await user.click(
+      await screen.findByRole("button", { name: "Needs approval" })
+    )
+    const approval = await screen.findByRole("region", {
+      name: "Approval required for apply_patch",
+    })
+    expect(
+      within(approval).getByRole("button", { name: "Approve" })
+    ).toBeEnabled()
+    const reconnect = await screen.findByRole(
+      "button",
+      { name: "Reconnect" },
+      { timeout: 3_000 }
+    )
+    lookupUnavailable = true
+    await user.click(reconnect)
+
+    expect(
+      await screen.findByRole("button", { name: "Reconnect" })
+    ).toBeInTheDocument()
+    await user.click(screen.getByRole("button", { name: "Needs approval" }))
+    const staleApproval = screen.getByRole("region", {
+      name: "Approval required for apply_patch",
+    })
+    expect(
+      within(staleApproval).queryByRole("button", { name: "Approve" })
+    ).toBeNull()
+    expect(
+      within(staleApproval).queryByRole("button", { name: "Deny" })
+    ).toBeNull()
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+    expect(resumes).toBe(4)
+  })
+
+  it.each(["queued", "waiting_for_approval"])(
+    "keeps Retry hidden while a restored run is %s",
+    async (initialStatus) => {
+      const turnId = "a369bf43-07d8-4b5b-a128-f058d24bb87f"
+      const replay =
+        initialStatus === "queued"
+          ? [["run.queued", { status: "queued" }]]
+          : [
+              ["run.queued", { status: "queued" }],
+              ["run.started", { status: "running" }],
+              [
+                "tool.call",
+                { tool_call_id: "tool-approval", name: "read_file" },
+              ],
+              [
+                "tool.approval_requested",
+                { tool_call_id: "tool-approval", name: "read_file" },
+              ],
+            ]
+      let latestStatus = initialStatus
+      let runtimeSocket: TestWebSocket | null = null
+      installRuntimeServer((socket, request) => {
+        expect(request.method).toBe("run.resume")
+        runtimeSocket = socket
+        socket.reply({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            runId: "run-pending-refresh",
+            status: initialStatus,
+            lastSequence: replay.length,
+          },
+        })
+        replay.forEach(([eventType, data], index) => {
+          runtimeEvent(
+            socket,
+            "run-pending-refresh",
+            index + 1,
+            eventType as string,
+            data as Record<string, unknown>
+          )
+        })
+      })
+      vi.stubGlobal(
+        "fetch",
+        startupFetch((url) => {
+          if (url === "/api/sessions") return response([recentSession])
+          if (url === "/api/sessions/session-recent/runs/latest")
+            return response({
+              run_id: "run-pending-refresh",
+              turn_id: turnId,
+              status: latestStatus,
+              last_sequence: replay.length,
+            })
+          if (url === "/api/sessions/session-recent")
+            return response({
+              session: { ...recentSession, message_count: 1 },
+              messages: [
+                {
+                  id: "persisted-user",
+                  turn_id: turnId,
+                  role: "user",
+                  content: "Wait for this run",
+                  provider: null,
+                  model: null,
+                  created_at: "2026-08-25T10:00:00Z",
+                },
+              ],
+            })
+          return undefined
+        })
+      )
+
+      renderApp()
+      await openSavedSession("Persisted conversation")
+      expect(
+        await screen.findByRole("button", { name: "Stop generating" })
+      ).toBeInTheDocument()
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+      expect(screen.getByRole("textbox", { name: "Message" })).toBeDisabled()
+
+      if (initialStatus === "waiting_for_approval") {
+        const user = userEvent.setup()
+        await user.click(screen.getByRole("button", { name: /New session/ }))
+        expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+        latestStatus = "cancelled"
+        act(() => {
+          if (!runtimeSocket) throw new Error("run was not resumed")
+          runtimeEvent(
+            runtimeSocket,
+            "run-pending-refresh",
+            replay.length + 1,
+            "run.cancelled",
+            { status: "cancelled" }
+          )
+        })
+        expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+        return
+      }
+
+      latestStatus = "cancelled"
+      act(() => {
+        if (!runtimeSocket) throw new Error("run was not resumed")
+        runtimeEvent(
+          runtimeSocket,
+          "run-pending-refresh",
+          replay.length + 1,
+          "run.cancelled",
+          { status: "cancelled" }
+        )
+      })
+      expect(
+        await screen.findByRole("button", { name: "Retry" })
+      ).toBeInTheDocument()
+    }
+  )
+
+  it("offers Retry for a saved terminal failure without replaying its events", async () => {
+    const turnId = "0cbac0bb-d031-4ef2-a7e1-cc006487e756"
+    const methods: string[] = []
+    installRuntimeServer((_socket, request) =>
+      methods.push(String(request.method))
+    )
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest")
+          return response({
+            run_id: "run-failed-before-refresh",
+            turn_id: turnId,
+            status: "failed",
+            last_sequence: 2,
+          })
+        if (url === "/api/sessions/session-recent")
+          return response({
+            session: { ...recentSession, message_count: 1 },
+            messages: [
+              {
+                id: "persisted-user",
+                turn_id: turnId,
+                role: "user",
+                content: "Try this again",
+                provider: null,
+                model: null,
+                created_at: "2026-08-25T10:00:00Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+
+    renderApp()
+    await openSavedSession("Persisted conversation")
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent(
+      "The previous assistant response did not complete."
+    )
+    expect(
+      within(alert).getByRole("button", { name: "Retry" })
+    ).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Stop generating" })).toBeNull()
+    expect(methods).toEqual([])
+  })
+
+  it("starts new work without replaying a completed run from the restored timeline", async () => {
+    const turnId = "bc3f4014-2e95-424e-988d-3060d7087fc3"
+    const methods: string[] = []
+    installRuntimeServer((socket, request) => {
+      methods.push(String(request.method))
+      expect(request.method).toBe("run.start")
+      expect(request.params).toMatchObject({
+        sessionId: "session-recent",
+        content: "Next request",
+      })
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "run-new", status: "running", lastSequence: 2 },
+      })
+      runtimeEvent(socket, "run-new", 1, "run.queued", { status: "queued" })
+      runtimeEvent(socket, "run-new", 2, "run.started", {
+        status: "running",
+      })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        if (url === "/api/sessions") return response([recentSession])
+        if (url === "/api/sessions/session-recent/runs/latest")
+          return response({
+            run_id: "run-complete",
+            turn_id: turnId,
+            status: "completed",
+            last_sequence: 3,
+          })
+        if (url === "/api/sessions/session-recent")
+          return response({
+            session: recentSession,
+            messages: [
+              {
+                id: "saved-user",
+                turn_id: turnId,
+                role: "user",
+                content: "A finished request",
+                provider: null,
+                model: null,
+                created_at: "2026-08-25T10:00:00Z",
+              },
+              {
+                id: "saved-answer",
+                turn_id: turnId,
+                role: "assistant",
+                content: "Saved answer",
+                provider: "openai",
+                model: "gpt-5.5",
+                created_at: "2026-08-25T10:00:01Z",
+              },
+            ],
+          })
+        return undefined
+      })
+    )
+
+    const user = userEvent.setup()
+    renderApp()
+    await openSavedSession("Persisted conversation")
+    expect(await screen.findByText("Saved answer")).toBeInTheDocument()
+    expect(methods).toEqual([])
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+
+    await user.type(
+      screen.getByRole("textbox", { name: "Message" }),
+      "Next request"
+    )
+    await user.click(screen.getByRole("button", { name: "Send" }))
+    expect(
+      await screen.findByRole("button", { name: "Stop generating" })
+    ).toBeInTheDocument()
+    expect(methods).toEqual(["run.start"])
+    expect(
+      screen.getByRole("button", { name: "Stop generating" })
+    ).toBeInTheDocument()
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeDisabled()
+    expect(screen.getByText("Next request")).toBeInTheDocument()
   })
 
   it("edits the local profile and treats provider keys as write-only", async () => {
@@ -962,7 +3809,7 @@ describe("local-first chat", () => {
     const user = userEvent.setup()
 
     renderApp()
-    await screen.findByText("A workspace for ideas in motion")
+    await screen.findByRole("textbox", { name: "Message" })
     await user.click(screen.getByRole("button", { name: "Settings" }))
 
     expect(screen.getByDisplayValue(profile.id)).toBeDisabled()
@@ -1032,7 +3879,7 @@ describe("local-first chat", () => {
     vi.stubGlobal("fetch", fetchMock)
 
     renderApp()
-    await screen.findByText("A workspace for ideas in motion")
+    await screen.findByRole("textbox", { name: "Message" })
     await userEvent.click(screen.getByRole("button", { name: "Settings" }))
     await userEvent.click(screen.getByRole("button", { name: "Save profile" }))
 

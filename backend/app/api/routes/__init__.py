@@ -6,6 +6,8 @@ from app.api.routes.profile import router as profile_router
 from app.api.routes.runtime import router as runtime_router
 from app.api.routes.sessions import router as sessions_router
 from app.api.routes.settings import router as settings_router
+from app.api.routes.test_presets import router as test_presets_router
+from app.api.routes.workspaces import router as workspaces_router
 
 router = APIRouter()
 router.include_router(health_router)
@@ -14,5 +16,7 @@ router.include_router(onboarding_router)
 router.include_router(settings_router)
 router.include_router(sessions_router)
 router.include_router(runtime_router)
+router.include_router(test_presets_router)
+router.include_router(workspaces_router)
 
 __all__ = ["router"]

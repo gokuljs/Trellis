@@ -1,3 +1,5 @@
+import type { RunSummary } from "@/lib/app-types"
+
 export type RuntimeRunEvent = {
   runId: string
   sequence: number
@@ -7,11 +9,64 @@ export type RuntimeRunEvent = {
   createdAt?: string
 }
 
+export type RuntimeRunInfo = {
+  runId: string
+  budgetPreset?: string
+  limits?: {
+    maxModelCalls: number
+    maxToolCalls: number
+    maxTotalTokens: number
+    maxCostUsd: number
+    deadlineAt: string
+  }
+}
+
+export type TurnRunActivity = {
+  events: RuntimeRunEvent[]
+  runInfo: RuntimeRunInfo | null
+  latestEvent?: RuntimeRunEvent
+  summary?: RunSummary
+  priorAttempts?: RunAttemptActivity[]
+  eventsLoading?: boolean
+  eventsError?: string | null
+}
+
+export type RunAttemptActivity = {
+  runId: string
+  summary: RunSummary | null
+  runInfo: RuntimeRunInfo | null
+  events: RuntimeRunEvent[] | null
+  loading?: boolean
+  error?: string | null
+}
+
+export function mergeRunEvents(
+  runId: string,
+  saved: RuntimeRunEvent[],
+  live: RuntimeRunEvent[]
+): RuntimeRunEvent[] {
+  const bySequence = new Map(
+    saved
+      .filter((event) => event.runId === runId)
+      .map((event) => [event.sequence, event])
+  )
+  for (const event of live) {
+    if (event.runId === runId) bySequence.set(event.sequence, event)
+  }
+  return [...bySequence.values()].sort(
+    (left, right) => left.sequence - right.sequence
+  )
+}
+
+export type ToolApprovalDecision = "approved" | "denied"
+
 export type StartRunInput = {
   sessionId: string
   turnId: string
   clientRequestId: string
   content: string
+  modelId?: string
+  budgetPreset?: "conservative" | "longer"
 }
 
 export type RuntimeErrorPayload = {
@@ -46,6 +101,7 @@ type RpcRequest = {
 type RuntimeClientOptions = {
   onEvent?: (event: RuntimeRunEvent) => void
   onRunId?: (runId: string) => void
+  onRunInfo?: (run: RuntimeRunInfo) => void
   reconnectAttempts?: number
   reconnectDelayMs?: number
 }
@@ -116,22 +172,53 @@ function rpcError(response: RpcResponse): RuntimeError {
   )
 }
 
-export function streamRun(
-  input: StartRunInput,
-  options: RuntimeClientOptions = {}
+function parseRunInfo(result: Record<string, unknown>): RuntimeRunInfo {
+  const runId = result.runId as string
+  const info: RuntimeRunInfo = { runId }
+  if (typeof result.budgetPreset === "string") {
+    info.budgetPreset = result.budgetPreset
+  }
+  const limits = asRecord(result.limits)
+  if (
+    limits &&
+    typeof limits.maxModelCalls === "number" &&
+    typeof limits.maxToolCalls === "number" &&
+    typeof limits.maxTotalTokens === "number" &&
+    typeof limits.maxCostUsd === "number" &&
+    typeof limits.deadlineAt === "string"
+  ) {
+    info.limits = {
+      maxModelCalls: limits.maxModelCalls,
+      maxToolCalls: limits.maxToolCalls,
+      maxTotalTokens: limits.maxTotalTokens,
+      maxCostUsd: limits.maxCostUsd,
+      deadlineAt: limits.deadlineAt,
+    }
+  }
+  return info
+}
+
+function followRun(
+  input: StartRunInput | null,
+  resumedRunId: string | null,
+  options: RuntimeClientOptions,
+  initialSequence: number
 ): Promise<RunResult> {
   const reconnectLimit = options.reconnectAttempts ?? 4
   const reconnectDelay = options.reconnectDelayMs ?? 200
 
   return new Promise((resolve, reject) => {
     let socket: WebSocket | null = null
-    let runId: string | null = null
-    let lastSequence = 0
+    let runId: string | null = resumedRunId
+    let lastSequence = initialSequence
+    let runIdNotified = false
+    let subscriptionReady = false
     let reconnects = 0
     let nextRpcId = 0
     let settled = false
     let subscriptionRequestPending = false
     let bufferedEventOverflowed = false
+    let replayRequiredForRun: string | null = null
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     const pending = new Map<
       string,
@@ -235,6 +322,15 @@ export function streamRun(
       subscriptionRequestPending = true
       const method = runId ? "run.resume" : "run.start"
       const params = runId ? { runId, afterSequence: lastSequence } : input
+      if (!params) {
+        finish(
+          new RuntimeError(
+            "runtime_protocol_error",
+            "Run cannot start without its request."
+          )
+        )
+        return
+      }
       void sendRpc(activeSocket, method, params)
         .then((response) => {
           if (settled || socket !== activeSocket) return
@@ -242,7 +338,7 @@ export function streamRun(
           if (response.error) throw rpcError(response)
           const result = response.result
           const responseRunId = result?.runId
-          if (typeof responseRunId !== "string") {
+          if (!result || typeof responseRunId !== "string") {
             throw new RuntimeError(
               "runtime_protocol_error",
               "The local service returned an invalid run."
@@ -254,11 +350,18 @@ export function streamRun(
               "The local service resumed a different run."
             )
           }
-          if (!runId) {
-            runId = responseRunId
+          if (!runId) runId = responseRunId
+          if (!runIdNotified) {
+            runIdNotified = true
             options.onRunId?.(runId)
           }
+          options.onRunInfo?.(parseRunInfo(result))
+          subscriptionReady = true
           flushBufferedEvents()
+          if (!settled && replayRequiredForRun === runId) {
+            replayRequiredForRun = null
+            beginRequest(activeSocket)
+          }
         })
         .catch((error: unknown) => {
           if (settled || socket !== activeSocket) return
@@ -322,7 +425,7 @@ export function streamRun(
           const params = asRecord(message.params)
           const event = params ? parseRunEvent(params) : null
           if (!event) continue
-          if (!runId) {
+          if (!subscriptionReady) {
             if (bufferedEvents.length < maxBufferedEvents)
               bufferedEvents.push(event)
             else bufferedEventOverflowed = true
@@ -331,8 +434,15 @@ export function streamRun(
           }
         } else if (message.method === "run.replay_required") {
           const params = asRecord(message.params)
-          if (runId && params?.runId === runId && socket === activeSocket) {
-            beginRequest(activeSocket)
+          const requestedRunId = params?.runId
+          if (
+            typeof requestedRunId === "string" &&
+            (!runId || requestedRunId === runId) &&
+            socket === activeSocket
+          ) {
+            if (subscriptionRequestPending)
+              replayRequiredForRun = requestedRunId
+            else if (runId) beginRequest(activeSocket)
           }
         }
       }
@@ -358,6 +468,8 @@ export function streamRun(
         if (socket !== activeSocket || settled) return
         socket = null
         subscriptionRequestPending = false
+        subscriptionReady = false
+        replayRequiredForRun = null
         const closed = new RuntimeError(
           "connection_lost",
           "Connection to Trellis was lost."
@@ -372,16 +484,52 @@ export function streamRun(
   })
 }
 
-export function cancelRun(
+export function streamRun(
+  input: StartRunInput,
+  options: RuntimeClientOptions = {}
+): Promise<RunResult> {
+  return followRun(input, null, options, 0)
+}
+
+export function resumeRun(
   runId: string,
+  options: RuntimeClientOptions = {},
   afterSequence = 0
-): Promise<{ runId: string; status: string }> {
+): Promise<RunResult> {
+  if (!runId || !Number.isSafeInteger(afterSequence) || afterSequence < 0)
+    return Promise.reject(
+      new RuntimeError("runtime_protocol_error", "Run cursor is invalid.")
+    )
+  return followRun(null, runId, options, afterSequence)
+}
+
+function requestRunAction(
+  method: string,
+  params: Record<string, unknown>,
+  requestId: string,
+  failureMessage: string
+): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(runtimeUrl())
-    const requestId = "runtime-cancel"
-    const timeout = setTimeout(() => {
+    let settled = false
+    const finish = (result?: Record<string, unknown>, error?: RuntimeError) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
       socket.close()
-      reject(
+      if (error) reject(error)
+      else if (result) resolve(result)
+      else
+        reject(
+          new RuntimeError(
+            "runtime_protocol_error",
+            "The local service returned an invalid run."
+          )
+        )
+    }
+    const timeout = setTimeout(() => {
+      finish(
+        undefined,
         new RuntimeError(
           "runtime_timeout",
           "The local service did not respond."
@@ -389,14 +537,16 @@ export function cancelRun(
       )
     }, rpcTimeoutMs)
     socket.onopen = () => {
-      socket.send(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          id: requestId,
-          method: "run.cancel",
-          params: { runId, afterSequence },
-        })
-      )
+      try {
+        socket.send(
+          JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params })
+        )
+      } catch {
+        finish(
+          undefined,
+          new RuntimeError("connection_lost", "Connection to Trellis was lost.")
+        )
+      }
     }
     socket.onmessage = ({ data }) => {
       if (typeof data !== "string") return
@@ -404,9 +554,8 @@ export function cancelRun(
       try {
         response = JSON.parse(data) as unknown
       } catch {
-        clearTimeout(timeout)
-        socket.close()
-        reject(
+        finish(
+          undefined,
           new RuntimeError(
             "runtime_protocol_error",
             "The local service sent invalid data."
@@ -416,44 +565,75 @@ export function cancelRun(
       }
       const envelope = asRecord(response)
       if (!envelope || envelope.id !== requestId) return
-      clearTimeout(timeout)
-      socket.close()
       if (envelope.error) {
         const error = asRecord(envelope.error)
         const detail = asRecord(error?.data)
-        reject(
+        finish(
+          undefined,
           new RuntimeError(
             typeof detail?.code === "string"
               ? detail.code
               : "runtime_request_failed",
-            typeof error?.message === "string"
-              ? error.message
-              : "Trellis could not cancel that run."
+            typeof error?.message === "string" ? error.message : failureMessage
           )
         )
         return
       }
-      const result = asRecord(envelope.result)
-      if (
-        typeof result?.runId !== "string" ||
-        typeof result.status !== "string"
-      ) {
-        reject(
-          new RuntimeError(
-            "runtime_protocol_error",
-            "The local service returned an invalid run."
-          )
-        )
-        return
-      }
-      resolve({ runId: result.runId, status: result.status })
+      finish(asRecord(envelope.result) ?? undefined)
     }
     socket.onerror = () => {
-      clearTimeout(timeout)
-      socket.close()
-      reject(
+      finish(
+        undefined,
         new RuntimeError("connection_lost", "Connection to Trellis was lost.")
       )
     }
   })
+}
+
+export async function cancelRun(
+  runId: string,
+  afterSequence = 0
+): Promise<{ runId: string; status: string }> {
+  const result = await requestRunAction(
+    "run.cancel",
+    { runId, afterSequence },
+    "runtime-cancel",
+    "Trellis could not cancel that run."
+  )
+  if (typeof result.runId !== "string" || typeof result.status !== "string") {
+    throw new RuntimeError(
+      "runtime_protocol_error",
+      "The local service returned an invalid run."
+    )
+  }
+  return { runId: result.runId, status: result.status }
+}
+
+export async function respondToToolApproval(
+  runId: string,
+  toolCallId: string,
+  decision: ToolApprovalDecision,
+  afterSequence = 0
+): Promise<{
+  runId: string
+  toolCallId: string
+  decision: ToolApprovalDecision
+}> {
+  const result = await requestRunAction(
+    "run.respond",
+    { runId, toolCallId, decision, afterSequence },
+    "runtime-respond",
+    "Trellis could not answer that approval request."
+  )
+  if (
+    result.runId !== runId ||
+    result.toolCallId !== toolCallId ||
+    result.decision !== decision
+  ) {
+    throw new RuntimeError(
+      "runtime_protocol_error",
+      "The local service returned a different approval."
+    )
+  }
+  return { runId, toolCallId, decision }
 }

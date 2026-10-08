@@ -1,7 +1,6 @@
 import type { LucideIcon } from "lucide-react"
 
-export type WorkspaceView =
-  "New session" | "Capabilities" | "Settings" | "session"
+export type WorkspaceView = "New session" | "Settings" | "session"
 export type ProviderId = string
 export type ModelId = string
 export type OnboardingStep = "intro" | "profile" | "model"
@@ -23,6 +22,7 @@ export type Session = {
   created_at: string
   updated_at: string
   message_count: number
+  workspace_path: string | null
 }
 
 export type Profile = {
@@ -60,6 +60,7 @@ export type Settings = {
   providers: ProviderStatus[]
   selected_model_id?: ModelId
   models?: ModelStatus[]
+  default_budget_preset?: "conservative" | "longer"
 }
 
 export type Message = {
@@ -75,6 +76,45 @@ export type Message = {
 export type SessionDetail = {
   session: Session
   messages: Message[]
+}
+
+export type TestPreset = {
+  name: string
+  command: string
+  cwd: string
+}
+
+export type LatestRun = {
+  run_id: string
+  turn_id: string
+  status: string
+  last_sequence: number
+}
+
+export type RunSummary = {
+  run_id: string
+  turn_id: string
+  retry_of: string | null
+  status: string
+  budget_preset: string
+  max_model_calls: number
+  max_tool_calls: number
+  max_total_tokens: number
+  max_cost_usd: number
+  deadline_at: string
+  last_sequence: number
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+}
+
+export type SavedRunEvent = {
+  run_id: string
+  sequence: number
+  event_type: string
+  event_version: number
+  data: Record<string, unknown>
+  created_at: string
 }
 
 export type TurnResult = {
