@@ -1991,7 +1991,7 @@ html.theme-ripple-fallback::before {
     flex-direction: column;
     border: 1px solid var(--shell-line);
     border-radius: 19px;
-    padding: 10px 13px 11px;
+    padding: 10px 13px 4px;
     background: var(--shell-input);
     transition:
       border-color 140ms ease,
@@ -2054,7 +2054,7 @@ html.theme-ripple-fallback::before {
   .composer-workspace-anchor {
     position: absolute;
     z-index: 30;
-    bottom: 16px;
+    bottom: 4px;
     left: 13px;
   }
 
@@ -2189,7 +2189,7 @@ html.theme-ripple-fallback::before {
 
   .composer-tools {
     display: flex;
-    height: 40px;
+    height: 30px;
     align-items: center;
     gap: 13px;
   }
@@ -2253,6 +2253,14 @@ html.theme-ripple-fallback::before {
   }
 
   @media (pointer: coarse) {
+    .composer-workspace-anchor {
+      bottom: 9px;
+    }
+
+    .composer-tools {
+      height: 40px;
+    }
+
     .send-button-metal {
       flex-basis: 40px;
     }
