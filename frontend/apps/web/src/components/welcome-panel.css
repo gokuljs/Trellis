@@ -3,9 +3,9 @@
   width: min(100%, 760px);
   align-items: center;
   justify-content: center;
-  gap: clamp(5px, 0.75vw, 10px);
+  gap: var(--space-control);
   margin: auto;
-  padding: 24px;
+  padding: var(--space-component);
 }
 
 .welcome-dither {
@@ -24,8 +24,8 @@
 
 @media (max-width: 640px) {
   .welcome-scene {
-    gap: 6px;
-    padding: 16px;
+    gap: var(--space-control);
+    padding: var(--space-component);
   }
 
   .welcome-dither {
