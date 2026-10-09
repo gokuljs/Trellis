@@ -1,5 +1,5 @@
 import { Menu } from "lucide-react"
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 
 import { ChatThread } from "@/components/chat-thread"
 import { Composer } from "@/components/composer"
@@ -186,7 +186,9 @@ function startNextAttempt(previous?: TurnRunActivity): TurnRunActivity {
   return { events: [], runInfo: null, priorAttempts }
 }
 
-export function AppShell() {
+export function AppShell({
+  accountControl,
+}: { accountControl?: ReactNode } = {}) {
   const [activeView, setActiveView] = useState<WorkspaceView>("New session")
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
@@ -1172,6 +1174,11 @@ export function AppShell() {
         className="onboarding-shell onboarding-loading-shell"
         data-theme="dark"
       >
+        {accountControl && (
+          <header className="onboarding-topbar onboarding-account-loading">
+            {accountControl}
+          </header>
+        )}
         <div className="workspace-loading" role="status">
           Opening your local workspace…
         </div>
@@ -1182,6 +1189,7 @@ export function AppShell() {
   if (onboardingRequired && profile && settings) {
     return (
       <OnboardingFlow
+        accountControl={accountControl}
         profile={profile}
         settings={settings}
         initialStep={onboardingStep}
@@ -1227,6 +1235,7 @@ export function AppShell() {
 
       <section className="workspace">
         <WorkspaceTopbar
+          accountControl={accountControl}
           activeView={activeView}
           activeSessionTitle={activeSession?.title ?? null}
           onNavigate={handleNavigate}

@@ -19,6 +19,7 @@ export interface AuthController {
   getSnapshot: () => AuthState
   subscribe: (listener: () => void) => () => void
   signIn: (provider: AuthProvider) => Promise<void>
+  signOut: () => Promise<void>
   retry: () => Promise<void>
 }
 
@@ -171,6 +172,8 @@ export function createAuthController(
   let callbackConsumed = false
   let version = 0
   let rejectLateAuthEvents = false
+  let signingOut: Promise<void> | null = null
+  let signOutRecoveryRequired = false
 
   const publish = (next: AuthState) => {
     state = next
@@ -233,12 +236,24 @@ export function createAuthController(
     return initialization
   }
 
+  const recoverFromBrowserBack = (event: PageTransitionEvent) => {
+    if (!event.persisted || !state.pendingProvider) return
+    version += 1
+    rejectLateAuthEvents = true
+    publish({
+      ...emptyState,
+      status: "signed-out",
+      error: "Sign-in was interrupted. Choose a provider to try again.",
+    })
+  }
+
   const startSubscription = () => {
     const { data } = client.auth.onAuthStateChange((event, session) => {
       if (event === "INITIAL_SESSION") return
       if (event === "SIGNED_OUT" || !session) {
         version += 1
         rejectLateAuthEvents = true
+        signOutRecoveryRequired = false
         publish({ ...emptyState, status: "signed-out" })
         return
       }
@@ -259,6 +274,7 @@ export function createAuthController(
       })
     })
     sdkSubscription = data.subscription
+    window.addEventListener("pageshow", recoverFromBrowserBack)
   }
 
   const controller: AuthController = {
@@ -275,6 +291,7 @@ export function createAuthController(
         if (listeners.size === 0) {
           sdkSubscription?.unsubscribe()
           sdkSubscription = null
+          window.removeEventListener("pageshow", recoverFromBrowserBack)
         }
       }
     },
@@ -282,6 +299,7 @@ export function createAuthController(
       if (state.pendingProvider || state.status === "signed-in") return
       const expectedVersion = ++version
       rejectLateAuthEvents = false
+      signOutRecoveryRequired = false
       publish({
         ...emptyState,
         status: "signed-out",
@@ -314,7 +332,49 @@ export function createAuthController(
         })
       }
     },
+    signOut: () => {
+      if (signingOut) return signingOut
+      if (state.status !== "signed-in" && !signOutRecoveryRequired)
+        return Promise.resolve()
+      const previousState = state
+      const expectedVersion = ++version
+      rejectLateAuthEvents = true
+      publish({ ...state, error: null, pendingProvider: null })
+      signingOut = withDeadline(async () => {
+        const { error } = await client.auth.signOut({ scope: "local" })
+        if (error) throw error
+      })
+        .then(() => {
+          if (version !== expectedVersion) return
+          signOutRecoveryRequired = false
+          publish({ ...emptyState, status: "signed-out" })
+        })
+        .catch((error: unknown) => {
+          if (version !== expectedVersion) return
+          if (error instanceof AuthTimeoutError) {
+            version += 1
+            signOutRecoveryRequired = true
+            publish({
+              ...emptyState,
+              status: "error",
+              error:
+                "Sign-out timed out. Your workspace is locked. Try again to finish signing out.",
+            })
+            return
+          }
+          if (previousState.status === "signed-in") rejectLateAuthEvents = false
+          publish({
+            ...previousState,
+            error: "We could not finish signing you out. Please try again.",
+          })
+        })
+        .finally(() => {
+          signingOut = null
+        })
+      return signingOut
+    },
     retry: async () => {
+      if (signOutRecoveryRequired) return controller.signOut()
       if (initialization) return initialization
       version += 1
       rejectLateAuthEvents = false
@@ -342,6 +402,7 @@ export function getAuthController(): AuthController {
       getSnapshot: () => state,
       subscribe: () => () => {},
       signIn: async () => {},
+      signOut: async () => {},
       retry: async () => {},
     }
   }

@@ -10,5 +10,10 @@ export function useAuth() {
     controller.getSnapshot
   )
 
-  return { ...state, signIn: controller.signIn, retry: controller.retry }
+  return {
+    ...state,
+    signIn: controller.signIn,
+    signOut: controller.signOut,
+    retry: controller.retry,
+  }
 }

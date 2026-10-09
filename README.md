@@ -4,7 +4,10 @@ Trellis is a self-improving multi-agent system for coding and research. It coord
 
 ## Local chat quick start
 
-Install dependencies once, then start both services from the repository root:
+Use Node.js 22.12 or newer and Bun 1.2.4. First configure the existing Supabase
+project's Google/GitHub providers and copy the frontend environment template as
+described in the [frontend setup guide](frontend/README.md). Then install
+dependencies and start both services from the repository root:
 
 ```bash
 uvx --from uv==0.12.5 uv sync --locked --directory backend
@@ -17,10 +20,17 @@ The frontend is served at `http://127.0.0.1:3000` and the backend at
 `http://127.0.0.1:8000`. The command uses plain streamed logs so both services
 remain readable in one terminal. Press `Ctrl-C` once to stop both services.
 
-Then open `http://127.0.0.1:3000`, visit Settings, and add an OpenAI or
-Anthropic key. Trellis creates a stable local installation ID automatically and
-restores saved sessions from `~/.trellis` after restarts. Set
+Then open `http://127.0.0.1:3000`, sign in with Google or GitHub, complete local
+onboarding, and add an OpenAI or Anthropic key in Settings. Supabase stores the
+account and provider identity; Trellis creates a separate local installation ID
+and restores saved sessions from `~/.trellis` after restarts. Set
 `TRELLIS_DATA_DIR` before starting the backend to store local data elsewhere.
+
+This integration gates the frontend only. Backend authorization and application
+data isolation per account are planned for a later PR; accounts on the same
+local installation currently share its profile, chats, settings, and model
+keys. See the [frontend guide](frontend/README.md#account-storage-and-local-workspace)
+for the storage boundary and provider verification checklist.
 
 ## Formatting and pre-commit checks
 

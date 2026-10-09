@@ -1,5 +1,5 @@
 import { ArrowUpRight, Eye, EyeOff, KeyRound } from "lucide-react"
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState, type ReactNode } from "react"
 
 import { TrellisMark } from "@/components/trellis-mark"
 import { ApiError } from "@/lib/api"
@@ -17,6 +17,7 @@ export type OnboardingValues = {
 }
 
 type OnboardingFlowProps = {
+  accountControl?: ReactNode
   profile: Profile
   settings: Settings
   initialStep: OnboardingStep
@@ -47,6 +48,7 @@ function isValidEmail(value: string) {
 }
 
 export function OnboardingFlow({
+  accountControl,
   profile,
   settings,
   initialStep,
@@ -185,8 +187,11 @@ export function OnboardingFlow({
             <TrellisMark size={18} />
             <span>Trellis</span>
           </div>
-          <div className="onboarding-step" aria-live="polite">
-            {stepLabel}
+          <div className="onboarding-account-actions">
+            <div className="onboarding-step" aria-live="polite">
+              {stepLabel}
+            </div>
+            {accountControl}
           </div>
         </header>
 

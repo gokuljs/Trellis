@@ -19,6 +19,7 @@ const auth = vi.hoisted(() => ({
   listeners: new Set<() => void>(),
   signIn: vi.fn(async () => undefined),
   retry: vi.fn(async () => undefined),
+  signOut: vi.fn(async () => undefined),
 }))
 
 vi.mock("@/lib/auth-controller", () => ({
@@ -30,6 +31,7 @@ vi.mock("@/lib/auth-controller", () => ({
     },
     signIn: auth.signIn,
     retry: auth.retry,
+    signOut: auth.signOut,
   }),
 }))
 
@@ -49,6 +51,7 @@ beforeEach(() => {
   }
   auth.signIn.mockClear()
   auth.retry.mockClear()
+  auth.signOut.mockClear()
 })
 
 afterEach(() => {
@@ -58,6 +61,47 @@ afterEach(() => {
 })
 
 describe("authentication gate", () => {
+  it.each(["loading", "onboarding"])(
+    "lets a verified user sign out during workspace %s",
+    async (stage) => {
+      auth.state = {
+        ...auth.state,
+        status: "signed-in",
+        user: { id: "account-1", email: "ada@example.com" } as User,
+      }
+      const fetch = vi.fn((url: string) => {
+        if (stage === "loading") return new Promise<Response>(() => {})
+        const data =
+          url === "/api/profile"
+            ? { id: "profile-1", display_name: null, email: null }
+            : url === "/api/settings"
+              ? { providers: [], models: [] }
+              : { completed: false, current_step: "intro" }
+        return Promise.resolve(
+          new Response(JSON.stringify(data), {
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+      })
+      vi.stubGlobal("fetch", fetch)
+      render(
+        <ThemeProvider>
+          <App />
+        </ThemeProvider>
+      )
+      if (stage === "onboarding") {
+        expect(
+          await screen.findByRole("heading", { name: "Workspace setup" })
+        ).toBeVisible()
+      }
+
+      await userEvent.click(screen.getByLabelText("Account: ada@example.com"))
+      await userEvent.click(screen.getByRole("button", { name: "Sign out" }))
+
+      expect(auth.signOut).toHaveBeenCalledOnce()
+    }
+  )
+
   it("preserves workspace state on token refresh and resets it for a different account", async () => {
     const user = userEvent.setup()
     auth.state = {

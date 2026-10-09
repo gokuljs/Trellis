@@ -32,10 +32,12 @@ const session: Session = {
 
 function deferred<T>() {
   let resolve!: (value: T) => void
-  const promise = new Promise<T>((resolvePromise) => {
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise
+    reject = rejectPromise
   })
-  return { promise, resolve }
+  return { promise, resolve, reject }
 }
 
 function fakeAuthClient() {
@@ -66,6 +68,9 @@ function fakeAuthClient() {
         },
         error: null,
       }),
+    signOut: vi
+      .fn<SupabaseClient["auth"]["signOut"]>()
+      .mockResolvedValue({ error: null }),
     onAuthStateChange: (
       callback: (event: AuthChangeEvent, session: Session | null) => void
     ) => {
@@ -629,6 +634,250 @@ describe("authentication controller", () => {
     expect(subscriptionCount()).toBe(1)
     unsubscribeSecond()
     expect(subscriptionCount()).toBe(0)
+  })
+
+  it("signs out only this browser and clears the verified user", async () => {
+    const { client, auth } = fakeAuthClient()
+    auth.getSession.mockResolvedValue({ data: { session }, error: null })
+    const controller = createAuthController(client)
+    cleanups.push(controller.subscribe(() => {}))
+    await vi.waitFor(() =>
+      expect(controller.getSnapshot().status).toBe("signed-in")
+    )
+
+    await controller.signOut()
+
+    expect(auth.signOut).toHaveBeenCalledExactlyOnceWith({ scope: "local" })
+    expect(controller.getSnapshot()).toEqual({
+      status: "signed-out",
+      user: null,
+      error: null,
+      pendingProvider: null,
+    })
+  })
+
+  it("shares one pending sign-out across repeated clicks", async () => {
+    const { client, auth } = fakeAuthClient()
+    auth.getSession.mockResolvedValue({ data: { session }, error: null })
+    const signOutResult =
+      deferred<Awaited<ReturnType<SupabaseClient["auth"]["signOut"]>>>()
+    auth.signOut.mockReturnValueOnce(signOutResult.promise)
+    const controller = createAuthController(client)
+    cleanups.push(controller.subscribe(() => {}))
+    await vi.waitFor(() =>
+      expect(controller.getSnapshot().status).toBe("signed-in")
+    )
+
+    const first = controller.signOut()
+    const second = controller.signOut()
+    expect(first).toBe(second)
+    await vi.waitFor(() => expect(auth.signOut).toHaveBeenCalledTimes(1))
+    signOutResult.resolve({ error: null })
+    await first
+
+    expect(controller.getSnapshot().status).toBe("signed-out")
+  })
+
+  it("retains the verified workspace on sign-out failure and allows retry", async () => {
+    const { client, auth } = fakeAuthClient()
+    auth.getSession.mockResolvedValue({ data: { session }, error: null })
+    auth.signOut.mockRejectedValueOnce(
+      new TypeError("Sensitive logout network detail")
+    )
+    const controller = createAuthController(client)
+    cleanups.push(controller.subscribe(() => {}))
+    await vi.waitFor(() =>
+      expect(controller.getSnapshot().status).toBe("signed-in")
+    )
+
+    await controller.signOut()
+
+    expect(controller.getSnapshot().status).toBe("signed-in")
+    expect(controller.getSnapshot().user?.id).toBe("verified-user")
+    expect(controller.getSnapshot().error).toBeTruthy()
+    expect(controller.getSnapshot().error).not.toContain("Sensitive logout")
+    await controller.signOut()
+    expect(controller.getSnapshot().status).toBe("signed-out")
+  })
+
+  it("never restores a previous user after the SDK has signed out during a failed request", async () => {
+    const { client, auth, emit } = fakeAuthClient()
+    auth.getSession.mockResolvedValue({ data: { session }, error: null })
+    const signOutResult =
+      deferred<Awaited<ReturnType<SupabaseClient["auth"]["signOut"]>>>()
+    auth.signOut.mockReturnValueOnce(signOutResult.promise)
+    const controller = createAuthController(client)
+    cleanups.push(controller.subscribe(() => {}))
+    await vi.waitFor(() =>
+      expect(controller.getSnapshot().status).toBe("signed-in")
+    )
+
+    const signingOut = controller.signOut()
+    emit("SIGNED_OUT", null)
+    signOutResult.reject(
+      new TypeError("Logout request failed after local removal")
+    )
+    await signingOut
+
+    expect(controller.getSnapshot().status).toBe("signed-out")
+    expect(controller.getSnapshot().user).toBeNull()
+  })
+
+  it("continues validating fresh auth events when a failed sign-out retains the session", async () => {
+    const { client, auth, emit } = fakeAuthClient()
+    auth.getSession.mockResolvedValue({ data: { session }, error: null })
+    auth.signOut.mockRejectedValueOnce(
+      new TypeError("Logout failed before removing session")
+    )
+    const controller = createAuthController(client)
+    cleanups.push(controller.subscribe(() => {}))
+    await vi.waitFor(() =>
+      expect(controller.getSnapshot().status).toBe("signed-in")
+    )
+    await controller.signOut()
+    auth.getUser.mockResolvedValueOnce({
+      data: { user: { ...user, user_metadata: { name: "Updated user" } } },
+      error: null,
+    })
+
+    emit("TOKEN_REFRESHED", {
+      ...session,
+      user,
+      access_token: "after-logout-failure-token",
+    })
+
+    await vi.waitFor(() =>
+      expect(controller.getSnapshot().user?.user_metadata.name).toBe(
+        "Updated user"
+      )
+    )
+    expect(controller.getSnapshot().status).toBe("signed-in")
+  })
+
+  it("locks the workspace after sign-out timeout and ignores late auth work", async () => {
+    vi.useFakeTimers()
+    const { client, auth, emit } = fakeAuthClient()
+    auth.getSession.mockResolvedValue({ data: { session }, error: null })
+    const signOutResult =
+      deferred<Awaited<ReturnType<SupabaseClient["auth"]["signOut"]>>>()
+    auth.signOut.mockReturnValueOnce(signOutResult.promise)
+    const controller = createAuthController(client)
+    cleanups.push(controller.subscribe(() => {}))
+    await vi.advanceTimersByTimeAsync(0)
+    const signingOut = controller.signOut()
+
+    await vi.advanceTimersByTimeAsync(15000)
+    await signingOut
+
+    expect(controller.getSnapshot().status).toBe("error")
+    expect(controller.getSnapshot().user).toBeNull()
+    expect(controller.getSnapshot().error).toMatch(/timed out|try again/i)
+    emit("SIGNED_IN", session)
+    signOutResult.resolve({ error: null })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(controller.getSnapshot().status).toBe("error")
+    await controller.retry()
+    expect(auth.signOut).toHaveBeenCalledTimes(2)
+    expect(controller.getSnapshot().error).toBeNull()
+  })
+
+  it("ignores user validation that finishes after sign-out starts", async () => {
+    const { client, auth, emit } = fakeAuthClient()
+    auth.getSession.mockResolvedValue({ data: { session }, error: null })
+    const controller = createAuthController(client)
+    cleanups.push(controller.subscribe(() => {}))
+    await vi.waitFor(() =>
+      expect(controller.getSnapshot().status).toBe("signed-in")
+    )
+    const validation = deferred<{ data: { user: User }; error: null }>()
+    auth.getUser.mockReturnValueOnce(validation.promise)
+    emit("TOKEN_REFRESHED", { ...session, user, access_token: "new-token" })
+    await vi.waitFor(() =>
+      expect(auth.getUser).toHaveBeenCalledWith("new-token")
+    )
+
+    await controller.signOut()
+    validation.resolve({ data: { user }, error: null })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(controller.getSnapshot().status).toBe("signed-out")
+    expect(controller.getSnapshot().user).toBeNull()
+  })
+
+  it("removes the persisted session through the real SDK's local sign-out", async () => {
+    const logoutScopes: string[] = []
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = new URL(String(input))
+      if (url.pathname === "/auth/v1/user")
+        return new Response(JSON.stringify(user), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      if (url.pathname === "/auth/v1/logout") {
+        logoutScopes.push(url.searchParams.get("scope") ?? "")
+        return new Response(null, { status: 204 })
+      }
+      throw new Error("Unexpected auth request")
+    })
+    localStorage.setItem(
+      "sb-real-signout-auth-token",
+      JSON.stringify({ ...session, user })
+    )
+    const client = createSupabaseClient({
+      VITE_SUPABASE_URL: "https://real-signout.supabase.co",
+      VITE_SUPABASE_PUBLISHABLE_KEY: "sb_publishable_real_signout",
+    })
+    sdkClients.push(client)
+    const controller = createAuthController(client)
+    cleanups.push(controller.subscribe(() => {}))
+    await vi.waitFor(() =>
+      expect(controller.getSnapshot().status).toBe("signed-in")
+    )
+
+    await controller.signOut()
+
+    expect(logoutScopes).toEqual(["local"])
+    expect(localStorage.getItem("sb-real-signout-auth-token")).toBeNull()
+    expect((await client.auth.getSession()).data.session).toBeNull()
+    expect(controller.getSnapshot().status).toBe("signed-out")
+  })
+
+  it("releases a cancelled provider action when Back restores the document", async () => {
+    const { client } = fakeAuthClient()
+    const controller = createAuthController(client, () => {})
+    cleanups.push(controller.subscribe(() => {}))
+    await vi.waitFor(() =>
+      expect(controller.getSnapshot().status).toBe("signed-out")
+    )
+    await controller.signIn("google")
+
+    window.dispatchEvent(
+      new PageTransitionEvent("pageshow", { persisted: true })
+    )
+
+    expect(controller.getSnapshot().pendingProvider).toBeNull()
+    expect(controller.getSnapshot().error).toMatch(/interrupted|cancelled/i)
+    await controller.signIn("github")
+    expect(controller.getSnapshot().pendingProvider).toBe("github")
+  })
+
+  it("removes the BFCache recovery listener when the last subscriber leaves", async () => {
+    const { client } = fakeAuthClient()
+    const controller = createAuthController(client, () => {})
+    const unsubscribe = controller.subscribe(() => {})
+    cleanups.push(unsubscribe)
+    await vi.waitFor(() =>
+      expect(controller.getSnapshot().status).toBe("signed-out")
+    )
+    await controller.signIn("google")
+    unsubscribe()
+
+    window.dispatchEvent(
+      new PageTransitionEvent("pageshow", { persisted: true })
+    )
+
+    expect(controller.getSnapshot().pendingProvider).toBe("google")
   })
 
   it("returns a configuration error store when browser configuration is absent", async () => {
