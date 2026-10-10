@@ -1,5 +1,5 @@
 import { LayoutGrid, MessageSquare, Moon, Settings, Sun } from "lucide-react"
-import type { MouseEvent } from "react"
+import type { MouseEvent, ReactNode } from "react"
 
 import { useTheme } from "@/components/theme-provider"
 import type { WorkspaceView } from "@/lib/app-types"
@@ -9,12 +9,14 @@ type ViewTransitionDocument = Document & {
 }
 
 type WorkspaceTopbarProps = {
+  accountControl?: ReactNode
   activeView: WorkspaceView
   activeSessionTitle: string | null
   onNavigate: (view: WorkspaceView) => void
 }
 
 export function WorkspaceTopbar({
+  accountControl,
   activeView,
   activeSessionTitle,
   onNavigate,
@@ -103,6 +105,7 @@ export function WorkspaceTopbar({
             <Moon size={15} strokeWidth={1.7} aria-hidden="true" />
           )}
         </button>
+        {accountControl}
       </div>
     </div>
   )

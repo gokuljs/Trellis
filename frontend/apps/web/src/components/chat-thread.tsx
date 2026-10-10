@@ -4,7 +4,7 @@ import Markdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { ThinkingOrb } from "thinking-orbs"
 
-import { TrellisMark } from "@/components/trellis-mark"
+import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 import { RunActivityDisclosure } from "@/components/run-activity-disclosure"
 import type { Message, Session } from "@/lib/app-types"
 import type {

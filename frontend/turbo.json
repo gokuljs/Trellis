@@ -4,7 +4,8 @@
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
-      "inputs": ["$TURBO_DEFAULT$", ".env*"],
+      "env": ["VITE_SUPABASE_URL", "VITE_SUPABASE_PUBLISHABLE_KEY"],
+      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/.env*"],
       "outputs": ["dist/**"]
     },
     "lint": {
@@ -20,6 +21,7 @@
       "dependsOn": ["^test"]
     },
     "dev": {
+      "env": ["VITE_SUPABASE_URL", "VITE_SUPABASE_PUBLISHABLE_KEY"],
       "cache": false,
       "persistent": true
     }

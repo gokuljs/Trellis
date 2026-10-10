@@ -1,11 +1,11 @@
-import type { WorkspaceView } from "@/lib/app-types";
-import { TrellisMark } from "@/components/trellis-mark";
-import "./welcome-panel.css";
+import type { WorkspaceView } from "@/lib/app-types"
+import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
+import "./welcome-panel.css"
 
 type WelcomePanelProps = {
-  activeView: WorkspaceView;
-  activeSessionTitle: string | null;
-};
+  activeView: WorkspaceView
+  activeSessionTitle: string | null
+}
 
 export function WelcomePanel({
   activeView,
@@ -18,7 +18,7 @@ export function WelcomePanel({
         <h1>{activeSessionTitle ?? "New session"}</h1>
         <p>Trellis is ready for the next piece of work.</p>
       </div>
-    );
+    )
   }
 
   return (
@@ -26,5 +26,5 @@ export function WelcomePanel({
       <p className="welcome-scene__copy">What would you like to work on?</p>
       <TrellisMark className="welcome-dither" size={24} animated />
     </div>
-  );
+  )
 }

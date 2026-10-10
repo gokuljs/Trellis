@@ -13,6 +13,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.117.3",
     "@trellis/ui": "workspace:*",
     "lucide-react": "^1.34.0",
     "metal-fx": "^2.0.11",

@@ -7,7 +7,7 @@ import {
 } from "lucide-react"
 import { Toaster } from "sonner"
 
-import { TrellisMark } from "@/components/trellis-mark"
+import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 import { useTheme } from "@/components/theme-provider"
 
 const iconProps = {

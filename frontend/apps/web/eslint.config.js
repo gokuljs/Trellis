@@ -18,5 +18,16 @@ export default defineConfig([
     languageOptions: {
       globals: globals.browser,
     },
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector:
+            "JSXOpeningElement[name.type='JSXIdentifier'][name.name='svg']",
+          message:
+            "Define custom SVG icons in frontend/packages/ui/src/icons/ and reuse the shared components.",
+        },
+      ],
+    },
   },
 ])

@@ -11,8 +11,19 @@ import { toast } from "sonner"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import "@trellis/ui/globals.css"
-import { App } from "@/App"
+import { AppShell } from "@/components/app-shell"
+import { GlobalToaster } from "@/components/global-toaster"
 import { ThemeProvider } from "@/components/theme-provider"
+
+// These tests cover local workspace behavior after the auth gate admits a user.
+function App() {
+  return (
+    <>
+      <AppShell />
+      <GlobalToaster />
+    </>
+  )
+}
 
 const profile = {
   id: "a59673c1-78d0-4bc8-8c49-6bc2e7a01dd5",

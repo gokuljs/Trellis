@@ -1,0 +1,138 @@
+.account-menu {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.account-trigger {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  gap: var(--space-2);
+  border-radius: 8px;
+  padding: var(--space-1) var(--space-2);
+  color: var(--shell-text-muted);
+  font-size: 13px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.account-trigger::-webkit-details-marker {
+  display: none;
+}
+
+.account-label {
+  max-width: 112px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-trigger:focus-visible,
+.account-sign-out:focus-visible {
+  outline: 2px solid var(--shell-focus);
+  outline-offset: 3px;
+}
+
+.account-menu[open] .account-trigger {
+  color: var(--shell-text-strong);
+  background: var(--shell-hover);
+}
+
+.account-panel {
+  position: absolute;
+  top: calc(100% + var(--space-2));
+  right: 0;
+  z-index: 30;
+  width: min(264px, calc(100vw - 32px));
+  max-height: calc(100svh - 80px);
+  overflow-y: auto;
+  border: 1px solid var(--shell-line);
+  border-radius: var(--radius);
+  padding: var(--space-4);
+  color: var(--shell-text-strong);
+  background: var(--shell-card);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.account-name {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.5;
+}
+
+.account-email {
+  margin: var(--space-1) 0 0;
+  color: var(--shell-text-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.account-error {
+  margin: var(--space-3) 0 0;
+  color: var(--destructive);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.account-sign-out {
+  display: flex;
+  width: 100%;
+  min-height: 44px;
+  align-items: center;
+  gap: var(--space-inline);
+  margin-top: var(--space-3);
+  border-radius: 8px;
+  padding: var(--space-2);
+  color: var(--shell-text-strong);
+  font-size: 14px;
+}
+
+.account-sign-out:disabled {
+  color: var(--shell-disabled-text);
+  cursor: wait;
+}
+
+.onboarding-account-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.onboarding-account-loading {
+  justify-content: flex-end;
+}
+
+.onboarding-shell .account-menu {
+  --destructive: #ff6369;
+  --shell-text-muted: var(--onboarding-muted);
+  --shell-text-strong: var(--onboarding-text);
+  --shell-hover: var(--onboarding-hover);
+  --shell-focus: var(--onboarding-focus);
+  --shell-line: var(--onboarding-line);
+  --shell-card: var(--onboarding-panel);
+  --shell-disabled-text: var(--onboarding-disabled-text);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .account-trigger:hover,
+  .account-sign-out:not(:disabled):hover {
+    background: var(--shell-hover);
+  }
+}
+
+@media (max-width: 640px), (pointer: coarse) {
+  .account-trigger {
+    min-width: 40px;
+    min-height: 40px;
+    justify-content: center;
+  }
+}
+
+@media (max-width: 640px) {
+  .account-label,
+  .account-chevron {
+    display: none;
+  }
+}

@@ -2,7 +2,7 @@ import { MoreHorizontal, PanelLeft } from "lucide-react"
 
 import { NAVIGATION_ITEMS } from "@/lib/app-data"
 import type { Session, WorkspaceView } from "@/lib/app-types"
-import { TrellisMark } from "@/components/trellis-mark"
+import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 
 type SidebarProps = {
   activeView: WorkspaceView

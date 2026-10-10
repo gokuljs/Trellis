@@ -1,6 +1,6 @@
 import { useId } from "react"
 
-import ditherProfile from "@/assets/dither-profile.png"
+import ditherProfile from "./dither-profile.png"
 import "./trellis-mark.css"
 
 type TrellisMarkProps = {
