@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import json
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import httpx
@@ -12,6 +14,15 @@ from app.core.config import Settings
 
 USER_ID = "715f11e0-38e5-48bd-b63a-8c7980a9bd55"
 SUPABASE_URL = "https://example.supabase.co"
+
+
+def access_token(
+    *, user_id: str = USER_ID, expires_at: datetime | None = None, role: str = "authenticated"
+) -> str:
+    expiry = expires_at or datetime.now(UTC) + timedelta(hours=1)
+    claims = {"sub": user_id, "exp": int(expiry.timestamp()), "role": role}
+    encoded = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"header.{encoded}.signature"
 
 
 def settings() -> Settings:
@@ -49,18 +60,19 @@ def test_verifier_returns_auth_user_from_fixed_endpoint_without_url_token() -> N
     async def verify() -> VerifiedUser:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
             return await SupabaseAuthVerifier(settings(), client).verify_bearer(
-                "Bearer access-token"
+                f"Bearer {access_token()}"
             )
 
     user = asyncio.run(verify())
 
     assert user.id == UUID(USER_ID)
     assert user.email == "user@example.com"
+    assert user.expires_at is not None and user.expires_at > datetime.now(UTC)
     assert len(requests) == 1
     assert requests[0].method == "GET"
     assert str(requests[0].url) == "https://example.supabase.co/auth/v1/user"
     assert requests[0].headers["apikey"] == "sb_publishable_test"
-    assert requests[0].headers["authorization"] == "Bearer access-token"
+    assert requests[0].headers["authorization"].startswith("Bearer header.")
     assert "access-token" not in str(requests[0].url)
 
 
@@ -230,9 +242,31 @@ def test_verifier_accepts_local_http_in_development() -> None:
                 supabase_url="http://127.0.0.1:54321/",
                 supabase_publishable_key="sb_publishable_local",
             )
-            return await SupabaseAuthVerifier(configured, client).verify_token("access-token")
+            return await SupabaseAuthVerifier(configured, client).verify_token(access_token())
 
     user = asyncio.run(verify())
 
     assert user.email is None
     assert str(requests[0].url) == "http://127.0.0.1:54321/auth/v1/user"
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "access-token",
+        access_token(user_id="d7a9cd14-6abd-42c4-b46d-2f5bb82e7231"),
+        access_token(expires_at=datetime(2020, 1, 1, tzinfo=UTC)),
+        access_token(role="service_role"),
+    ],
+)
+def test_verifier_rejects_unusable_postgrest_access_token(token: str) -> None:
+    async def verify() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=auth_user()))
+        ) as client:
+            await SupabaseAuthVerifier(settings(), client).verify_token(token)
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(verify())
+
+    assert caught.value.status_code == 401

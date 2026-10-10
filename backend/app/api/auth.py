@@ -1,6 +1,10 @@
 import asyncio
+import base64
+import binascii
+import json
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -18,6 +22,37 @@ _AUTH_DEADLINE_SECONDS = 5.0
 class VerifiedUser:
     id: UUID
     email: str | None
+    expires_at: datetime | None = None
+
+
+def _verified_jwt_expiry(token: str, user_id: UUID) -> datetime:
+    """Read claims only after Supabase Auth has verified this exact access token."""
+    parts = token.split(".")
+    if len(parts) != 3 or not all(parts):
+        raise _unauthorized()
+    try:
+        claims_raw = base64.b64decode(
+            parts[1] + "=" * (-len(parts[1]) % 4), altchars=b"-_", validate=True
+        )
+        claims = json.loads(claims_raw)
+        if not isinstance(claims, dict):
+            raise ValueError("Invalid claims")
+        subject = claims.get("sub")
+        expiry = claims.get("exp")
+        if (
+            not isinstance(subject, str)
+            or UUID(subject) != user_id
+            or claims.get("role") != "authenticated"
+            or isinstance(expiry, bool)
+            or not isinstance(expiry, int)
+        ):
+            raise ValueError("Invalid access claims")
+        expires_at = datetime.fromtimestamp(expiry, UTC)
+    except binascii.Error, ValueError, TypeError, OverflowError:
+        raise _unauthorized() from None
+    if expires_at <= datetime.now(UTC) + timedelta(seconds=5):
+        raise _unauthorized()
+    return expires_at
 
 
 def _auth_endpoint(settings: Settings) -> str | None:
@@ -123,4 +158,6 @@ class SupabaseAuthVerifier:
             user_id = UUID(raw_id)
         except ValueError, TypeError:
             raise _unavailable() from None
-        return VerifiedUser(id=user_id, email=email)
+        return VerifiedUser(
+            id=user_id, email=email, expires_at=_verified_jwt_expiry(token, user_id)
+        )
