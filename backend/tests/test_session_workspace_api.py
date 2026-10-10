@@ -45,6 +45,34 @@ def test_session_workspace_is_canonical_and_survives_restart(tmp_path: Path) -> 
     assert cleared.json()["workspace_path"] is None
 
 
+def test_synced_workspace_requires_selection_on_each_backend_instance(tmp_path: Path) -> None:
+    settings = Settings(environment="test", data_dir=tmp_path / "data")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    with TestClient(create_app(settings)) as client:
+        attached = client.post("/api/sessions", json={"workspace_path": str(project)})
+        assert attached.json()["workspace_ready"] is True
+
+    with TestClient(create_app(settings)) as client:
+        session_id = attached.json()["id"]
+        detail = client.get(f"/api/sessions/{session_id}")
+        listed = client.get("/api/sessions")
+        assert detail.json()["session"]["workspace_path"] == str(project)
+        assert detail.json()["session"]["workspace_ready"] is False
+        assert listed.json()[0]["workspace_ready"] is False
+
+        selected = client.put(
+            f"/api/sessions/{session_id}/workspace",
+            json={"workspace_path": str(project)},
+        )
+        assert selected.json()["workspace_ready"] is True
+        project.rmdir()
+        assert (
+            client.get(f"/api/sessions/{session_id}").json()["session"]["workspace_ready"] is False
+        )
+
+
 @pytest.mark.parametrize("workspace_path", ["relative/path", "missing", "file"])
 def test_session_creation_rejects_invalid_workspace_paths(
     tmp_path: Path, workspace_path: str

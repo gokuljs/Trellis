@@ -75,3 +75,10 @@ class SessionService:
             session=session,
             messages=await self._repository.list_messages(session_id),
         )
+
+    async def workspace_ready(self, session: Session) -> bool:
+        if session.workspace_path is None or self._workspace_bindings is None:
+            return False
+        return (
+            await self._workspace_bindings.resolve(session.id, session.workspace_path) is not None
+        )

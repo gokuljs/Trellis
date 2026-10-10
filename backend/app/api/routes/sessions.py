@@ -15,6 +15,7 @@ class SessionResponse(BaseModel):
     updated_at: str
     message_count: int
     workspace_path: str | None
+    workspace_ready: bool
 
 
 class SessionWorkspaceRequest(BaseModel):
@@ -93,7 +94,7 @@ class TurnResponse(BaseModel):
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 
-def serialize_session(session: Session) -> SessionResponse:
+async def serialize_session(session: Session, service: SessionServiceDep) -> SessionResponse:
     return SessionResponse(
         id=session.id,
         title=session.title,
@@ -101,6 +102,7 @@ def serialize_session(session: Session) -> SessionResponse:
         updated_at=session.updated_at,
         message_count=session.message_count,
         workspace_path=session.workspace_path,
+        workspace_ready=await service.workspace_ready(session),
     )
 
 
@@ -118,21 +120,25 @@ def serialize_message(message: Message) -> MessageResponse:
 
 @router.get("")
 async def list_sessions(service: SessionServiceDep) -> list[SessionResponse]:
-    return [serialize_session(session) for session in await service.list_sessions()]
+    return [await serialize_session(session, service) for session in await service.list_sessions()]
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_session(
     service: SessionServiceDep, payload: SessionWorkspaceRequest | None = None
 ) -> SessionResponse:
-    return serialize_session(await service.create(payload.workspace_path if payload else None))
+    return await serialize_session(
+        await service.create(payload.workspace_path if payload else None), service
+    )
 
 
 @router.put("/{session_id}/workspace")
 async def set_session_workspace(
     session_id: str, payload: SessionWorkspaceRequest, service: SessionServiceDep
 ) -> SessionResponse:
-    return serialize_session(await service.set_workspace(session_id, payload.workspace_path))
+    return await serialize_session(
+        await service.set_workspace(session_id, payload.workspace_path), service
+    )
 
 
 @router.get("/{session_id}")
@@ -141,7 +147,7 @@ async def get_session(session_id: str, service: SessionServiceDep) -> SessionDet
     if detail is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return SessionDetailResponse(
-        session=serialize_session(detail.session),
+        session=await serialize_session(detail.session, service),
         messages=[serialize_message(message) for message in detail.messages],
     )
 
@@ -225,10 +231,11 @@ async def complete_turn(
     session_id: str,
     payload: TurnRequest,
     chat_service: ChatServiceDep,
+    session_service: SessionServiceDep,
 ) -> TurnResponse:
     result = await chat_service.complete_turn(session_id, str(payload.turn_id), payload.content)
     return TurnResponse(
-        session=serialize_session(result.session),
+        session=await serialize_session(result.session, session_service),
         user_message=serialize_message(result.user_message),
         assistant_message=serialize_message(result.assistant_message),
     )

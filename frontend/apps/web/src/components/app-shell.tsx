@@ -1298,6 +1298,7 @@ export function AppShell({
                   : "Adjust or continue"
               }
               workspacePath={activeSession?.workspace_path ?? null}
+              workspaceReady={activeSession?.workspace_ready ?? false}
               workspaceSessionKey={activeSession?.id ?? "new-session"}
               onChange={setComposerValue}
               onSubmit={() => void submitComposer()}

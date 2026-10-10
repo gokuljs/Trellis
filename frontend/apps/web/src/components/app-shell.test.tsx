@@ -114,6 +114,7 @@ const recentSession = {
   updated_at: "2026-08-25T10:00:00Z",
   message_count: 2,
   workspace_path: null,
+  workspace_ready: false,
 }
 
 const olderSession = {
@@ -123,6 +124,7 @@ const olderSession = {
   updated_at: "2026-07-20T10:00:00Z",
   message_count: 1,
   workspace_path: null,
+  workspace_ready: false,
 }
 
 function response(body: unknown, status = 200) {
@@ -1411,7 +1413,11 @@ describe("local-first chat", () => {
           workspace_path: string | null
         }
         updates.push(payload.workspace_path)
-        return response({ ...current, workspace_path: payload.workspace_path })
+        return response({
+          ...current,
+          workspace_path: payload.workspace_path,
+          workspace_ready: payload.workspace_path !== null,
+        })
       }
       return undefined
     })
@@ -1424,6 +1430,9 @@ describe("local-first chat", () => {
     const currentChip = await screen.findByText("first-project")
     expect(currentChip.closest(".composer-box")).not.toBeNull()
     expect(screen.queryByText(current.workspace_path!)).not.toBeInTheDocument()
+    expect(
+      screen.getByText(/select a folder on this computer to use local tools/i)
+    ).toBeInTheDocument()
 
     await user.click(screen.getByRole("button", { name: "Attach" }))
     await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
@@ -1435,6 +1444,9 @@ describe("local-first chat", () => {
     const replacementChip = await screen.findByText("second-project")
     expect(replacementChip.closest(".composer-box")).not.toBeNull()
     expect(screen.queryByText(replacement)).not.toBeInTheDocument()
+    expect(
+      screen.queryByText(/select a folder on this computer to use local tools/i)
+    ).not.toBeInTheDocument()
 
     await user.click(screen.getByRole("button", { name: "Remove workspace" }))
     expect(screen.queryByText("second-project")).not.toBeInTheDocument()

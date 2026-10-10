@@ -17,6 +17,7 @@ type ComposerProps = {
   value: string
   placeholder: string
   workspacePath: string | null
+  workspaceReady: boolean
   workspaceSessionKey: string
   onChange: (value: string) => void
   onSubmit: () => void
@@ -51,6 +52,7 @@ export function Composer({
   value,
   placeholder,
   workspacePath,
+  workspaceReady,
   workspaceSessionKey,
   onChange,
   onSubmit,
@@ -88,6 +90,7 @@ export function Composer({
         <WorkspaceAttachment
           key={workspaceSessionKey}
           workspacePath={workspacePath}
+          workspaceReady={workspaceReady}
           disabled={disabled}
           onPickWorkspace={onPickWorkspace}
           onSave={onSaveWorkspace}
