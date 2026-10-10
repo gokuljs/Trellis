@@ -4,16 +4,62 @@ on:
   push:
     paths:
       - "backend/**"
+      - "supabase/**"
       - ".github/workflows/**"
   pull_request:
     paths:
       - "backend/**"
+      - "supabase/**"
       - ".github/workflows/**"
 
 permissions:
   contents: read
 
 jobs:
+  sql:
+    name: Supabase SQL contracts
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check web schema, ownership, and import contracts
+        run: |
+          set -euo pipefail
+          for file in \
+            supabase/tests/local_bootstrap.sql \
+            supabase/migrations/202610100001_web_schema.sql \
+            supabase/migrations/202610100002_web_rpc.sql \
+            supabase/migrations/202610100003_web_import.sql \
+            supabase/migrations/202610100004_import_hardening.sql \
+            supabase/migrations/202610100005_chat_summaries.sql \
+            supabase/tests/schema_contract.sql \
+            supabase/tests/rpc_security.sql \
+            supabase/tests/runtime_rpc.sql \
+            supabase/tests/import_security.sql \
+            supabase/tests/import_hardening.sql \
+            supabase/tests/chat_summaries.sql; do
+            psql -X -v ON_ERROR_STOP=1 -f "$file"
+          done
+
   quality:
     name: Backend quality
     runs-on: ubuntu-latest
