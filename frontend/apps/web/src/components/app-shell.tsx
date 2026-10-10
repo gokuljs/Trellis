@@ -741,13 +741,12 @@ export function AppShell({
     )
   }
 
-  const saveOnboardingProfile = async (displayName: string, email: string) => {
+  const saveOnboardingProfile = async (displayName: string) => {
     const progress = await api.saveOnboardingProfile({
       display_name: displayName,
-      email,
     })
     setProfile((current) =>
-      current ? { ...current, display_name: displayName, email } : current
+      current ? { ...current, display_name: displayName } : current
     )
     setOnboardingStep(
       progress.current_step === "complete" ? "intro" : progress.current_step

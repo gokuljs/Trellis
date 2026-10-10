@@ -1,4 +1,5 @@
 import type { RunSummary } from "@/lib/app-types"
+import { getAuthController } from "@/lib/auth-controller"
 
 export type RuntimeRunEvent = {
   runId: string
@@ -111,6 +112,10 @@ type RunResult = { runId: string }
 const rpcTimeoutMs = 30_000
 const maxBufferedEvents = 500
 
+function authenticationError() {
+  return new RuntimeError("authentication_required", "Sign in to continue.")
+}
+
 function runtimeUrl() {
   const url = new URL("/api/runtime", window.location.href)
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:"
@@ -206,6 +211,7 @@ function followRun(
 ): Promise<RunResult> {
   const reconnectLimit = options.reconnectAttempts ?? 4
   const reconnectDelay = options.reconnectDelayMs ?? 200
+  const auth = getAuthController()
 
   return new Promise((resolve, reject) => {
     let socket: WebSocket | null = null
@@ -220,15 +226,24 @@ function followRun(
     let bufferedEventOverflowed = false
     let replayRequiredForRun: string | null = null
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+    let userId: string | null = null
+    let unsubscribeAuth: (() => void) | null = null
     const pending = new Map<
       string,
       { resolve: (value: RpcResponse) => void; reject: (reason: Error) => void }
     >()
     const bufferedEvents: RuntimeRunEvent[] = []
 
+    const stillCurrent = () => {
+      const current = auth.getSnapshot()
+      return current.status === "signed-in" && current.user?.id === userId
+    }
+
     const finish = (error?: Error) => {
       if (settled) return
       settled = true
+      unsubscribeAuth?.()
+      unsubscribeAuth = null
       if (reconnectTimer !== null) clearTimeout(reconnectTimer)
       for (const request of pending.values()) {
         request.reject(
@@ -391,7 +406,7 @@ function followRun(
       reconnects += 1
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null
-        connect()
+        void connect()
       }, reconnectDelay * reconnects)
     }
 
@@ -448,8 +463,25 @@ function followRun(
       }
     }
 
-    function connect() {
+    async function connect() {
       if (settled) return
+      let credential: { token: string; userId: string }
+      try {
+        credential = await auth.getAccessToken()
+      } catch {
+        finish(authenticationError())
+        return
+      }
+      if (settled) return
+      if (userId !== null && userId !== credential.userId) {
+        finish(authenticationError())
+        return
+      }
+      userId = credential.userId
+      if (!stillCurrent()) {
+        finish(authenticationError())
+        return
+      }
       let activeSocket: WebSocket
       try {
         activeSocket = new WebSocket(runtimeUrl())
@@ -459,7 +491,34 @@ function followRun(
       }
       socket = activeSocket
       activeSocket.onopen = () => {
-        if (socket === activeSocket && !settled) beginRequest(activeSocket)
+        if (socket !== activeSocket || settled) return
+        void (async () => {
+          try {
+            const freshCredential = await auth.getAccessToken()
+            if (socket !== activeSocket || settled) return
+            if (
+              freshCredential.userId !== credential.userId ||
+              !stillCurrent()
+            ) {
+              throw authenticationError()
+            }
+            const response = await sendRpc(activeSocket, "auth.authenticate", {
+              accessToken: freshCredential.token,
+            })
+            if (socket !== activeSocket || settled) return
+            if (
+              response.error ||
+              response.result?.userId !== credential.userId ||
+              !stillCurrent()
+            ) {
+              throw authenticationError()
+            }
+            beginRequest(activeSocket)
+          } catch {
+            if (socket === activeSocket && !settled)
+              finish(authenticationError())
+          }
+        })()
       }
       activeSocket.onmessage = (message) =>
         handleMessage(activeSocket, message.data)
@@ -480,7 +539,10 @@ function followRun(
       }
     }
 
-    connect()
+    unsubscribeAuth = auth.subscribe(() => {
+      if (userId !== null && !stillCurrent()) finish(authenticationError())
+    })
+    void connect()
   })
 }
 
@@ -503,18 +565,41 @@ export function resumeRun(
   return followRun(null, runId, options, afterSequence)
 }
 
-function requestRunAction(
+async function requestRunAction(
   method: string,
   params: Record<string, unknown>,
   requestId: string,
   failureMessage: string
 ): Promise<Record<string, unknown>> {
+  const auth = getAuthController()
+  let credential: { token: string; userId: string }
+  try {
+    credential = await auth.getAccessToken()
+  } catch {
+    throw authenticationError()
+  }
+  const stillCurrent = () => {
+    const current = auth.getSnapshot()
+    return (
+      current.status === "signed-in" && current.user?.id === credential.userId
+    )
+  }
+  if (!stillCurrent()) throw authenticationError()
+  let socket: WebSocket
+  try {
+    socket = new WebSocket(runtimeUrl())
+  } catch {
+    throw new RuntimeError("connection_lost", "Connection to Trellis was lost.")
+  }
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(runtimeUrl())
     let settled = false
+    let authenticated = false
+    let unsubscribeAuth: (() => void) | null = null
     const finish = (result?: Record<string, unknown>, error?: RuntimeError) => {
       if (settled) return
       settled = true
+      unsubscribeAuth?.()
+      unsubscribeAuth = null
       clearTimeout(timeout)
       socket.close()
       if (error) reject(error)
@@ -537,16 +622,38 @@ function requestRunAction(
       )
     }, rpcTimeoutMs)
     socket.onopen = () => {
-      try {
-        socket.send(
-          JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params })
-        )
-      } catch {
-        finish(
-          undefined,
-          new RuntimeError("connection_lost", "Connection to Trellis was lost.")
-        )
-      }
+      void (async () => {
+        let freshCredential: { token: string; userId: string }
+        try {
+          freshCredential = await auth.getAccessToken()
+        } catch {
+          finish(undefined, authenticationError())
+          return
+        }
+        if (settled) return
+        if (freshCredential.userId !== credential.userId || !stillCurrent()) {
+          finish(undefined, authenticationError())
+          return
+        }
+        try {
+          socket.send(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: "runtime-auth",
+              method: "auth.authenticate",
+              params: { accessToken: freshCredential.token },
+            })
+          )
+        } catch {
+          finish(
+            undefined,
+            new RuntimeError(
+              "connection_lost",
+              "Connection to Trellis was lost."
+            )
+          )
+        }
+      })()
     }
     socket.onmessage = ({ data }) => {
       if (typeof data !== "string") return
@@ -564,7 +671,38 @@ function requestRunAction(
         return
       }
       const envelope = asRecord(response)
-      if (!envelope || envelope.id !== requestId) return
+      if (!envelope) return
+      if (envelope.id === "runtime-auth") {
+        if (authenticated) return
+        if (
+          envelope.error ||
+          asRecord(envelope.result)?.userId !== credential.userId ||
+          !stillCurrent()
+        ) {
+          finish(undefined, authenticationError())
+          return
+        }
+        authenticated = true
+        try {
+          socket.send(
+            JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params })
+          )
+        } catch {
+          finish(
+            undefined,
+            new RuntimeError(
+              "connection_lost",
+              "Connection to Trellis was lost."
+            )
+          )
+        }
+        return
+      }
+      if (!authenticated || envelope.id !== requestId) return
+      if (!stillCurrent()) {
+        finish(undefined, authenticationError())
+        return
+      }
       if (envelope.error) {
         const error = asRecord(envelope.error)
         const detail = asRecord(error?.data)
@@ -587,6 +725,16 @@ function requestRunAction(
         new RuntimeError("connection_lost", "Connection to Trellis was lost.")
       )
     }
+    socket.onclose = () => {
+      finish(
+        undefined,
+        new RuntimeError("connection_lost", "Connection to Trellis was lost.")
+      )
+    }
+    unsubscribeAuth = auth.subscribe(() => {
+      if (!stillCurrent()) finish(undefined, authenticationError())
+    })
+    if (!stillCurrent()) finish(undefined, authenticationError())
   })
 }
 

@@ -195,3 +195,32 @@ it("rejects an old token when the same user signs in again", async () => {
     auth.unsubscribe()
   }
 })
+
+it("changes the session epoch when the same account signs out and back in", async () => {
+  const auth = authClient(session(ada, "first-token"))
+  try {
+    await vi.waitFor(() =>
+      expect(auth.controller.getSnapshot().status).toBe("signed-in")
+    )
+    const firstEpoch = auth.controller.getSessionEpoch()
+
+    await auth.controller.signOut()
+    auth.sdk.auth.getSession.mockResolvedValueOnce({
+      data: { session: session(ada, "second-token") },
+      error: null,
+    })
+    auth.sdk.auth.getUser.mockResolvedValueOnce({
+      data: { user: ada },
+      error: null,
+    })
+    await auth.controller.retry()
+
+    expect(auth.controller.getSnapshot()).toMatchObject({
+      status: "signed-in",
+      user: { id: "ada-id" },
+    })
+    expect(auth.controller.getSessionEpoch()).not.toBe(firstEpoch)
+  } finally {
+    auth.unsubscribe()
+  }
+})

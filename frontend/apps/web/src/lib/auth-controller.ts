@@ -17,6 +17,7 @@ export interface AuthState {
 
 export interface AuthController {
   getSnapshot: () => AuthState
+  getSessionEpoch: () => number
   getAccessToken: () => Promise<{ token: string; userId: string }>
   subscribe: (listener: () => void) => () => void
   signIn: (provider: AuthProvider) => Promise<void>
@@ -287,6 +288,7 @@ export function createAuthController(
 
   const controller: AuthController = {
     getSnapshot: () => state,
+    getSessionEpoch: () => accessGeneration,
     getAccessToken: async () => {
       const user = state.status === "signed-in" ? state.user : null
       if (!user) throw new Error("Sign in to continue.")
@@ -425,6 +427,7 @@ export function getAuthController(): AuthController {
     }
     controller = {
       getSnapshot: () => state,
+      getSessionEpoch: () => 0,
       getAccessToken: async () => {
         throw new Error("Sign in to continue.")
       },

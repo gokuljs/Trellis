@@ -22,7 +22,7 @@ type OnboardingFlowProps = {
   settings: Settings
   initialStep: OnboardingStep
   onAdvanceIntro: () => Promise<void>
-  onSaveProfile: (displayName: string, email: string) => Promise<void>
+  onSaveProfile: (displayName: string) => Promise<void>
   onComplete: (values: OnboardingValues) => Promise<void>
 }
 
@@ -43,10 +43,6 @@ function errorMessage(error: unknown) {
   return "Trellis could not finish setup."
 }
 
-function isValidEmail(value: string) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())
-}
-
 export function OnboardingFlow({
   accountControl,
   profile,
@@ -59,7 +55,6 @@ export function OnboardingFlow({
   const [step, setStep] = useState<OnboardingStep>(initialStep)
   const [direction, setDirection] = useState<"forward" | "back">("forward")
   const [displayName, setDisplayName] = useState(profile.display_name ?? "")
-  const [email, setEmail] = useState(profile.email ?? "")
   const modelOptions: ModelStatus[] =
     settings.models ??
     settings.providers.map((provider) => ({
@@ -115,7 +110,6 @@ export function OnboardingFlow({
 
   const continueFromProfile = async () => {
     const trimmedName = displayName.trim()
-    const trimmedEmail = email.trim()
     if (!trimmedName) {
       setError("Enter your name.")
       return
@@ -124,14 +118,10 @@ export function OnboardingFlow({
       setError("Keep your name under 100 characters.")
       return
     }
-    if (!isValidEmail(trimmedEmail)) {
-      setError("Enter a valid email address.")
-      return
-    }
     setSubmitting(true)
     setError(null)
     try {
-      await onSaveProfile(trimmedName, trimmedEmail)
+      await onSaveProfile(trimmedName)
       changeStep("model", "forward")
     } catch (submitError) {
       setError(errorMessage(submitError))
@@ -261,10 +251,9 @@ export function OnboardingFlow({
                       <input
                         aria-label="Email"
                         type="email"
-                        required
-                        value={email}
+                        readOnly
+                        value={profile.email ?? ""}
                         autoComplete="email"
-                        onChange={(event) => setEmail(event.target.value)}
                       />
                     </label>
                     {error ? (
