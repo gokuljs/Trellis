@@ -2,7 +2,7 @@ import asyncio
 from pathlib import Path
 
 from app.application.errors import ApplicationError
-from app.application.ports import SessionRepository
+from app.application.ports import SessionRepository, WorkspaceBindingPort
 from app.domain.models import Session, SessionDetail, SessionWorkspaceBusy
 
 
@@ -22,8 +22,14 @@ def _resolved_workspace(raw_path: str) -> str:
 
 
 class SessionService:
-    def __init__(self, repository: SessionRepository) -> None:
+    def __init__(
+        self,
+        repository: SessionRepository,
+        *,
+        workspace_bindings: WorkspaceBindingPort | None = None,
+    ) -> None:
         self._repository = repository
+        self._workspace_bindings = workspace_bindings
 
     async def list_sessions(self) -> list[Session]:
         return await self._repository.list_sessions()
@@ -34,7 +40,12 @@ class SessionService:
             if workspace_path is not None
             else None
         )
-        return await self._repository.create_session(resolved)
+        session = await self._repository.create_session(resolved)
+        if self._workspace_bindings is not None:
+            self._workspace_bindings.bind(
+                session.id, Path(resolved) if resolved is not None else None
+            )
+        return session
 
     async def set_workspace(self, session_id: str, workspace_path: str | None) -> Session:
         resolved = (
@@ -50,6 +61,10 @@ class SessionService:
             ) from None
         if session is None:
             raise ApplicationError("session_not_found", "Session not found.")
+        if self._workspace_bindings is not None:
+            self._workspace_bindings.bind(
+                session.id, Path(resolved) if resolved is not None else None
+            )
         return session
 
     async def get(self, session_id: str) -> SessionDetail | None:

@@ -27,6 +27,7 @@ from app.application.ports import (
     SessionRepository,
     SettingsRepository,
     StreamingProviderAdapter,
+    WorkspaceBindingPort,
 )
 from app.application.tools import (
     MAX_ARGUMENT_BYTES,
@@ -158,6 +159,7 @@ class RunService:
         *,
         tool_registry: ToolRegistry | None = None,
         workspace_guidance_reader: Callable[[Path], Awaitable[str | None]] | None = None,
+        workspace_bindings: WorkspaceBindingPort | None = None,
         max_concurrent_runs: int = DEFAULT_MAX_CONCURRENT_RUNS,
     ) -> None:
         if max_concurrent_runs < 1:
@@ -171,6 +173,7 @@ class RunService:
         self._event_publisher = event_publisher
         self._tool_registry = tool_registry
         self._workspace_guidance_reader = workspace_guidance_reader
+        self._workspace_bindings = workspace_bindings
         self._slots = asyncio.Semaphore(max_concurrent_runs)
         self._admission_lock = asyncio.Lock()
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -529,7 +532,12 @@ class RunService:
             session = await self._sessions.get_session(run.session_id)
             if session is None:
                 raise ApplicationError("session_not_found", "Session not found.")
-            workspace_root = Path(session.workspace_path) if session.workspace_path else None
+            if self._workspace_bindings is not None:
+                workspace_root = await self._workspace_bindings.resolve(
+                    session.id, session.workspace_path
+                )
+            else:
+                workspace_root = Path(session.workspace_path) if session.workspace_path else None
             guidance = (
                 await self._workspace_guidance_reader(workspace_root)
                 if workspace_root is not None and self._workspace_guidance_reader is not None
