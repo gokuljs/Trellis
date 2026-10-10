@@ -1,6 +1,7 @@
 import asyncio
 from pathlib import Path
 from threading import Event, Timer
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -11,7 +12,13 @@ from starlette.websockets import WebSocketDisconnect
 from app.api.auth import VerifiedUser
 from app.api.routes import runtime
 from app.core.config import Settings
-from app.main import create_app
+from app.main import create_app as production_create_app
+
+
+def create_app(*args, **kwargs):
+    if args and isinstance(args[0], Settings) and args[0].environment == "test":
+        kwargs.setdefault("legacy_sqlite_for_tests", True)
+    return production_create_app(*args, **kwargs)
 
 
 class StubVerifier:
@@ -174,7 +181,9 @@ def test_runtime_websocket_closes_idle_connection_when_auth_changes(
             probe.cancel()
 
 
-def test_runtime_websocket_allows_only_configured_web_origin(tmp_path: Path) -> None:
+def test_runtime_websocket_allows_only_configured_web_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     app = create_app(
         Settings(
             environment="production",
@@ -185,6 +194,11 @@ def test_runtime_websocket_allows_only_configured_web_origin(tmp_path: Path) -> 
     )
 
     with TestClient(app) as client:
+
+        async def account_for_origin_check(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(run_service=None, event_hub=None)
+
+        monkeypatch.setattr(app.state.account_registry, "get", account_for_origin_check)
         with client.websocket_connect(
             "/api/runtime", headers={"origin": "https://app.example.com"}
         ) as socket:

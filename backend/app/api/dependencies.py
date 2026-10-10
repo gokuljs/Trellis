@@ -21,7 +21,11 @@ CurrentUserDep = Annotated[VerifiedUser, Depends(get_current_user)]
 
 
 async def get_account_context(request: Request, verified: CurrentUserDep) -> AccountContext:
-    return await request.app.state.account_registry.get(verified.id)
+    authorization = request.headers.get("Authorization", "")
+    _, _, token = authorization.partition(" ")
+    return await request.app.state.account_registry.get(
+        verified.id, access_token=token, expires_at=verified.expires_at
+    )
 
 
 AccountDep = Annotated[AccountContext, Depends(get_account_context)]

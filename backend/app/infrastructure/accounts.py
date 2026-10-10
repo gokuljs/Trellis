@@ -4,8 +4,11 @@ import os
 import stat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from uuid import UUID
+
+import httpx
 
 try:
     import fcntl
@@ -29,11 +32,14 @@ from app.infrastructure.local_patch import LocalPatchToolExecutor
 from app.infrastructure.local_tools import LocalReadToolExecutor, read_workspace_guidance
 from app.infrastructure.runtime_events import RuntimeEventHub
 from app.infrastructure.secrets import SecretStore
+from app.infrastructure.sqlite_import import import_locked_account
+from app.infrastructure.supabase_repository import SupabaseRepository, VerifiedTokenSource
+from app.infrastructure.workspace_bindings import LocalWorkspaceBindings
 
 
 @dataclass(frozen=True, slots=True)
 class AccountContext:
-    database: Database
+    database: Database | SupabaseRepository
     secret_store: SecretStore
     profile_service: ProfileService
     session_service: SessionService
@@ -117,24 +123,44 @@ class AccountRegistry:
         providers: Mapping[ProviderName, ProviderAdapter],
         runtime_providers: Mapping[str, StreamingProviderAdapter],
         *,
-        tool_registry_factory: Callable[[Database], ToolRegistry] | None = None,
+        tool_registry_factory: Callable[..., ToolRegistry] | None = None,
+        cloud_client: httpx.AsyncClient | None = None,
+        legacy_sqlite_for_tests: bool = False,
     ) -> None:
         self._settings = settings
         self._providers = providers
         self._runtime_providers = runtime_providers
         self._tool_registry_factory = tool_registry_factory
+        self._cloud_client = cloud_client
+        self._legacy_sqlite_for_tests = legacy_sqlite_for_tests
+        self._token_sources: dict[UUID, VerifiedTokenSource] = {}
         self._contexts: dict[UUID, AccountContext] = {}
         self._locks: dict[UUID, int] = {}
         self._lock = asyncio.Lock()
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
 
-    async def get(self, user_id: UUID) -> AccountContext:
+    async def get(
+        self,
+        user_id: UUID,
+        *,
+        access_token: str | None = None,
+        expires_at: datetime | None = None,
+    ) -> AccountContext:
         if not isinstance(user_id, UUID):
             raise TypeError("Account identity must be a verified UUID")
         async with self._lock:
             if self._closed:
                 raise RuntimeError("Account registry is closed")
+            token_source: VerifiedTokenSource | None = None
+            if not self._legacy_sqlite_for_tests:
+                if access_token is None or expires_at is None:
+                    raise RuntimeError("A fresh verified token is required for cloud data")
+                token_source = self._token_sources.get(user_id)
+                if token_source is None:
+                    token_source = VerifiedTokenSource(user_id)
+                    self._token_sources[user_id] = token_source
+                token_source.record_verified(access_token, user_id, expires_at)
             existing = self._contexts.get(user_id)
             if existing is not None:
                 return existing
@@ -149,12 +175,27 @@ class AccountRegistry:
                 lock_task.add_done_callback(_release_unclaimed_lock)
                 raise
             try:
-                database = Database(account_dir / "state.db", owner_id=user_id)
-                await database.initialize()
-                await asyncio.to_thread(database.path.chmod, 0o600)
-                await database.recover_active_runs()
+                database: Database | SupabaseRepository
+                if self._legacy_sqlite_for_tests:
+                    local_database = Database(account_dir / "state.db", owner_id=user_id)
+                    await local_database.initialize()
+                    await asyncio.to_thread(local_database.path.chmod, 0o600)
+                    await local_database.recover_active_runs()
+                    database = local_database
+                else:
+                    if self._cloud_client is None or token_source is None:
+                        raise RuntimeError("A verified cloud client is required")
+                    cloud_database = SupabaseRepository(
+                        self._settings, user_id, token_source, self._cloud_client
+                    )
+                    await import_locked_account(
+                        account_dir, user_id, lock_descriptor, cloud_database
+                    )
+                    await cloud_database.ensure_account()
+                    database = cloud_database
                 secret_store = SecretStore(account_dir / ".env")
                 event_hub = RuntimeEventHub()
+                workspace_bindings = LocalWorkspaceBindings()
                 tools = (
                     self._tool_registry_factory(database)
                     if self._tool_registry_factory is not None
@@ -174,6 +215,8 @@ class AccountRegistry:
                     event_hub,
                     tool_registry=tools,
                     workspace_guidance_reader=read_workspace_guidance,
+                    workspace_bindings=workspace_bindings,
+                    lease_repository=database if isinstance(database, SupabaseRepository) else None,
                 )
                 try:
                     await run_service.resume_decided_approvals()
@@ -181,7 +224,9 @@ class AccountRegistry:
                         database=database,
                         secret_store=secret_store,
                         profile_service=ProfileService(database),
-                        session_service=SessionService(database),
+                        session_service=SessionService(
+                            database, workspace_bindings=workspace_bindings
+                        ),
                         settings_service=SettingsService(database, secret_store),
                         onboarding_service=OnboardingService(database, database, secret_store),
                         chat_service=ChatService(database, secret_store, self._providers),
@@ -193,6 +238,7 @@ class AccountRegistry:
                     raise
             except BaseException:
                 os.close(lock_descriptor)
+                self._token_sources.pop(user_id, None)
                 raise
             self._contexts[user_id] = context
             self._locks[user_id] = lock_descriptor
@@ -204,6 +250,7 @@ class AccountRegistry:
                 self._closed = True
                 contexts = tuple(self._contexts.values())
                 self._contexts.clear()
+                self._token_sources.clear()
                 locks = tuple(self._locks.values())
                 self._locks.clear()
                 self._close_task = asyncio.create_task(self._finish_close(contexts, locks))

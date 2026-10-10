@@ -31,7 +31,11 @@ def test_private_api_requires_bearer_token(tmp_path: Path) -> None:
 
 
 def test_verified_accounts_cannot_read_each_others_chats(tmp_path: Path) -> None:
-    app = create_app(Settings(environment="test", data_dir=tmp_path), auth_verifier=StubVerifier())
+    app = create_app(
+        Settings(environment="test", data_dir=tmp_path),
+        auth_verifier=StubVerifier(),
+        legacy_sqlite_for_tests=True,
+    )
 
     with TestClient(app) as client:
         alice = {"Authorization": "Bearer alice"}
@@ -51,7 +55,11 @@ def test_verified_accounts_cannot_read_each_others_chats(tmp_path: Path) -> None
 
 
 def test_profile_email_is_owned_by_verified_auth_user(tmp_path: Path) -> None:
-    app = create_app(Settings(environment="test", data_dir=tmp_path), auth_verifier=StubVerifier())
+    app = create_app(
+        Settings(environment="test", data_dir=tmp_path),
+        auth_verifier=StubVerifier(),
+        legacy_sqlite_for_tests=True,
+    )
 
     with TestClient(app) as client:
         alice = {"Authorization": "Bearer alice"}
@@ -68,7 +76,11 @@ def test_profile_email_is_owned_by_verified_auth_user(tmp_path: Path) -> None:
 
 
 def test_onboarding_uses_verified_email_not_submitted_email(tmp_path: Path) -> None:
-    app = create_app(Settings(environment="test", data_dir=tmp_path), auth_verifier=StubVerifier())
+    app = create_app(
+        Settings(environment="test", data_dir=tmp_path),
+        auth_verifier=StubVerifier(),
+        legacy_sqlite_for_tests=True,
+    )
 
     with TestClient(app) as client:
         alice = {"Authorization": "Bearer alice"}

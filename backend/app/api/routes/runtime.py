@@ -208,7 +208,9 @@ async def runtime_websocket(websocket: WebSocket) -> None:
         await websocket.close(code=4401)
         return
     try:
-        account = await websocket.app.state.account_registry.get(verified.id)
+        account = await websocket.app.state.account_registry.get(
+            verified.id, access_token=token, expires_at=verified.expires_at
+        )
     except ApplicationError as error:
         if error.code != "account_in_use":
             raise
@@ -248,7 +250,16 @@ async def runtime_websocket(websocket: WebSocket) -> None:
         except Exception as error:
             logger.error("Runtime authentication check failed (%s)", type(error).__name__)
             return False
-        return refreshed.id == verified.id and not auth_lost.is_set()
+        if refreshed.id != verified.id or auth_lost.is_set():
+            return False
+        try:
+            await websocket.app.state.account_registry.get(
+                verified.id, access_token=token, expires_at=refreshed.expires_at
+            )
+        except Exception as error:
+            logger.error("Runtime cloud token refresh failed (%s)", type(error).__name__)
+            return False
+        return True
 
     async def close_for_auth() -> None:
         if auth_lost.is_set():
