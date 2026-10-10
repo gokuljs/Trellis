@@ -9,7 +9,6 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from fastapi.testclient import TestClient
 
 from app.application.tools import ToolRegistry
 from app.core.config import Settings
@@ -17,7 +16,7 @@ from app.domain.models import ProviderName
 from app.domain.runtime import ModelRequest, ModelStreamEvent, ModelToolCall, RunEvent, RunEventType
 from app.infrastructure.local_tools import LocalReadToolExecutor
 from app.infrastructure.runtime_events import RuntimeEventHub
-from app.main import create_app
+from tests.support import TestClient, account_context, create_app
 
 
 class StreamingProvider:
@@ -217,7 +216,7 @@ def test_run_event_cursor_uses_page_lookahead_when_snapshot_is_stale(
         client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-history"})
         session_id = client.post("/api/sessions").json()["id"]
         run_id = start_completed_run(client, session_id, "stale-snapshot")
-        database = client.app.state.database
+        database = account_context(client.app).database
         original_get_run = database.get_run
 
         async def stale_get_run(requested_run_id: str):
@@ -411,7 +410,7 @@ def test_command_waits_for_approval_then_runs_in_workspace(tmp_path: Path) -> No
                     and item["params"]["eventType"] == RunEventType.COMPLETED.value
                 ),
             )
-        tool_calls = asyncio.run(app.state.database.list_tool_calls(run_id))
+        tool_calls = asyncio.run(account_context(app).database.list_tool_calls(run_id))
 
     assert (project / "marker").read_text() == "ran"
     assert len(tool_calls) == 1 and tool_calls[0].name == "run_command"
@@ -506,7 +505,9 @@ def test_jsonrpc_start_selects_a_budget_preset_and_rejects_unknown_names(tmp_pat
             )
             rejected = receive_until(websocket, lambda item: item.get("id") == "bad-budget")
             error = next(item for item in rejected if item.get("id") == "bad-budget")
-        persisted = asyncio.run(client.app.state.database.get_run(response["result"]["runId"]))
+        persisted = asyncio.run(
+            account_context(client.app).database.get_run(response["result"]["runId"])
+        )
 
     assert response["result"]["budgetPreset"] == "longer"
     assert response["result"]["limits"]["maxTotalTokens"] == 200_000
@@ -633,7 +634,10 @@ def test_jsonrpc_resume_replays_persisted_events_after_disconnect(tmp_path: Path
             )
             first_messages = receive_until(
                 websocket,
-                lambda item: item.get("method") == "run.event" and item["params"]["sequence"] >= 4,
+                lambda item: (
+                    item.get("method") == "run.event"
+                    and item["params"]["eventType"] == RunEventType.COMPLETED.value
+                ),
             )
             if not any(item.get("id") == 1 for item in first_messages):
                 first_messages.extend(receive_until(websocket, lambda item: item.get("id") == 1))
@@ -669,7 +673,7 @@ def test_jsonrpc_replays_when_a_live_event_sequence_has_a_gap(tmp_path: Path) ->
             "/api/settings/providers/openai/api-key",
             json={"api_key": "sk-jsonrpc-gap"},
         )
-        event_hub: RuntimeEventHub = client.app.state.runtime_event_hub
+        event_hub: RuntimeEventHub = account_context(client.app).event_hub
         dropped = threading.Event()
 
         class DropFirstUsage:
@@ -683,7 +687,7 @@ def test_jsonrpc_replays_when_a_live_event_sequence_has_a_gap(tmp_path: Path) ->
                     return
                 await event_hub.publish(event)
 
-        client.app.state.run_service._event_publisher = DropFirstUsage()
+        account_context(client.app).run_service._event_publisher = DropFirstUsage()
         session_id = client.post("/api/sessions").json()["id"]
         with client.websocket_connect("/api/runtime") as websocket:
             websocket.send_json(
@@ -769,7 +773,7 @@ def test_custom_model_uses_registered_adapter_without_provider_specific_runtime_
     )
     with TestClient(app) as client:
         client.get("/api/profile")
-        with sqlite3.connect(settings.database_path) as connection:
+        with sqlite3.connect(account_context(app).database.path) as connection:
             connection.execute(
                 """INSERT INTO models(
                        id, provider_id, provider_name, adapter_kind, upstream_model_id,
@@ -837,7 +841,8 @@ def test_unpriced_custom_model_stops_before_a_tool_continuation(tmp_path: Path) 
     provider = ToolingProvider()
     app = create_app(settings, streaming_provider_adapters={"openai-compatible": provider})
     with TestClient(app) as client:
-        with sqlite3.connect(settings.database_path) as connection:
+        client.get("/api/profile")
+        with sqlite3.connect(account_context(app).database.path) as connection:
             connection.execute(
                 """INSERT INTO models(
                        id, provider_id, provider_name, adapter_kind, upstream_model_id,
@@ -877,9 +882,10 @@ def test_unpriced_custom_model_stops_before_a_tool_continuation(tmp_path: Path) 
                 ),
             )
         run_id = next(item["result"]["runId"] for item in events if item.get("id"))
-        run = asyncio.run(client.app.state.database.get_run(run_id))
-        calls = asyncio.run(client.app.state.database.list_model_calls(run_id))
-        tools = asyncio.run(client.app.state.database.list_tool_calls(run_id))
+        database = account_context(client.app).database
+        run = asyncio.run(database.get_run(run_id))
+        calls = asyncio.run(database.list_model_calls(run_id))
+        tools = asyncio.run(database.list_tool_calls(run_id))
 
     assert run is not None and run.error_code == "pricing_unavailable"
     assert len(calls) == 1 and calls[0].estimated_cost is None

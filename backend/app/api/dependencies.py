@@ -2,6 +2,7 @@ from typing import Annotated
 
 from fastapi import Depends, Request
 
+from app.api.auth import VerifiedUser
 from app.application.chat import ChatService
 from app.application.onboarding import OnboardingService
 from app.application.profile import ProfileService
@@ -9,33 +10,48 @@ from app.application.runs import RunService
 from app.application.sessions import SessionService
 from app.application.settings import SettingsService
 from app.application.workspaces import WorkspacePickerService
+from app.infrastructure.accounts import AccountContext
 
 
-def get_chat_service(request: Request) -> ChatService:
-    return request.app.state.chat_service
+async def get_current_user(request: Request) -> VerifiedUser:
+    return await request.app.state.auth_verifier.verify_bearer(request.headers.get("Authorization"))
 
 
-def get_profile_service(request: Request) -> ProfileService:
-    return request.app.state.profile_service
+CurrentUserDep = Annotated[VerifiedUser, Depends(get_current_user)]
 
 
-def get_session_service(request: Request) -> SessionService:
-    return request.app.state.session_service
+async def get_account_context(request: Request, verified: CurrentUserDep) -> AccountContext:
+    return await request.app.state.account_registry.get(verified.id)
 
 
-def get_settings_service(request: Request) -> SettingsService:
-    return request.app.state.settings_service
+AccountDep = Annotated[AccountContext, Depends(get_account_context)]
 
 
-def get_onboarding_service(request: Request) -> OnboardingService:
-    return request.app.state.onboarding_service
+def get_chat_service(account: AccountDep) -> ChatService:
+    return account.chat_service
 
 
-def get_run_service(request: Request) -> RunService:
-    return request.app.state.run_service
+def get_profile_service(account: AccountDep) -> ProfileService:
+    return account.profile_service
 
 
-def get_workspace_picker(request: Request) -> WorkspacePickerService:
+def get_session_service(account: AccountDep) -> SessionService:
+    return account.session_service
+
+
+def get_settings_service(account: AccountDep) -> SettingsService:
+    return account.settings_service
+
+
+def get_onboarding_service(account: AccountDep) -> OnboardingService:
+    return account.onboarding_service
+
+
+def get_run_service(account: AccountDep) -> RunService:
+    return account.run_service
+
+
+def get_workspace_picker(request: Request, _account: AccountDep) -> WorkspacePickerService:
     return request.app.state.workspace_picker
 
 

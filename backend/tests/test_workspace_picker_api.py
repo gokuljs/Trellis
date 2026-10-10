@@ -2,10 +2,9 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 from app.core.config import Settings
-from app.main import create_app
+from tests.support import TestClient, create_app
 
 
 class FakeFolderPicker:

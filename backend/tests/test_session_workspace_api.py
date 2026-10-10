@@ -2,11 +2,10 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 from app.core.config import Settings
 from app.infrastructure.database import Database
-from app.main import create_app
+from tests.support import TestClient, account_database_path, create_app
 
 
 def test_session_workspace_is_canonical_and_survives_restart(tmp_path: Path) -> None:
@@ -72,7 +71,7 @@ def test_workspace_cannot_change_during_an_active_run(tmp_path: Path) -> None:
     settings = Settings(environment="test", data_dir=tmp_path / "data")
     project = tmp_path / "project"
     project.mkdir()
-    database = Database(settings.database_path)
+    database = Database(account_database_path(settings))
 
     with TestClient(create_app(settings)) as client:
         session = client.post("/api/sessions", json={"workspace_path": str(project)}).json()

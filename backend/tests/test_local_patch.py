@@ -7,12 +7,11 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 from app.core.config import Settings
 from app.domain.models import ProviderName
 from app.domain.runtime import ModelRequest, ModelStreamEvent, ModelToolCall, RunEventType
-from app.main import create_app
+from tests.support import TestClient, account_database_path, create_app
 
 
 def test_attached_workspace_offers_patch_tool_to_the_model(tmp_path: Path) -> None:
@@ -198,7 +197,7 @@ def test_approved_patch_uses_the_saved_preview_then_continues_the_run(tmp_path: 
     assert len(provider.requests) == 2
     assert provider.requests[1].messages[-1].role == "tool"
     assert provider.requests[1].messages[-1].content == "Updated src/note.txt."
-    with sqlite3.connect(settings.database_path) as connection:
+    with sqlite3.connect(account_database_path(settings)) as connection:
         approval_json, status = connection.execute(
             "SELECT approval_preview_json, status FROM tool_calls WHERE id = ?", (tool_call_id,)
         ).fetchone()

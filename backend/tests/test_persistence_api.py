@@ -6,7 +6,6 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
-from fastapi.testclient import TestClient
 
 from app.core.config import Settings
 from app.domain.runtime import ModelCallStatus, ModelMessage, ModelToolCall, RunEventType, RunStatus
@@ -20,17 +19,33 @@ from app.infrastructure.database import (
     Database,
 )
 from app.infrastructure.secrets import SecretStore
-from app.main import create_app
+from tests.support import (
+    TEST_EMAIL,
+    TEST_USER_ID,
+    TestClient,
+    account_database_path,
+    account_secrets_path,
+    create_app,
+)
 
 
 def make_settings(data_dir: Path) -> Settings:
     return Settings(environment="test", data_dir=data_dir)
 
 
+def prepare_account_database_directory(settings: Settings) -> None:
+    for path in (
+        settings.data_dir,
+        settings.data_dir / "accounts",
+        account_database_path(settings).parent,
+    ):
+        path.mkdir(mode=0o700, exist_ok=True)
+
+
 EXPECTED_SCHEMA_VERSIONS = [(version,) for version in range(1, SCHEMA_VERSION + 1)]
 
 
-def test_installation_profile_id_survives_application_restart(tmp_path: Path) -> None:
+def test_verified_profile_id_survives_application_restart(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
 
     with TestClient(create_app(settings)) as first_client:
@@ -43,15 +58,16 @@ def test_installation_profile_id_survives_application_restart(tmp_path: Path) ->
     assert restarted_response.status_code == 200
     first_profile = first_response.json()
     restarted_profile = restarted_response.json()
-    assert UUID(first_profile["id"])
+    assert UUID(first_profile["id"]) == TEST_USER_ID
     assert restarted_profile["id"] == first_profile["id"]
     assert first_profile["display_name"] is None
-    assert first_profile["email"] is None
+    assert first_profile["email"] == TEST_EMAIL
 
 
 def test_application_startup_marks_a_persisted_active_run_interrupted(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
+    prepare_account_database_directory(settings)
+    database = Database(account_database_path(settings), owner_id=TEST_USER_ID)
 
     async def create_run() -> str:
         await database.initialize()
@@ -66,7 +82,8 @@ def test_application_startup_marks_a_persisted_active_run_interrupted(tmp_path: 
         return run.id
 
     run_id = asyncio.run(create_run())
-    with TestClient(create_app(settings)):
+    with TestClient(create_app(settings)) as client:
+        client.get("/api/profile")
         run = asyncio.run(database.get_run(run_id))
         events = asyncio.run(database.list_run_events(run_id))
 
@@ -76,13 +93,15 @@ def test_application_startup_marks_a_persisted_active_run_interrupted(tmp_path: 
     assert events[-1].event_type is RunEventType.INTERRUPTED
 
 
-def test_separate_data_directories_receive_distinct_installation_ids(tmp_path: Path) -> None:
+def test_verified_user_id_is_stable_across_data_directories(tmp_path: Path) -> None:
     with TestClient(create_app(make_settings(tmp_path / "first"))) as first_client:
         first_id = first_client.get("/api/profile").json()["id"]
     with TestClient(create_app(make_settings(tmp_path / "second"))) as second_client:
         second_id = second_client.get("/api/profile").json()["id"]
 
-    assert first_id != second_id
+    assert first_id == second_id == str(TEST_USER_ID)
+    assert account_database_path(make_settings(tmp_path / "first")).exists()
+    assert account_database_path(make_settings(tmp_path / "second")).exists()
 
 
 def test_profile_details_can_be_updated_and_restored(tmp_path: Path) -> None:
@@ -91,7 +110,7 @@ def test_profile_details_can_be_updated_and_restored(tmp_path: Path) -> None:
     with TestClient(create_app(settings)) as client:
         response = client.put(
             "/api/profile",
-            json={"display_name": "Gokul", "email": "gokul@example.com"},
+            json={"display_name": "Gokul"},
         )
 
     with TestClient(create_app(settings)) as restarted_client:
@@ -99,7 +118,7 @@ def test_profile_details_can_be_updated_and_restored(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert restored.json()["display_name"] == "Gokul"
-    assert restored.json()["email"] == "gokul@example.com"
+    assert restored.json()["email"] == TEST_EMAIL
 
 
 def test_api_keys_are_write_only_and_kept_outside_sqlite(tmp_path: Path) -> None:
@@ -122,10 +141,10 @@ def test_api_keys_are_write_only_and_kept_outside_sqlite(tmp_path: Path) -> None
     assert openai["key_hint"] == "••••7890"
     assert secret not in saved.text
     assert secret not in visible_settings.text
-    assert secret.encode() not in settings.database_path.read_bytes()
-    assert secret in settings.secrets_path.read_text()
+    assert secret.encode() not in account_database_path(settings).read_bytes()
+    assert secret in account_secrets_path(settings).read_text()
     assert stat.S_IMODE(settings.data_dir.stat().st_mode) == 0o700
-    assert stat.S_IMODE(settings.secrets_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(account_secrets_path(settings).stat().st_mode) == 0o600
 
 
 def test_rejected_api_key_is_not_disclosed_in_validation_response(tmp_path: Path) -> None:
@@ -221,7 +240,7 @@ def test_onboarding_progress_and_answers_are_saved_after_each_step(tmp_path: Pat
         intro = client.put("/api/onboarding/steps/intro")
         profile = client.put(
             "/api/onboarding/steps/profile",
-            json={"display_name": "Ada", "email": "ada@example.com"},
+            json={"display_name": "Ada"},
         )
         repeated_intro = client.put("/api/onboarding/steps/intro")
 
@@ -245,9 +264,10 @@ def test_onboarding_progress_and_answers_are_saved_after_each_step(tmp_path: Pat
     assert repeated_intro.json() == {"current_step": "model", "completed": False}
     assert resumed.json() == {"current_step": "model", "completed": False}
     assert restored_profile.json()["display_name"] == "Ada"
+    assert restored_profile.json()["email"] == TEST_EMAIL
     assert completed.status_code == 200
     assert final_state.json() == {"current_step": "complete", "completed": True}
-    assert b"sk-onboarding-secret" not in settings.database_path.read_bytes()
+    assert b"sk-onboarding-secret" not in account_database_path(settings).read_bytes()
 
 
 def test_onboarding_model_step_requires_credentials_without_advancing(tmp_path: Path) -> None:
@@ -255,7 +275,7 @@ def test_onboarding_model_step_requires_credentials_without_advancing(tmp_path: 
         client.put("/api/onboarding/steps/intro")
         client.put(
             "/api/onboarding/steps/profile",
-            json={"display_name": "Ada", "email": "ada@example.com"},
+            json={"display_name": "Ada"},
         )
         model = client.get("/api/settings").json()["models"][0]
         response = client.put(
@@ -271,7 +291,8 @@ def test_onboarding_model_step_requires_credentials_without_advancing(tmp_path: 
 
 def test_existing_installations_with_a_profile_are_backfilled_as_complete(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    with closing(sqlite3.connect(settings.database_path)) as connection:
+    prepare_account_database_directory(settings)
+    with closing(sqlite3.connect(account_database_path(settings))) as connection:
         connection.executescript(SCHEMA_V1)
         connection.executescript(SCHEMA_V2)
         connection.executescript(SCHEMA_V3)
@@ -281,7 +302,8 @@ def test_existing_installations_with_a_profile_are_backfilled_as_complete(tmp_pa
         )
         connection.execute(
             """INSERT INTO users(id, display_name, email, created_at, updated_at)
-               VALUES ('existing-installation', 'Ada', 'ada@example.com', 'v3', 'v3')"""
+               VALUES (?, 'Ada', ?, 'v3', 'v3')""",
+            (str(TEST_USER_ID), TEST_EMAIL),
         )
         connection.execute(
             """INSERT INTO app_settings(id, selected_provider, selected_model_id, updated_at)
@@ -289,7 +311,7 @@ def test_existing_installations_with_a_profile_are_backfilled_as_complete(tmp_pa
         )
         connection.commit()
 
-    asyncio.run(Database(settings.database_path).initialize())
+    asyncio.run(Database(account_database_path(settings), owner_id=TEST_USER_ID).initialize())
 
     with TestClient(create_app(settings)) as client:
         state = client.get("/api/onboarding")
@@ -340,10 +362,10 @@ def test_sessions_are_listed_by_recent_activity_and_survive_restart(tmp_path: Pa
 def test_database_records_all_schema_migrations(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
 
-    with TestClient(create_app(settings)):
-        pass
+    with TestClient(create_app(settings)) as client:
+        client.get("/api/profile")
 
-    with closing(sqlite3.connect(settings.database_path)) as connection:
+    with closing(sqlite3.connect(account_database_path(settings))) as connection:
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()

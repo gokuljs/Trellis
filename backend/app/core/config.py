@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     data_dir: Path = Field(default_factory=lambda: Path.home() / ".trellis")
     supabase_url: str | None = None
     supabase_publishable_key: str | None = None
+    web_origin: str | None = None
 
     @property
     def database_path(self) -> Path:
