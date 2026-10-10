@@ -2,19 +2,16 @@ import asyncio
 import base64
 import binascii
 import json
-import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
 from fastapi import HTTPException, status
 
 from app.core.config import Settings
+from app.core.supabase import project_base_url
 
-_HOSTED_PROJECT = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.supabase\.co\Z")
-_PUBLISHABLE_KEY = re.compile(r"sb_publishable_[A-Za-z0-9_-]+\Z")
 _AUTH_DEADLINE_SECONDS = 5.0
 
 
@@ -55,38 +52,6 @@ def _verified_jwt_expiry(token: str, user_id: UUID) -> datetime:
     return expires_at
 
 
-def _auth_endpoint(settings: Settings) -> str | None:
-    raw_url = (settings.supabase_url or "").strip()
-    key = (settings.supabase_publishable_key or "").strip()
-    if not raw_url or _PUBLISHABLE_KEY.fullmatch(key) is None:
-        return None
-    if "?" in raw_url or "#" in raw_url or "\\" in raw_url:
-        return None
-    try:
-        parts = urlsplit(raw_url)
-        port = parts.port
-    except ValueError:
-        return None
-    if (
-        parts.scheme not in {"http", "https"}
-        or not parts.hostname
-        or parts.username is not None
-        or parts.password is not None
-        or parts.path not in {"", "/"}
-        or (port is not None and port < 1)
-    ):
-        return None
-    if parts.scheme == "https" and (
-        _HOSTED_PROJECT.fullmatch(parts.hostname) is None or port not in {None, 443}
-    ):
-        return None
-    if parts.scheme == "http" and not (
-        settings.environment == "development" and parts.hostname in {"localhost", "127.0.0.1"}
-    ):
-        return None
-    return f"{parts.scheme}://{parts.netloc}/auth/v1/user"
-
-
 def _unauthorized() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -104,7 +69,8 @@ def _unavailable() -> HTTPException:
 
 class SupabaseAuthVerifier:
     def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
-        self._endpoint = _auth_endpoint(settings)
+        project_url = project_base_url(settings)
+        self._endpoint = None if project_url is None else f"{project_url}/auth/v1/user"
         self._publishable_key = (settings.supabase_publishable_key or "").strip()
         self._client = client
 
