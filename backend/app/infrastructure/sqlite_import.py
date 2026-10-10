@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets
 import stat
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ except ImportError:  # pragma: no cover - the account store itself requires POSI
 MAX_BATCH_ROWS = 100
 MAX_BATCH_BYTES = 7_500_000  # Leave room for the RPC envelope under its 8 MiB cap.
 MARKER_NAME = ".supabase-imported.json"
+CAPABILITY_NAME = ".supabase-import-capability"
 _INTERRUPTION = "The run was interrupted while local data moved to cloud storage."
 _PHASES = (
     "profiles",
@@ -48,7 +50,11 @@ _PHASES = (
 
 
 class LegacyImportSink(Protocol):
-    async def import_batch(self, table: str, rows: list[dict[str, object]]) -> None: ...
+    async def import_batch(
+        self, table: str, rows: list[dict[str, object]], capability: str
+    ) -> None: ...
+
+    async def seal_import(self, capability: str) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,11 +461,8 @@ def _marker_digest(path: Path, user_id: UUID) -> str | None:
     return marker["digest"]
 
 
-def _write_marker(path: Path, user_id: UUID, digest: str) -> None:
+def _write_private_file(path: Path, payload: bytes) -> None:
     temporary = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
-    payload = json.dumps(
-        {"version": 1, "user_id": str(user_id), "digest": digest}, sort_keys=True
-    ).encode()
     descriptor = os.open(
         temporary,
         os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -484,6 +487,41 @@ def _write_marker(path: Path, user_id: UUID, digest: str) -> None:
             os.close(directory_fd)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _write_marker(path: Path, user_id: UUID, digest: str) -> None:
+    payload = json.dumps(
+        {"version": 1, "user_id": str(user_id), "digest": digest}, sort_keys=True
+    ).encode()
+    _write_private_file(path, payload)
+
+
+def _import_capability(path: Path) -> str:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        capability = secrets.token_urlsafe(48)
+        _write_private_file(path, capability.encode("ascii"))
+        return capability
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise RuntimeError("Account import capability must be a private regular file")
+        raw = os.read(descriptor, 257)
+        try:
+            capability = raw.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise RuntimeError("Account import capability is invalid") from error
+        if not 32 <= len(capability) <= 256 or any(char.isspace() for char in capability):
+            raise RuntimeError("Account import capability is invalid")
+        return capability
+    finally:
+        os.close(descriptor)
 
 
 def _release_unclaimed_source(task: asyncio.Task[tuple[Path | None, int]]) -> None:
@@ -513,6 +551,12 @@ async def import_locked_account(
     marker_task: asyncio.Task[None] | None = None
     try:
         if source is None:
+            marker = await asyncio.to_thread(_marker_digest, account_dir / MARKER_NAME, user_id)
+            capability_path = account_dir / CAPABILITY_NAME
+            if marker is None and (capability_path.exists() or capability_path.is_symlink()):
+                raise RuntimeError(
+                    "Legacy account import was interrupted; restore the original state.db"
+                )
             return
         uri = f"file:{quote(str(source), safe='/')}?mode=ro"
         async with aiosqlite.connect(uri, uri=True) as connection:
@@ -524,11 +568,13 @@ async def import_locked_account(
             active = await _active_runs(connection, user_id)
             digest = await _digest(connection, user_id, active)
             marker_path = account_dir / MARKER_NAME
+            capability_path = account_dir / CAPABILITY_NAME
             previous = await asyncio.to_thread(_marker_digest, marker_path, user_id)
             if previous is not None:
                 if previous != digest:
                     raise RuntimeError("Legacy account data changed after cloud import")
                 return
+            capability = await asyncio.to_thread(_import_capability, capability_path)
             for phase in _PHASES:
                 table = phase.removesuffix("_assistant").removesuffix("_tool")
                 batch: list[dict[str, object]] = []
@@ -538,13 +584,14 @@ async def import_locked_account(
                     if batch and (
                         len(batch) >= MAX_BATCH_ROWS or batch_bytes + row_bytes > MAX_BATCH_BYTES
                     ):
-                        await sink.import_batch(table, batch)
+                        await sink.import_batch(table, batch, capability)
                         batch = []
                         batch_bytes = 0
                     batch.append(row)
                     batch_bytes += row_bytes
                 if batch:
-                    await sink.import_batch(table, batch)
+                    await sink.import_batch(table, batch, capability)
+            await sink.seal_import(capability)
             marker_task = asyncio.create_task(
                 asyncio.to_thread(_write_marker, marker_path, user_id, digest)
             )

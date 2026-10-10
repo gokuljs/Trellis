@@ -107,6 +107,51 @@ def test_verified_token_source_keeps_freshest_same_account_session() -> None:
     assert source.valid_for(30 * 60)
 
 
+def test_import_seal_uses_authenticated_rpc() -> None:
+    captured: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"sealed": True})
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            await repository.seal_import("private-import-capability-with-forty-characters")
+
+    asyncio.run(exercise())
+    assert len(captured) == 1
+    assert captured[0].url.path == "/rest/v1/rpc/seal_import"
+    assert captured[0].headers["Authorization"] == "Bearer alice-token"
+    assert captured[0].headers["Content-Profile"] == "trellis"
+    assert json.loads(captured[0].content) == {
+        "p_capability": "private-import-capability-with-forty-characters"
+    }
+
+
+def test_import_batch_sends_private_capability_with_rows() -> None:
+    captured: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"inserted": 1})
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            await repository.import_batch(
+                "profiles", [{"id": str(ALICE)}], "private-import-capability-with-forty-characters"
+            )
+
+    asyncio.run(exercise())
+    assert len(captured) == 1
+    assert captured[0].url.path == "/rest/v1/rpc/import_snapshot"
+    assert json.loads(captured[0].content) == {
+        "p_snapshot": {"table": "profiles", "rows": [{"id": str(ALICE)}]},
+        "p_capability": "private-import-capability-with-forty-characters",
+    }
+
+
 def test_profile_read_uses_authenticated_rls_request_and_maps_auth_email_separately() -> None:
     captured: list[httpx.Request] = []
 
@@ -433,18 +478,51 @@ def test_mutation_methods_send_one_sql_transaction_each() -> None:
             assert await repository.set_selected_provider("openai") == "openai"
             assert await repository.set_selected_model("openai:gpt-5.5")
             assert await repository.claim_turn(chat_id, "turn-one")
-            await repository.release_turn(chat_id, "turn-one")
             assert (await repository.add_user_message(chat_id, "turn-one", "Hello")).role == "user"
             assert (
                 await repository.add_assistant_message(
                     chat_id, "turn-one", "Hi", "openai", "gpt-5.5"
                 )
             ).role == "assistant"
+            await repository.release_turn(chat_id, "turn-one")
 
     asyncio.run(exercise())
     assert len(captured) == 10
     assert all(request.url.path == "/rest/v1/rpc/mutate" for request in captured)
     assert b"ignored@example.com" not in b"".join(request.content for request in captured)
+    turn_capabilities = [json.loads(request.content)["p_capability"] for request in captured[6:]]
+    assert len(turn_capabilities[0]) >= 32
+    assert len(set(turn_capabilities)) == 1
+
+
+def test_classic_turn_writes_require_a_private_local_claim_capability() -> None:
+    captured: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        action = json.loads(request.content)["p_action"]
+        return httpx.Response(200, json=True if action == "claim_turn" else None)
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            with pytest.raises(ApplicationError) as missing:
+                await repository.add_user_message("chat-one", "turn-one", "Hello")
+            assert missing.value.code == "turn_not_owned"
+            assert await repository.claim_turn("chat-one", "turn-one")
+            await repository.release_turn("chat-one", "turn-one")
+            with pytest.raises(ApplicationError) as released:
+                await repository.add_user_message("chat-one", "turn-one", "Hello")
+            assert released.value.code == "turn_not_owned"
+
+    asyncio.run(exercise())
+    assert len(captured) == 2
+    claim = json.loads(captured[0].content)
+    release = json.loads(captured[1].content)
+    assert claim["p_action"] == "claim_turn"
+    assert release["p_action"] == "release_turn"
+    assert len(claim["p_capability"]) >= 32
+    assert release["p_capability"] == claim["p_capability"]
 
 
 def test_session_mutations_return_chat_with_message_count() -> None:
@@ -853,6 +931,29 @@ def test_workspace_busy_conflict_preserves_application_error_type() -> None:
                 await repository.set_session_workspace(
                     "5f2b6daa-65db-43ad-b0ad-742e5c3645b9", "/tmp/project"
                 )
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_code"),
+    [
+        ("session_run_busy", "session_run_busy"),
+        ("session_turn_busy", "session_turn_busy"),
+        ("account_import_in_progress", "account_import_in_progress"),
+        ("account_activity_busy", "account_activity_busy"),
+    ],
+)
+def test_cloud_mutation_conflicts_have_public_codes(message: str, expected_code: str) -> None:
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json={"code": "PT409", "message": message})
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            with pytest.raises(ApplicationError) as conflict:
+                await repository.set_default_budget_preset("conservative")
+            assert conflict.value.code == expected_code
 
     asyncio.run(exercise())
 

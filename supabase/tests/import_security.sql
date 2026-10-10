@@ -7,7 +7,8 @@ BEGIN
        OR has_table_privilege('authenticated', 'trellis_private.import_ledger', 'UPDATE') THEN
         RAISE EXCEPTION 'private import ledger accessible directly';
     END IF;
-    IF has_function_privilege('anon', 'trellis.import_snapshot(jsonb)', 'EXECUTE') THEN
+    IF has_function_privilege('anon', 'trellis.import_snapshot(jsonb,text)', 'EXECUTE')
+       OR pg_catalog.to_regprocedure('trellis.import_snapshot(jsonb)') IS NOT NULL THEN
         RAISE EXCEPTION 'anon can call import RPC';
     END IF;
 END
@@ -29,21 +30,12 @@ DECLARE
                 'created_at', '2026-10-01T00:00:00Z',
                 'updated_at', '2026-10-01T00:00:00Z')));
     result jsonb;
+    cap text := 'CarolLegacyImportCapabilityWithThirtyTwoBytes123';
 BEGIN
-    result := trellis.import_snapshot(batch);
+    result := trellis.import_snapshot(batch, cap);
     IF result->>'inserted' <> '1' THEN
         RAISE EXCEPTION 'profile import did not insert';
     END IF;
-    PERFORM trellis.mutate('update_profile', '{"display_name":"Changed"}'::jsonb);
-    result := trellis.import_snapshot(batch);
-    IF result->>'already_imported' <> '1' THEN
-        RAISE EXCEPTION 'repeat import was not idempotent';
-    END IF;
-    IF (SELECT display_name FROM trellis.profiles WHERE id=
-        '00000000-0000-0000-0000-0000000000c3') <> 'Changed' THEN
-        RAISE EXCEPTION 'repeat import overwrote cloud change';
-    END IF;
-
     result := trellis.import_snapshot(pg_catalog.jsonb_build_object(
         'table', 'chats', 'rows', pg_catalog.jsonb_build_array(
             pg_catalog.jsonb_build_object(
@@ -51,7 +43,7 @@ BEGIN
                 'user_id', '00000000-0000-0000-0000-0000000000c3',
                 'title', pg_catalog.repeat('x', 300000),
                 'created_at', '2026-10-01T00:00:00Z',
-                'updated_at', '2026-10-01T00:00:00Z'))));
+                'updated_at', '2026-10-01T00:00:00Z'))), cap);
     IF result->>'inserted' <> '1' THEN
         RAISE EXCEPTION 'valid large legacy row was rejected';
     END IF;
@@ -62,13 +54,14 @@ BEGIN
                 pg_catalog.jsonb_build_object(
                     'id', '00000000-0000-0000-0000-0000000000d4',
                     'created_at', '2026-10-01T00:00:00Z',
-                    'updated_at', '2026-10-01T00:00:00Z'))));
+                    'updated_at', '2026-10-01T00:00:00Z'))), cap);
         RAISE EXCEPTION 'cross-account import accepted';
     EXCEPTION WHEN insufficient_privilege THEN NULL;
     END;
 
     BEGIN
-        PERFORM trellis.import_snapshot('{"table":"workspace_test_presets","rows":[]}'::jsonb);
+        PERFORM trellis.import_snapshot(
+            '{"table":"workspace_test_presets","rows":[]}'::jsonb, cap);
         RAISE EXCEPTION 'retired table import accepted';
     EXCEPTION WHEN invalid_parameter_value THEN NULL;
     END;
@@ -79,10 +72,21 @@ BEGIN
                 pg_catalog.jsonb_build_object(
                     'id', '00000000-0000-0000-0000-000000000010',
                     'user_id', '00000000-0000-0000-0000-0000000000c3',
-                    'status', 'running'))));
+                    'status', 'running'))), cap);
         RAISE EXCEPTION 'active run import accepted';
     EXCEPTION WHEN invalid_parameter_value THEN NULL;
     END;
+
+    PERFORM trellis.seal_import(cap);
+    PERFORM trellis.mutate('update_profile', '{"display_name":"Changed"}'::jsonb);
+    result := trellis.import_snapshot(batch, cap);
+    IF result->>'already_imported' <> '1' THEN
+        RAISE EXCEPTION 'repeat import was not idempotent';
+    END IF;
+    IF (SELECT display_name FROM trellis.profiles WHERE id=
+        '00000000-0000-0000-0000-0000000000c3') <> 'Changed' THEN
+        RAISE EXCEPTION 'repeat import overwrote cloud change';
+    END IF;
 END
 $check$;
 

@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from app.infrastructure import sqlite_import
 from app.infrastructure.accounts import _acquire_account_lock, _prepare_account_directory
 from app.infrastructure.database import Database
 from app.infrastructure.sqlite_import import import_locked_account
@@ -16,11 +17,22 @@ class RecordingSink:
     def __init__(self, *, fail_on: str | None = None) -> None:
         self.batches: list[tuple[str, list[dict[str, object]]]] = []
         self.fail_on = fail_on
+        self.seal_calls = 0
+        self.capabilities: list[str] = []
 
-    async def import_batch(self, table: str, rows: list[dict[str, object]]) -> None:
+    async def import_batch(
+        self, table: str, rows: list[dict[str, object]], capability: str
+    ) -> None:
+        self.capabilities.append(capability)
         if table == self.fail_on:
             raise RuntimeError("cloud unavailable")
         self.batches.append((table, rows))
+
+    async def seal_import(self, capability: str) -> None:
+        self.capabilities.append(capability)
+        if self.fail_on == "seal":
+            raise RuntimeError("cloud unavailable")
+        self.seal_calls += 1
 
 
 async def _account(tmp_path: Path, user_id: UUID) -> tuple[Path, int]:
@@ -77,6 +89,9 @@ async def test_imports_owned_conversation_rows_and_skips_completed_replay(tmp_pa
         assert "turn_claims" not in batches
         assert "workspace_test_presets" not in batches
         assert "should-not-import" not in json.dumps(sink.batches)
+        assert len(set(sink.capabilities)) == 1
+        assert len(sink.capabilities[0]) >= 32
+        assert (account_dir / ".supabase-import-capability").stat().st_mode & 0o777 == 0o600
         count = len(sink.batches)
         await import_locked_account(account_dir, user_id, lock_fd, sink)
         assert len(sink.batches) == count
@@ -103,16 +118,155 @@ async def test_rejects_mismatched_source_owner_without_sending_rows(tmp_path: Pa
 async def test_failed_batch_is_replayed_without_completion_marker(tmp_path: Path) -> None:
     user_id = uuid4()
     account_dir, lock_fd = await _account(tmp_path, user_id)
+    failing_sink = RecordingSink(fail_on="user_settings")
     try:
         with pytest.raises(RuntimeError, match="cloud unavailable"):
-            await import_locked_account(
-                account_dir, user_id, lock_fd, RecordingSink(fail_on="user_settings")
-            )
+            await import_locked_account(account_dir, user_id, lock_fd, failing_sink)
+        assert failing_sink.seal_calls == 0
         assert not (account_dir / ".supabase-imported.json").exists()
         sink = RecordingSink()
         await import_locked_account(account_dir, user_id, lock_fd, sink)
         assert (account_dir / ".supabase-imported.json").exists()
         assert [name for name, _ in sink.batches][:2] == ["profiles", "user_settings"]
+    finally:
+        os.close(lock_fd)
+
+
+@pytest.mark.anyio
+async def test_seals_cloud_import_before_writing_completion_marker(tmp_path: Path) -> None:
+    user_id = uuid4()
+    account_dir, lock_fd = await _account(tmp_path, user_id)
+    marker = account_dir / ".supabase-imported.json"
+
+    class InspectingSink(RecordingSink):
+        async def seal_import(self, capability: str) -> None:
+            assert marker.exists() is (self.seal_calls > 0)
+            assert self.batches
+            await super().seal_import(capability)
+
+    sink = InspectingSink()
+    try:
+        await import_locked_account(account_dir, user_id, lock_fd, sink)
+        assert sink.seal_calls == 1
+        assert marker.exists()
+        await import_locked_account(account_dir, user_id, lock_fd, sink)
+        assert sink.seal_calls == 1
+    finally:
+        os.close(lock_fd)
+
+
+@pytest.mark.anyio
+async def test_missing_completion_marker_replays_with_original_private_capability(
+    tmp_path: Path,
+) -> None:
+    user_id = uuid4()
+    account_dir, lock_fd = await _account(tmp_path, user_id)
+    sink = RecordingSink()
+    try:
+        await import_locked_account(account_dir, user_id, lock_fd, sink)
+        original_capability = sink.capabilities[0]
+        (account_dir / ".supabase-imported.json").unlink()
+        await import_locked_account(account_dir, user_id, lock_fd, sink)
+        assert set(sink.capabilities) == {original_capability}
+        assert sink.seal_calls == 2
+        assert (account_dir / ".supabase-imported.json").exists()
+    finally:
+        os.close(lock_fd)
+
+
+@pytest.mark.anyio
+async def test_missing_source_after_partial_import_requires_restoration(tmp_path: Path) -> None:
+    user_id = uuid4()
+    account_dir, lock_fd = await _account(tmp_path, user_id)
+    sink = RecordingSink(fail_on="user_settings")
+    try:
+        with pytest.raises(RuntimeError, match="cloud unavailable"):
+            await import_locked_account(account_dir, user_id, lock_fd, sink)
+        (account_dir / "state.db").unlink()
+        with pytest.raises(RuntimeError, match=r"restore the original state\.db"):
+            await import_locked_account(account_dir, user_id, lock_fd, RecordingSink())
+    finally:
+        os.close(lock_fd)
+
+
+@pytest.mark.anyio
+async def test_failed_seal_does_not_write_completion_marker(tmp_path: Path) -> None:
+    user_id = uuid4()
+    account_dir, lock_fd = await _account(tmp_path, user_id)
+    sink = RecordingSink(fail_on="seal")
+    try:
+        with pytest.raises(RuntimeError, match="cloud unavailable"):
+            await import_locked_account(account_dir, user_id, lock_fd, sink)
+        assert sink.batches
+        assert not (account_dir / ".supabase-imported.json").exists()
+        assert (account_dir / ".supabase-import-capability").stat().st_mode & 0o777 == 0o600
+    finally:
+        os.close(lock_fd)
+
+
+@pytest.mark.anyio
+async def test_replays_only_existing_rows_after_seal_if_marker_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user_id = uuid4()
+    account_dir, lock_fd = await _account(tmp_path, user_id)
+    marker = account_dir / ".supabase-imported.json"
+
+    class ReplayOnlySink(RecordingSink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sealed = False
+            self.accepted: set[str] = set()
+
+        async def import_batch(
+            self, table: str, rows: list[dict[str, object]], capability: str
+        ) -> None:
+            key = json.dumps([table, rows], sort_keys=True)
+            if self.sealed and key not in self.accepted:
+                raise RuntimeError("new cloud data after seal")
+            self.accepted.add(key)
+            await super().import_batch(table, rows, capability)
+
+        async def seal_import(self, capability: str) -> None:
+            self.sealed = True
+            await super().seal_import(capability)
+
+    write_marker = sqlite_import._write_marker
+    attempts = 0
+
+    def fail_once(path: Path, owner: UUID, digest: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("marker write failed")
+        write_marker(path, owner, digest)
+
+    monkeypatch.setattr(sqlite_import, "_write_marker", fail_once)
+    sink = ReplayOnlySink()
+    try:
+        with pytest.raises(OSError, match="marker write failed"):
+            await import_locked_account(account_dir, user_id, lock_fd, sink)
+        assert sink.sealed
+        assert not marker.exists()
+        await import_locked_account(account_dir, user_id, lock_fd, sink)
+        assert marker.exists()
+        assert sink.seal_calls == 2
+        assert len(set(sink.capabilities)) == 1
+    finally:
+        os.close(lock_fd)
+
+
+@pytest.mark.anyio
+async def test_new_device_without_legacy_database_does_not_seal_import(tmp_path: Path) -> None:
+    user_id = uuid4()
+    await asyncio.to_thread(tmp_path.chmod, 0o700)
+    account_dir = await asyncio.to_thread(_prepare_account_directory, tmp_path, user_id)
+    lock_fd = await asyncio.to_thread(_acquire_account_lock, account_dir)
+    sink = RecordingSink()
+    try:
+        await import_locked_account(account_dir, user_id, lock_fd, sink)
+        assert sink.seal_calls == 0
+        assert sink.batches == []
     finally:
         os.close(lock_fd)
 

@@ -166,6 +166,7 @@ class SupabaseRepository:
         self._capabilities: dict[str, str] = {}
         self._lease_expires: dict[str, datetime] = {}
         self._model_call_runs: dict[str, str] = {}
+        self._turn_capabilities: dict[tuple[str, str], str] = {}
 
     async def _send(
         self,
@@ -213,6 +214,25 @@ class SupabaseRepository:
         if response.status_code == 409:
             if error_code == "PT409" and error_message == "session_workspace_busy":
                 raise SessionWorkspaceBusy
+            if error_code == "PT409" and error_message == "session_run_busy":
+                raise ApplicationError(
+                    "session_run_busy", "This chat has an active run. Try again after it finishes."
+                )
+            if error_code == "PT409" and error_message == "session_turn_busy":
+                raise ApplicationError(
+                    "session_turn_busy",
+                    "This chat has an active turn. Try again after it finishes.",
+                )
+            if error_code == "PT409" and error_message == "account_import_in_progress":
+                raise ApplicationError(
+                    "account_import_in_progress",
+                    "Account data is being imported. Try again shortly.",
+                )
+            if error_code == "PT409" and error_message == "account_activity_busy":
+                raise ApplicationError(
+                    "account_activity_busy",
+                    "An active request must finish before account data can be imported.",
+                )
             raise ValueError("The cloud record conflicts with the current state")
         if response.status_code == 400 and error_code == "22023":
             if isinstance(error_message, str) and len(error_message) <= 200:
@@ -493,14 +513,38 @@ class SupabaseRepository:
         return await self._messages({"chat_id": f"eq.{session_id}", "turn_id": f"eq.{turn_id}"})
 
     async def claim_turn(self, session_id: str, turn_id: str) -> bool:
-        return await self._rpc("claim_turn", {"session_id": session_id, "turn_id": turn_id}) is True
+        capability = secrets.token_urlsafe(48)
+        claimed = (
+            await self._rpc(
+                "claim_turn",
+                {"session_id": session_id, "turn_id": turn_id},
+                capability=capability,
+            )
+            is True
+        )
+        if claimed:
+            self._turn_capabilities[(session_id, turn_id)] = capability
+        return claimed
+
+    def _turn_capability(self, session_id: str, turn_id: str) -> str:
+        capability = self._turn_capabilities.get((session_id, turn_id))
+        if capability is None:
+            raise ApplicationError("turn_not_owned", "This turn belongs to another device.")
+        return capability
 
     async def release_turn(self, session_id: str, turn_id: str) -> None:
-        await self._rpc("release_turn", {"session_id": session_id, "turn_id": turn_id})
+        await self._rpc(
+            "release_turn",
+            {"session_id": session_id, "turn_id": turn_id},
+            capability=self._turn_capability(session_id, turn_id),
+        )
+        self._turn_capabilities.pop((session_id, turn_id), None)
 
     async def add_user_message(self, session_id: str, turn_id: str, content: str) -> Message:
         result = await self._rpc(
-            "add_user_message", {"session_id": session_id, "turn_id": turn_id, "content": content}
+            "add_user_message",
+            {"session_id": session_id, "turn_id": turn_id, "content": content},
+            capability=self._turn_capability(session_id, turn_id),
         )
         return self._message(_object(result))
 
@@ -521,6 +565,7 @@ class SupabaseRepository:
                 "provider": provider,
                 "model": model,
             },
+            capability=self._turn_capability(session_id, turn_id),
         )
         return self._message(_object(result))
 
@@ -1189,9 +1234,16 @@ class SupabaseRepository:
     async def ensure_account(self) -> None:
         await self._request("POST", "rpc/ensure_account", payload={})
 
-    async def import_batch(self, table: str, rows: list[dict[str, object]]) -> None:
+    async def import_batch(
+        self, table: str, rows: list[dict[str, object]], capability: str
+    ) -> None:
         if not rows:
             return
         await self._request(
-            "POST", "rpc/import_snapshot", payload={"p_snapshot": {"table": table, "rows": rows}}
+            "POST",
+            "rpc/import_snapshot",
+            payload={"p_snapshot": {"table": table, "rows": rows}, "p_capability": capability},
         )
+
+    async def seal_import(self, capability: str) -> None:
+        await self._request("POST", "rpc/seal_import", payload={"p_capability": capability})

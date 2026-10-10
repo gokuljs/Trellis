@@ -85,4 +85,8 @@ BEGIN
     IF has_column_privilege('authenticated', 'trellis.runs', 'lease_token', 'SELECT') THEN
         RAISE EXCEPTION 'run capability digest selectable';
     END IF;
+    IF has_column_privilege('authenticated', 'trellis.turn_claims',
+                            'claim_token_hash', 'SELECT') THEN
+        RAISE EXCEPTION 'classic turn capability digest selectable';
+    END IF;
 END $check$;
