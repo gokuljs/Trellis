@@ -1,4 +1,4 @@
-import type { ReactNode } from "react"
+import { useEffect, useSyncExternalStore, type ReactNode } from "react"
 
 import { GitHubIcon } from "@trellis/ui/icons/github-icon"
 import { GoogleIcon } from "@trellis/ui/icons/google-icon"
@@ -6,10 +6,66 @@ import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 import { useAuth } from "@/lib/use-auth"
 import "./auth-screen.css"
 
+function subscribeToPath(listener: () => void) {
+  window.addEventListener("popstate", listener)
+  return () => window.removeEventListener("popstate", listener)
+}
+
+function currentPath() {
+  return window.location.pathname
+}
+
+function navigate(path: "/" | "/login" | "/signup", replace = false) {
+  if (replace) window.history.replaceState(null, "", path)
+  else window.history.pushState(null, "", path)
+  window.dispatchEvent(new PopStateEvent("popstate"))
+}
+
+function AuthPageLink({
+  href,
+  children,
+}: {
+  href: "/login" | "/signup"
+  children: ReactNode
+}) {
+  return (
+    <a
+      href={href}
+      onClick={(event) => {
+        if (
+          event.defaultPrevented ||
+          event.button !== 0 ||
+          event.metaKey ||
+          event.ctrlKey ||
+          event.shiftKey ||
+          event.altKey
+        ) {
+          return
+        }
+        event.preventDefault()
+        navigate(href)
+      }}
+    >
+      {children}
+    </a>
+  )
+}
+
 export function AuthGate({ children }: { children: ReactNode }) {
   const auth = useAuth()
+  const path = useSyncExternalStore(subscribeToPath, currentPath, currentPath)
+  const authPage = path === "/login" || path === "/signup"
+  const signedIn = auth.status === "signed-in" && auth.user !== null
+  const signup = path === "/signup"
 
-  if (auth.status === "signed-in" && auth.user) {
+  useEffect(() => {
+    // Let session restoration consume OAuth callback parameters first.
+    if (auth.status === "loading") return
+    if (signedIn && authPage) navigate("/", true)
+    else if (!signedIn && !authPage) navigate("/login", true)
+  }, [auth.status, authPage, signedIn, path])
+
+  if (signedIn && auth.user) {
     return (
       <div className="authenticated-workspace" key={auth.user.id}>
         {children}
@@ -39,11 +95,17 @@ export function AuthGate({ children }: { children: ReactNode }) {
         ) : (
           <>
             <h1 id="auth-heading">
-              {configured ? "Sign in to Trellis" : "Sign-in needs setup"}
+              {configured
+                ? signup
+                  ? "Create your Trellis account"
+                  : "Sign in to Trellis"
+                : "Sign-in needs setup"}
             </h1>
             <p className="auth-description">
               {configured
-                ? "Use your Google or GitHub account to get started."
+                ? signup
+                  ? "Use your Google or GitHub account to create an account."
+                  : "Use your Google or GitHub account to get started."
                 : "Add your Supabase project configuration, then restart the frontend."}
             </p>
             {auth.error ? (
@@ -55,7 +117,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
               <div
                 className="auth-providers"
                 role="group"
-                aria-label="Sign-in options"
+                aria-label={signup ? "Sign-up options" : "Sign-in options"}
               >
                 {(["google", "github"] as const).map((provider) => {
                   const label = provider === "google" ? "Google" : "GitHub"
@@ -95,6 +157,12 @@ export function AuthGate({ children }: { children: ReactNode }) {
                 Try again
               </button>
             ) : null}
+            <p className="auth-switch">
+              {signup ? "Already have an account? " : "New to Trellis? "}
+              <AuthPageLink href={signup ? "/login" : "/signup"}>
+                {signup ? "Sign in" : "Sign up"}
+              </AuthPageLink>
+            </p>
           </>
         )}
       </section>
