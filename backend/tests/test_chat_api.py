@@ -1,3 +1,4 @@
+import asyncio
 import threading
 from collections.abc import Sequence
 from pathlib import Path
@@ -6,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+from app.application import chat as chat_module
 from app.core.config import Settings
 from app.domain.models import Message, ProviderName
 from app.infrastructure.providers import ProviderError
@@ -222,6 +224,37 @@ def test_failed_turn_resumes_without_duplicating_the_user_message(tmp_path: Path
         "Recovered reply",
     ]
     assert provider.calls[1]["history"] == [("user", "Resume me")]
+
+
+def test_classic_turn_times_out_before_its_cloud_claim_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class SlowOnceProvider(RecordingProvider):
+        async def complete(self, messages: Sequence[Message], api_key: str, user_id: str) -> str:
+            reply = await super().complete(messages, api_key, user_id)
+            if len(self.calls) == 1:
+                await asyncio.sleep(0.1)
+            return reply
+
+    monkeypatch.setattr(chat_module, "_CLASSIC_TURN_TIMEOUT_SECONDS", 0.01, raising=False)
+    provider = SlowOnceProvider()
+    with configured_client(tmp_path, provider) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-local-test"})
+        session_id = client.post("/api/sessions").json()["id"]
+        turn_id = str(uuid4())
+        timed_out = client.post(
+            f"/api/sessions/{session_id}/turns",
+            json={"turn_id": turn_id, "content": "Try again"},
+        )
+        retry = client.post(
+            f"/api/sessions/{session_id}/turns",
+            json={"turn_id": turn_id, "content": "Try again"},
+        )
+
+    assert timed_out.status_code == 504
+    assert timed_out.json()["error"]["code"] == "provider_timeout"
+    assert retry.status_code == 201
+    assert retry.json()["assistant_message"]["content"] == "Second reply"
 
 
 def test_first_message_title_is_normalized_and_capped_at_eighty_characters(

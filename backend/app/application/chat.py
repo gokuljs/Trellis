@@ -1,8 +1,11 @@
+import asyncio
 from collections.abc import Mapping, Sequence
 
 from app.application.errors import ApplicationError, ProviderError
 from app.application.ports import ChatRepository, ProviderAdapter, SecretStorePort
 from app.domain.models import Message, ProviderName, Session, TurnResult
+
+_CLASSIC_TURN_TIMEOUT_SECONDS = 240
 
 
 class ChatService:
@@ -67,7 +70,14 @@ class ChatService:
             history = await self._database.list_messages(session_id)
             profile = await self._database.get_profile()
             try:
-                assistant_content = (await provider.complete(history, api_key, profile.id)).strip()
+                async with asyncio.timeout(_CLASSIC_TURN_TIMEOUT_SECONDS):
+                    assistant_content = (
+                        await provider.complete(history, api_key, profile.id)
+                    ).strip()
+            except TimeoutError:
+                raise ApplicationError(
+                    "provider_timeout", "The provider took too long to respond. Try again."
+                ) from None
             except ProviderError as error:
                 raise ApplicationError(error.code, error.message) from None
             if not assistant_content:
