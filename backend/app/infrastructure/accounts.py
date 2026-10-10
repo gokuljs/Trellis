@@ -1,0 +1,225 @@
+import asyncio
+import errno
+import os
+import stat
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from uuid import UUID
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no compatible process lock.
+    fcntl = None  # type: ignore[assignment]
+
+from app.application.chat import ChatService
+from app.application.errors import ApplicationError
+from app.application.onboarding import OnboardingService
+from app.application.ports import ProviderAdapter, StreamingProviderAdapter
+from app.application.profile import ProfileService
+from app.application.runs import RunService
+from app.application.sessions import SessionService
+from app.application.settings import SettingsService
+from app.application.tools import ToolRegistry
+from app.core.config import Settings
+from app.domain.models import ProviderName
+from app.infrastructure.command_tools import LocalCommandToolExecutor
+from app.infrastructure.database import Database
+from app.infrastructure.local_patch import LocalPatchToolExecutor
+from app.infrastructure.local_tools import LocalReadToolExecutor, read_workspace_guidance
+from app.infrastructure.runtime_events import RuntimeEventHub
+from app.infrastructure.secrets import SecretStore
+
+
+@dataclass(frozen=True, slots=True)
+class AccountContext:
+    database: Database
+    secret_store: SecretStore
+    profile_service: ProfileService
+    session_service: SessionService
+    settings_service: SettingsService
+    onboarding_service: OnboardingService
+    chat_service: ChatService
+    run_service: RunService
+    event_hub: RuntimeEventHub
+
+
+def _prepare_account_directory(data_dir: Path, user_id: UUID) -> Path:
+    account_dir = data_dir / "accounts" / str(user_id)
+    for path in (data_dir, data_dir / "accounts", account_dir):
+        if path.is_symlink():
+            raise RuntimeError("An account data path must not be a symlink")
+        path.mkdir(mode=0o700, parents=path == data_dir, exist_ok=True)
+        if path.is_symlink() or not path.is_dir():
+            raise RuntimeError("An account data path must be a private directory")
+        metadata = path.stat()
+        mode = metadata.st_mode
+        if path == data_dir:
+            if mode & (stat.S_IWGRP | stat.S_IWOTH) and not mode & stat.S_ISVTX:
+                raise RuntimeError("Account data root is an unsafe shared directory")
+            if metadata.st_uid != os.geteuid() and not (
+                metadata.st_uid == 0
+                and mode & stat.S_ISVTX
+                and mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                raise RuntimeError("Account data root must be owned by this process")
+        else:
+            if stat.S_IMODE(mode) != 0o700:
+                raise RuntimeError("An account data path must be a private directory")
+            if metadata.st_uid != os.geteuid():
+                raise RuntimeError("An account data path must be owned by this process")
+    for filename in ("state.db", ".env"):
+        if (account_dir / filename).is_symlink():
+            raise RuntimeError("An account data file must not be a symlink")
+    return account_dir
+
+
+def _acquire_account_lock(account_dir: Path) -> int:
+    if fcntl is None or not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("Per-account storage requires POSIX file locking")
+    lock_path = account_dir / ".account.lock"
+    descriptor = os.open(
+        lock_path,
+        os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RuntimeError("An account lock must be a private regular file")
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EAGAIN, errno.EACCES}:
+                raise ApplicationError(
+                    "account_in_use", "This account is open in another backend process."
+                ) from None
+            raise
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _release_unclaimed_lock(task: asyncio.Task[int]) -> None:
+    try:
+        descriptor = task.result()
+    except BaseException:
+        return
+    os.close(descriptor)
+
+
+class AccountRegistry:
+    def __init__(
+        self,
+        settings: Settings,
+        providers: Mapping[ProviderName, ProviderAdapter],
+        runtime_providers: Mapping[str, StreamingProviderAdapter],
+        *,
+        tool_registry_factory: Callable[[Database], ToolRegistry] | None = None,
+    ) -> None:
+        self._settings = settings
+        self._providers = providers
+        self._runtime_providers = runtime_providers
+        self._tool_registry_factory = tool_registry_factory
+        self._contexts: dict[UUID, AccountContext] = {}
+        self._locks: dict[UUID, int] = {}
+        self._lock = asyncio.Lock()
+        self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
+
+    async def get(self, user_id: UUID) -> AccountContext:
+        if not isinstance(user_id, UUID):
+            raise TypeError("Account identity must be a verified UUID")
+        async with self._lock:
+            if self._closed:
+                raise RuntimeError("Account registry is closed")
+            existing = self._contexts.get(user_id)
+            if existing is not None:
+                return existing
+
+            account_dir = await asyncio.to_thread(
+                _prepare_account_directory, self._settings.data_dir, user_id
+            )
+            lock_task = asyncio.create_task(asyncio.to_thread(_acquire_account_lock, account_dir))
+            try:
+                lock_descriptor = await asyncio.shield(lock_task)
+            except BaseException:
+                lock_task.add_done_callback(_release_unclaimed_lock)
+                raise
+            try:
+                database = Database(account_dir / "state.db", owner_id=user_id)
+                await database.initialize()
+                await asyncio.to_thread(database.path.chmod, 0o600)
+                await database.recover_active_runs()
+                secret_store = SecretStore(account_dir / ".env")
+                event_hub = RuntimeEventHub()
+                tools = (
+                    self._tool_registry_factory(database)
+                    if self._tool_registry_factory is not None
+                    else ToolRegistry(
+                        LocalReadToolExecutor(),
+                        patch_executor=LocalPatchToolExecutor(),
+                        command_executor=LocalCommandToolExecutor(),
+                    )
+                )
+                run_service = RunService(
+                    database,
+                    database,
+                    database,
+                    database,
+                    secret_store,
+                    self._runtime_providers,
+                    event_hub,
+                    tool_registry=tools,
+                    workspace_guidance_reader=read_workspace_guidance,
+                )
+                try:
+                    await run_service.resume_decided_approvals()
+                    context = AccountContext(
+                        database=database,
+                        secret_store=secret_store,
+                        profile_service=ProfileService(database),
+                        session_service=SessionService(database),
+                        settings_service=SettingsService(database, secret_store),
+                        onboarding_service=OnboardingService(database, database, secret_store),
+                        chat_service=ChatService(database, secret_store, self._providers),
+                        run_service=run_service,
+                        event_hub=event_hub,
+                    )
+                except BaseException:
+                    await run_service.close()
+                    raise
+            except BaseException:
+                os.close(lock_descriptor)
+                raise
+            self._contexts[user_id] = context
+            self._locks[user_id] = lock_descriptor
+            return context
+
+    async def close(self) -> None:
+        async with self._lock:
+            if self._close_task is None:
+                self._closed = True
+                contexts = tuple(self._contexts.values())
+                self._contexts.clear()
+                locks = tuple(self._locks.values())
+                self._locks.clear()
+                self._close_task = asyncio.create_task(self._finish_close(contexts, locks))
+            close_task = self._close_task
+        await asyncio.shield(close_task)
+
+    async def _finish_close(
+        self, contexts: tuple[AccountContext, ...], locks: tuple[int, ...]
+    ) -> None:
+        try:
+            results = await asyncio.gather(
+                *(context.run_service.close() for context in contexts), return_exceptions=True
+            )
+        finally:
+            for descriptor in locks:
+                os.close(descriptor)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result

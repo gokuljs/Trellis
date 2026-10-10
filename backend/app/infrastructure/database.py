@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import aiosqlite
 
@@ -378,8 +378,9 @@ def utc_now() -> str:
 
 
 class Database:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, owner_id: UUID | None = None) -> None:
         self.path = path
+        self._owner_id = str(owner_id) if owner_id is not None else None
 
     async def initialize(self) -> None:
         await asyncio.to_thread(self._prepare_parent_directory)
@@ -423,6 +424,11 @@ class Database:
                     COMMIT;
                     """
                 )
+            if self._owner_id is not None:
+                owner_cursor = await connection.execute("SELECT id FROM users LIMIT 2")
+                owners = tuple(await owner_cursor.fetchall())
+                if owners and (len(owners) != 1 or owners[0]["id"] != self._owner_id):
+                    raise RuntimeError("Account database owner does not match authenticated user")
             now = utc_now()
             await connection.execute(
                 """
@@ -430,7 +436,7 @@ class Database:
                 SELECT ?, NULL, NULL, ?, ?
                 WHERE NOT EXISTS (SELECT 1 FROM users)
                 """,
-                (str(uuid4()), now, now),
+                (self._owner_id or str(uuid4()), now, now),
             )
             await connection.execute(
                 """
