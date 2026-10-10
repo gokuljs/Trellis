@@ -8,7 +8,6 @@ import type {
   Session,
   SessionDetail,
   Settings,
-  TestPreset,
 } from "@/lib/app-types"
 
 type ErrorPayload = {
@@ -134,17 +133,5 @@ export const api = {
   listRunEvents: (sessionId: string, runId: string, afterSequence: number) =>
     request<{ items: SavedRunEvent[]; next_after_sequence: number | null }>(
       `/api/sessions/${sessionId}/runs/${encodeURIComponent(runId)}/events?after_sequence=${afterSequence}&limit=500`
-    ),
-  listTestPresets: (sessionId: string) =>
-    request<TestPreset[]>(`/api/sessions/${sessionId}/test-presets`),
-  saveTestPreset: (sessionId: string, preset: TestPreset) =>
-    request<TestPreset>(`/api/sessions/${sessionId}/test-presets`, {
-      method: "POST",
-      body: JSON.stringify(preset),
-    }),
-  deleteTestPreset: (sessionId: string, name: string) =>
-    request<void>(
-      `/api/sessions/${sessionId}/test-presets/${encodeURIComponent(name)}`,
-      { method: "DELETE" }
     ),
 }

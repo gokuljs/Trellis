@@ -1913,91 +1913,6 @@ html.theme-ripple-fallback::before {
     margin: var(--space-6) auto 0;
   }
 
-  .test-presets {
-    flex: 0 0 auto;
-    width: min(760px, calc(100% - 64px));
-    margin: 0 auto var(--space-2);
-    color: var(--shell-text-muted);
-    font-size: 12px;
-  }
-
-  .test-presets > button,
-  .test-presets li button {
-    color: var(--shell-accent);
-    font-weight: 600;
-  }
-
-  .test-presets > button:disabled,
-  .test-presets-panel button:disabled {
-    cursor: not-allowed;
-    opacity: 0.55;
-  }
-
-  .test-presets-panel {
-    display: grid;
-    gap: var(--space-2);
-    margin-top: var(--space-2);
-    padding: var(--space-3);
-    border: 1px solid var(--shell-line);
-    border-radius: 12px;
-    background: var(--shell-input);
-  }
-
-  .test-presets-panel ul {
-    display: grid;
-    gap: var(--space-2);
-  }
-
-  .test-presets-panel li {
-    display: flex;
-    justify-content: space-between;
-    gap: var(--space-3);
-  }
-
-  .test-presets-panel li span {
-    display: flex;
-    min-width: 0;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-    align-items: baseline;
-  }
-
-  .test-presets-panel code {
-    overflow-wrap: anywhere;
-    color: var(--shell-text-strong);
-  }
-
-  .test-presets-panel form {
-    display: grid;
-    grid-template-columns: max-content minmax(0, 1fr);
-    align-items: center;
-    gap: var(--space-2);
-  }
-
-  .test-presets-panel input {
-    min-width: 0;
-    padding: var(--space-2);
-    border: 1px solid var(--shell-line);
-    border-radius: 7px;
-    outline-color: var(--shell-focus);
-    color: var(--shell-text-bright);
-    background: var(--shell-bg);
-  }
-
-  .test-presets-panel form button {
-    grid-column: 2;
-    justify-self: start;
-    padding: var(--space-2) var(--space-3);
-    border-radius: 7px;
-    color: var(--primary-foreground);
-    background: var(--shell-accent);
-    font-weight: 600;
-  }
-
-  .test-presets-panel [role="alert"] {
-    color: var(--destructive);
-  }
-
   .composer-wrap {
     flex: 0 0 auto;
     width: min(760px, calc(100% - 64px));
@@ -2306,9 +2221,7 @@ html.theme-ripple-fallback::before {
     .chat-error button,
     .cancel-run-button,
     .run-approval-actions button,
-    .composer-workspace-menu-item,
-    .test-presets > button,
-    .test-presets li button {
+    .composer-workspace-menu-item {
       min-height: var(--space-10);
     }
 
@@ -3046,11 +2959,6 @@ html.theme-ripple-fallback::before {
     .composer-wrap {
       width: calc(100% - 32px);
       margin: 0 auto calc(var(--space-2) + env(safe-area-inset-bottom, 0px));
-    }
-
-    .test-presets {
-      width: calc(100% - 32px);
-      margin: 0 auto var(--space-2);
     }
 
     .composer-box {

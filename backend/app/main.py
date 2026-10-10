@@ -15,7 +15,6 @@ from app.application.profile import ProfileService
 from app.application.runs import RunService
 from app.application.sessions import SessionService
 from app.application.settings import SettingsService
-from app.application.test_presets import TestPresetService
 from app.application.tools import ToolRegistry
 from app.application.workspaces import (
     DEFAULT_WORKSPACE_PICKER_TIMEOUT_SECONDS,
@@ -41,9 +40,6 @@ ERROR_STATUS = {
     "invalid_workspace": 422,
     "workspace_picker_unavailable": 503,
     "workspace_picker_timeout": 504,
-    "invalid_test_preset": 422,
-    "workspace_required": 409,
-    "too_many_test_presets": 409,
     "session_workspace_busy": 409,
     "provider_not_configured": 409,
     "pricing_unavailable": 409,
@@ -88,7 +84,6 @@ def create_app(
             NativeFolderPicker(),
             timeout_seconds=WORKSPACE_PICKER_TIMEOUT_SECONDS,
         )
-        application.state.test_preset_service = TestPresetService(database)
         application.state.settings_service = SettingsService(database, secret_store)
         application.state.onboarding_service = OnboardingService(
             database,
@@ -123,7 +118,7 @@ def create_app(
                 or ToolRegistry(
                     LocalReadToolExecutor(),
                     patch_executor=LocalPatchToolExecutor(),
-                    command_executor=LocalCommandToolExecutor(database),
+                    command_executor=LocalCommandToolExecutor(),
                 ),
                 workspace_guidance_reader=read_workspace_guidance,
             )

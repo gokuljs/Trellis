@@ -1184,7 +1184,11 @@ describe("local-first chat", () => {
     vi.stubGlobal("fetch", fetchMock)
     const user = userEvent.setup()
 
-    renderApp()
+    render(
+      <ThemeProvider defaultTheme="dark">
+        <AppShell />
+      </ThemeProvider>
+    )
     await screen.findByRole("textbox", { name: "Message" })
     await user.click(screen.getByRole("button", { name: "Attach" }))
     await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
@@ -1203,6 +1207,9 @@ describe("local-first chat", () => {
     )
     expect(screen.queryByRole("menu")).not.toBeInTheDocument()
     expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+    expect(
+      screen.queryByRole("button", { name: "Test commands" })
+    ).not.toBeInTheDocument()
   })
 
   it("keeps the composer idle while the folder picker and attachment are pending", async () => {

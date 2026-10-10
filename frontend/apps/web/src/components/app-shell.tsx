@@ -11,7 +11,6 @@ import { SettingsPage } from "@/components/settings-page"
 import { Sidebar } from "@/components/sidebar"
 import { WelcomePanel } from "@/components/welcome-panel"
 import { WorkspaceTopbar } from "@/components/workspace-topbar"
-import { TestPresets } from "@/components/test-presets"
 import { ApiError, api } from "@/lib/api"
 import {
   RuntimeError,
@@ -1292,13 +1291,6 @@ export function AppShell({
 
         {activeView !== "Settings" ? (
           <>
-            {activeSession?.workspace_path ? (
-              <TestPresets
-                key={`${activeSession.id}:${activeSession.workspace_path}`}
-                sessionId={activeSession.id}
-                disabled={pending || sessionLoading || workspaceSaving}
-              />
-            ) : null}
             <Composer
               value={composerValue}
               placeholder={

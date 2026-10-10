@@ -89,14 +89,6 @@ class _RunCommandArguments(_StrictArguments):
     timeout_seconds: int = Field(default=120, ge=1, le=120)
 
 
-class _RunTestArguments(_StrictArguments):
-    name: str = Field(min_length=1, max_length=64)
-
-
-class _ListTestPresetsArguments(_StrictArguments):
-    pass
-
-
 _DEFINITIONS: tuple[tuple[str, str, type[_StrictArguments]], ...] = (
     (
         "list_files",
@@ -126,16 +118,6 @@ _PATCH_DEFINITION = (
 )
 
 _COMMAND_DEFINITIONS: tuple[tuple[str, str, type[_StrictArguments]], ...] = (
-    (
-        "list_test_presets",
-        "List the names of test commands the user saved for this workspace.",
-        _ListTestPresetsArguments,
-    ),
-    (
-        "run_test",
-        "Run one exact user-saved test by name without approval, using Trellis's OS permissions.",
-        _RunTestArguments,
-    ),
     (
         "run_command",
         "Run one executable from a workspace folder after approval, using Trellis's OS "
@@ -312,7 +294,7 @@ class ToolRegistry:
                 content, truncated = await self._patch_executor.execute(
                     arguments, workspace_root, approval_preview
                 )
-            elif call.name in {"run_command", "run_test", "list_test_presets"}:
+            elif call.name == "run_command":
                 if self._command_executor is None:
                     raise ToolExecutionError("unknown_tool", "This tool is not available.")
                 content, truncated = await self._command_executor.execute(
