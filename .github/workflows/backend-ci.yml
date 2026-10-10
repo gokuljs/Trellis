@@ -56,7 +56,9 @@ jobs:
             supabase/tests/runtime_rpc.sql \
             supabase/tests/import_security.sql \
             supabase/tests/import_hardening.sql \
-            supabase/tests/chat_summaries.sql; do
+            supabase/tests/chat_summaries.sql \
+            supabase/tests/runtime_regressions.sql \
+            supabase/tests/create_run_regressions.sql; do
             psql -X -v ON_ERROR_STOP=1 -f "$file"
           done
 
