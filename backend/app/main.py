@@ -1,21 +1,15 @@
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
-from typing import cast
+from typing import Protocol, cast
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.api import router
-from app.application.chat import ChatService
+from app.api.auth import SupabaseAuthVerifier, VerifiedUser
 from app.application.errors import ApplicationError
-from app.application.onboarding import OnboardingService
 from app.application.ports import ProviderAdapter, StreamingProviderAdapter
-from app.application.profile import ProfileService
-from app.application.runs import RunService
-from app.application.sessions import SessionService
-from app.application.settings import SettingsService
-from app.application.test_presets import TestPresetService
 from app.application.tools import ToolRegistry
 from app.application.workspaces import (
     DEFAULT_WORKSPACE_PICKER_TIMEOUT_SECONDS,
@@ -23,16 +17,17 @@ from app.application.workspaces import (
 )
 from app.core.config import Settings
 from app.domain.models import ProviderName
-from app.infrastructure.command_tools import LocalCommandToolExecutor
-from app.infrastructure.database import Database
-from app.infrastructure.local_patch import LocalPatchToolExecutor
-from app.infrastructure.local_tools import LocalReadToolExecutor, read_workspace_guidance
+from app.infrastructure.accounts import AccountRegistry
 from app.infrastructure.providers import AnthropicProvider, OpenAIProvider
-from app.infrastructure.runtime_events import RuntimeEventHub
-from app.infrastructure.secrets import SecretStore
 from app.infrastructure.workspace_picker import NativeFolderPicker
 
 WORKSPACE_PICKER_TIMEOUT_SECONDS = DEFAULT_WORKSPACE_PICKER_TIMEOUT_SECONDS
+
+
+class AuthVerifier(Protocol):
+    async def verify_bearer(self, authorization: str | None) -> VerifiedUser: ...
+    async def verify_token(self, token: str) -> VerifiedUser: ...
+
 
 ERROR_STATUS = {
     "model_not_available": 404,
@@ -41,9 +36,6 @@ ERROR_STATUS = {
     "invalid_workspace": 422,
     "workspace_picker_unavailable": 503,
     "workspace_picker_timeout": 504,
-    "invalid_test_preset": 422,
-    "workspace_required": 409,
-    "too_many_test_presets": 409,
     "session_workspace_busy": 409,
     "provider_not_configured": 409,
     "pricing_unavailable": 409,
@@ -56,6 +48,7 @@ ERROR_STATUS = {
     "provider_upstream_failed": 502,
     "turn_conflict": 409,
     "turn_in_progress": 409,
+    "account_in_use": 409,
     "message_empty": 422,
     "invalid_api_key": 422,
     "invalid_profile": 422,
@@ -71,32 +64,22 @@ def create_app(
     streaming_provider_adapters: Mapping[str, StreamingProviderAdapter] | None = None,
     tool_registry: ToolRegistry | None = None,
     workspace_picker: WorkspacePickerService | None = None,
+    auth_verifier: AuthVerifier | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-        database = Database(resolved_settings.database_path)
-        await database.initialize()
-        await database.recover_active_runs()
-        application.state.database = database
-        secret_store = SecretStore(resolved_settings.secrets_path)
-        application.state.secret_store = secret_store
-        application.state.profile_service = ProfileService(database)
-        application.state.session_service = SessionService(database)
+        application.state.settings = resolved_settings
         application.state.workspace_picker = workspace_picker or WorkspacePickerService(
             NativeFolderPicker(),
             timeout_seconds=WORKSPACE_PICKER_TIMEOUT_SECONDS,
         )
-        application.state.test_preset_service = TestPresetService(database)
-        application.state.settings_service = SettingsService(database, secret_store)
-        application.state.onboarding_service = OnboardingService(
-            database,
-            database,
-            secret_store,
-        )
         timeout = httpx.Timeout(connect=10, read=120, write=30, pool=10)
         async with httpx.AsyncClient(timeout=timeout) as http_client:
+            application.state.auth_verifier = auth_verifier or SupabaseAuthVerifier(
+                resolved_settings, http_client
+            )
             if provider_adapters is None:
                 providers: Mapping[ProviderName, ProviderAdapter] = {
                     "openai": OpenAIProvider(http_client),
@@ -109,35 +92,19 @@ def create_app(
                 if callable(getattr(provider, "stream", None)):
                     runtime_providers[provider_id] = cast(StreamingProviderAdapter, provider)
             runtime_providers.update(streaming_provider_adapters or {})
-            event_hub = RuntimeEventHub()
-            application.state.runtime_event_hub = event_hub
-            run_service = RunService(
-                database,
-                database,
-                database,
-                database,
-                secret_store,
-                runtime_providers,
-                event_hub,
-                tool_registry=tool_registry
-                or ToolRegistry(
-                    LocalReadToolExecutor(),
-                    patch_executor=LocalPatchToolExecutor(),
-                    command_executor=LocalCommandToolExecutor(database),
-                ),
-                workspace_guidance_reader=read_workspace_guidance,
-            )
-            application.state.run_service = run_service
-            await run_service.resume_decided_approvals()
-            application.state.chat_service = ChatService(
-                database,
-                secret_store,
+            registry = AccountRegistry(
+                resolved_settings,
                 providers,
+                runtime_providers,
+                tool_registry_factory=(
+                    (lambda _database: tool_registry) if tool_registry is not None else None
+                ),
             )
+            application.state.account_registry = registry
             try:
                 yield
             finally:
-                await run_service.close()
+                await registry.close()
 
     application = FastAPI(
         title=resolved_settings.app_name,

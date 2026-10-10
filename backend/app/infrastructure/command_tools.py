@@ -1,4 +1,4 @@
-"""Bounded local commands for explicitly approved requests and saved tests."""
+"""Bounded local commands for explicitly approved requests."""
 
 import asyncio
 import os
@@ -6,15 +6,13 @@ import signal
 import sys
 from contextlib import suppress
 from pathlib import Path
-from typing import Protocol, cast
+from typing import cast
 
 from app.application.tools import ToolExecutionError, parse_command
-from app.domain.models import TestPreset
 from app.infrastructure.local_tools import _open_directory, _parts, _root
 
 MAX_COMMAND_OUTPUT_BYTES = 20_000
 MAX_COMMAND_SECONDS = 120
-MAX_TEST_SECONDS = 180
 _EXEC_FROM_DIRECTORY = (
     "import os,sys; "
     "fd=int(sys.argv[1]); "
@@ -116,34 +114,10 @@ async def run_bounded_command(
     return content, False
 
 
-class TestPresetReader(Protocol):
-    async def list_test_presets(self, workspace_path: str) -> list[TestPreset]: ...
-    async def get_test_preset(self, workspace_path: str, name: str) -> TestPreset | None: ...
-
-
 class LocalCommandToolExecutor:
-    def __init__(self, presets: TestPresetReader) -> None:
-        self._presets = presets
-
     async def execute(
         self, name: str, arguments: dict[str, object], workspace_root: Path
     ) -> tuple[str, bool]:
-        if name == "list_test_presets":
-            await asyncio.to_thread(_root, workspace_root)
-            presets = await self._presets.list_test_presets(str(workspace_root))
-            return "\n".join(preset.name for preset in presets), False
-        if name == "run_test":
-            await asyncio.to_thread(_root, workspace_root)
-            preset = await self._presets.get_test_preset(
-                str(workspace_root), cast(str, arguments["name"])
-            )
-            if preset is None:
-                raise ToolExecutionError(
-                    "unknown_test_preset", "That saved test command is unavailable."
-                )
-            return await run_bounded_command(
-                workspace_root, preset.command, preset.cwd, timeout_seconds=MAX_TEST_SECONDS
-            )
         if name == "run_command":
             return await run_bounded_command(
                 workspace_root,

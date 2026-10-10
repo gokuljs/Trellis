@@ -8,8 +8,8 @@ import type {
   Session,
   SessionDetail,
   Settings,
-  TestPreset,
 } from "@/lib/app-types"
+import { getAuthController } from "@/lib/auth-controller"
 
 type ErrorPayload = {
   error?: {
@@ -32,14 +32,51 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const auth = getAuthController()
+  const { token, userId } = await auth.getAccessToken()
+  const sessionEpoch = auth.getSessionEpoch()
+  const headers = new Headers(init.headers)
+  headers.set("Accept", "application/json")
+  if (init.body) headers.set("Content-Type", "application/json")
+  headers.set("Authorization", `Bearer ${token}`)
   const response = await fetch(path, {
     ...init,
-    headers: {
-      Accept: "application/json",
-      ...(init.body ? { "Content-Type": "application/json" } : {}),
-      ...init.headers,
-    },
+    headers,
   })
+
+  function assertCurrentUser() {
+    const current = auth.getSnapshot()
+    if (
+      current.status !== "signed-in" ||
+      current.user?.id !== userId ||
+      auth.getSessionEpoch() !== sessionEpoch
+    ) {
+      throw new ApiError(
+        "authentication_required",
+        "Sign in again to continue.",
+        401
+      )
+    }
+  }
+
+  assertCurrentUser()
+  if (response.status === 401) {
+    let stillRejectedToken = false
+    try {
+      const currentCredential = await auth.getAccessToken()
+      assertCurrentUser()
+      stillRejectedToken =
+        currentCredential.userId === userId && currentCredential.token === token
+    } catch {
+      // An old request must not sign out a newer or unavailable session.
+    }
+    if (stillRejectedToken) void auth.signOut()
+    throw new ApiError(
+      "authentication_required",
+      "Sign in again to continue.",
+      401
+    )
+  }
 
   if (!response.ok) {
     let payload: ErrorPayload = {}
@@ -48,6 +85,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     } catch {
       // Responses from upstreams are deliberately not exposed to the UI.
     }
+    assertCurrentUser()
     throw new ApiError(
       payload.error?.code ?? "request_failed",
       payload.error?.message ??
@@ -58,12 +96,14 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
 
   if (response.status === 204) return undefined as T
-  return (await response.json()) as T
+  const payload = (await response.json()) as T
+  assertCurrentUser()
+  return payload
 }
 
 export const api = {
   getProfile: () => request<Profile>("/api/profile"),
-  updateProfile: (profile: Pick<Profile, "display_name" | "email">) =>
+  updateProfile: (profile: Pick<Profile, "display_name">) =>
     request<Profile>("/api/profile", {
       method: "PUT",
       body: JSON.stringify(profile),
@@ -72,7 +112,7 @@ export const api = {
   getOnboarding: () => request<OnboardingState>("/api/onboarding"),
   completeOnboardingIntro: () =>
     request<OnboardingState>("/api/onboarding/steps/intro", { method: "PUT" }),
-  saveOnboardingProfile: (profile: Pick<Profile, "display_name" | "email">) =>
+  saveOnboardingProfile: (profile: Pick<Profile, "display_name">) =>
     request<OnboardingState>("/api/onboarding/steps/profile", {
       method: "PUT",
       body: JSON.stringify(profile),
@@ -134,17 +174,5 @@ export const api = {
   listRunEvents: (sessionId: string, runId: string, afterSequence: number) =>
     request<{ items: SavedRunEvent[]; next_after_sequence: number | null }>(
       `/api/sessions/${sessionId}/runs/${encodeURIComponent(runId)}/events?after_sequence=${afterSequence}&limit=500`
-    ),
-  listTestPresets: (sessionId: string) =>
-    request<TestPreset[]>(`/api/sessions/${sessionId}/test-presets`),
-  saveTestPreset: (sessionId: string, preset: TestPreset) =>
-    request<TestPreset>(`/api/sessions/${sessionId}/test-presets`, {
-      method: "POST",
-      body: JSON.stringify(preset),
-    }),
-  deleteTestPreset: (sessionId: string, name: string) =>
-    request<void>(
-      `/api/sessions/${sessionId}/test-presets/${encodeURIComponent(name)}`,
-      { method: "DELETE" }
     ),
 }

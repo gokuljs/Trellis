@@ -25,7 +25,6 @@ export function SettingsPage({
   onSettingsChange,
 }: SettingsPageProps) {
   const [displayName, setDisplayName] = useState(profile.display_name ?? "")
-  const [email, setEmail] = useState(profile.email ?? "")
   const [apiKey, setApiKey] = useState("")
   const [showApiKey, setShowApiKey] = useState(false)
   const [saving, setSaving] = useState<string | null>(null)
@@ -103,20 +102,17 @@ export function SettingsPage({
       <h1 className="sr-only">Settings</h1>
       <header className="settings-header">
         <div className="utility-kicker">SETTINGS</div>
-        <p>
-          Set up this local installation. Your profile and sessions stay on this
-          device.
-        </p>
+        <p>Manage your account, model, and local provider keys.</p>
       </header>
 
       <div className="settings-sections">
         <section className="settings-section" aria-labelledby="profile-heading">
           <div className="settings-section-copy">
-            <div className="settings-section-label">LOCAL PROFILE</div>
-            <h2 id="profile-heading">Your installation</h2>
+            <div className="settings-section-label">ACCOUNT</div>
+            <h2 id="profile-heading">Your profile</h2>
             <p>
-              Optional details make the workspace feel familiar. The
-              installation ID identifies this local user.
+              Your sign-in email is managed by your account. You can change how
+              Trellis addresses you here.
             </p>
           </div>
 
@@ -139,24 +135,23 @@ export function SettingsPage({
                 <input
                   aria-label="Email"
                   type="email"
-                  value={email}
-                  onChange={(event) => setEmail(event.target.value)}
-                  placeholder="you@example.com"
+                  value={profile.email ?? ""}
+                  readOnly
                 />
               </span>
             </label>
             <label className="settings-field settings-field-wide">
-              <span className="settings-field-label">Installation ID</span>
+              <span className="settings-field-label">Account ID</span>
               <span className="settings-input-wrap readonly">
                 <input
-                  aria-label="Installation ID"
+                  aria-label="Account ID"
                   value={profile.id}
                   disabled
                   readOnly
                 />
               </span>
               <span className="settings-field-help">
-                Stable until the Trellis data directory is removed.
+                This ID identifies your account across devices.
               </span>
             </label>
             <button
@@ -168,13 +163,12 @@ export function SettingsPage({
                   "profile",
                   {
                     title: "Profile saved",
-                    description: "Your details stay on this device.",
+                    description: "Your display name has been updated.",
                   },
                   async () => {
                     onProfileChange(
                       await api.updateProfile({
                         display_name: displayName.trim() || null,
-                        email: email.trim() || null,
                       })
                     )
                   }
@@ -193,10 +187,7 @@ export function SettingsPage({
           <div className="settings-section-copy">
             <div className="settings-section-label">MODEL</div>
             <h2 id="provider-heading">Choose your model</h2>
-            <p>
-              Choose which available model powers new turns. Your choice is
-              stored locally.
-            </p>
+            <p>Choose which available model powers new turns.</p>
           </div>
 
           <div

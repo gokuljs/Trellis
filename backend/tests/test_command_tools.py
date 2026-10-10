@@ -7,10 +7,8 @@ from typing import Any
 import pytest
 
 from app.application.tools import ToolExecutionError, ToolRegistry
-from app.domain.models import TestPreset as SavedTestPreset
 from app.domain.runtime import ModelToolCall
 from app.infrastructure.command_tools import LocalCommandToolExecutor, run_bounded_command
-from app.infrastructure.database import Database
 from app.infrastructure.local_tools import LocalReadToolExecutor
 
 
@@ -121,11 +119,7 @@ def test_cancellation_stops_child_process_group(tmp_path: Path) -> None:
 
 
 def test_run_command_requires_approval_and_revalidates_preview(tmp_path: Path) -> None:
-    database = Database(tmp_path / "data.db")
-    asyncio.run(database.initialize())
-    registry = ToolRegistry(
-        LocalReadToolExecutor(), command_executor=LocalCommandToolExecutor(database)
-    )
+    registry = ToolRegistry(LocalReadToolExecutor(), command_executor=LocalCommandToolExecutor())
     call = ModelToolCall(
         "call-1",
         "run_command",
@@ -150,31 +144,16 @@ def test_run_command_requires_approval_and_revalidates_preview(tmp_path: Path) -
     assert not approved.is_error
 
 
-def test_run_test_can_only_execute_a_saved_exact_workspace_preset(tmp_path: Path) -> None:
-    database = Database(tmp_path / "data.db")
-    asyncio.run(database.initialize())
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    asyncio.run(
-        database.save_test_preset(
-            str(workspace), SavedTestPreset("Backend", _python("print('saved')"), ".")
-        )
-    )
-    registry = ToolRegistry(
-        LocalReadToolExecutor(), command_executor=LocalCommandToolExecutor(database)
-    )
-    listed = asyncio.run(
-        registry.execute(ModelToolCall("list", "list_test_presets", {}), workspace)
-    )
-    unsaved = asyncio.run(
-        registry.execute(ModelToolCall("unknown", "run_test", {"name": "Injected"}), workspace)
-    )
-    saved = asyncio.run(
-        registry.execute(ModelToolCall("saved", "run_test", {"name": "Backend"}), workspace)
-    )
+@pytest.mark.parametrize(
+    "name,arguments",
+    [("list_test_presets", {}), ("run_test", {"name": "Backend"})],
+)
+def test_saved_test_command_tools_are_unavailable(
+    tmp_path: Path, name: str, arguments: dict[str, object]
+) -> None:
+    registry = ToolRegistry(LocalReadToolExecutor(), command_executor=LocalCommandToolExecutor())
 
-    assert "Backend" in listed.content
-    assert "saved" not in listed.content
-    assert unsaved.error_code == "unknown_test_preset"
-    assert saved.content == "saved"
-    assert not saved.is_error
+    result = asyncio.run(registry.execute(ModelToolCall("removed", name, arguments), tmp_path))
+
+    assert name not in {spec.name for spec in registry.specs()}
+    assert result.error_code == "unknown_tool"

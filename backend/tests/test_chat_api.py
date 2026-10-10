@@ -5,12 +5,11 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from fastapi.testclient import TestClient
 
 from app.core.config import Settings
 from app.domain.models import Message, ProviderName
 from app.infrastructure.providers import ProviderError
-from app.main import create_app
+from tests.support import TestClient, create_app
 
 
 class RecordingProvider:
@@ -368,7 +367,7 @@ def test_second_concurrent_turn_for_same_session_is_rejected(tmp_path: Path) -> 
     assert second.json()["error"]["code"] == "turn_in_progress"
 
 
-def test_turn_claim_is_shared_across_application_instances(tmp_path: Path) -> None:
+def test_second_application_cannot_open_account_during_active_turn(tmp_path: Path) -> None:
     from concurrent.futures import ThreadPoolExecutor
 
     provider = BlockingProvider()
@@ -403,4 +402,4 @@ def test_turn_claim_is_shared_across_application_instances(tmp_path: Path) -> No
 
     assert first.status_code == 201
     assert second.status_code == 409
-    assert second.json()["error"]["code"] == "turn_in_progress"
+    assert second.json()["error"]["code"] == "account_in_use"

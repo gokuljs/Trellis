@@ -8,12 +8,24 @@ import {
 } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { toast } from "sonner"
-import { afterEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import "@trellis/ui/globals.css"
 import { AppShell } from "@/components/app-shell"
 import { GlobalToaster } from "@/components/global-toaster"
 import { ThemeProvider } from "@/components/theme-provider"
+
+const auth = vi.hoisted(() => ({
+  getAccessToken: vi.fn(),
+  getSessionEpoch: vi.fn(),
+  getSnapshot: vi.fn(),
+  subscribe: vi.fn(),
+  signOut: vi.fn(),
+}))
+
+vi.mock("@/lib/auth-controller", () => ({
+  getAuthController: () => auth,
+}))
 
 // These tests cover local workspace behavior after the auth gate admits a user.
 function App() {
@@ -181,7 +193,16 @@ class TestWebSocket {
   }
 
   send(data: string) {
-    TestWebSocket.onSend(this, JSON.parse(data) as Record<string, unknown>)
+    const request = JSON.parse(data) as Record<string, unknown>
+    if (request.method === "auth.authenticate") {
+      this.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { userId: "test-user" },
+      })
+      return
+    }
+    TestWebSocket.onSend(this, request)
   }
 
   close() {
@@ -256,10 +277,25 @@ function startupFetch(
   })
 }
 
+beforeEach(() => {
+  auth.getSessionEpoch.mockReturnValue(0)
+  auth.getAccessToken.mockResolvedValue({
+    token: "test-token",
+    userId: "test-user",
+  })
+  auth.getSnapshot.mockReturnValue({
+    status: "signed-in",
+    user: { id: "test-user" },
+  })
+  auth.subscribe.mockReturnValue(() => {})
+  auth.signOut.mockResolvedValue(undefined)
+})
+
 afterEach(() => {
   cleanup()
   toast.dismiss()
   vi.unstubAllGlobals()
+  vi.resetAllMocks()
   localStorage.clear()
   onboardingState = { current_step: "complete", completed: true }
 })
@@ -1184,7 +1220,11 @@ describe("local-first chat", () => {
     vi.stubGlobal("fetch", fetchMock)
     const user = userEvent.setup()
 
-    renderApp()
+    render(
+      <ThemeProvider defaultTheme="dark">
+        <AppShell />
+      </ThemeProvider>
+    )
     await screen.findByRole("textbox", { name: "Message" })
     await user.click(screen.getByRole("button", { name: "Attach" }))
     await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
@@ -1203,6 +1243,9 @@ describe("local-first chat", () => {
     )
     expect(screen.queryByRole("menu")).not.toBeInTheDocument()
     expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+    expect(
+      screen.queryByRole("button", { name: "Test commands" })
+    ).not.toBeInTheDocument()
   })
 
   it("keeps the composer idle while the folder picker and attachment are pending", async () => {
@@ -1480,7 +1523,9 @@ describe("local-first chat", () => {
     await user.click(screen.getByRole("menuitem", { name: "Workspace" }))
 
     expect(screen.queryByRole("menu")).not.toBeInTheDocument()
-    expect(screen.getByRole("button", { name: "Attach" })).toHaveFocus()
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Attach" })).toHaveFocus()
+    )
     expect(screen.queryByText("trellis-project")).not.toBeInTheDocument()
     expect(fetchMock).not.toHaveBeenCalledWith(
       "/api/sessions",
@@ -1516,8 +1561,10 @@ describe("local-first chat", () => {
         return response(currentSettings)
       if (url === "/api/onboarding/steps/intro" && method === "PUT")
         return response({ current_step: "profile", completed: false })
-      if (url === "/api/onboarding/steps/profile" && method === "PUT")
+      if (url === "/api/onboarding/steps/profile" && method === "PUT") {
+        expect(JSON.parse(String(init?.body))).toEqual({ display_name: "Ada" })
         return response({ current_step: "model", completed: false })
+      }
       if (url === "/api/onboarding/steps/model" && method === "PUT") {
         const submitted = JSON.parse(String(init?.body)) as {
           model_id: string
@@ -1548,10 +1595,8 @@ describe("local-first chat", () => {
     await user.click(await screen.findByRole("button", { name: "Continue" }))
     await user.clear(screen.getByRole("textbox", { name: "Name" }))
     await user.type(screen.getByRole("textbox", { name: "Name" }), "Ada")
-    await user.clear(screen.getByRole("textbox", { name: "Email" }))
-    await user.type(
-      screen.getByRole("textbox", { name: "Email" }),
-      "ada@example.com"
+    expect(screen.getByRole("textbox", { name: "Email" })).toHaveAttribute(
+      "readonly"
     )
     await user.click(screen.getByRole("button", { name: "Continue" }))
     await user.click(screen.getByRole("radio", { name: /Anthropic/ }))

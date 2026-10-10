@@ -2,9 +2,11 @@ import asyncio
 import json
 import logging
 from collections.abc import Mapping
+from contextlib import suppress
 from typing import cast
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
 from app.application.budgets import BudgetPreset
 from app.application.errors import ApplicationError
@@ -27,6 +29,32 @@ _TERMINAL_EVENTS = frozenset(
         RunEventType.INTERRUPTED,
     }
 )
+_WEB_ORIGINS = frozenset({"http://localhost:3000", "http://127.0.0.1:3000"})
+_AUTH_TIMEOUT_SECONDS = 5
+_AUTH_RECHECK_SECONDS = 30
+_MAX_AUTH_FRAME_BYTES = 20_000
+
+
+def _allowed_origins(environment: str, web_origin: str | None) -> frozenset[str]:
+    origins = set(_WEB_ORIGINS) if environment in {"development", "test"} else set()
+    if web_origin is None or web_origin != web_origin.strip() or "\\" in web_origin:
+        return frozenset(origins)
+    try:
+        parts = urlsplit(web_origin)
+        port = parts.port
+    except ValueError:
+        return frozenset(origins)
+    if (
+        parts.scheme == "https"
+        and parts.hostname
+        and parts.username is None
+        and parts.password is None
+        and port != 0
+        and "*" not in web_origin
+        and web_origin == f"https://{parts.netloc}"
+    ):
+        origins.add(web_origin)
+    return frozenset(origins)
 
 
 class RpcFault(Exception):
@@ -133,15 +161,122 @@ def _run_result(run) -> dict[str, object]:
 
 @router.websocket("/api/runtime")
 async def runtime_websocket(websocket: WebSocket) -> None:
+    settings = websocket.app.state.settings
+    if websocket.headers.get("origin") not in _allowed_origins(
+        settings.environment, settings.web_origin
+    ):
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
-    service: RunService = websocket.app.state.run_service
-    event_hub: RuntimeEventHub = websocket.app.state.runtime_event_hub
+    try:
+        raw_auth = await asyncio.wait_for(websocket.receive_text(), timeout=_AUTH_TIMEOUT_SECONDS)
+        if len(raw_auth.encode("utf-8")) > _MAX_AUTH_FRAME_BYTES:
+            raise RpcFault(-32600, "Authentication frame is too large")
+        auth_requests, is_batch = _decode_requests(raw_auth)
+        if is_batch:
+            raise RpcFault(-32600, "Authenticate before sending run requests")
+        method, params, request_id, has_id = _parse_request(auth_requests[0])
+        if method != "auth.authenticate" or not has_id:
+            raise RpcFault(-32001, "Authenticate before sending run requests")
+        token = _required_string(params, "accessToken", maximum=16_384)
+    except TimeoutError, WebSocketDisconnect:
+        await websocket.close(code=4401)
+        return
+    except RpcFault as error:
+        await websocket.send_json(
+            _error_response(
+                None,
+                error.code,
+                error.message,
+                {"code": "auth_required"},
+            )
+        )
+        await websocket.close(code=4401)
+        return
+
+    try:
+        verified = await websocket.app.state.auth_verifier.verify_token(token)
+    except HTTPException as error:
+        await websocket.send_json(
+            _error_response(
+                request_id,
+                -32001,
+                "Authentication failed",
+                {"code": "auth_unavailable" if error.status_code == 503 else "auth_failed"},
+            )
+        )
+        await websocket.close(code=4401)
+        return
+    try:
+        account = await websocket.app.state.account_registry.get(verified.id)
+    except ApplicationError as error:
+        if error.code != "account_in_use":
+            raise
+        await websocket.send_json(
+            _error_response(
+                request_id,
+                -32009,
+                "Account is open in another backend process",
+                {"code": "account_in_use", "status": 409},
+            )
+        )
+        await websocket.close(code=4409)
+        return
+    await websocket.send_json(
+        {"jsonrpc": "2.0", "id": request_id, "result": {"userId": str(verified.id)}}
+    )
+    service: RunService = account.run_service
+    event_hub: RuntimeEventHub = account.event_hub
     send_lock = asyncio.Lock()
+    auth_lost = asyncio.Event()
     active_subscriptions: dict[str, tuple[RuntimeEventSubscription, asyncio.Task[None]]] = {}
 
     async def send(payload: object) -> None:
         async with send_lock:
+            if auth_lost.is_set():
+                raise WebSocketDisconnect(code=4401)
             await websocket.send_json(payload)
+
+    async def identity_is_current() -> bool:
+        try:
+            refreshed = await asyncio.wait_for(
+                websocket.app.state.auth_verifier.verify_token(token),
+                timeout=_AUTH_TIMEOUT_SECONDS,
+            )
+        except HTTPException, TimeoutError:
+            return False
+        except Exception as error:
+            logger.error("Runtime authentication check failed (%s)", type(error).__name__)
+            return False
+        return refreshed.id == verified.id and not auth_lost.is_set()
+
+    async def close_for_auth() -> None:
+        if auth_lost.is_set():
+            return
+        auth_lost.set()
+        try:
+            async with asyncio.timeout(_AUTH_TIMEOUT_SECONDS):
+                with suppress(RuntimeError, WebSocketDisconnect):
+                    async with send_lock:
+                        # The peer may already have disconnected while a check was in flight.
+                        await websocket.close(code=4401)
+        except TimeoutError:
+            logger.error("Runtime authentication close timed out")
+
+    handler_task = asyncio.current_task()
+
+    async def monitor_auth() -> None:
+        while True:
+            await asyncio.sleep(_AUTH_RECHECK_SECONDS)
+            if not await identity_is_current():
+                try:
+                    await close_for_auth()
+                finally:
+                    if handler_task is not None:
+                        handler_task.cancel()
+                return
+
+    auth_task = asyncio.create_task(monitor_auth(), name="trellis-websocket-auth")
 
     async def relay_events(
         run_id: str,
@@ -330,6 +465,9 @@ async def runtime_websocket(websocket: WebSocket) -> None:
     try:
         while True:
             raw = await websocket.receive_text()
+            if not await identity_is_current():
+                await close_for_auth()
+                return
             try:
                 requests, is_batch = _decode_requests(raw)
             except RpcFault as error:
@@ -337,7 +475,10 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                 continue
 
             responses: list[dict[str, object]] = []
-            for request in requests:
+            for index, request in enumerate(requests):
+                if index and not await identity_is_current():
+                    await close_for_auth()
+                    return
                 request_id: str | int | None = None
                 has_id = True
                 try:
@@ -372,7 +513,12 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                 await send(responses if is_batch else responses[0])
     except WebSocketDisconnect:
         pass
+    except asyncio.CancelledError:
+        if not auth_lost.is_set():
+            raise
     finally:
+        auth_task.cancel()
+        await asyncio.gather(auth_task, return_exceptions=True)
         subscriptions = tuple(active_subscriptions.values())
         active_subscriptions.clear()
         for subscription, task in subscriptions:

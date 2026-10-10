@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import aiosqlite
 
@@ -19,7 +19,6 @@ from app.domain.models import (
     ProviderName,
     Session,
     SessionWorkspaceBusy,
-    TestPreset,
     UserProfile,
 )
 from app.domain.runtime import (
@@ -379,8 +378,9 @@ def utc_now() -> str:
 
 
 class Database:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, owner_id: UUID | None = None) -> None:
         self.path = path
+        self._owner_id = str(owner_id) if owner_id is not None else None
 
     async def initialize(self) -> None:
         await asyncio.to_thread(self._prepare_parent_directory)
@@ -424,6 +424,11 @@ class Database:
                     COMMIT;
                     """
                 )
+            if self._owner_id is not None:
+                owner_cursor = await connection.execute("SELECT id FROM users LIMIT 2")
+                owners = tuple(await owner_cursor.fetchall())
+                if owners and (len(owners) != 1 or owners[0]["id"] != self._owner_id):
+                    raise RuntimeError("Account database owner does not match authenticated user")
             now = utc_now()
             await connection.execute(
                 """
@@ -431,7 +436,7 @@ class Database:
                 SELECT ?, NULL, NULL, ?, ?
                 WHERE NOT EXISTS (SELECT 1 FROM users)
                 """,
-                (str(uuid4()), now, now),
+                (self._owner_id or str(uuid4()), now, now),
             )
             await connection.execute(
                 """
@@ -2012,49 +2017,6 @@ class Database:
         if session is None:
             raise RuntimeError("Created session could not be loaded")
         return session
-
-    async def list_test_presets(self, workspace_path: str) -> list[TestPreset]:
-        async with self._connect() as connection:
-            cursor = await connection.execute(
-                """SELECT name, command, cwd FROM workspace_test_presets
-                   WHERE workspace_path = ? ORDER BY name COLLATE NOCASE""",
-                (workspace_path,),
-            )
-            rows = await cursor.fetchall()
-        return [TestPreset(row["name"], row["command"], row["cwd"]) for row in rows]
-
-    async def get_test_preset(self, workspace_path: str, name: str) -> TestPreset | None:
-        async with self._connect() as connection:
-            cursor = await connection.execute(
-                """SELECT name, command, cwd FROM workspace_test_presets
-                   WHERE workspace_path = ? AND name = ?""",
-                (workspace_path, name),
-            )
-            row = await cursor.fetchone()
-        return None if row is None else TestPreset(row["name"], row["command"], row["cwd"])
-
-    async def save_test_preset(self, workspace_path: str, preset: TestPreset) -> None:
-        async with self._connect() as connection:
-            await connection.execute(
-                """INSERT INTO workspace_test_presets(
-                       workspace_path, name, command, cwd, updated_at
-                   ) VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT(workspace_path, name) DO UPDATE SET
-                       command = excluded.command,
-                       cwd = excluded.cwd,
-                       updated_at = excluded.updated_at""",
-                (workspace_path, preset.name, preset.command, preset.cwd, utc_now()),
-            )
-            await connection.commit()
-
-    async def delete_test_preset(self, workspace_path: str, name: str) -> bool:
-        async with self._connect() as connection:
-            cursor = await connection.execute(
-                "DELETE FROM workspace_test_presets WHERE workspace_path = ? AND name = ?",
-                (workspace_path, name),
-            )
-            await connection.commit()
-            return bool(cursor.rowcount)
 
     async def set_session_workspace(
         self, session_id: str, workspace_path: str | None

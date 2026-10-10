@@ -17,6 +17,8 @@ export interface AuthState {
 
 export interface AuthController {
   getSnapshot: () => AuthState
+  getSessionEpoch: () => number
+  getAccessToken: () => Promise<{ token: string; userId: string }>
   subscribe: (listener: () => void) => () => void
   signIn: (provider: AuthProvider) => Promise<void>
   signOut: () => Promise<void>
@@ -174,8 +176,15 @@ export function createAuthController(
   let rejectLateAuthEvents = false
   let signingOut: Promise<void> | null = null
   let signOutRecoveryRequired = false
+  let accessGeneration = 0
 
   const publish = (next: AuthState) => {
+    if (
+      state.status === "signed-in" &&
+      (next.status !== "signed-in" || state.user?.id !== next.user?.id)
+    ) {
+      accessGeneration += 1
+    }
     state = next
     for (const listener of listeners) listener()
   }
@@ -279,6 +288,24 @@ export function createAuthController(
 
   const controller: AuthController = {
     getSnapshot: () => state,
+    getSessionEpoch: () => accessGeneration,
+    getAccessToken: async () => {
+      const user = state.status === "signed-in" ? state.user : null
+      if (!user) throw new Error("Sign in to continue.")
+      const expectedGeneration = accessGeneration
+      const { data, error } = await withDeadline(() => client.auth.getSession())
+      if (
+        error ||
+        !data.session?.access_token ||
+        data.session.user.id !== user.id ||
+        state.status !== "signed-in" ||
+        state.user?.id !== user.id ||
+        accessGeneration !== expectedGeneration
+      ) {
+        throw new Error("Sign in to continue.")
+      }
+      return { token: data.session.access_token, userId: user.id }
+    },
     subscribe: (listener) => {
       const subscriptionListener = () => listener()
       listeners.add(subscriptionListener)
@@ -339,7 +366,7 @@ export function createAuthController(
       const previousState = state
       const expectedVersion = ++version
       rejectLateAuthEvents = true
-      publish({ ...state, error: null, pendingProvider: null })
+      publish({ ...emptyState, status: "loading" })
       signingOut = withDeadline(async () => {
         const { error } = await client.auth.signOut({ scope: "local" })
         if (error) throw error
@@ -400,6 +427,10 @@ export function getAuthController(): AuthController {
     }
     controller = {
       getSnapshot: () => state,
+      getSessionEpoch: () => 0,
+      getAccessToken: async () => {
+        throw new Error("Sign in to continue.")
+      },
       subscribe: () => () => {},
       signIn: async () => {},
       signOut: async () => {},

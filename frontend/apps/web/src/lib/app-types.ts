@@ -78,12 +78,6 @@ export type SessionDetail = {
   messages: Message[]
 }
 
-export type TestPreset = {
-  name: string
-  command: string
-  cwd: string
-}
-
 export type LatestRun = {
   run_id: string
   turn_id: string

@@ -1,7 +1,7 @@
-from fastapi import APIRouter
-from pydantic import BaseModel, EmailStr, Field, SecretStr
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-from app.api.dependencies import OnboardingServiceDep
+from app.api.dependencies import CurrentUserDep, OnboardingServiceDep
 from app.domain.models import OnboardingStep
 
 
@@ -11,8 +11,9 @@ class OnboardingStateResponse(BaseModel):
 
 
 class OnboardingProfileUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     display_name: str = Field(min_length=1, max_length=100)
-    email: EmailStr
 
 
 class OnboardingModelUpdate(BaseModel):
@@ -43,10 +44,13 @@ async def complete_intro(service: OnboardingServiceDep) -> OnboardingStateRespon
 async def save_profile(
     payload: OnboardingProfileUpdate,
     service: OnboardingServiceDep,
+    user: CurrentUserDep,
 ) -> OnboardingStateResponse:
+    if user.email is None:
+        raise HTTPException(status_code=409, detail="Your sign-in has no email address.")
     _, progress = await service.save_profile(
         payload.display_name,
-        str(payload.email),
+        user.email,
     )
     return serialize_progress(progress.current_step, progress.completed)
 

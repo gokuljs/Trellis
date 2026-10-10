@@ -86,11 +86,12 @@ async function reachModelStep() {
   const user = userEvent.setup()
   await user.click(screen.getByRole("button", { name: "Continue" }))
   await user.type(screen.getByRole("textbox", { name: "Name" }), "Ada")
-  await user.type(
-    screen.getByRole("textbox", { name: "Email" }),
-    "ada@example.com"
-  )
   await user.click(screen.getByRole("button", { name: "Continue" }))
+  await waitFor(() =>
+    expect(
+      screen.getByRole("heading", { name: "Choose a model" })
+    ).toHaveFocus()
+  )
   return user
 }
 
@@ -123,8 +124,8 @@ describe("OnboardingFlow", () => {
     expect(screen.getByText("02 / 03")).toBeInTheDocument()
   })
 
-  it("blocks profile progression until name and a valid email are present", async () => {
-    renderOnboarding()
+  it("uses the sign-in email and saves only the display name", async () => {
+    const { onSaveProfile } = renderOnboarding()
     const user = userEvent.setup()
     await user.click(screen.getByRole("button", { name: "Continue" }))
     await user.click(screen.getByRole("button", { name: "Continue" }))
@@ -135,15 +136,11 @@ describe("OnboardingFlow", () => {
     expect(screen.getByText("02 / 03")).toBeInTheDocument()
 
     await user.type(screen.getByRole("textbox", { name: "Name" }), "Ada")
-    await user.type(
-      screen.getByRole("textbox", { name: "Email" }),
-      "not-an-email"
+    expect(screen.getByRole("textbox", { name: "Email" })).toHaveAttribute(
+      "readonly"
     )
     await user.click(screen.getByRole("button", { name: "Continue" }))
-
-    expect(
-      screen.getByRole("heading", { name: "Your profile" })
-    ).toBeInTheDocument()
+    await waitFor(() => expect(onSaveProfile).toHaveBeenCalledWith("Ada"))
   })
 
   it("requires an API key for an unconfigured model provider", async () => {

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import {
   cancelRun,
@@ -7,6 +7,17 @@ import {
   respondToToolApproval,
   streamRun,
 } from "@/lib/runtime-client"
+
+const auth = vi.hoisted(() => ({
+  getAccessToken: vi.fn(),
+  getSnapshot: vi.fn(),
+  subscribe: vi.fn(),
+}))
+const authListeners = new Set<() => void>()
+
+vi.mock("@/lib/auth-controller", () => ({
+  getAuthController: () => auth,
+}))
 
 it("keeps newer live events when saved history overlaps a running stream", () => {
   const event = (sequence: number, eventType: string) => ({
@@ -34,6 +45,7 @@ type SocketMessage = { data: string }
 class MockWebSocket {
   static instances: MockWebSocket[] = []
   static onSend: (socket: MockWebSocket, payload: unknown) => void = () => {}
+  static autoAuthenticate = true
   static OPEN = 1
   static CONNECTING = 0
   readyState = MockWebSocket.CONNECTING
@@ -56,6 +68,18 @@ class MockWebSocket {
   send(data: string) {
     const payload = JSON.parse(data) as unknown
     this.sent.push(payload)
+    const request = rpcRequest(payload)
+    if (
+      request.method === "auth.authenticate" &&
+      MockWebSocket.autoAuthenticate
+    ) {
+      this.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { userId: "user-1" },
+      })
+      return
+    }
     MockWebSocket.onSend(this, payload)
   }
 
@@ -87,13 +111,208 @@ function event(
   }
 }
 
+beforeEach(() => {
+  auth.getAccessToken.mockResolvedValue({
+    token: "test-token",
+    userId: "user-1",
+  })
+  auth.getSnapshot.mockReturnValue({
+    status: "signed-in",
+    user: { id: "user-1" },
+  })
+  auth.subscribe.mockImplementation((listener: () => void) => {
+    authListeners.add(listener)
+    return () => authListeners.delete(listener)
+  })
+})
+
 afterEach(() => {
   vi.unstubAllGlobals()
+  vi.resetAllMocks()
+  authListeners.clear()
   MockWebSocket.instances = []
   MockWebSocket.onSend = () => {}
+  MockWebSocket.autoAuthenticate = true
 })
 
 describe("streamRun", () => {
+  it("uses a refreshed token when a run socket finishes opening", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    auth.getAccessToken
+      .mockResolvedValueOnce({ token: "opening-token", userId: "user-1" })
+      .mockResolvedValueOnce({ token: "fresh-token", userId: "user-1" })
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      if (request.method !== "run.start") return
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "run-fresh", status: "running", lastSequence: 0 },
+      })
+      socket.reply(event("run-fresh", 1, "run.completed", {}))
+    }
+
+    await streamRun({
+      sessionId: "session-1",
+      turnId: "turn-fresh",
+      clientRequestId: "request-fresh",
+      content: "Hello",
+    })
+
+    expect(MockWebSocket.instances[0]?.sent[0]).toMatchObject({
+      method: "auth.authenticate",
+      params: { accessToken: "fresh-token" },
+    })
+  })
+
+  it("waits for the auth response before sending a run request", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    MockWebSocket.autoAuthenticate = false
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      if (request.method !== "run.start") return
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "run-wait", status: "running", lastSequence: 0 },
+      })
+      socket.reply(event("run-wait", 1, "run.completed", {}))
+    }
+    const running = streamRun({
+      sessionId: "session-1",
+      turnId: "turn-wait",
+      clientRequestId: "request-wait",
+      content: "Hello",
+    })
+    await vi.waitFor(() =>
+      expect(MockWebSocket.instances[0]?.sent).toHaveLength(1)
+    )
+    const socket = MockWebSocket.instances[0]!
+    const authRequest = rpcRequest(socket.sent[0])
+    expect(authRequest.method).toBe("auth.authenticate")
+    socket.reply({
+      jsonrpc: "2.0",
+      id: authRequest.id,
+      result: { userId: "user-1" },
+    })
+
+    await expect(running).resolves.toEqual({ runId: "run-wait" })
+    expect(socket.sent[1]).toMatchObject({ method: "run.start" })
+  })
+
+  it("stops without retrying when the server denies authentication", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    MockWebSocket.autoAuthenticate = false
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: { code: -32001, message: "Private auth detail" },
+      })
+    }
+
+    await expect(
+      streamRun(
+        {
+          sessionId: "session-1",
+          turnId: "turn-denied",
+          clientRequestId: "request-denied",
+          content: "Hello",
+        },
+        { reconnectAttempts: 4 }
+      )
+    ).rejects.toMatchObject({
+      code: "authentication_required",
+      message: "Sign in to continue.",
+    })
+    expect(MockWebSocket.instances).toHaveLength(1)
+    expect(MockWebSocket.instances[0]?.sent).toHaveLength(1)
+  })
+
+  it("does not open a socket when no verified token is available", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    auth.getAccessToken.mockRejectedValue(new Error("No session"))
+
+    await expect(
+      streamRun({
+        sessionId: "session-1",
+        turnId: "turn-no-auth",
+        clientRequestId: "request-no-auth",
+        content: "Hello",
+      })
+    ).rejects.toMatchObject({ code: "authentication_required" })
+    expect(MockWebSocket.instances).toHaveLength(0)
+  })
+
+  it("stops an active run connection when the account signs out", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "run-switch", status: "running", lastSequence: 0 },
+      })
+    }
+    const running = streamRun(
+      {
+        sessionId: "session-1",
+        turnId: "turn-switch",
+        clientRequestId: "request-switch",
+        content: "Hello",
+      },
+      { reconnectAttempts: 0 }
+    )
+    await vi.waitFor(() =>
+      expect(MockWebSocket.instances[0]?.sent).toHaveLength(2)
+    )
+
+    auth.getSnapshot.mockReturnValue({ status: "signed-out", user: null })
+    for (const listener of authListeners) listener()
+    const outcome = await Promise.race([
+      running.then(
+        () => "resolved",
+        (error: unknown) => error
+      ),
+      new Promise<string>((resolve) =>
+        setTimeout(() => resolve("pending"), 100)
+      ),
+    ])
+    MockWebSocket.instances[0]?.close()
+
+    expect(outcome).toMatchObject({ code: "authentication_required" })
+    expect(MockWebSocket.instances[0]?.readyState).toBe(3)
+  })
+
+  it("authenticates before starting a run without putting the token in the URL", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "run-auth", status: "running", lastSequence: 0 },
+      })
+      socket.reply(event("run-auth", 1, "run.completed", {}))
+    }
+
+    await streamRun({
+      sessionId: "session-1",
+      turnId: "turn-auth",
+      clientRequestId: "request-auth",
+      content: "Hello",
+    })
+
+    const socket = MockWebSocket.instances[0]
+    expect(socket?.sent[0]).toMatchObject({
+      method: "auth.authenticate",
+      params: { accessToken: "test-token" },
+    })
+    expect(socket?.sent[1]).toMatchObject({ method: "run.start" })
+    expect(socket?.url).not.toContain("test-token")
+  })
+
   it("reports the selected run limits from the start response", async () => {
     vi.stubGlobal("WebSocket", MockWebSocket)
     MockWebSocket.onSend = (socket, payload) => {
@@ -233,6 +452,11 @@ describe("streamRun", () => {
 
   it("resumes a known run after disconnecting and ignores replayed events", async () => {
     vi.stubGlobal("WebSocket", MockWebSocket)
+    auth.getAccessToken
+      .mockResolvedValueOnce({ token: "first-token", userId: "user-1" })
+      .mockResolvedValueOnce({ token: "first-token", userId: "user-1" })
+      .mockResolvedValueOnce({ token: "refreshed-token", userId: "user-1" })
+      .mockResolvedValueOnce({ token: "refreshed-token", userId: "user-1" })
     MockWebSocket.onSend = (socket, payload) => {
       const request = rpcRequest(payload)
       if (request.method === "run.start") {
@@ -277,6 +501,12 @@ describe("streamRun", () => {
     ).resolves.toEqual({ runId: "run-3" })
 
     expect(MockWebSocket.instances).toHaveLength(2)
+    expect(MockWebSocket.instances[0]?.sent[0]).toMatchObject({
+      params: { accessToken: "first-token" },
+    })
+    expect(MockWebSocket.instances[1]?.sent[0]).toMatchObject({
+      params: { accessToken: "refreshed-token" },
+    })
     expect(onEvent.mock.calls.map(([runEvent]) => runEvent.sequence)).toEqual([
       1, 2, 3,
     ])
@@ -435,6 +665,87 @@ describe("resumeRun", () => {
 })
 
 describe("cancelRun", () => {
+  it("uses a refreshed token when an action socket finishes opening", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    auth.getAccessToken
+      .mockResolvedValueOnce({ token: "opening-token", userId: "user-1" })
+      .mockResolvedValueOnce({ token: "fresh-token", userId: "user-1" })
+    MockWebSocket.onSend = (socket, payload) => {
+      const request = rpcRequest(payload)
+      if (request.method !== "run.cancel") return
+      socket.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "run-fresh", status: "cancelling" },
+      })
+    }
+
+    await cancelRun("run-fresh")
+
+    expect(MockWebSocket.instances[0]?.sent[0]).toMatchObject({
+      method: "auth.authenticate",
+      params: { accessToken: "fresh-token" },
+    })
+  })
+
+  it("does not repeat an action when auth replies are duplicated", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    MockWebSocket.autoAuthenticate = false
+    const cancelling = cancelRun("run-stop", 0)
+    await vi.waitFor(() =>
+      expect(MockWebSocket.instances[0]?.sent).toHaveLength(1)
+    )
+    const socket = MockWebSocket.instances[0]!
+    const authRequest = rpcRequest(socket.sent[0])
+    const authReply = {
+      jsonrpc: "2.0",
+      id: authRequest.id,
+      result: { userId: "user-1" },
+    }
+    socket.reply(authReply)
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(2))
+    socket.reply(authReply)
+    const action = rpcRequest(socket.sent[1])
+
+    try {
+      expect(
+        socket.sent.filter((item) => rpcRequest(item).method === "run.cancel")
+      ).toHaveLength(1)
+    } finally {
+      socket.reply({
+        jsonrpc: "2.0",
+        id: action.id,
+        result: { runId: "run-stop", status: "cancelling" },
+      })
+      await cancelling
+    }
+  })
+
+  it("closes a pending cancellation when the account signs out", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    MockWebSocket.autoAuthenticate = false
+    const cancelling = cancelRun("run-stop", 0)
+    await vi.waitFor(() =>
+      expect(MockWebSocket.instances[0]?.sent).toHaveLength(1)
+    )
+
+    auth.getSnapshot.mockReturnValue({ status: "signed-out", user: null })
+    for (const listener of authListeners) listener()
+    const outcome = await Promise.race([
+      cancelling.then(
+        () => "resolved",
+        (error: unknown) => error
+      ),
+      new Promise<string>((resolve) =>
+        setTimeout(() => resolve("pending"), 100)
+      ),
+    ])
+    MockWebSocket.instances[0]?.close()
+
+    expect(outcome).toMatchObject({ code: "authentication_required" })
+    expect(MockWebSocket.instances[0]?.sent).toHaveLength(1)
+  })
+
   it("cancels a run at the last event cursor", async () => {
     vi.stubGlobal("WebSocket", MockWebSocket)
     MockWebSocket.onSend = (socket, payload) => {
@@ -454,6 +765,13 @@ describe("cancelRun", () => {
     await expect(cancelRun("run-stop", 7)).resolves.toEqual({
       runId: "run-stop",
       status: "cancelling",
+    })
+    expect(MockWebSocket.instances[0]?.sent[0]).toMatchObject({
+      method: "auth.authenticate",
+      params: { accessToken: "test-token" },
+    })
+    expect(MockWebSocket.instances[0]?.sent[1]).toMatchObject({
+      method: "run.cancel",
     })
   })
 })
@@ -491,6 +809,12 @@ describe("respondToToolApproval", () => {
       runId: "run-edit",
       toolCallId: "tool-7",
       decision: "approved",
+    })
+    expect(MockWebSocket.instances[0]?.sent[0]).toMatchObject({
+      method: "auth.authenticate",
+    })
+    expect(MockWebSocket.instances[0]?.sent[1]).toMatchObject({
+      method: "run.respond",
     })
   })
 
