@@ -10,15 +10,17 @@ import hashlib
 import json
 import os
 import secrets
+import sqlite3
 import stat
-from collections.abc import AsyncIterator
+import threading
+import time
+from collections.abc import AsyncGenerator, Callable
+from contextlib import aclosing, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import quote
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
-
-import aiosqlite
 
 from app.domain.runtime import RunEventType
 
@@ -30,6 +32,7 @@ except ImportError:  # pragma: no cover - the account store itself requires POSI
 
 MAX_BATCH_ROWS = 100
 MAX_BATCH_BYTES = 7_500_000  # Leave room for the RPC envelope under its 8 MiB cap.
+SQLITE_READ_TIMEOUT_SECONDS = 30
 MARKER_NAME = ".supabase-imported.json"
 CAPABILITY_NAME = ".supabase-import-capability"
 _INTERRUPTION = "The run was interrupted while local data moved to cloud storage."
@@ -47,6 +50,73 @@ _PHASES = (
     "tool_calls",
     "run_messages_tool",
 )
+
+
+async def _settle_task[T](task: asyncio.Task[T]) -> None:
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            break
+
+
+async def _thread_call[T](operation: Callable[[], T]) -> T:
+    task = asyncio.create_task(asyncio.to_thread(operation))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await _settle_task(task)
+        with suppress(Exception):
+            task.result()
+        raise
+
+
+async def _open_connection(uri: str) -> sqlite3.Connection:
+    task = asyncio.create_task(
+        asyncio.to_thread(sqlite3.connect, uri, uri=True, check_same_thread=False, timeout=5)
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await _settle_task(task)
+        try:
+            connection = task.result()
+        except Exception:
+            pass
+        else:
+            await _thread_call(connection.close)
+        raise
+
+
+async def _sqlite_call[T](connection: sqlite3.Connection, operation: Callable[[], T]) -> T:
+    """Run one bounded SQLite read off the event loop and settle it before cancellation."""
+    cancelled = threading.Event()
+
+    def execute() -> T:
+        deadline = time.monotonic() + SQLITE_READ_TIMEOUT_SECONDS
+        connection.set_progress_handler(
+            lambda: int(cancelled.is_set() or time.monotonic() >= deadline), 1000
+        )
+        try:
+            return operation()
+        except sqlite3.OperationalError as error:
+            if "interrupted" in str(error) and time.monotonic() >= deadline:
+                raise TimeoutError("Legacy account database read timed out") from error
+            raise
+        finally:
+            connection.set_progress_handler(None, 0)
+
+    task = asyncio.create_task(asyncio.to_thread(execute))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        cancelled.set()
+        await _settle_task(task)
+        with suppress(Exception):
+            task.result()
+        raise
 
 
 class LegacyImportSink(Protocol):
@@ -128,31 +198,27 @@ def _decode_json(value: str | None, *, nullable: bool = False) -> object:
         raise RuntimeError("Legacy account data has invalid JSON") from error
 
 
-async def _validate_database(connection: aiosqlite.Connection, user_id: UUID) -> None:
-    cursor = await connection.execute("PRAGMA quick_check")
-    quick_check = await cursor.fetchone()
+def _validate_database(connection: sqlite3.Connection, user_id: UUID) -> None:
+    quick_check = connection.execute("PRAGMA quick_check").fetchone()
     if quick_check is None or quick_check[0] != "ok":
         raise RuntimeError("Legacy account database failed integrity check")
-    cursor = await connection.execute("SELECT MAX(version) FROM schema_migrations")
-    version = await cursor.fetchone()
+    version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
     if version is None or version[0] != 13:
         raise RuntimeError("Legacy account database must have PR1 schema version 13")
-    cursor = await connection.execute("SELECT id FROM users LIMIT 2")
-    owners = tuple(await cursor.fetchall())
+    owners = tuple(connection.execute("SELECT id FROM users LIMIT 2").fetchall())
     if len(owners) != 1 or owners[0]["id"] != str(user_id):
         raise RuntimeError("Legacy account database owner does not match authenticated user")
-    cursor = await connection.execute("PRAGMA foreign_key_check")
-    if await cursor.fetchone() is not None:
+    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise RuntimeError("Legacy account database has broken foreign keys")
-    cursor = await connection.execute(
+    cursor = connection.execute(
         "SELECT 1 FROM sessions WHERE user_id != ? LIMIT 1", (str(user_id),)
     )
-    if await cursor.fetchone() is not None:
+    if cursor.fetchone() is not None:
         raise RuntimeError("Legacy account database has another owner's chats")
-    cursor = await connection.execute(
+    cursor = connection.execute(
         "SELECT 1 FROM onboarding_progress WHERE user_id != ? LIMIT 1", (str(user_id),)
     )
-    if await cursor.fetchone() is not None:
+    if cursor.fetchone() is not None:
         raise RuntimeError("Legacy account database has another owner's onboarding")
     ownership_checks = (
         """SELECT 1 FROM runs AS r JOIN messages AS m ON m.id = r.input_message_id
@@ -181,10 +247,10 @@ async def _validate_database(connection: aiosqlite.Connection, user_id: UUID) ->
              AND r.status NOT IN ('queued', 'running', 'cancelling') LIMIT 1""",
     )
     for query in ownership_checks:
-        cursor = await connection.execute(query)
-        if await cursor.fetchone() is not None:
+        cursor = connection.execute(query)
+        if cursor.fetchone() is not None:
             raise RuntimeError("Legacy account database has inconsistent run ownership or state")
-    cursor = await connection.execute(
+    cursor = connection.execute(
         """WITH RECURSIVE ordered(id) AS (
              SELECT id FROM runs WHERE retry_of IS NULL
              UNION ALL
@@ -192,13 +258,13 @@ async def _validate_database(connection: aiosqlite.Connection, user_id: UUID) ->
            )
            SELECT (SELECT COUNT(*) FROM ordered), (SELECT COUNT(*) FROM runs)"""
     )
-    counts = await cursor.fetchone()
+    counts = cursor.fetchone()
     if counts is None or counts[0] != counts[1]:
         raise RuntimeError("Legacy account run retries are not a valid history")
 
 
-async def _active_runs(connection: aiosqlite.Connection, user_id: UUID) -> dict[str, _ActiveRun]:
-    cursor = await connection.execute(
+def _active_runs(connection: sqlite3.Connection, user_id: UUID) -> dict[str, _ActiveRun]:
+    cursor = connection.execute(
         """SELECT r.id, r.last_event_sequence,
                   COALESCE((SELECT MAX(e.sequence) FROM run_events AS e
                             WHERE e.run_id = r.id), 0) AS actual_sequence,
@@ -212,10 +278,10 @@ async def _active_runs(connection: aiosqlite.Connection, user_id: UUID) -> dict[
         (str(user_id),),
     )
     active: dict[str, _ActiveRun] = {}
-    async for run in cursor:
+    for run in cursor:
         if run["actual_sequence"] != run["last_event_sequence"]:
             raise RuntimeError("Legacy account run has an inconsistent event sequence")
-        tool_cursor = await connection.execute(
+        tool_cursor = connection.execute(
             """SELECT t.id, EXISTS(
                    SELECT 1 FROM run_messages AS result WHERE result.tool_call_id = t.id
                ) AS has_result FROM tool_calls AS t
@@ -224,7 +290,7 @@ async def _active_runs(connection: aiosqlite.Connection, user_id: UUID) -> dict[
                ORDER BY m.ordinal, t.call_index""",
             (run["id"],),
         )
-        pending = await tool_cursor.fetchall()
+        pending = tool_cursor.fetchall()
         if any(tool["has_result"] for tool in pending):
             raise RuntimeError("Legacy account has a pending tool with a saved result")
         tools = tuple(
@@ -294,7 +360,7 @@ _QUERIES = {
 
 
 def _map_row(
-    phase: str, row: aiosqlite.Row, user_id: UUID, active: dict[str, _ActiveRun]
+    phase: str, row: sqlite3.Row, user_id: UUID, active: dict[str, _ActiveRun]
 ) -> dict[str, object]:
     data = dict(row)
     if phase == "profiles":
@@ -368,15 +434,18 @@ def _map_row(
 
 
 async def _rows(
-    connection: aiosqlite.Connection,
+    connection: sqlite3.Connection,
     phase: str,
     user_id: UUID,
     active: dict[str, _ActiveRun],
-) -> AsyncIterator[dict[str, object]]:
-    cursor = await connection.execute(_QUERIES[phase])
-    while chunk := await cursor.fetchmany(MAX_BATCH_ROWS):
-        for row in chunk:
-            yield _map_row(phase, row, user_id, active)
+) -> AsyncGenerator[dict[str, object]]:
+    cursor = await _sqlite_call(connection, lambda: connection.execute(_QUERIES[phase]))
+    try:
+        while chunk := await _sqlite_call(connection, lambda: cursor.fetchmany(MAX_BATCH_ROWS)):
+            for row in chunk:
+                yield _map_row(phase, row, user_id, active)
+    finally:
+        await _sqlite_call(connection, cursor.close)
     if phase == "run_events":
         for run_id, run in active.items():
             for tool in run.pending_tools:
@@ -431,15 +500,16 @@ def _encoded_row(phase: str, row: dict[str, object]) -> bytes:
 
 
 async def _digest(
-    connection: aiosqlite.Connection, user_id: UUID, active: dict[str, _ActiveRun]
+    connection: sqlite3.Connection, user_id: UUID, active: dict[str, _ActiveRun]
 ) -> str:
     digest = hashlib.sha256()
     for phase in _PHASES:
-        async for row in _rows(connection, phase, user_id, active):
-            encoded = _encoded_row(phase, row)
-            if len(encoded) > MAX_BATCH_BYTES:
-                raise RuntimeError("A legacy account row exceeds the import size limit")
-            digest.update(encoded)
+        async with aclosing(_rows(connection, phase, user_id, active)) as stream:
+            async for row in stream:
+                encoded = _encoded_row(phase, row)
+                if len(encoded) > MAX_BATCH_BYTES:
+                    raise RuntimeError("A legacy account row exceeds the import size limit")
+                digest.update(encoded)
     return digest.hexdigest()
 
 
@@ -559,13 +629,14 @@ async def import_locked_account(
                 )
             return
         uri = f"file:{quote(str(source), safe='/')}?mode=ro"
-        async with aiosqlite.connect(uri, uri=True) as connection:
-            connection.row_factory = aiosqlite.Row
-            await connection.execute("PRAGMA query_only = ON")
-            await connection.execute("PRAGMA foreign_keys = ON")
-            await connection.execute("BEGIN")
-            await _validate_database(connection, user_id)
-            active = await _active_runs(connection, user_id)
+        connection = await _open_connection(uri)
+        try:
+            await _sqlite_call(connection, lambda: setattr(connection, "row_factory", sqlite3.Row))
+            await _sqlite_call(connection, lambda: connection.execute("PRAGMA query_only = ON"))
+            await _sqlite_call(connection, lambda: connection.execute("PRAGMA foreign_keys = ON"))
+            await _sqlite_call(connection, lambda: connection.execute("BEGIN"))
+            await _sqlite_call(connection, lambda: _validate_database(connection, user_id))
+            active = await _sqlite_call(connection, lambda: _active_runs(connection, user_id))
             digest = await _digest(connection, user_id, active)
             marker_path = account_dir / MARKER_NAME
             capability_path = account_dir / CAPABILITY_NAME
@@ -579,16 +650,18 @@ async def import_locked_account(
                 table = phase.removesuffix("_assistant").removesuffix("_tool")
                 batch: list[dict[str, object]] = []
                 batch_bytes = 0
-                async for row in _rows(connection, phase, user_id, active):
-                    row_bytes = len(_encoded_row(phase, row))
-                    if batch and (
-                        len(batch) >= MAX_BATCH_ROWS or batch_bytes + row_bytes > MAX_BATCH_BYTES
-                    ):
-                        await sink.import_batch(table, batch, capability)
-                        batch = []
-                        batch_bytes = 0
-                    batch.append(row)
-                    batch_bytes += row_bytes
+                async with aclosing(_rows(connection, phase, user_id, active)) as stream:
+                    async for row in stream:
+                        row_bytes = len(_encoded_row(phase, row))
+                        if batch and (
+                            len(batch) >= MAX_BATCH_ROWS
+                            or batch_bytes + row_bytes > MAX_BATCH_BYTES
+                        ):
+                            await sink.import_batch(table, batch, capability)
+                            batch = []
+                            batch_bytes = 0
+                        batch.append(row)
+                        batch_bytes += row_bytes
                 if batch:
                     await sink.import_batch(table, batch, capability)
             await sink.seal_import(capability)
@@ -596,6 +669,8 @@ async def import_locked_account(
                 asyncio.to_thread(_write_marker, marker_path, user_id, digest)
             )
             await asyncio.shield(marker_task)
+        finally:
+            await _thread_call(connection.close)
     finally:
         if marker_task is not None and not marker_task.done():
             marker_task.add_done_callback(lambda _: os.close(held_fd))

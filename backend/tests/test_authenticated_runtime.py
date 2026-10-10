@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event, Timer
 from types import SimpleNamespace
@@ -14,11 +15,12 @@ from app.api.routes import runtime
 from app.application.errors import ApplicationError
 from app.core.config import Settings
 from app.main import create_app as production_create_app
+from tests.memory_repository import memory_repository_factory
 
 
 def create_app(*args, **kwargs):
     if args and isinstance(args[0], Settings) and args[0].environment == "test":
-        kwargs.setdefault("legacy_sqlite_for_tests", True)
+        kwargs.setdefault("repository_factory", memory_repository_factory)
     return production_create_app(*args, **kwargs)
 
 
@@ -29,10 +31,15 @@ class StubVerifier:
         return await self.verify_token(authorization.removeprefix("Bearer "))
 
     async def verify_token(self, token: str) -> VerifiedUser:
+        expiry = datetime.now(UTC) + timedelta(hours=1)
         if token == "alice":
-            return VerifiedUser(UUID("a59673c1-78d0-4bc8-8c49-6bc2e7a01dd5"), "alice@example.com")
+            return VerifiedUser(
+                UUID("a59673c1-78d0-4bc8-8c49-6bc2e7a01dd5"), "alice@example.com", expiry
+            )
         if token == "bob":
-            return VerifiedUser(UUID("d7a9cd14-6abd-42c4-b46d-2f5bb82e7231"), "bob@example.com")
+            return VerifiedUser(
+                UUID("d7a9cd14-6abd-42c4-b46d-2f5bb82e7231"), "bob@example.com", expiry
+            )
         raise HTTPException(status_code=401)
 
 
@@ -45,7 +52,11 @@ class ChangingVerifier(StubVerifier):
         if self.revoked.is_set():
             raise HTTPException(status_code=401)
         if self.changed_user.is_set():
-            return VerifiedUser(UUID("b47a02f5-660b-4f9c-9be4-52c46a7e98ce"), "bob@example.com")
+            return VerifiedUser(
+                UUID("b47a02f5-660b-4f9c-9be4-52c46a7e98ce"),
+                "bob@example.com",
+                datetime.now(UTC) + timedelta(hours=1),
+            )
         return await super().verify_token(token)
 
 
@@ -100,6 +111,41 @@ def test_runtime_websocket_authenticates_before_run_rpc(tmp_path: Path) -> None:
         )
         reply = socket.receive_json()
         assert reply["result"] == {"userId": "a59673c1-78d0-4bc8-8c49-6bc2e7a01dd5"}
+
+
+@pytest.mark.parametrize(
+    ("auth_status", "expected_code"), [(401, "auth_failed"), (503, "auth_unavailable")]
+)
+def test_runtime_websocket_rejects_invalid_or_unavailable_sign_in(
+    tmp_path: Path, auth_status: int, expected_code: str
+) -> None:
+    class FailingVerifier(StubVerifier):
+        async def verify_token(self, token: str) -> VerifiedUser:
+            del token
+            raise HTTPException(status_code=auth_status)
+
+    app = create_app(
+        Settings(environment="test", data_dir=tmp_path), auth_verifier=FailingVerifier()
+    )
+    with (
+        TestClient(app) as client,
+        client.websocket_connect(
+            "/api/runtime", headers={"origin": "http://localhost:3000"}
+        ) as socket,
+    ):
+        socket.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": "auth",
+                "method": "auth.authenticate",
+                "params": {"accessToken": "invalid"},
+            }
+        )
+        reply = socket.receive_json()
+        assert reply["error"]["data"]["code"] == expected_code
+        with pytest.raises(WebSocketDisconnect) as closed:
+            socket.receive_json()
+        assert closed.value.code == 4401
 
 
 def test_runtime_websocket_reports_account_in_use(tmp_path: Path) -> None:

@@ -20,11 +20,3 @@ class Settings(BaseSettings):
     supabase_url: str | None = None
     supabase_publishable_key: str | None = None
     web_origin: str | None = None
-
-    @property
-    def database_path(self) -> Path:
-        return self.data_dir / "state.db"
-
-    @property
-    def secrets_path(self) -> Path:
-        return self.data_dir / ".env"

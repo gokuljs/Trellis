@@ -1,7 +1,5 @@
 import asyncio
-import json
 import os
-import sqlite3
 import stat
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -10,7 +8,14 @@ import pytest
 
 from app.core.config import Settings
 from app.domain.models import ProviderName
-from app.domain.runtime import ModelRequest, ModelStreamEvent, ModelToolCall, RunEventType
+from app.domain.runtime import (
+    ModelRequest,
+    ModelStreamEvent,
+    ModelToolCall,
+    RunEventType,
+    ToolCallStatus,
+)
+from tests.memory_repository import MemoryRepository
 from tests.support import TestClient, account_database_path, create_app
 
 
@@ -197,12 +202,10 @@ def test_approved_patch_uses_the_saved_preview_then_continues_the_run(tmp_path: 
     assert len(provider.requests) == 2
     assert provider.requests[1].messages[-1].role == "tool"
     assert provider.requests[1].messages[-1].content == "Updated src/note.txt."
-    with sqlite3.connect(account_database_path(settings)) as connection:
-        approval_json, status = connection.execute(
-            "SELECT approval_preview_json, status FROM tool_calls WHERE id = ?", (tool_call_id,)
-        ).fetchone()
-    assert status == "completed"
-    assert json.loads(approval_json)["target_sha256"] == preview["target_sha256"]
+    saved_call = MemoryRepository(account_database_path(settings)).state.tool_calls[tool_call_id]
+    assert saved_call.status is ToolCallStatus.COMPLETED
+    assert saved_call.approval_preview is not None
+    assert saved_call.approval_preview["target_sha256"] == preview["target_sha256"]
 
 
 def test_patch_tool_is_offered_with_strict_args_and_requires_approved_preview(

@@ -56,8 +56,9 @@ The test fixture `tests/local_bootstrap.sql` supplies only a mock `auth.users`,
 database. **Never apply that fixture to a hosted Supabase project.** Apply the
 five migrations to that local database, then run `tests/schema_contract.sql`,
 `tests/rpc_security.sql`, `tests/runtime_rpc.sql`,
-`tests/import_security.sql`, `tests/import_hardening.sql` and
-`tests/chat_summaries.sql` with
+`tests/import_security.sql`, `tests/import_hardening.sql`,
+`tests/chat_summaries.sql`, `tests/runtime_regressions.sql` and
+`tests/create_run_regressions.sql` with
 `psql -v ON_ERROR_STOP=1 -f ...` in that order. The tests use fixed local-only
 UUIDs and must run on a disposable database.
 

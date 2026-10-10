@@ -6,16 +6,16 @@ from app.application.runs import RunService
 from app.application.sessions import SessionService
 from app.application.tools import ToolRegistry
 from app.domain.runtime import ModelRequest, ModelStreamEvent, RunStatus
-from app.infrastructure.database import Database
 from app.infrastructure.local_tools import LocalReadToolExecutor, read_workspace_guidance
 from app.infrastructure.secrets import SecretStore
 from app.infrastructure.workspace_bindings import LocalWorkspaceBindings
+from tests.memory_repository import MemoryRepository
 
 
 def test_cloud_workspace_path_requires_a_local_selection(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
-    database = Database(tmp_path / "state.db")
+    database = MemoryRepository(tmp_path / "cloud-account")
 
     async def exercise() -> None:
         await database.initialize()
@@ -40,7 +40,7 @@ def test_cloud_workspace_metadata_cannot_offer_local_tools(tmp_path: Path) -> No
     project = tmp_path / "project"
     project.mkdir()
     (project / "AGENTS.md").write_text("Private local guidance.\n", encoding="utf-8")
-    database = Database(tmp_path / "state.db")
+    database = MemoryRepository(tmp_path / "cloud-account")
     secret_store = SecretStore(tmp_path / ".env")
 
     class Provider:
