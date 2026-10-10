@@ -96,6 +96,17 @@ def test_verified_token_source_rejects_unverified_identity_and_expiry() -> None:
         source.get_token()
 
 
+def test_verified_token_source_keeps_freshest_same_account_session() -> None:
+    source = VerifiedTokenSource(ALICE)
+    now = datetime.now(UTC)
+    source.record_verified("older-tab", ALICE, now + timedelta(minutes=10))
+    source.record_verified("fresh-tab", ALICE, now + timedelta(hours=1))
+    source.record_verified("older-tab", ALICE, now + timedelta(minutes=10))
+
+    assert source.get_token() == "fresh-tab"
+    assert source.valid_for(30 * 60)
+
+
 def test_profile_read_uses_authenticated_rls_request_and_maps_auth_email_separately() -> None:
     captured: list[httpx.Request] = []
 

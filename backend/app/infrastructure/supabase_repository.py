@@ -72,8 +72,11 @@ class VerifiedTokenSource:
             raise ValueError("verified token expiry must be timezone aware")
         if expires_at <= datetime.now(UTC):
             raise ValueError("verified token is expired")
-        self._token = token
-        self._expires_at = expires_at
+        # Multiple tabs can present different still-valid JWTs for this account.
+        # A shorter-lived session must not downgrade the token renewing an active run.
+        if self._expires_at is None or expires_at >= self._expires_at:
+            self._token = token
+            self._expires_at = expires_at
 
     def get_token(self) -> str:
         if self._token is None or self._expires_at is None:
