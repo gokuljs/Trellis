@@ -50,22 +50,28 @@ afterEach(() => {
 function renderComposer({
   theme = "dark",
   value = "",
+  workspacePath = null,
+  workspaceReady = false,
 }: {
   theme?: "dark" | "light"
   value?: string
+  workspacePath?: string | null
+  workspaceReady?: boolean
 } = {}) {
   const onSubmit = vi.fn()
+  const onPickWorkspace = vi.fn(async () => true)
 
   render(
     <ThemeProvider defaultTheme={theme}>
       <Composer
         value={value}
         placeholder="Write a message"
-        workspacePath={null}
+        workspacePath={workspacePath}
+        workspaceReady={workspaceReady}
         workspaceSessionKey="new-session"
         onChange={vi.fn()}
         onSubmit={onSubmit}
-        onPickWorkspace={async () => false}
+        onPickWorkspace={onPickWorkspace}
         onSaveWorkspace={async () => undefined}
         onRemoveWorkspace={async () => undefined}
         budgetPreset="conservative"
@@ -74,8 +80,24 @@ function renderComposer({
     </ThemeProvider>
   )
 
-  return { onSubmit }
+  return { onSubmit, onPickWorkspace }
 }
+
+it("prompts to select a synced folder on this computer", async () => {
+  const { onPickWorkspace } = renderComposer({
+    workspacePath: "/from/other/computer/project",
+    workspaceReady: false,
+  })
+
+  expect(screen.getByText("project")).toBeInTheDocument()
+  expect(
+    screen.getByText(/select a folder on this computer to use local tools/i)
+  ).toBeInTheDocument()
+  await userEvent.click(
+    screen.getByRole("button", { name: "Choose local folder" })
+  )
+  expect(onPickWorkspace).toHaveBeenCalledOnce()
+})
 
 describe("Composer send button", () => {
   it("keeps an upward arrow visible while the empty draft stays disabled", () => {

@@ -1,6 +1,7 @@
 import asyncio
 from pathlib import Path
 from threading import Event, Timer
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -10,8 +11,15 @@ from starlette.websockets import WebSocketDisconnect
 
 from app.api.auth import VerifiedUser
 from app.api.routes import runtime
+from app.application.errors import ApplicationError
 from app.core.config import Settings
-from app.main import create_app
+from app.main import create_app as production_create_app
+
+
+def create_app(*args, **kwargs):
+    if args and isinstance(args[0], Settings) and args[0].environment == "test":
+        kwargs.setdefault("legacy_sqlite_for_tests", True)
+    return production_create_app(*args, **kwargs)
 
 
 class StubVerifier:
@@ -127,6 +135,49 @@ def test_runtime_websocket_reports_account_in_use(tmp_path: Path) -> None:
             assert closed.value.code == 4409
 
 
+@pytest.mark.parametrize(
+    ("error_code", "expected_status", "expected_close"),
+    [
+        ("account_activity_busy", 409, 4409),
+        ("account_import_in_progress", 409, 4409),
+        ("database_unavailable", 503, 1013),
+    ],
+)
+def test_runtime_websocket_reports_cloud_account_startup_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    expected_status: int,
+    expected_close: int,
+) -> None:
+    app = create_app(Settings(environment="test", data_dir=tmp_path), auth_verifier=StubVerifier())
+
+    async def fail_account(*_args: object, **_kwargs: object) -> None:
+        raise ApplicationError(error_code, "Account startup is temporarily unavailable.")
+
+    with TestClient(app) as client:
+        monkeypatch.setattr(app.state.account_registry, "get", fail_account)
+        with client.websocket_connect(
+            "/api/runtime", headers={"origin": "http://localhost:3000"}
+        ) as socket:
+            socket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "auth",
+                    "method": "auth.authenticate",
+                    "params": {"accessToken": "alice"},
+                }
+            )
+            reply = socket.receive_json()
+            assert reply["error"]["data"] == {
+                "code": error_code,
+                "status": expected_status,
+            }
+            with pytest.raises(WebSocketDisconnect) as closed:
+                socket.receive_json()
+            assert closed.value.code == expected_close
+
+
 @pytest.mark.parametrize("change", ["revoked", "changed_user"])
 def test_runtime_websocket_closes_idle_connection_when_auth_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
@@ -174,7 +225,9 @@ def test_runtime_websocket_closes_idle_connection_when_auth_changes(
             probe.cancel()
 
 
-def test_runtime_websocket_allows_only_configured_web_origin(tmp_path: Path) -> None:
+def test_runtime_websocket_allows_only_configured_web_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     app = create_app(
         Settings(
             environment="production",
@@ -185,6 +238,11 @@ def test_runtime_websocket_allows_only_configured_web_origin(tmp_path: Path) -> 
     )
 
     with TestClient(app) as client:
+
+        async def account_for_origin_check(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(run_service=None, event_hub=None)
+
+        monkeypatch.setattr(app.state.account_registry, "get", account_for_origin_check)
         with client.websocket_connect(
             "/api/runtime", headers={"origin": "https://app.example.com"}
         ) as socket:

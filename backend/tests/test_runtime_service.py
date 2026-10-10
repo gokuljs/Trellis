@@ -2006,7 +2006,7 @@ def test_user_cancellation_transitions_running_run_and_cancels_model_call(tmp_pa
         asyncio.run(run())
     )
     assert cancellation.status is RunStatus.CANCELLING
-    assert repeated_cancellation.status is RunStatus.CANCELLING
+    assert repeated_cancellation.status in {RunStatus.CANCELLING, RunStatus.CANCELLED}
     assert cancellation_requests == 1
     assert result and isinstance(result[0], asyncio.CancelledError)
     assert persisted is not None and persisted.status is RunStatus.CANCELLED

@@ -14,6 +14,7 @@ from app.application.tools import ToolRegistry
 from app.core.config import Settings
 from app.domain.models import ProviderName
 from app.domain.runtime import ModelRequest, ModelStreamEvent, ModelToolCall, RunEvent, RunEventType
+from app.infrastructure.database import Database
 from app.infrastructure.local_tools import LocalReadToolExecutor
 from app.infrastructure.runtime_events import RuntimeEventHub
 from tests.support import TestClient, account_context, create_app
@@ -773,7 +774,9 @@ def test_custom_model_uses_registered_adapter_without_provider_specific_runtime_
     )
     with TestClient(app) as client:
         client.get("/api/profile")
-        with sqlite3.connect(account_context(app).database.path) as connection:
+        database = account_context(app).database
+        assert isinstance(database, Database)
+        with sqlite3.connect(database.path) as connection:
             connection.execute(
                 """INSERT INTO models(
                        id, provider_id, provider_name, adapter_kind, upstream_model_id,
@@ -842,7 +845,9 @@ def test_unpriced_custom_model_stops_before_a_tool_continuation(tmp_path: Path) 
     app = create_app(settings, streaming_provider_adapters={"openai-compatible": provider})
     with TestClient(app) as client:
         client.get("/api/profile")
-        with sqlite3.connect(account_context(app).database.path) as connection:
+        database = account_context(app).database
+        assert isinstance(database, Database)
+        with sqlite3.connect(database.path) as connection:
             connection.execute(
                 """INSERT INTO models(
                        id, provider_id, provider_name, adapter_kind, upstream_model_id,

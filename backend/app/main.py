@@ -33,10 +33,19 @@ ERROR_STATUS = {
     "model_not_available": 404,
     "session_not_found": 404,
     "run_not_found": 404,
+    "run_not_owned": 409,
+    "run_lease_lost": 409,
+    "reauth_required": 401,
+    "cloud_access_denied": 401,
+    "database_unavailable": 503,
     "invalid_workspace": 422,
     "workspace_picker_unavailable": 503,
     "workspace_picker_timeout": 504,
     "session_workspace_busy": 409,
+    "session_run_busy": 409,
+    "session_turn_busy": 409,
+    "account_import_in_progress": 409,
+    "account_activity_busy": 409,
     "provider_not_configured": 409,
     "pricing_unavailable": 409,
     "invalid_budget_preset": 422,
@@ -48,6 +57,7 @@ ERROR_STATUS = {
     "provider_upstream_failed": 502,
     "turn_conflict": 409,
     "turn_in_progress": 409,
+    "turn_not_owned": 409,
     "account_in_use": 409,
     "message_empty": 422,
     "invalid_api_key": 422,
@@ -65,8 +75,11 @@ def create_app(
     tool_registry: ToolRegistry | None = None,
     workspace_picker: WorkspacePickerService | None = None,
     auth_verifier: AuthVerifier | None = None,
+    legacy_sqlite_for_tests: bool = False,
 ) -> FastAPI:
     resolved_settings = settings or Settings()
+    if legacy_sqlite_for_tests and resolved_settings.environment != "test":
+        raise ValueError("The legacy SQLite adapter is available only to tests")
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -99,6 +112,8 @@ def create_app(
                 tool_registry_factory=(
                     (lambda _database: tool_registry) if tool_registry is not None else None
                 ),
+                cloud_client=http_client,
+                legacy_sqlite_for_tests=legacy_sqlite_for_tests,
             )
             application.state.account_registry = registry
             try:

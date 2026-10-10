@@ -208,19 +208,29 @@ async def runtime_websocket(websocket: WebSocket) -> None:
         await websocket.close(code=4401)
         return
     try:
-        account = await websocket.app.state.account_registry.get(verified.id)
+        account = await websocket.app.state.account_registry.get(
+            verified.id, access_token=token, expires_at=verified.expires_at
+        )
     except ApplicationError as error:
-        if error.code != "account_in_use":
-            raise
+        if error.code in {
+            "account_in_use",
+            "account_activity_busy",
+            "account_import_in_progress",
+        }:
+            status, close_code, rpc_code = 409, 4409, -32009
+        elif error.code in {"reauth_required", "cloud_access_denied"}:
+            status, close_code, rpc_code = 401, 4401, -32001
+        else:
+            status, close_code, rpc_code = 503, 1013, -32003
         await websocket.send_json(
             _error_response(
                 request_id,
-                -32009,
-                "Account is open in another backend process",
-                {"code": "account_in_use", "status": 409},
+                rpc_code,
+                error.message if status != 503 else "Account data is temporarily unavailable",
+                {"code": error.code, "status": status},
             )
         )
-        await websocket.close(code=4409)
+        await websocket.close(code=close_code)
         return
     await websocket.send_json(
         {"jsonrpc": "2.0", "id": request_id, "result": {"userId": str(verified.id)}}
@@ -248,7 +258,16 @@ async def runtime_websocket(websocket: WebSocket) -> None:
         except Exception as error:
             logger.error("Runtime authentication check failed (%s)", type(error).__name__)
             return False
-        return refreshed.id == verified.id and not auth_lost.is_set()
+        if refreshed.id != verified.id or auth_lost.is_set():
+            return False
+        try:
+            await websocket.app.state.account_registry.get(
+                verified.id, access_token=token, expires_at=refreshed.expires_at
+            )
+        except Exception as error:
+            logger.error("Runtime cloud token refresh failed (%s)", type(error).__name__)
+            return False
+        return True
 
     async def close_for_auth() -> None:
         if auth_lost.is_set():

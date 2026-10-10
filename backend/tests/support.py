@@ -36,6 +36,7 @@ class StubVerifier:
 
 def create_app(*args: Any, **kwargs: Any) -> FastAPI:
     kwargs.setdefault("auth_verifier", StubVerifier())
+    kwargs.setdefault("legacy_sqlite_for_tests", True)
     return production_create_app(*args, **kwargs)
 
 

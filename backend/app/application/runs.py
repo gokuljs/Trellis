@@ -22,11 +22,13 @@ from app.application.errors import ApplicationError, ProviderError
 from app.application.ports import (
     ProfileRepository,
     RunEventPublisher,
+    RunLeasePort,
     RunRepository,
     SecretStorePort,
     SessionRepository,
     SettingsRepository,
     StreamingProviderAdapter,
+    WorkspaceBindingPort,
 )
 from app.application.tools import (
     MAX_ARGUMENT_BYTES,
@@ -51,12 +53,14 @@ from app.domain.runtime import (
     ToolCallRecord,
     ToolCallStatus,
     ToolResult,
+    is_terminal_run_status,
 )
 
 logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_TOKENS = 4096
 DEFAULT_MAX_CONCURRENT_RUNS = 4
+DEFAULT_LEASE_RENEW_INTERVAL_SECONDS = 30.0
 MAX_MODEL_RESPONSE_BYTES = 256_000
 MAX_CONTINUATION_BYTES = 256_000
 
@@ -158,10 +162,15 @@ class RunService:
         *,
         tool_registry: ToolRegistry | None = None,
         workspace_guidance_reader: Callable[[Path], Awaitable[str | None]] | None = None,
+        workspace_bindings: WorkspaceBindingPort | None = None,
+        lease_repository: RunLeasePort | None = None,
+        lease_renew_interval_seconds: float = DEFAULT_LEASE_RENEW_INTERVAL_SECONDS,
         max_concurrent_runs: int = DEFAULT_MAX_CONCURRENT_RUNS,
     ) -> None:
         if max_concurrent_runs < 1:
             raise ValueError("maximum concurrent runs must be positive")
+        if lease_renew_interval_seconds <= 0:
+            raise ValueError("lease renewal interval must be positive")
         self._runs = runs
         self._sessions = sessions
         self._settings = settings
@@ -171,10 +180,15 @@ class RunService:
         self._event_publisher = event_publisher
         self._tool_registry = tool_registry
         self._workspace_guidance_reader = workspace_guidance_reader
+        self._workspace_bindings = workspace_bindings
+        self._lease_repository = lease_repository
+        self._lease_renew_interval_seconds = lease_renew_interval_seconds
         self._slots = asyncio.Semaphore(max_concurrent_runs)
         self._admission_lock = asyncio.Lock()
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._cancel_finalizers: dict[str, asyncio.Task[None]] = {}
+        self._lease_monitors: dict[str, asyncio.Task[None]] = {}
+        self._lease_lost: set[str] = set()
         self._reschedule_pending: set[str] = set()
         self._closing = False
 
@@ -247,9 +261,14 @@ class RunService:
                     "run_invalid", "The run request could not be accepted."
                 ) from None
 
-            if run.status is RunStatus.QUEUED:
+            if run.status is RunStatus.QUEUED and self._can_execute(run.id):
                 self._schedule(run.id)
             return run
+
+    def _can_execute(self, run_id: str) -> bool:
+        return run_id not in self._lease_lost and (
+            self._lease_repository is None or self._lease_repository.owns_run_lease(run_id)
+        )
 
     async def wait_for_run(self, run_id: str) -> None:
         task = self._tasks.get(run_id)
@@ -266,12 +285,36 @@ class RunService:
                 await finalizer
 
     async def get_run(self, run_id: str) -> RunSnapshot | None:
-        return await self._runs.get_run(run_id)
+        return await self._recover_if_expired(await self._runs.get_run(run_id))
+
+    async def _recover_if_expired(self, run: RunSnapshot | None) -> RunSnapshot | None:
+        if self._lease_repository is None or run is None or is_terminal_run_status(run.status):
+            return run
+        if run.lease_expires_at is None:
+            return run
+        try:
+            expiry = datetime.fromisoformat(run.lease_expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            raise RuntimeError("Cloud run has an invalid lease expiry") from None
+        if expiry.tzinfo is None:
+            raise RuntimeError("Cloud run has an invalid lease expiry")
+        if expiry > datetime.now(UTC):
+            return run
+        return await self._lease_repository.recover_expired_run(run.id)
+
+    async def _require_local_control(self, run_id: str) -> None:
+        if self._lease_repository is None or self._can_execute(run_id):
+            return
+        if await self._runs.get_run(run_id) is None:
+            raise ApplicationError("run_not_found", "Run not found.")
+        raise ApplicationError("run_not_owned", "This run is active on another computer.")
 
     async def get_latest_run_for_session(self, session_id: str) -> RunSnapshot | None:
         if await self._sessions.get_session(session_id) is None:
             raise ApplicationError("session_not_found", "Session not found.")
-        return await self._runs.get_latest_run_for_session(session_id)
+        return await self._recover_if_expired(
+            await self._runs.get_latest_run_for_session(session_id)
+        )
 
     async def list_session_runs(
         self, session_id: str, offset: int, limit: int
@@ -279,7 +322,10 @@ class RunService:
         if await self._sessions.get_session(session_id) is None:
             raise ApplicationError("session_not_found", "Session not found.")
         runs = await self._runs.list_runs_for_session(session_id, offset, limit + 1)
-        return runs[:limit], offset + limit if len(runs) > limit else None
+        visible = [await self._recover_if_expired(run) for run in runs[:limit]]
+        return [run for run in visible if run is not None], offset + limit if len(
+            runs
+        ) > limit else None
 
     async def list_session_run_events(
         self, session_id: str, run_id: str, after_sequence: int, limit: int
@@ -304,6 +350,7 @@ class RunService:
         return await self._runs.list_run_events(run_id, after_sequence, limit=limit)
 
     async def cancel_run(self, run_id: str) -> RunSnapshot:
+        await self._require_local_control(run_id)
         try:
             run, event = await self._runs.request_run_cancellation(run_id)
         except ValueError as error:
@@ -357,6 +404,8 @@ class RunService:
 
     async def _finalize_cancelled_task(self, run_id: str, task: asyncio.Task[None]) -> None:
         await asyncio.gather(task, return_exceptions=True)
+        if not self._can_execute(run_id):
+            return
         current = await self._runs.get_run(run_id)
         if current is not None and current.status is RunStatus.CANCELLING:
             await self._mark_cancelled(run_id, None)
@@ -373,6 +422,7 @@ class RunService:
     ) -> tuple[RunSnapshot, ToolCallRecord]:
         if self._closing:
             raise ApplicationError("runtime_shutting_down", "The runtime is shutting down.")
+        await self._require_local_control(run_id)
         try:
             tool_call, event = await self._runs.record_tool_approval_decision(
                 run_id, tool_call_id, decision
@@ -416,11 +466,20 @@ class RunService:
         if finalizers:
             await asyncio.gather(*finalizers, return_exceptions=True)
         for run_id, _task in pending:
-            run = await self._runs.get_run(run_id)
-            if run is not None and run.status is RunStatus.QUEUED:
-                await self._interrupt_queued_run(run_id)
+            if self._can_execute(run_id):
+                run = await self._runs.get_run(run_id)
+                if run is not None and run.status is RunStatus.QUEUED:
+                    await self._interrupt_queued_run(run_id)
+        monitors = tuple(self._lease_monitors.values())
+        for monitor in monitors:
+            monitor.cancel()
+        if monitors:
+            await asyncio.gather(*monitors, return_exceptions=True)
 
     def _schedule(self, run_id: str) -> None:
+        if not self._can_execute(run_id):
+            return
+        self._start_lease_monitor(run_id)
         existing = self._tasks.get(run_id)
         if existing is not None and not existing.done():
             self._reschedule_pending.add(run_id)
@@ -428,6 +487,42 @@ class RunService:
         task = asyncio.create_task(self._run_with_limit(run_id), name=f"trellis-run-{run_id}")
         self._tasks[run_id] = task
         task.add_done_callback(lambda done: self._discard_task(run_id, done))
+
+    def _start_lease_monitor(self, run_id: str) -> None:
+        if self._lease_repository is None:
+            return
+        existing = self._lease_monitors.get(run_id)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._monitor_lease(run_id), name=f"trellis-lease-{run_id}")
+        self._lease_monitors[run_id] = task
+        task.add_done_callback(lambda done: self._discard_lease_monitor(run_id, done))
+
+    def _discard_lease_monitor(self, run_id: str, task: asyncio.Task[None]) -> None:
+        if self._lease_monitors.get(run_id) is task:
+            del self._lease_monitors[run_id]
+
+    async def _monitor_lease(self, run_id: str) -> None:
+        assert self._lease_repository is not None
+        while True:
+            await asyncio.sleep(self._lease_renew_interval_seconds)
+            try:
+                run = await self._lease_repository.renew_run_lease(run_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning(
+                    "Stopping local execution after lease renewal failed for %s (%s)",
+                    run_id,
+                    type(error).__name__,
+                )
+                self._lease_lost.add(run_id)
+                active = self._tasks.get(run_id)
+                if active is not None and not active.done():
+                    active.cancel()
+                return
+            if is_terminal_run_status(run.status):
+                return
 
     def _discard_task(self, run_id: str, task: asyncio.Task[None]) -> None:
         if self._tasks.get(run_id) is task:
@@ -442,6 +537,8 @@ class RunService:
             async with self._slots:
                 await self._execute(run_id)
         except asyncio.CancelledError:
+            if run_id in self._lease_lost:
+                raise
             run = await self._runs.get_run(run_id)
             if run is not None and run.status is RunStatus.QUEUED:
                 await self._interrupt_queued_run(run_id)
@@ -454,6 +551,8 @@ class RunService:
                 run_id,
                 type(error).__name__,
             )
+            if not self._can_execute(run_id):
+                return
             try:
                 run = await self._runs.get_run(run_id)
                 if run is not None and run.status in {RunStatus.QUEUED, RunStatus.RUNNING}:
@@ -529,7 +628,12 @@ class RunService:
             session = await self._sessions.get_session(run.session_id)
             if session is None:
                 raise ApplicationError("session_not_found", "Session not found.")
-            workspace_root = Path(session.workspace_path) if session.workspace_path else None
+            if self._workspace_bindings is not None:
+                workspace_root = await self._workspace_bindings.resolve(
+                    session.id, session.workspace_path
+                )
+            else:
+                workspace_root = Path(session.workspace_path) if session.workspace_path else None
             guidance = (
                 await self._workspace_guidance_reader(workspace_root)
                 if workspace_root is not None and self._workspace_guidance_reader is not None
@@ -699,6 +803,8 @@ class RunService:
                     return
             raise ProviderError("model_call_limit", "The run reached its model-call limit.")
         except asyncio.CancelledError:
+            if run_id in self._lease_lost:
+                raise
             current = await self._runs.get_run(run_id)
             if current is not None and current.status is RunStatus.CANCELLING:
                 await self._mark_cancelled(run_id, call)
@@ -706,10 +812,10 @@ class RunService:
                 await self._mark_interrupted(run_id, call)
             raise
         except ProviderError as error:
-            if started:
+            if started and self._can_execute(run_id):
                 await self._fail_or_cancel(run_id, call, error.code, error.message)
         except ApplicationError as error:
-            if started:
+            if started and self._can_execute(run_id):
                 await self._fail_or_cancel(run_id, call, error.code, error.message)
         except Exception as error:
             logger.error(
@@ -717,13 +823,31 @@ class RunService:
                 run_id,
                 type(error).__name__,
             )
-            if started:
+            if started and self._can_execute(run_id):
                 await self._fail_or_cancel(
                     run_id,
                     call,
                     "runtime_internal_error",
                     "Trellis could not complete this run.",
                 )
+
+    async def _renew_before_local_tool(self, run_id: str) -> None:
+        if self._lease_repository is None:
+            return
+        if not self._can_execute(run_id):
+            raise ApplicationError("run_lease_lost", "This run is no longer active here.")
+        try:
+            renewed = await self._lease_repository.renew_run_lease(run_id)
+            if is_terminal_run_status(renewed.status):
+                raise ApplicationError("run_lease_lost", "This run is no longer active here.")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._lease_lost.add(run_id)
+            monitor = self._lease_monitors.get(run_id)
+            if monitor is not None:
+                monitor.cancel()
+            raise ApplicationError("run_lease_lost", "This run is no longer active here.") from None
 
     async def _execute_pending_tools(self, run: RunSnapshot, workspace_root: Path | None) -> bool:
         if self._tool_registry is None or workspace_root is None:
@@ -734,6 +858,7 @@ class RunService:
         for call_index, stored_call in enumerate(all_tool_calls):
             if stored_call.status is not ToolCallStatus.PENDING:
                 continue
+            await self._renew_before_local_tool(run.id)
             self._check_budget(
                 run,
                 kind="tool",
@@ -800,6 +925,7 @@ class RunService:
                 )
                 continue
             try:
+                await self._renew_before_local_tool(run.id)
                 async with asyncio.timeout(remaining_seconds):
                     result = await self._tool_registry.execute(
                         tool_request,

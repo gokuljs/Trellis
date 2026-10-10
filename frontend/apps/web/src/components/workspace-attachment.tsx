@@ -12,6 +12,7 @@ import { ApiError } from "@/lib/api"
 
 type WorkspaceAttachmentProps = {
   workspacePath: string | null
+  workspaceReady: boolean
   disabled: boolean
   onPickWorkspace: () => Promise<boolean>
   onSave: (path: string) => Promise<void>
@@ -27,6 +28,7 @@ function workspaceName(path: string) {
 
 export function WorkspaceAttachment({
   workspacePath,
+  workspaceReady,
   disabled,
   onPickWorkspace,
   onSave,
@@ -210,6 +212,18 @@ export function WorkspaceAttachment({
             disabled={busy}
           >
             <X size={13} aria-hidden="true" />
+          </button>
+        </div>
+      ) : null}
+      {workspacePath && !workspaceReady ? (
+        <div className="composer-workspace-reconnect" role="status">
+          <span>Select a folder on this computer to use local tools.</span>
+          <button
+            type="button"
+            onClick={() => void pickWorkspace()}
+            disabled={busy}
+          >
+            Choose local folder
           </button>
         </div>
       ) : null}

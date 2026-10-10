@@ -1,4 +1,5 @@
 from collections.abc import AsyncGenerator, Sequence
+from pathlib import Path
 from typing import Protocol
 
 from app.application.budgets import BudgetPreset
@@ -78,6 +79,20 @@ class SessionRepository(Protocol):
 
 class WorkspaceDirectoryPicker(Protocol):
     async def pick_directory(self) -> str | None: ...
+
+
+class WorkspaceBindingPort(Protocol):
+    def bind(self, session_id: str, workspace_root: Path | None) -> None: ...
+
+    async def resolve(self, session_id: str, workspace_path: str | None) -> Path | None: ...
+
+
+class RunLeasePort(Protocol):
+    def owns_run_lease(self, run_id: str) -> bool: ...
+
+    async def renew_run_lease(self, run_id: str) -> RunSnapshot: ...
+
+    async def recover_expired_run(self, run_id: str) -> RunSnapshot: ...
 
 
 class RunRepository(Protocol):

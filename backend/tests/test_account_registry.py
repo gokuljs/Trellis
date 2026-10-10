@@ -2,7 +2,7 @@ import asyncio
 import os
 import stat
 from pathlib import Path
-from typing import Never
+from typing import Any, Never
 from uuid import UUID
 
 import pytest
@@ -10,11 +10,16 @@ import pytest
 from app.application.errors import ApplicationError
 from app.core.config import Settings
 from app.domain.runtime import RunStatus
-from app.infrastructure.accounts import AccountRegistry
+from app.infrastructure.accounts import AccountRegistry as ProductionAccountRegistry
 from app.infrastructure.database import Database
 
 ALICE = UUID("c928705a-6f03-4aa8-9f81-c4fb50696527")
 BOB = UUID("55114a4d-aa42-4eb6-a61d-f91c7992c06d")
+
+
+def AccountRegistry(*args: Any, **kwargs: Any) -> ProductionAccountRegistry:
+    kwargs.setdefault("legacy_sqlite_for_tests", True)
+    return ProductionAccountRegistry(*args, **kwargs)
 
 
 def test_registry_separates_user_data_and_provider_keys(tmp_path: Path) -> None:
