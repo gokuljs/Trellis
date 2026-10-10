@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncGenerator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -23,13 +24,21 @@ from app.domain.runtime import (
     ToolApprovalDecision,
     ToolCallStatus,
 )
-from app.infrastructure.database import Database
 from app.infrastructure.local_tools import LocalReadToolExecutor, read_workspace_guidance
 from app.infrastructure.secrets import SecretStore
+from tests.memory_repository import MemoryRepository as Database
 
 
 def make_settings(data_dir: Path) -> Settings:
     return Settings(environment="test", data_dir=data_dir)
+
+
+def _database_path(settings: Settings) -> Path:
+    return settings.data_dir / "state.db"
+
+
+def _secrets_path(settings: Settings) -> Path:
+    return settings.data_dir / ".env"
 
 
 class RecordingProvider:
@@ -243,8 +252,8 @@ class PersistBeforePublish:
 
 def test_run_service_streams_and_persists_a_provider_neutral_run(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider(
         (
             ModelStreamEvent(kind="text_delta", text="Hello"),
@@ -355,15 +364,15 @@ def test_run_service_streams_and_persists_a_provider_neutral_run(tmp_path: Path)
         "cached_tokens": 2,
         "cache_creation_tokens": None,
     }
-    assert b"sk-runtime-secret" not in settings.database_path.read_bytes()
+    assert b"sk-runtime-secret" not in repr(database.state).encode()
 
 
 def test_run_service_persists_read_tool_exchange_before_a_second_model_call(
     tmp_path: Path,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     (tmp_path / "README.md").write_text("Hello from the workspace.\n", encoding="utf-8")
     (tmp_path / "AGENTS.md").write_text("Read carefully.\n", encoding="utf-8")
     provider = SequencedProvider(
@@ -465,8 +474,8 @@ def test_budget_blocks_tool_execution_after_exhausted_or_missing_usage(
     tmp_path: Path, usage: ModelStreamEvent | None, expected_error: str
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     (tmp_path / "note.txt").write_text("Read me\n", encoding="utf-8")
     events = [
         ModelStreamEvent(
@@ -529,18 +538,14 @@ def test_estimated_cost_limit_stops_before_publishing_a_final_answer(tmp_path: P
                 model,
                 budget_preset=budget_preset,
             )
-            async with self._connect() as connection:
-                await connection.execute(
-                    "UPDATE runs SET max_cost_usd = ? WHERE id = ?", (0.00004, created.id)
-                )
-                await connection.commit()
+            self.state.runs[created.id] = replace(created, max_cost_usd=0.00004)
             refreshed = await self.get_run(created.id)
             assert refreshed is not None
             return refreshed
 
     settings = make_settings(tmp_path)
-    database = TinyCostDatabase(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = TinyCostDatabase(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider(
         (
             ModelStreamEvent(kind="text_delta", text="Expensive answer"),
@@ -576,8 +581,8 @@ def test_approved_tool_resumes_after_restart_without_repeating_the_model_call(
     tmp_path: Path,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     (tmp_path / "note.txt").write_text("safe contents\n", encoding="utf-8")
     provider = SequencedProvider(
         (
@@ -621,8 +626,7 @@ def test_approved_tool_resumes_after_restart_without_repeating_the_model_call(
         )
         await first_service.close()
 
-        restarted_database = Database(settings.database_path)
-        assert await restarted_database.recover_active_runs() == ()
+        restarted_database = Database(_database_path(settings))
         second_service = RunService(
             restarted_database,
             restarted_database,
@@ -658,8 +662,8 @@ def test_approved_tool_resumes_after_restart_without_repeating_the_model_call(
 
 def test_approved_tool_keeps_execution_budget_after_a_delayed_decision(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     (tmp_path / "note.txt").write_text("safe contents\n", encoding="utf-8")
     provider = SequencedProvider(
         (
@@ -701,34 +705,28 @@ def test_approved_tool_keeps_execution_budget_after_a_delayed_decision(tmp_path:
         original_deadline = (reference - timedelta(minutes=2)).isoformat()
         requested_at = (reference - timedelta(minutes=4)).isoformat()
         decided_at = (reference - timedelta(minutes=3)).isoformat()
-        async with database._connect() as connection:
-            await connection.execute(
-                "UPDATE runs SET deadline_at = ? WHERE id = ?", (original_deadline, created.id)
-            )
-            await connection.execute(
-                """UPDATE run_events SET created_at = ?
-                   WHERE run_id = ? AND event_type = ?""",
-                (requested_at, created.id, RunEventType.TOOL_APPROVAL_REQUESTED.value),
-            )
-            await connection.commit()
+        database.state.runs[created.id] = replace(waiting, deadline_at=original_deadline)
+        database.state.events[created.id] = [
+            replace(event, created_at=requested_at)
+            if event.event_type is RunEventType.TOOL_APPROVAL_REQUESTED
+            else event
+            for event in database.state.events[created.id]
+        ]
         await database.record_tool_approval_decision(
             created.id, calls[0].id, ToolApprovalDecision.APPROVED
         )
-        async with database._connect() as connection:
-            await connection.execute(
-                "UPDATE tool_calls SET approval_decided_at = ? WHERE id = ?",
-                (decided_at, calls[0].id),
-            )
-            await connection.execute(
-                """UPDATE run_events SET created_at = ?
-                   WHERE run_id = ? AND event_type = ?""",
-                (decided_at, created.id, RunEventType.TOOL_APPROVAL_DECIDED.value),
-            )
-            await connection.commit()
+        database.state.tool_calls[calls[0].id] = replace(
+            database.state.tool_calls[calls[0].id], approval_decided_at=decided_at
+        )
+        database.state.events[created.id] = [
+            replace(event, created_at=decided_at)
+            if event.event_type is RunEventType.TOOL_APPROVAL_DECIDED
+            else event
+            for event in database.state.events[created.id]
+        ]
         await first_service.close()
 
-        restarted_database = Database(settings.database_path)
-        assert await restarted_database.recover_active_runs() == ()
+        restarted_database = Database(_database_path(settings))
         second_service = RunService(
             restarted_database,
             restarted_database,
@@ -766,8 +764,8 @@ def test_approved_tool_keeps_execution_budget_after_a_delayed_decision(tmp_path:
 
 def test_cancelling_while_waiting_for_approval_closes_the_tool_call(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
             (
@@ -816,8 +814,8 @@ def test_cancelling_an_approved_run_before_it_gets_a_slot_finishes_cancellation(
     tmp_path: Path,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
             (
@@ -871,8 +869,8 @@ def test_shutdown_during_approval_notification_preserves_waiting_run(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
             (
@@ -926,8 +924,8 @@ def test_denial_becomes_a_tool_result_and_late_decisions_are_rejected(
     tmp_path: Path,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
             (
@@ -1004,8 +1002,8 @@ def test_denial_becomes_a_tool_result_and_late_decisions_are_rejected(
 
 def test_preview_failure_is_a_tool_result_without_requesting_approval(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
             (
@@ -1064,8 +1062,8 @@ def test_preview_failure_is_a_tool_result_without_requesting_approval(tmp_path: 
 
 def test_secret_in_approval_preview_is_not_persisted_or_shown(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
             (
@@ -1117,13 +1115,13 @@ def test_secret_in_approval_preview_is_not_persisted_or_shown(tmp_path: Path) ->
     assert run is not None and run.status is RunStatus.COMPLETED
     assert "sensitive_approval_preview" in exchange[1].content
     assert RunEventType.TOOL_APPROVAL_REQUESTED not in [event.event_type for event in events]
-    assert b"sk-previewsecret123" not in settings.database_path.read_bytes()
+    assert b"sk-previewsecret123" not in repr(database.state).encode()
 
 
 def test_tool_only_response_records_two_results_before_continuing(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     (tmp_path / "one.txt").write_text("first\n", encoding="utf-8")
     provider = SequencedProvider(
         (
@@ -1195,8 +1193,8 @@ def test_agent_loop_rejects_sensitive_tool_arguments_before_recording_them(
     tmp_path: Path,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
             (
@@ -1247,15 +1245,15 @@ def test_agent_loop_rejects_sensitive_tool_arguments_before_recording_them(
     assert calls[0].status is ToolCallStatus.FAILED
     assert "sensitive_tool_arguments" in exchange[1].content
     assert "sk-secret123" not in str(model_calls) + str(events)
-    assert b"sk-secret123" not in settings.database_path.read_bytes()
+    assert b"sk-secret123" not in repr(database.state).encode()
 
 
 def test_streamed_secret_split_across_chunks_is_redacted_before_persistence(
     tmp_path: Path,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider(
         (
             ModelStreamEvent(kind="text_delta", text="Authorization: Bearer "),
@@ -1287,14 +1285,14 @@ def test_streamed_secret_split_across_chunks_is_redacted_before_persistence(
 
     events, visible = asyncio.run(run())
     assert "secret123456" not in str(events) + str(visible)
-    assert b"secret123456" not in settings.database_path.read_bytes()
+    assert b"secret123456" not in repr(database.state).encode()
     assert "[REDACTED]" in visible[-1].content
 
 
 def test_cancelling_during_a_tool_records_a_terminal_result(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
             (
@@ -1375,11 +1373,7 @@ def test_a_tool_cannot_run_past_the_run_deadline(tmp_path: Path) -> None:
                 budget_preset=budget_preset,
             )
             deadline = (datetime.now(UTC) + timedelta(milliseconds=150)).isoformat()
-            async with self._connect() as connection:
-                await connection.execute(
-                    "UPDATE runs SET deadline_at = ? WHERE id = ?", (deadline, created.id)
-                )
-                await connection.commit()
+            self.state.runs[created.id] = replace(created, deadline_at=deadline)
             refreshed = await self.get_run(created.id)
             assert refreshed is not None
             return refreshed
@@ -1392,8 +1386,8 @@ def test_a_tool_cannot_run_past_the_run_deadline(tmp_path: Path) -> None:
             return "unreachable", False
 
     settings = make_settings(tmp_path)
-    database = NearDeadlineDatabase(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = NearDeadlineDatabase(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
             (
@@ -1434,8 +1428,8 @@ def test_a_tool_cannot_run_past_the_run_deadline(tmp_path: Path) -> None:
 
 def test_provider_metadata_is_redacted_before_events_and_records(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider(
         (
             ModelStreamEvent(
@@ -1468,14 +1462,14 @@ def test_provider_metadata_is_redacted_before_events_and_records(tmp_path: Path)
     assert calls[0].status.value == "completed"
     assert "private123456" not in str(calls) + str(events)
     assert "sk-proj-secret123456" not in str(calls) + str(events)
-    assert b"private123456" not in settings.database_path.read_bytes()
-    assert b"sk-proj-secret123456" not in settings.database_path.read_bytes()
+    assert b"private123456" not in repr(database.state).encode()
+    assert b"sk-proj-secret123456" not in repr(database.state).encode()
 
 
 def test_secret_looking_tool_call_id_is_rejected_before_persistence(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider(
         (
             ModelStreamEvent(
@@ -1508,7 +1502,7 @@ def test_secret_looking_tool_call_id_is_rejected_before_persistence(tmp_path: Pa
     assert run is not None and run.status is RunStatus.FAILED
     assert run.error_code == "provider_invalid_response"
     assert calls == []
-    assert b"sk-proj-secret123456" not in settings.database_path.read_bytes()
+    assert b"sk-proj-secret123456" not in repr(database.state).encode()
 
 
 def test_model_stream_stops_at_tool_call_limit(tmp_path: Path) -> None:
@@ -1532,8 +1526,8 @@ def test_model_stream_stops_at_tool_call_limit(tmp_path: Path) -> None:
             return generate()
 
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = TooManyToolsProvider()
 
     async def run():
@@ -1561,8 +1555,8 @@ def test_model_stream_stops_at_tool_call_limit(tmp_path: Path) -> None:
 
 def test_model_stream_rejects_oversized_continuation_data(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider(
         (
             ModelStreamEvent(kind="text_delta", text="Done"),
@@ -1622,8 +1616,8 @@ def test_cancellation_wins_when_provider_finishes_during_cancel_publication(
                 await self.release.wait()
 
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = CancelRaceProvider()
     publisher = BlockingCancelPublisher()
 
@@ -1668,8 +1662,8 @@ def test_truncated_tool_result_tells_the_next_model_step(tmp_path: Path) -> None
             return "partial file content", True
 
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
             (
@@ -1735,8 +1729,8 @@ def test_second_model_failure_keeps_the_first_tool_exchange(tmp_path: Path) -> N
             return generate()
 
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = FailsOnSecondStep()
 
     async def run():
@@ -1771,8 +1765,8 @@ def test_second_model_failure_keeps_the_first_tool_exchange(tmp_path: Path) -> N
 
 def test_run_service_rejects_an_unoffered_tool_call_without_a_final_reply(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider(
         (
             ModelStreamEvent(kind="text_delta", text="I will read that file."),
@@ -1818,8 +1812,8 @@ def test_run_service_rejects_an_unoffered_tool_call_without_a_final_reply(tmp_pa
 
 def test_provider_failure_keeps_no_partial_assistant_message(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = FailingProvider(())
 
     async def run():
@@ -1861,8 +1855,8 @@ def test_provider_failure_keeps_no_partial_assistant_message(tmp_path: Path) -> 
 def test_run_service_requires_selected_streaming_adapter_before_persisting(
     tmp_path: Path,
 ) -> None:
-    database = Database(make_settings(tmp_path).database_path)
-    secret_store = SecretStore(make_settings(tmp_path).secrets_path)
+    database = Database(_database_path(make_settings(tmp_path)))
+    secret_store = SecretStore(_secrets_path(make_settings(tmp_path)))
 
     async def run() -> tuple[int, int]:
         await database.initialize()
@@ -1899,8 +1893,8 @@ def test_run_service_records_timeout_and_rejects_truncated_streams(
     expected_error: str,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
 
     async def run():
         await database.initialize()
@@ -1934,8 +1928,8 @@ def test_run_service_records_timeout_and_rejects_truncated_streams(
 
 def test_shutdown_marks_running_and_semaphore_queued_runs_interrupted(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = BlockingProvider()
 
     async def run():
@@ -1965,8 +1959,8 @@ def test_shutdown_marks_running_and_semaphore_queued_runs_interrupted(tmp_path: 
 
 def test_user_cancellation_transitions_running_run_and_cancels_model_call(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = BlockingProvider()
 
     async def run():
@@ -2019,8 +2013,8 @@ def test_user_cancellation_transitions_running_run_and_cancels_model_call(tmp_pa
 
 def test_user_can_cancel_a_run_waiting_for_a_concurrency_slot(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = BlockingProvider()
 
     async def run():
@@ -2053,8 +2047,8 @@ def test_user_can_cancel_a_run_waiting_for_a_concurrency_slot(tmp_path: Path) ->
 
 def test_cancelling_orphaned_running_run_reaches_terminal_state(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
 
     async def run():
         await database.initialize()
@@ -2102,8 +2096,8 @@ def test_unexpected_provider_exception_does_not_expose_secret_in_logs(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = Database(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = UnexpectedFailureProvider(())
 
     async def run():
@@ -2135,8 +2129,8 @@ def test_prestart_repository_failure_is_persisted_without_unhandled_task_error(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = OneShotGetFailureDatabase(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = OneShotGetFailureDatabase(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider(())
 
     async def run():
@@ -2166,8 +2160,8 @@ def test_prestart_repository_failure_is_persisted_without_unhandled_task_error(
 
 def test_shutdown_waits_for_run_admission_before_draining_tasks(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = SlowCreateRunDatabase(settings.database_path)
-    secret_store = SecretStore(settings.secrets_path)
+    database = SlowCreateRunDatabase(_database_path(settings))
+    secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider((ModelStreamEvent(kind="text_delta", text="Will be interrupted"),))
 
     async def run():

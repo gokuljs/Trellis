@@ -10,8 +10,8 @@ import pytest
 from app.application import chat as chat_module
 from app.core.config import Settings
 from app.domain.models import Message, ProviderName
-from app.infrastructure.database import Database
 from app.infrastructure.providers import ProviderError
+from tests.memory_repository import MemoryRepository as Database
 from tests.support import TestClient, create_app
 
 

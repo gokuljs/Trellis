@@ -17,8 +17,8 @@ from app.domain.runtime import (
     RunStatus,
     ToolApprovalDecision,
 )
-from app.infrastructure.database import Database
 from app.infrastructure.secrets import SecretStore
+from tests.memory_repository import MemoryRepository as Database
 
 
 class LeaseDatabase(Database):

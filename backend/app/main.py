@@ -17,7 +17,7 @@ from app.application.workspaces import (
 )
 from app.core.config import Settings
 from app.domain.models import ProviderName
-from app.infrastructure.accounts import AccountRegistry
+from app.infrastructure.accounts import AccountRegistry, RepositoryFactory
 from app.infrastructure.providers import AnthropicProvider, OpenAIProvider
 from app.infrastructure.workspace_picker import NativeFolderPicker
 
@@ -75,11 +75,9 @@ def create_app(
     tool_registry: ToolRegistry | None = None,
     workspace_picker: WorkspacePickerService | None = None,
     auth_verifier: AuthVerifier | None = None,
-    legacy_sqlite_for_tests: bool = False,
+    repository_factory: RepositoryFactory | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings()
-    if legacy_sqlite_for_tests and resolved_settings.environment != "test":
-        raise ValueError("The legacy SQLite adapter is available only to tests")
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -113,7 +111,7 @@ def create_app(
                     (lambda _database: tool_registry) if tool_registry is not None else None
                 ),
                 cloud_client=http_client,
-                legacy_sqlite_for_tests=legacy_sqlite_for_tests,
+                repository_factory=repository_factory,
             )
             application.state.account_registry = registry
             try:

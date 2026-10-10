@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
@@ -7,14 +8,20 @@ from fastapi.testclient import TestClient
 from app.api.auth import VerifiedUser
 from app.core.config import Settings
 from app.main import create_app
+from tests.memory_repository import memory_repository_factory
 
 
 class StubVerifier:
     async def verify_bearer(self, authorization: str | None) -> VerifiedUser:
+        expiry = datetime.now(UTC) + timedelta(hours=1)
         if authorization == "Bearer alice":
-            return VerifiedUser(UUID("a59673c1-78d0-4bc8-8c49-6bc2e7a01dd5"), "alice@example.com")
+            return VerifiedUser(
+                UUID("a59673c1-78d0-4bc8-8c49-6bc2e7a01dd5"), "alice@example.com", expiry
+            )
         if authorization == "Bearer bob":
-            return VerifiedUser(UUID("d7a9cd14-6abd-42c4-b46d-2f5bb82e7231"), "bob@example.com")
+            return VerifiedUser(
+                UUID("d7a9cd14-6abd-42c4-b46d-2f5bb82e7231"), "bob@example.com", expiry
+            )
         raise HTTPException(status_code=401, detail="Sign in to continue.")
 
     async def verify_token(self, token: str) -> VerifiedUser:
@@ -34,7 +41,7 @@ def test_verified_accounts_cannot_read_each_others_chats(tmp_path: Path) -> None
     app = create_app(
         Settings(environment="test", data_dir=tmp_path),
         auth_verifier=StubVerifier(),
-        legacy_sqlite_for_tests=True,
+        repository_factory=memory_repository_factory,
     )
 
     with TestClient(app) as client:
@@ -58,7 +65,7 @@ def test_profile_email_is_owned_by_verified_auth_user(tmp_path: Path) -> None:
     app = create_app(
         Settings(environment="test", data_dir=tmp_path),
         auth_verifier=StubVerifier(),
-        legacy_sqlite_for_tests=True,
+        repository_factory=memory_repository_factory,
     )
 
     with TestClient(app) as client:
@@ -79,7 +86,7 @@ def test_onboarding_uses_verified_email_not_submitted_email(tmp_path: Path) -> N
     app = create_app(
         Settings(environment="test", data_dir=tmp_path),
         auth_verifier=StubVerifier(),
-        legacy_sqlite_for_tests=True,
+        repository_factory=memory_repository_factory,
     )
 
     with TestClient(app) as client:

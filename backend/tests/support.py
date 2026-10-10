@@ -6,6 +6,7 @@ invalid credentials. This helper authenticates only tests of other behavior.
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -18,6 +19,7 @@ from app.api.auth import VerifiedUser
 from app.core.config import Settings
 from app.infrastructure.accounts import AccountContext
 from app.main import create_app as production_create_app
+from tests.memory_repository import memory_repository_factory
 
 TEST_USER_ID = UUID("a59673c1-78d0-4bc8-8c49-6bc2e7a01dd5")
 TEST_EMAIL = "alice@example.com"
@@ -28,7 +30,7 @@ class StubVerifier:
     async def verify_bearer(self, authorization: str | None) -> VerifiedUser:
         if authorization != f"Bearer {TEST_TOKEN}":
             raise HTTPException(status_code=401, detail="Sign in to continue.")
-        return VerifiedUser(TEST_USER_ID, TEST_EMAIL)
+        return VerifiedUser(TEST_USER_ID, TEST_EMAIL, datetime.now(UTC) + timedelta(hours=1))
 
     async def verify_token(self, token: str) -> VerifiedUser:
         return await self.verify_bearer(f"Bearer {token}")
@@ -36,7 +38,7 @@ class StubVerifier:
 
 def create_app(*args: Any, **kwargs: Any) -> FastAPI:
     kwargs.setdefault("auth_verifier", StubVerifier())
-    kwargs.setdefault("legacy_sqlite_for_tests", True)
+    kwargs.setdefault("repository_factory", memory_repository_factory)
     return production_create_app(*args, **kwargs)
 
 

@@ -1,6 +1,5 @@
 import asyncio
 import shlex
-import sqlite3
 import sys
 import threading
 from collections.abc import AsyncGenerator
@@ -12,11 +11,11 @@ import pytest
 
 from app.application.tools import ToolRegistry
 from app.core.config import Settings
-from app.domain.models import ProviderName
+from app.domain.models import ModelDescriptor, ProviderName
 from app.domain.runtime import ModelRequest, ModelStreamEvent, ModelToolCall, RunEvent, RunEventType
-from app.infrastructure.database import Database
 from app.infrastructure.local_tools import LocalReadToolExecutor
 from app.infrastructure.runtime_events import RuntimeEventHub
+from tests.memory_repository import MemoryRepository
 from tests.support import TestClient, account_context, create_app
 
 
@@ -775,23 +774,22 @@ def test_custom_model_uses_registered_adapter_without_provider_specific_runtime_
     with TestClient(app) as client:
         client.get("/api/profile")
         database = account_context(app).database
-        assert isinstance(database, Database)
-        with sqlite3.connect(database.path) as connection:
-            connection.execute(
-                """INSERT INTO models(
-                       id, provider_id, provider_name, adapter_kind, upstream_model_id,
-                       name, requires_api_key, supports_streaming, supports_tools, enabled,
-                       created_at, updated_at
-                   ) VALUES (
-                       'weights:v4', 'self-hosted', 'Self hosted', 'openai-compatible',
-                       'weights/model-v4', 'Model v4', 0, 1, 0, 1,
-                       '2026-01-01', '2026-01-01'
-                   )"""
+        assert isinstance(database, MemoryRepository)
+        database.state.models.append(
+            ModelDescriptor(
+                "weights:v4",
+                "self-hosted",
+                "Self hosted",
+                "openai-compatible",
+                "weights/model-v4",
+                "Model v4",
+                False,
+                True,
+                False,
+                True,
             )
-            connection.execute(
-                "UPDATE app_settings SET selected_provider = ?, selected_model_id = ? WHERE id = 1",
-                ("self-hosted", "weights:v4"),
-            )
+        )
+        asyncio.run(database.set_selected_model("weights:v4"))
         session_id = client.post("/api/sessions").json()["id"]
         with client.websocket_connect("/api/runtime") as websocket:
             websocket.send_json(
@@ -846,23 +844,22 @@ def test_unpriced_custom_model_stops_before_a_tool_continuation(tmp_path: Path) 
     with TestClient(app) as client:
         client.get("/api/profile")
         database = account_context(app).database
-        assert isinstance(database, Database)
-        with sqlite3.connect(database.path) as connection:
-            connection.execute(
-                """INSERT INTO models(
-                       id, provider_id, provider_name, adapter_kind, upstream_model_id,
-                       name, requires_api_key, supports_streaming, supports_tools, enabled,
-                       created_at, updated_at
-                   ) VALUES (
-                       'weights:tooling', 'self-hosted', 'Self hosted', 'openai-compatible',
-                       'weights/tooling', 'Tooling', 0, 1, 1, 1,
-                       '2026-01-01', '2026-01-01'
-                   )"""
+        assert isinstance(database, MemoryRepository)
+        database.state.models.append(
+            ModelDescriptor(
+                "weights:tooling",
+                "self-hosted",
+                "Self hosted",
+                "openai-compatible",
+                "weights/tooling",
+                "Tooling",
+                False,
+                True,
+                True,
+                True,
             )
-            connection.execute(
-                "UPDATE app_settings SET selected_provider = ?, selected_model_id = ? WHERE id = 1",
-                ("self-hosted", "weights:tooling"),
-            )
+        )
+        asyncio.run(database.set_selected_model("weights:tooling"))
         session_id = client.post("/api/sessions", json={"workspace_path": str(tmp_path)}).json()[
             "id"
         ]
