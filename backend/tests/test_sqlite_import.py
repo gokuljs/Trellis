@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import threading
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -9,8 +10,9 @@ import pytest
 
 from app.infrastructure import sqlite_import
 from app.infrastructure.accounts import _acquire_account_lock, _prepare_account_directory
-from app.infrastructure.database import Database
 from app.infrastructure.sqlite_import import import_locked_account
+
+PR1_SCHEMA = Path(__file__).parent / "fixtures" / "pr1_v13.sql"
 
 
 class RecordingSink:
@@ -38,7 +40,25 @@ class RecordingSink:
 async def _account(tmp_path: Path, user_id: UUID) -> tuple[Path, int]:
     await asyncio.to_thread(tmp_path.chmod, 0o700)
     account_dir = _prepare_account_directory(tmp_path, user_id)
-    await Database(account_dir / "state.db", owner_id=user_id).initialize()
+    with sqlite3.connect(account_dir / "state.db") as connection:
+        connection.executescript(PR1_SCHEMA.read_text())
+        now = "2026-01-01T00:00:00Z"
+        connection.execute(
+            "INSERT INTO users(id, display_name, email, created_at, updated_at) "
+            "VALUES (?, NULL, NULL, ?, ?)",
+            (str(user_id), now, now),
+        )
+        connection.execute(
+            "INSERT INTO app_settings(id, selected_provider, selected_model_id, updated_at) "
+            "VALUES (1, 'openai', 'openai:gpt-5.5', ?)",
+            (now,),
+        )
+        connection.execute(
+            "INSERT INTO onboarding_progress("
+            "user_id, flow_version, current_step, created_at, updated_at) "
+            "VALUES (?, 1, 'intro', ?, ?)",
+            (str(user_id), now, now),
+        )
     (account_dir / "state.db").chmod(0o600)
     return account_dir, _acquire_account_lock(account_dir)
 
@@ -46,6 +66,66 @@ async def _account(tmp_path: Path, user_id: UUID) -> tuple[Path, int]:
 def _update(path: Path, sql: str, parameters: tuple[object, ...] = ()) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute(sql, parameters)
+
+
+@pytest.mark.anyio
+async def test_import_database_validation_does_not_block_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user_id = uuid4()
+    account_dir, lock_fd = await _account(tmp_path, user_id)
+    validate = sqlite_import._validate_database
+    release = threading.Event()
+
+    def pause_validation(connection: sqlite3.Connection, owner: UUID) -> None:
+        if not release.wait(1):
+            raise RuntimeError("SQLite validation blocked the event loop")
+        validate(connection, owner)
+
+    monkeypatch.setattr(sqlite_import, "_validate_database", pause_validation)
+    asyncio.get_running_loop().call_later(0.05, release.set)
+    try:
+        await import_locked_account(account_dir, user_id, lock_fd, RecordingSink())
+    finally:
+        release.set()
+        os.close(lock_fd)
+
+
+@pytest.mark.anyio
+async def test_cancellation_waits_for_sqlite_read_before_closing_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user_id = uuid4()
+    account_dir, lock_fd = await _account(tmp_path, user_id)
+    validate = sqlite_import._validate_database
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def pause_validation(connection: sqlite3.Connection, owner: UUID) -> None:
+        entered.set()
+        if not release.wait(2):
+            raise RuntimeError("SQLite validation was not released")
+        validate(connection, owner)
+        finished.set()
+
+    monkeypatch.setattr(sqlite_import, "_validate_database", pause_validation)
+    sink = RecordingSink()
+    task = asyncio.create_task(import_locked_account(account_dir, user_id, lock_fd, sink))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finished.is_set()
+        assert sink.batches == []
+        assert not (account_dir / ".supabase-imported.json").exists()
+        with sqlite3.connect(account_dir / "state.db") as connection:
+            assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+    finally:
+        release.set()
+        os.close(lock_fd)
 
 
 @pytest.mark.anyio
