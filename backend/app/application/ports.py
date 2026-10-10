@@ -87,6 +87,12 @@ class WorkspaceBindingPort(Protocol):
     async def resolve(self, session_id: str, workspace_path: str | None) -> Path | None: ...
 
 
+class RunLeasePort(Protocol):
+    def owns_run_lease(self, run_id: str) -> bool: ...
+
+    async def renew_run_lease(self, run_id: str) -> RunSnapshot: ...
+
+
 class RunRepository(Protocol):
     async def create_run(
         self,
