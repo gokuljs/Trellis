@@ -1,7 +1,7 @@
 import { ArrowUpRight, Eye, EyeOff, KeyRound } from "lucide-react"
 import { useEffect, useRef, useState, type ReactNode } from "react"
 
-import { TrellisMark } from "@/components/trellis-mark"
+import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 import { ApiError } from "@/lib/api"
 import type {
   ModelId,

@@ -1,5 +1,5 @@
 import type { WorkspaceView } from "@/lib/app-types"
-import { TrellisMark } from "@/components/trellis-mark"
+import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 import "./welcome-panel.css"
 
 type WelcomePanelProps = {
