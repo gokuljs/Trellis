@@ -10,6 +10,7 @@ import pytest
 from app.application import chat as chat_module
 from app.core.config import Settings
 from app.domain.models import Message, ProviderName
+from app.infrastructure.database import Database
 from app.infrastructure.providers import ProviderError
 from tests.support import TestClient, create_app
 
@@ -255,6 +256,38 @@ def test_classic_turn_times_out_before_its_cloud_claim_expires(
     assert timed_out.json()["error"]["code"] == "provider_timeout"
     assert retry.status_code == 201
     assert retry.json()["assistant_message"]["content"] == "Second reply"
+
+
+def test_classic_turn_deadline_also_bounds_cloud_history_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_list_messages = Database.list_messages
+
+    async def slow_list_messages(database: Database, session_id: str) -> list[Message]:
+        await asyncio.sleep(0.1)
+        return await original_list_messages(database, session_id)
+
+    monkeypatch.setattr(chat_module, "_CLASSIC_TURN_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(Database, "list_messages", slow_list_messages)
+    provider = RecordingProvider(["Recovered reply"])
+    with configured_client(tmp_path, provider) as client:
+        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-local-test"})
+        session_id = client.post("/api/sessions").json()["id"]
+        turn_id = str(uuid4())
+        timed_out = client.post(
+            f"/api/sessions/{session_id}/turns",
+            json={"turn_id": turn_id, "content": "Read history"},
+        )
+        monkeypatch.setattr(Database, "list_messages", original_list_messages)
+        retry = client.post(
+            f"/api/sessions/{session_id}/turns",
+            json={"turn_id": turn_id, "content": "Read history"},
+        )
+
+    assert timed_out.status_code == 504
+    assert timed_out.json()["error"]["code"] == "provider_timeout"
+    assert retry.status_code == 201
+    assert provider.calls[0]["history"] == [("user", "Read history")]
 
 
 def test_first_message_title_is_normalized_and_capped_at_eighty_characters(
