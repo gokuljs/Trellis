@@ -2,6 +2,7 @@
 
 Whenever a new Codex task is opened in this workspace, set its task title to exactly `Trellis` before doing other work.
 https://github.com/gokuljs
+
 # Repository guidance
 
 This repository contains the Trellis frontend and backend. Keep changes scoped
@@ -19,6 +20,21 @@ there.
 - Preserve Trellis's existing visual system unless a redesign is requested.
   Use Impeccable's layout workflow to improve spacing and rhythm; do not reduce
   padding indiscriminately or make the interface cramped.
+
+## SVG icon ownership and reuse
+
+- Store every custom SVG icon definition in `frontend/packages/ui/src/icons/`,
+  including SVG React components and any standalone SVG icon files. Keep icon
+  styles and supporting assets in that same folder.
+- Before creating or changing an icon, check that folder for an existing icon
+  to reuse. Use component props for size, color, and other supported variants;
+  do not copy SVG markup or create duplicate icons in feature components.
+- Export and import shared icon components through `@trellis/ui/icons/<name>`.
+  Custom `<svg>` definitions must not appear outside the shared icon folder;
+  the frontend ESLint configurations enforce this for JSX.
+- Keep shared icons independent of app-specific imports. Use relative imports
+  for their supporting assets. Existing third-party `lucide-react` icons may
+  continue to be imported directly.
 
 ## Backend architecture boundaries
 
