@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import threading
+from contextlib import closing
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -40,7 +41,7 @@ class RecordingSink:
 async def _account(tmp_path: Path, user_id: UUID) -> tuple[Path, int]:
     await asyncio.to_thread(tmp_path.chmod, 0o700)
     account_dir = _prepare_account_directory(tmp_path, user_id)
-    with sqlite3.connect(account_dir / "state.db") as connection:
+    with closing(sqlite3.connect(account_dir / "state.db")) as connection, connection:
         connection.executescript(PR1_SCHEMA.read_text())
         now = "2026-01-01T00:00:00Z"
         connection.execute(
@@ -64,7 +65,7 @@ async def _account(tmp_path: Path, user_id: UUID) -> tuple[Path, int]:
 
 
 def _update(path: Path, sql: str, parameters: tuple[object, ...] = ()) -> None:
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute(sql, parameters)
 
 
@@ -121,7 +122,7 @@ async def test_cancellation_waits_for_sqlite_read_before_closing_source(
         assert finished.is_set()
         assert sink.batches == []
         assert not (account_dir / ".supabase-imported.json").exists()
-        with sqlite3.connect(account_dir / "state.db") as connection:
+        with closing(sqlite3.connect(account_dir / "state.db")) as connection, connection:
             assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
     finally:
         release.set()
@@ -434,7 +435,7 @@ async def test_imports_active_run_as_interrupted_without_changing_backup(tmp_pat
         ]
         assert batches["run_events"][-1]["event_type"] == "run.interrupted"
         assert batches["run_events"][-1]["sequence"] == 2
-        with sqlite3.connect(state) as connection:
+        with closing(sqlite3.connect(state)) as connection, connection:
             assert connection.execute("SELECT status, lease_token FROM runs").fetchone() == (
                 "queued",
                 "local-secret-lease",
@@ -448,7 +449,7 @@ async def test_limits_import_batches_to_one_hundred_rows(tmp_path: Path) -> None
     user_id = uuid4()
     account_dir, lock_fd = await _account(tmp_path, user_id)
     state = account_dir / "state.db"
-    with sqlite3.connect(state) as connection:
+    with closing(sqlite3.connect(state)) as connection, connection:
         connection.executemany(
             "INSERT INTO sessions(id,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)",
             ((str(uuid4()), str(user_id), "Chat", "2026-01-01", "2026-01-01") for _ in range(101)),
@@ -469,7 +470,7 @@ async def test_imports_pending_approval_as_cancelled_tool_result(tmp_path: Path)
     state = account_dir / "state.db"
     chat_id, input_id, run_id, model_call_id, assistant_id, tool_id = (uuid4() for _ in range(6))
     now = "2026-01-01T00:00:00Z"
-    with sqlite3.connect(state) as connection:
+    with closing(sqlite3.connect(state)) as connection, connection:
         connection.execute(
             "INSERT INTO sessions(id,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)",
             (str(chat_id), str(user_id), "Approval", now, now),
@@ -593,7 +594,7 @@ async def test_imports_large_but_valid_visible_message(tmp_path: Path) -> None:
     state = account_dir / "state.db"
     chat_id, message_id = uuid4(), uuid4()
     now = "2026-01-01T00:00:00Z"
-    with sqlite3.connect(state) as connection:
+    with closing(sqlite3.connect(state)) as connection, connection:
         connection.execute(
             "INSERT INTO sessions(id,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)",
             (str(chat_id), str(user_id), "Large", now, now),
@@ -619,7 +620,7 @@ async def test_rejects_oversized_row_before_any_cloud_write(tmp_path: Path) -> N
     state = account_dir / "state.db"
     chat_id, message_id = uuid4(), uuid4()
     now = "2026-01-01T00:00:00Z"
-    with sqlite3.connect(state) as connection:
+    with closing(sqlite3.connect(state)) as connection, connection:
         connection.execute(
             "INSERT INTO sessions(id,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)",
             (str(chat_id), str(user_id), "Large", now, now),
