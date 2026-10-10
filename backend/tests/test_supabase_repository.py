@@ -313,6 +313,7 @@ def test_settings_and_conversation_reads_map_cloud_rows() -> None:
         "workspace_path": None,
         "created_at": "2026-10-10T10:00:00+00:00",
         "updated_at": "2026-10-10T10:00:00+00:00",
+        "message_count": 1,
     }
     message_row = {
         "id": "8875fe53-9716-41c6-95a7-83c3c87202c1",
@@ -330,8 +331,6 @@ def test_settings_and_conversation_reads_map_cloud_rows() -> None:
 
     def respond(request: httpx.Request) -> httpx.Response:
         calls.append(request)
-        if request.method == "HEAD":
-            return httpx.Response(200, headers={"Content-Range": "0-0/1"})
         rows: dict[str, object] = {
             "/rest/v1/user_settings": [settings_row],
             "/rest/v1/models": [
@@ -349,7 +348,7 @@ def test_settings_and_conversation_reads_map_cloud_rows() -> None:
                 }
             ],
             "/rest/v1/onboarding_progress": [{"user_id": str(ALICE), "current_step": "profile"}],
-            "/rest/v1/chats": [chat_row],
+            "/rest/v1/rpc/list_chat_summaries": [chat_row],
             "/rest/v1/messages": [message_row],
         }
         return httpx.Response(200, json=rows[request.url.path])
@@ -369,14 +368,23 @@ def test_settings_and_conversation_reads_map_cloud_rows() -> None:
             assert (await repository.get_turn_messages(chat_id, "turn-one"))[0].content == "Hello"
 
     asyncio.run(exercise())
-    assert all(request.headers["Accept-Profile"] == "trellis" for request in calls)
     assert all(
-        request.headers["Prefer"] == "count=exact" for request in calls if request.method == "HEAD"
+        request.headers["Accept-Profile"] == "trellis"
+        for request in calls
+        if request.method == "GET"
     )
+    summary_calls = [
+        request for request in calls if request.url.path == "/rest/v1/rpc/list_chat_summaries"
+    ]
+    assert [json.loads(request.content) for request in summary_calls] == [
+        {},
+        {"p_chat_id": chat_id},
+    ]
+    assert all(request.headers["Content-Profile"] == "trellis" for request in summary_calls)
     assert all(
         request.url.params.get("user_id") == f"eq.{ALICE}"
         for request in calls
-        if request.url.path not in {"/rest/v1/models"}
+        if request.method == "GET" and request.url.path not in {"/rest/v1/models"}
     )
 
 
@@ -533,8 +541,6 @@ def test_session_mutations_return_chat_with_message_count() -> None:
         requests.append(request)
         if request.url.path == "/rest/v1/rpc/mutate":
             return httpx.Response(200, json={"id": chat_id, "user_id": str(ALICE)})
-        if request.method == "HEAD":
-            return httpx.Response(200, headers={"Content-Range": "*/0"})
         return httpx.Response(
             200,
             json=[
@@ -545,6 +551,7 @@ def test_session_mutations_return_chat_with_message_count() -> None:
                     "workspace_path": "/home/alice/project",
                     "created_at": "2026-10-10T10:00:00+00:00",
                     "updated_at": "2026-10-10T10:00:00+00:00",
+                    "message_count": 0,
                 }
             ],
         )
@@ -560,12 +567,89 @@ def test_session_mutations_return_chat_with_message_count() -> None:
     asyncio.run(exercise())
     assert [request.method for request in requests] == [
         "POST",
-        "GET",
-        "HEAD",
         "POST",
-        "GET",
-        "HEAD",
+        "POST",
+        "POST",
     ]
+    assert [request.url.path for request in requests] == [
+        "/rest/v1/rpc/mutate",
+        "/rest/v1/rpc/list_chat_summaries",
+        "/rest/v1/rpc/mutate",
+        "/rest/v1/rpc/list_chat_summaries",
+    ]
+
+
+def test_chat_listing_loads_counts_in_one_owned_rpc() -> None:
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": f"5f2b6daa-65db-43ad-b0ad-742e5c3645b{index:01d}",
+                    "user_id": str(ALICE),
+                    "title": f"Chat {index}",
+                    "workspace_path": None,
+                    "created_at": "2026-10-10T10:00:00+00:00",
+                    "updated_at": "2026-10-10T10:00:00+00:00",
+                    "message_count": index,
+                }
+                for index in range(5)
+            ],
+        )
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            sessions = await repository.list_sessions()
+            assert [session.message_count for session in sessions] == list(range(5))
+
+    asyncio.run(exercise())
+    assert len(requests) == 1
+    assert requests[0].url.path == "/rest/v1/rpc/list_chat_summaries"
+    assert json.loads(requests[0].content) == {}
+    assert requests[0].url.params["order"] == "updated_at.desc,id.desc"
+
+
+def test_chat_listing_pages_summary_rpc_without_per_chat_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.infrastructure.supabase_repository._READ_PAGE_SIZE", 2)
+    offsets: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/rest/v1/rpc/list_chat_summaries"
+        assert request.url.params["limit"] == "2"
+        assert request.url.params["order"] == "updated_at.desc,id.desc"
+        offset = int(request.url.params["offset"])
+        offsets.append(str(offset))
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": f"5f2b6daa-65db-43ad-b0ad-742e5c3645b{index:01d}",
+                    "user_id": str(ALICE),
+                    "title": f"Chat {index}",
+                    "workspace_path": None,
+                    "created_at": "2026-10-10T10:00:00+00:00",
+                    "updated_at": "2026-10-10T10:00:00+00:00",
+                    "message_count": index,
+                }
+                for index in range(offset, min(offset + 2, 5))
+            ],
+        )
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            assert [chat.message_count for chat in await repository.list_sessions()] == list(
+                range(5)
+            )
+
+    asyncio.run(exercise())
+    assert offsets == ["0", "2", "4"]
 
 
 def test_run_start_requires_token_valid_through_selected_budget() -> None:

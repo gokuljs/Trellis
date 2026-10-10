@@ -143,8 +143,6 @@ def test_repository_rejects_invalid_message_count() -> None:
     chat_id = "5f2b6daa-65db-43ad-b0ad-742e5c3645b9"
 
     def respond(request: httpx.Request) -> httpx.Response:
-        if request.method == "HEAD":
-            return httpx.Response(200, headers={"Content-Range": "*/unknown"})
         return httpx.Response(
             200,
             json=[
@@ -155,6 +153,7 @@ def test_repository_rejects_invalid_message_count() -> None:
                     "workspace_path": None,
                     "created_at": "2026-10-10T10:00:00+00:00",
                     "updated_at": "2026-10-10T10:00:00+00:00",
+                    "message_count": "unknown",
                 }
             ],
         )
@@ -164,6 +163,32 @@ def test_repository_rejects_invalid_message_count() -> None:
             repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
             with pytest.raises(RuntimeError, match="invalid message count"):
                 await repository.get_session(chat_id)
+
+    asyncio.run(exercise())
+
+
+def test_repository_rejects_another_accounts_chat_summary() -> None:
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "5f2b6daa-65db-43ad-b0ad-742e5c3645b9",
+                    "user_id": str(BOB),
+                    "title": "Bob's chat",
+                    "workspace_path": None,
+                    "created_at": "2026-10-10T10:00:00+00:00",
+                    "updated_at": "2026-10-10T10:00:00+00:00",
+                    "message_count": 1,
+                }
+            ],
+        )
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            with pytest.raises(RuntimeError, match="another account"):
+                await repository.list_sessions()
 
     asyncio.run(exercise())
 

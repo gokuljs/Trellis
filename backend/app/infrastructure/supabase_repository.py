@@ -175,7 +175,6 @@ class SupabaseRepository:
         *,
         params: dict[str, str] | None = None,
         payload: dict[str, object] | None = None,
-        count_exact: bool = False,
     ) -> httpx.Response:
         token = self._token_source.get_token()
         headers = {
@@ -187,8 +186,6 @@ class SupabaseRepository:
             headers["Accept-Profile"] = "trellis"
         else:
             headers["Content-Profile"] = "trellis"
-        if count_exact:
-            headers["Prefer"] = "count=exact"
         try:
             response = await self._client.request(
                 method,
@@ -418,8 +415,15 @@ class SupabaseRepository:
             raise ValueError("Unknown run budget")
         await self._rpc("set_default_budget_preset", {"preset": preset})
 
-    def _session(self, row: dict[str, object], message_count: int) -> Session:
+    def _session(self, row: dict[str, object]) -> Session:
         self._owned(row)
+        message_count = row.get("message_count")
+        if (
+            isinstance(message_count, bool)
+            or not isinstance(message_count, int)
+            or message_count < 0
+        ):
+            raise RuntimeError("Supabase returned an invalid message count")
         return Session(
             id=_text(row, "id"),
             user_id=_text(row, "user_id"),
@@ -430,32 +434,26 @@ class SupabaseRepository:
             message_count=message_count,
         )
 
-    async def _count_messages(self, chat_id: str) -> int:
-        response = await self._send(
-            "HEAD",
-            "messages",
-            params={
-                "select": "id",
-                "user_id": f"eq.{self._user_id}",
-                "chat_id": f"eq.{chat_id}",
-            },
-            count_exact=True,
-        )
-        count = response.headers.get("Content-Range", "").rsplit("/", 1)[-1]
-        if not count.isdigit():
-            raise RuntimeError("Supabase returned an invalid message count")
-        return int(count)
-
-    async def _sessions(self, filters: dict[str, str]) -> list[Session]:
-        rows = await self._read(
-            "chats",
-            select="id,user_id,title,workspace_path,created_at,updated_at",
-            filters={"user_id": f"eq.{self._user_id}", **filters},
-        )
-        return [self._session(row, await self._count_messages(_text(row, "id"))) for row in rows]
-
     async def list_sessions(self) -> list[Session]:
-        return await self._sessions({"order": "updated_at.desc,id.desc"})
+        sessions: list[Session] = []
+        offset = 0
+        while True:
+            rows = _array(
+                await self._request(
+                    "POST",
+                    "rpc/list_chat_summaries",
+                    params={
+                        "limit": str(_READ_PAGE_SIZE),
+                        "offset": str(offset),
+                        "order": "updated_at.desc,id.desc",
+                    },
+                    payload={},
+                )
+            )
+            sessions.extend(self._session(row) for row in rows)
+            if len(rows) < _READ_PAGE_SIZE:
+                return sessions
+            offset += len(rows)
 
     async def create_session(self, workspace_path: str | None = None) -> Session:
         result = self._owned(
@@ -478,8 +476,15 @@ class SupabaseRepository:
         return await self.get_session(session_id)
 
     async def get_session(self, session_id: str) -> Session | None:
-        rows = await self._sessions({"id": f"eq.{session_id}", "limit": "1"})
-        return rows[0] if rows else None
+        rows = _array(
+            await self._request(
+                "POST",
+                "rpc/list_chat_summaries",
+                params={"limit": "1"},
+                payload={"p_chat_id": session_id},
+            )
+        )
+        return self._session(rows[0]) if rows else None
 
     def _message(self, row: dict[str, object]) -> Message:
         self._owned(row)

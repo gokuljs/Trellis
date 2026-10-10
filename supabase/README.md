@@ -9,10 +9,10 @@ token.
 
 `auth.users` remains Supabase-managed, including its `created_at` and
 `updated_at` columns. `trellis.ensure_account()` creates the matching profile,
-settings and onboarding rows for a new account. The account-scoped SQLite
-import runs before `ensure_account()` for existing users, so default rows do
-not conflict with historical account data. The older global SQLite database
-is never imported.
+settings and onboarding rows for a new account. A second computer may create
+these defaults before the old computer imports its account-scoped SQLite file.
+Import replaces only untouched generated defaults; cloud edits take
+precedence. The older global SQLite database is never imported.
 
 Authenticated users can read only their own rows through RLS. Models are
 read-only. No role using a publishable key can write tables directly. The
@@ -24,23 +24,42 @@ expire after 60 seconds unless the owning backend renews them. An expired
 active run can be marked interrupted and its event appended atomically; it
 cannot be resumed on another computer.
 
-`trellis.import_snapshot()` accepts additive batches of up to 100 rows and
-8 MiB. It records source row hashes in a private ledger so retries do not
-overwrite cloud changes. Imported runs, model calls and tool calls must be
-terminal, with no run lease or pending approval. This import RPC is intended
-only for the PR1 per-user SQLite snapshot and does not import provider keys,
-test-command presets, or the older shared SQLite file.
+Classic chat turns use a separate local capability for their claim, message
+writes, and release. Only its SHA-256 digest is stored in `turn_claims`; the
+authenticated role cannot select that column. Claims expire after five minutes.
+
+`trellis.list_chat_summaries(p_chat_id)` returns owned chats with visible
+message counts in one read request. Omit `p_chat_id` to list all chats; supply
+it to load one chat. The function runs with the caller's grants and RLS.
+
+`trellis.import_snapshot(p_snapshot, p_capability)` accepts additive batches of
+up to 100 rows and 8 MiB. Its first nonempty profile batch starts the import.
+The importer keeps a random capability in a private local file and sends it on
+every batch and to `trellis.seal_import(p_capability)`. Supabase stores only its
+SHA-256 digest. The private source-row ledger makes exact retries safe; after
+sealing, no new rows can be imported. Ordinary account mutations are blocked
+between the first batch and seal. Import cannot start while a cloud run or
+classic chat turn is active. Accounts without a local PR1 database stay
+unsealed so the old computer can import later.
+
+Imported runs, model calls and tool calls must be terminal, with no run lease
+or pending approval. Imported run events must be contiguous through the run's
+last event and end with the matching terminal event. Import cannot append to a
+live cloud run or chat. The source remains untouched as a backup; if it goes
+missing during a partial import, restore it before retrying. Provider keys,
+test-command presets and the older shared SQLite file are excluded.
 
 ## Local SQL checks
 
 The test fixture `tests/local_bootstrap.sql` supplies only a mock `auth.users`,
 `auth.uid()` and the `anon`/`authenticated` roles for a fresh local PostgreSQL
 database. **Never apply that fixture to a hosted Supabase project.** Apply the
-three migrations to that local database, then run `tests/schema_contract.sql`,
-`tests/rpc_security.sql`, `tests/runtime_rpc.sql` and
-`tests/import_security.sql` with `psql -v ON_ERROR_STOP=1 -f ...` in that
-order. The tests use fixed local-only UUIDs and must run on a disposable
-database.
+five migrations to that local database, then run `tests/schema_contract.sql`,
+`tests/rpc_security.sql`, `tests/runtime_rpc.sql`,
+`tests/import_security.sql`, `tests/import_hardening.sql` and
+`tests/chat_summaries.sql` with
+`psql -v ON_ERROR_STOP=1 -f ...` in that order. The tests use fixed local-only
+UUIDs and must run on a disposable database.
 
 Hosted verification still requires applying the migrations to the chosen
 project, exposing `trellis`, and testing with two actual Supabase accounts.
