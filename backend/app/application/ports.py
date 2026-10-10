@@ -92,6 +92,8 @@ class RunLeasePort(Protocol):
 
     async def renew_run_lease(self, run_id: str) -> RunSnapshot: ...
 
+    async def recover_expired_run(self, run_id: str) -> RunSnapshot: ...
+
 
 class RunRepository(Protocol):
     async def create_run(

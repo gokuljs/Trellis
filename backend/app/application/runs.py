@@ -285,12 +285,36 @@ class RunService:
                 await finalizer
 
     async def get_run(self, run_id: str) -> RunSnapshot | None:
-        return await self._runs.get_run(run_id)
+        return await self._recover_if_expired(await self._runs.get_run(run_id))
+
+    async def _recover_if_expired(self, run: RunSnapshot | None) -> RunSnapshot | None:
+        if self._lease_repository is None or run is None or is_terminal_run_status(run.status):
+            return run
+        if run.lease_expires_at is None:
+            return run
+        try:
+            expiry = datetime.fromisoformat(run.lease_expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            raise RuntimeError("Cloud run has an invalid lease expiry") from None
+        if expiry.tzinfo is None:
+            raise RuntimeError("Cloud run has an invalid lease expiry")
+        if expiry > datetime.now(UTC):
+            return run
+        return await self._lease_repository.recover_expired_run(run.id)
+
+    async def _require_local_control(self, run_id: str) -> None:
+        if self._lease_repository is None or self._can_execute(run_id):
+            return
+        if await self._runs.get_run(run_id) is None:
+            raise ApplicationError("run_not_found", "Run not found.")
+        raise ApplicationError("run_not_owned", "This run is active on another computer.")
 
     async def get_latest_run_for_session(self, session_id: str) -> RunSnapshot | None:
         if await self._sessions.get_session(session_id) is None:
             raise ApplicationError("session_not_found", "Session not found.")
-        return await self._runs.get_latest_run_for_session(session_id)
+        return await self._recover_if_expired(
+            await self._runs.get_latest_run_for_session(session_id)
+        )
 
     async def list_session_runs(
         self, session_id: str, offset: int, limit: int
@@ -298,7 +322,10 @@ class RunService:
         if await self._sessions.get_session(session_id) is None:
             raise ApplicationError("session_not_found", "Session not found.")
         runs = await self._runs.list_runs_for_session(session_id, offset, limit + 1)
-        return runs[:limit], offset + limit if len(runs) > limit else None
+        visible = [await self._recover_if_expired(run) for run in runs[:limit]]
+        return [run for run in visible if run is not None], offset + limit if len(
+            runs
+        ) > limit else None
 
     async def list_session_run_events(
         self, session_id: str, run_id: str, after_sequence: int, limit: int
@@ -323,6 +350,7 @@ class RunService:
         return await self._runs.list_run_events(run_id, after_sequence, limit=limit)
 
     async def cancel_run(self, run_id: str) -> RunSnapshot:
+        await self._require_local_control(run_id)
         try:
             run, event = await self._runs.request_run_cancellation(run_id)
         except ValueError as error:
@@ -376,6 +404,8 @@ class RunService:
 
     async def _finalize_cancelled_task(self, run_id: str, task: asyncio.Task[None]) -> None:
         await asyncio.gather(task, return_exceptions=True)
+        if not self._can_execute(run_id):
+            return
         current = await self._runs.get_run(run_id)
         if current is not None and current.status is RunStatus.CANCELLING:
             await self._mark_cancelled(run_id, None)
@@ -392,6 +422,7 @@ class RunService:
     ) -> tuple[RunSnapshot, ToolCallRecord]:
         if self._closing:
             raise ApplicationError("runtime_shutting_down", "The runtime is shutting down.")
+        await self._require_local_control(run_id)
         try:
             tool_call, event = await self._runs.record_tool_approval_decision(
                 run_id, tool_call_id, decision

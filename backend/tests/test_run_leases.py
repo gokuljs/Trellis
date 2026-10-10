@@ -1,7 +1,12 @@
 import asyncio
 from collections.abc import AsyncGenerator
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
+from app.application.errors import ApplicationError
 from app.application.runs import RunService
 from app.application.tools import ToolRegistry
 from app.domain.runtime import (
@@ -10,6 +15,7 @@ from app.domain.runtime import (
     ModelToolCall,
     RunSnapshot,
     RunStatus,
+    ToolApprovalDecision,
 )
 from app.infrastructure.database import Database
 from app.infrastructure.secrets import SecretStore
@@ -44,6 +50,11 @@ class LeaseDatabase(Database):
         run = await self.get_run(run_id)
         assert run is not None
         return run
+
+    async def recover_expired_run(self, run_id: str) -> RunSnapshot:
+        run = await self.get_run(run_id)
+        assert run is not None
+        return replace(run, status=RunStatus.INTERRUPTED)
 
 
 class BlockingProvider:
@@ -126,6 +137,87 @@ def test_foreign_queued_run_is_never_scheduled_locally(tmp_path: Path) -> None:
             assert created.status is RunStatus.QUEUED
             assert not provider.started.is_set()
             assert database.renewals == 0
+        finally:
+            await service.close()
+
+    asyncio.run(exercise())
+
+
+def test_foreign_run_cannot_be_cancelled_or_approved_locally(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        database = LeaseDatabase(tmp_path / "state.db", owns_created_run=False)
+        await database.initialize()
+        session = await database.create_session()
+        secrets = SecretStore(tmp_path / ".env")
+        await secrets.set("openai", "sk-test")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secrets,
+            {"openai": BlockingProvider()},
+            lease_repository=database,
+        )
+        try:
+            run = await service.create_run(session.id, "request", "Hello")
+            with pytest.raises(ApplicationError) as cancel:
+                await service.cancel_run(run.id)
+            assert cancel.value.code == "run_not_owned"
+            with pytest.raises(ApplicationError) as approve:
+                await service.respond_to_tool_approval(
+                    run.id, "tool", ToolApprovalDecision.APPROVED
+                )
+            assert approve.value.code == "run_not_owned"
+            persisted = await database.get_run(run.id)
+            assert persisted is not None and persisted.status is RunStatus.QUEUED
+        finally:
+            await service.close()
+
+    asyncio.run(exercise())
+
+
+def test_expired_foreign_run_recovers_on_read(tmp_path: Path) -> None:
+    class ExpiredDatabase(LeaseDatabase):
+        recoveries = 0
+
+        async def get_run(self, run_id: str) -> RunSnapshot | None:
+            run = await super().get_run(run_id)
+            return (
+                replace(
+                    run,
+                    lease_expires_at=(datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+                )
+                if run is not None
+                else None
+            )
+
+        async def recover_expired_run(self, run_id: str) -> RunSnapshot:
+            self.recoveries += 1
+            run = await self.get_run(run_id)
+            assert run is not None
+            return replace(run, status=RunStatus.INTERRUPTED)
+
+    async def exercise() -> None:
+        database = ExpiredDatabase(tmp_path / "state.db", owns_created_run=False)
+        await database.initialize()
+        session = await database.create_session()
+        secrets = SecretStore(tmp_path / ".env")
+        await secrets.set("openai", "sk-test")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secrets,
+            {"openai": BlockingProvider()},
+            lease_repository=database,
+        )
+        try:
+            created = await service.create_run(session.id, "request", "Hello")
+            observed = await service.get_run(created.id)
+            assert observed is not None and observed.status is RunStatus.INTERRUPTED
+            assert database.recoveries == 1
         finally:
             await service.close()
 
