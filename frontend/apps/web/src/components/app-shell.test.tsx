@@ -306,6 +306,43 @@ afterEach(() => {
 })
 
 describe("local-first chat", () => {
+  it("shows the persisted account name and confirmed setup in the real workspace", async () => {
+    let savedProfile = profile
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url, init) => {
+        if (url === "/api/profile" && init?.method === "PUT") {
+          savedProfile = { ...profile, display_name: "Ada Lovelace" }
+          return response(savedProfile)
+        }
+        if (url === "/api/profile") return response(savedProfile)
+        return undefined
+      })
+    )
+    render(
+      <ThemeProvider defaultTheme="dark">
+        <AppShell
+          accountControl={(saved) => (
+            <span>Signed in as {saved?.display_name ?? "Loading"}</span>
+          )}
+        />
+      </ThemeProvider>
+    )
+    expect(await screen.findByText("Signed in as Ada")).toBeInTheDocument()
+    await userEvent.click(screen.getByRole("button", { name: "Settings" }))
+    const setup = screen.getByRole("region", { name: "Saved setup" })
+    expect(within(setup).getByText("Complete")).toBeInTheDocument()
+    const name = screen.getByRole("textbox", { name: "Display name" })
+    await userEvent.clear(name)
+    await userEvent.type(name, "Ada Lovelace")
+    expect(within(setup).getByText("Ada")).toBeInTheDocument()
+    await userEvent.click(screen.getByRole("button", { name: "Save profile" }))
+    expect(
+      await screen.findByText("Signed in as Ada Lovelace")
+    ).toBeInTheDocument()
+    expect(within(setup).getByText("Ada Lovelace")).toBeInTheDocument()
+  })
+
   it("does not reopen a workspace after completion unmounts its account shell", async () => {
     const reads: string[] = []
     vi.stubGlobal(

@@ -2,12 +2,19 @@ import { Check, Eye, EyeOff, KeyRound, Sparkles, Trash2 } from "lucide-react"
 import { useState } from "react"
 
 import { ApiError, api } from "@/lib/api"
-import type { ModelStatus, Profile, Settings } from "@/lib/app-types"
+import type {
+  ModelStatus,
+  OnboardingState,
+  Profile,
+  Settings,
+} from "@/lib/app-types"
 import { notifications } from "@/lib/notifications"
+import "./profile-summary.css"
 
 type SettingsPageProps = {
   profile: Profile
   settings: Settings
+  onboarding?: OnboardingState
   onProfileChange: (profile: Profile) => void
   onSettingsChange: (settings: Settings) => void
 }
@@ -21,6 +28,7 @@ function errorMessage(error: unknown) {
 export function SettingsPage({
   profile,
   settings,
+  onboarding,
   onProfileChange,
   onSettingsChange,
 }: SettingsPageProps) {
@@ -53,6 +61,18 @@ export function SettingsPage({
     selectedProviderStatus?.configured ?? selectedModel?.configured ?? false
   const credentialHint =
     selectedProviderStatus?.key_hint ?? selectedModel?.key_hint
+  const setupStatus = onboarding
+    ? onboarding.completed
+      ? "Complete"
+      : "In progress"
+    : "Setup status unavailable"
+  const localKeyStatus = !selectedModel
+    ? "Select an available model to check its key"
+    : !selectedModel.requires_api_key
+      ? "Not required"
+      : credentialConfigured
+        ? `Configured on this computer${credentialHint ? ` · ${credentialHint}` : ""}`
+        : "Not configured on this computer"
 
   const runUpdate = async (
     label: string,
@@ -95,8 +115,6 @@ export function SettingsPage({
     )
   }
 
-  if (!selectedModel) return null
-
   return (
     <div className="settings-page">
       <h1 className="sr-only">Settings</h1>
@@ -117,6 +135,38 @@ export function SettingsPage({
           </div>
 
           <div className="settings-form-grid">
+            <section
+              className="profile-setup-summary"
+              aria-labelledby="saved-setup-heading"
+            >
+              <h3 id="saved-setup-heading">Saved setup</h3>
+              <dl>
+                <div>
+                  <dt>Name</dt>
+                  <dd>{profile.display_name?.trim() || "Not set"}</dd>
+                </div>
+                <div>
+                  <dt>Email</dt>
+                  <dd>{profile.email || "Not available"}</dd>
+                </div>
+                <div>
+                  <dt>Onboarding</dt>
+                  <dd>{setupStatus}</dd>
+                </div>
+                <div>
+                  <dt>Selected model</dt>
+                  <dd>
+                    {selectedModel
+                      ? `${selectedModel.provider_name} · ${selectedModel.name}`
+                      : "Selected model unavailable"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Local API key</dt>
+                  <dd>{localKeyStatus}</dd>
+                </div>
+              </dl>
+            </section>
             <label className="settings-field">
               <span className="settings-field-label">Display name</span>
               <span className="settings-input-wrap">
@@ -195,6 +245,11 @@ export function SettingsPage({
             role="radiogroup"
             aria-label="Available models"
           >
+            {!selectedModel ? (
+              <p className="settings-field-help">
+                Choose an available model to use for new turns.
+              </p>
+            ) : null}
             {models.map((item) => {
               const isSelected = item.id === selectedModelId
               return (
@@ -270,7 +325,7 @@ export function SettingsPage({
           </label>
         </section>
 
-        {selectedModel.requires_api_key ? (
+        {selectedModel?.requires_api_key ? (
           <section
             className="settings-section"
             aria-labelledby="api-key-heading"

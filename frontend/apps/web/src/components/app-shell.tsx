@@ -194,7 +194,9 @@ function startNextAttempt(previous?: TurnRunActivity): TurnRunActivity {
 
 export function AppShell({
   accountControl,
-}: { accountControl?: ReactNode } = {}) {
+}: {
+  accountControl?: ReactNode | ((profile: Profile | null) => ReactNode)
+} = {}) {
   const [activeView, setActiveView] = useState<WorkspaceView>("New session")
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
@@ -1191,15 +1193,20 @@ export function AppShell({
     }
   }
 
+  const renderedAccountControl =
+    typeof accountControl === "function"
+      ? accountControl(profile)
+      : accountControl
+
   if (bootstrap.status === "loading" || bootstrap.status === "failed") {
     return (
       <main
         className="onboarding-shell onboarding-loading-shell"
         data-theme="dark"
       >
-        {accountControl && (
+        {renderedAccountControl && (
           <header className="onboarding-topbar onboarding-account-loading">
-            {accountControl}
+            {renderedAccountControl}
           </header>
         )}
         {bootstrap.status === "failed" ? (
@@ -1234,7 +1241,7 @@ export function AppShell({
   if (bootstrap.status === "onboarding" && profile && settings) {
     return (
       <OnboardingFlow
-        accountControl={accountControl}
+        accountControl={renderedAccountControl}
         profile={profile}
         settings={settings}
         initialStep={
@@ -1284,7 +1291,7 @@ export function AppShell({
 
       <section className="workspace">
         <WorkspaceTopbar
-          accountControl={accountControl}
+          accountControl={renderedAccountControl}
           activeView={activeView}
           activeSessionTitle={activeSession?.title ?? null}
           onNavigate={handleNavigate}
@@ -1297,6 +1304,9 @@ export function AppShell({
             <SettingsPage
               profile={profile}
               settings={settings}
+              onboarding={
+                bootstrap.status === "ready" ? bootstrap.progress : undefined
+              }
               onProfileChange={setProfile}
               onSettingsChange={setSettings}
             />

@@ -1,10 +1,11 @@
 import { ChevronDown, LogOut, UserRound } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
 
+import type { Profile } from "@/lib/app-types"
 import { useAuth } from "@/lib/use-auth"
 import "./account-control.css"
 
-export function AccountControl() {
+export function AccountControl({ profile }: { profile?: Profile | null }) {
   const auth = useAuth()
   const menuRef = useRef<HTMLDetailsElement>(null)
   const [busy, setBusy] = useState(false)
@@ -39,6 +40,7 @@ export function AccountControl() {
 
   const metadata = auth.user.user_metadata
   const name = [
+    profile?.display_name,
     metadata?.full_name,
     metadata?.name,
     metadata?.user_name,

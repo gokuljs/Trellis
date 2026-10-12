@@ -7,7 +7,9 @@ export function App() {
   return (
     <>
       <AuthGate>
-        <AppShell accountControl={<AccountControl />} />
+        <AppShell
+          accountControl={(profile) => <AccountControl profile={profile} />}
+        />
       </AuthGate>
       <GlobalToaster />
     </>
