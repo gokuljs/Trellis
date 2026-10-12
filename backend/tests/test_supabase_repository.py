@@ -107,51 +107,6 @@ def test_verified_token_source_keeps_freshest_same_account_session() -> None:
     assert source.valid_for(30 * 60)
 
 
-def test_import_seal_uses_authenticated_rpc() -> None:
-    captured: list[httpx.Request] = []
-
-    def respond(request: httpx.Request) -> httpx.Response:
-        captured.append(request)
-        return httpx.Response(200, json={"sealed": True})
-
-    async def exercise() -> None:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
-            await repository.seal_import("private-import-capability-with-forty-characters")
-
-    asyncio.run(exercise())
-    assert len(captured) == 1
-    assert captured[0].url.path == "/rest/v1/rpc/seal_import"
-    assert captured[0].headers["Authorization"] == "Bearer alice-token"
-    assert captured[0].headers["Content-Profile"] == "trellis"
-    assert json.loads(captured[0].content) == {
-        "p_capability": "private-import-capability-with-forty-characters"
-    }
-
-
-def test_import_batch_sends_private_capability_with_rows() -> None:
-    captured: list[httpx.Request] = []
-
-    def respond(request: httpx.Request) -> httpx.Response:
-        captured.append(request)
-        return httpx.Response(200, json={"inserted": 1})
-
-    async def exercise() -> None:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
-            await repository.import_batch(
-                "profiles", [{"id": str(ALICE)}], "private-import-capability-with-forty-characters"
-            )
-
-    asyncio.run(exercise())
-    assert len(captured) == 1
-    assert captured[0].url.path == "/rest/v1/rpc/import_snapshot"
-    assert json.loads(captured[0].content) == {
-        "p_snapshot": {"table": "profiles", "rows": [{"id": str(ALICE)}]},
-        "p_capability": "private-import-capability-with-forty-characters",
-    }
-
-
 def test_profile_read_uses_authenticated_rls_request_and_maps_auth_email_separately() -> None:
     captured: list[httpx.Request] = []
 
@@ -1024,8 +979,6 @@ def test_workspace_busy_conflict_preserves_application_error_type() -> None:
     [
         ("session_run_busy", "session_run_busy"),
         ("session_turn_busy", "session_turn_busy"),
-        ("account_import_in_progress", "account_import_in_progress"),
-        ("account_activity_busy", "account_activity_busy"),
     ],
 )
 def test_cloud_mutation_conflicts_have_public_codes(message: str, expected_code: str) -> None:

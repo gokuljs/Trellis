@@ -53,9 +53,6 @@ class AccountRegistry:
 
 def test_registry_separates_cloud_rows_and_local_provider_keys(tmp_path: Path) -> None:
     settings = Settings(environment="test", data_dir=tmp_path / "data")
-    global_database = settings.data_dir / "state.db"
-    global_database.parent.mkdir(parents=True)
-    global_database.write_bytes(b"old-global-database")
 
     async def exercise() -> None:
         registry = AccountRegistry(settings)
@@ -80,10 +77,6 @@ def test_registry_separates_cloud_rows_and_local_provider_keys(tmp_path: Path) -
     asyncio.run(exercise())
 
     alice_dir = settings.data_dir / "accounts" / str(ALICE)
-    bob_dir = settings.data_dir / "accounts" / str(BOB)
-    assert global_database.read_bytes() == b"old-global-database"
-    assert not (alice_dir / "state.db").exists()
-    assert not (bob_dir / "state.db").exists()
     assert stat.S_IMODE((settings.data_dir / "accounts").stat().st_mode) == 0o700
     assert stat.S_IMODE(alice_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE((alice_dir / ".env").stat().st_mode) == 0o600

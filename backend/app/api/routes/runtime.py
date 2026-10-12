@@ -214,8 +214,6 @@ async def runtime_websocket(websocket: WebSocket) -> None:
     except ApplicationError as error:
         if error.code in {
             "account_in_use",
-            "account_activity_busy",
-            "account_import_in_progress",
         }:
             status, close_code, rpc_code = 409, 4409, -32009
         elif error.code in {"reauth_required", "cloud_access_denied"}:

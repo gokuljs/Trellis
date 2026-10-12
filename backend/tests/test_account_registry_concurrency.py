@@ -16,9 +16,9 @@ BOB = UUID("55114a4d-aa42-4eb6-a61d-f91c7992c06d")
 
 class StubRepository:
     def __init__(
-        self, _settings: Settings, _user_id: UUID, _source: VerifiedTokenSource, _client: object
+        self, _settings: Settings, user_id: UUID, _source: VerifiedTokenSource, _client: object
     ) -> None:
-        pass
+        self.user_id = user_id
 
     async def ensure_account(self) -> None:
         pass
@@ -27,19 +27,19 @@ class StubRepository:
         return []
 
 
-def test_existing_account_remains_available_during_another_accounts_import(
+def test_existing_account_remains_available_during_another_accounts_initialization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import_started = asyncio.Event()
-    allow_import = asyncio.Event()
+    initialization_started = asyncio.Event()
+    allow_initialization = asyncio.Event()
 
-    async def controlled_import(_directory: Path, user_id: UUID, _lock: int, _sink: object) -> None:
-        if user_id == ALICE:
-            import_started.set()
-            await allow_import.wait()
+    class ControlledRepository(StubRepository):
+        async def ensure_account(self) -> None:
+            if self.user_id == ALICE:
+                initialization_started.set()
+                await allow_initialization.wait()
 
-    monkeypatch.setattr(accounts, "SupabaseRepository", StubRepository)
-    monkeypatch.setattr(accounts, "import_locked_account", controlled_import)
+    monkeypatch.setattr(accounts, "SupabaseRepository", ControlledRepository)
     settings = Settings(environment="test", data_dir=tmp_path / "data")
 
     async def exercise() -> None:
@@ -51,14 +51,14 @@ def test_existing_account_remains_available_during_another_accounts_import(
                 registry.get(ALICE, access_token="alice", expires_at=expires)
             )
             try:
-                await asyncio.wait_for(import_started.wait(), timeout=1)
+                await asyncio.wait_for(initialization_started.wait(), timeout=1)
                 existing = await asyncio.wait_for(
                     registry.get(BOB, access_token="bob-second", expires_at=expires),
                     timeout=0.5,
                 )
                 assert existing is first
             finally:
-                allow_import.set()
+                allow_initialization.set()
                 await alice_task
                 await registry.close()
 
@@ -68,20 +68,18 @@ def test_existing_account_remains_available_during_another_accounts_import(
 def test_concurrent_requests_initialize_one_account_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import_started = asyncio.Event()
-    allow_import = asyncio.Event()
-    imports = 0
+    initialization_started = asyncio.Event()
+    allow_initialization = asyncio.Event()
+    initializations = 0
 
-    async def controlled_import(
-        _directory: Path, _user_id: UUID, _lock: int, _sink: object
-    ) -> None:
-        nonlocal imports
-        imports += 1
-        import_started.set()
-        await allow_import.wait()
+    class ControlledRepository(StubRepository):
+        async def ensure_account(self) -> None:
+            nonlocal initializations
+            initializations += 1
+            initialization_started.set()
+            await allow_initialization.wait()
 
-    monkeypatch.setattr(accounts, "SupabaseRepository", StubRepository)
-    monkeypatch.setattr(accounts, "import_locked_account", controlled_import)
+    monkeypatch.setattr(accounts, "SupabaseRepository", ControlledRepository)
     settings = Settings(environment="test", data_dir=tmp_path / "data")
 
     async def exercise() -> None:
@@ -92,17 +90,17 @@ def test_concurrent_requests_initialize_one_account_once(
                 registry.get(ALICE, access_token="first", expires_at=expires)
             )
             try:
-                await asyncio.wait_for(import_started.wait(), timeout=1)
+                await asyncio.wait_for(initialization_started.wait(), timeout=1)
                 second_task = asyncio.create_task(
                     registry.get(ALICE, access_token="second", expires_at=expires)
                 )
                 await asyncio.sleep(0)
-                allow_import.set()
+                allow_initialization.set()
                 first, second = await asyncio.gather(first_task, second_task)
                 assert first is second
-                assert imports == 1
+                assert initializations == 1
             finally:
-                allow_import.set()
+                allow_initialization.set()
                 if not first_task.done():
                     await first_task
                 await registry.close()
@@ -110,23 +108,21 @@ def test_concurrent_requests_initialize_one_account_once(
     asyncio.run(exercise())
 
 
-def test_cancelled_import_releases_its_account_lock_for_waiting_request(
+def test_cancelled_initialization_releases_its_account_lock_for_waiting_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import_started = asyncio.Event()
-    allow_import = asyncio.Event()
-    imports = 0
+    initialization_started = asyncio.Event()
+    allow_initialization = asyncio.Event()
+    initializations = 0
 
-    async def controlled_import(
-        _directory: Path, _user_id: UUID, _lock: int, _sink: object
-    ) -> None:
-        nonlocal imports
-        imports += 1
-        import_started.set()
-        await allow_import.wait()
+    class ControlledRepository(StubRepository):
+        async def ensure_account(self) -> None:
+            nonlocal initializations
+            initializations += 1
+            initialization_started.set()
+            await allow_initialization.wait()
 
-    monkeypatch.setattr(accounts, "SupabaseRepository", StubRepository)
-    monkeypatch.setattr(accounts, "import_locked_account", controlled_import)
+    monkeypatch.setattr(accounts, "SupabaseRepository", ControlledRepository)
     settings = Settings(environment="test", data_dir=tmp_path / "data")
 
     async def exercise() -> None:
@@ -137,7 +133,7 @@ def test_cancelled_import_releases_its_account_lock_for_waiting_request(
                 registry.get(ALICE, access_token="first", expires_at=expires)
             )
             try:
-                await asyncio.wait_for(import_started.wait(), timeout=1)
+                await asyncio.wait_for(initialization_started.wait(), timeout=1)
                 waiting_task = asyncio.create_task(
                     registry.get(ALICE, access_token="second", expires_at=expires)
                 )
@@ -145,31 +141,29 @@ def test_cancelled_import_releases_its_account_lock_for_waiting_request(
                 first_task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await first_task
-                allow_import.set()
+                allow_initialization.set()
                 context = await asyncio.wait_for(waiting_task, timeout=1)
                 assert context.database is not None
-                assert imports == 2
+                assert initializations == 2
             finally:
-                allow_import.set()
+                allow_initialization.set()
                 await registry.close()
 
     asyncio.run(exercise())
 
 
-def test_close_waits_for_import_before_releasing_account_lock(
+def test_close_waits_for_account_initialization_before_releasing_account_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import_started = asyncio.Event()
-    allow_import = asyncio.Event()
+    initialization_started = asyncio.Event()
+    allow_initialization = asyncio.Event()
 
-    async def controlled_import(
-        _directory: Path, _user_id: UUID, _lock: int, _sink: object
-    ) -> None:
-        import_started.set()
-        await allow_import.wait()
+    class ControlledRepository(StubRepository):
+        async def ensure_account(self) -> None:
+            initialization_started.set()
+            await allow_initialization.wait()
 
-    monkeypatch.setattr(accounts, "SupabaseRepository", StubRepository)
-    monkeypatch.setattr(accounts, "import_locked_account", controlled_import)
+    monkeypatch.setattr(accounts, "SupabaseRepository", ControlledRepository)
     settings = Settings(environment="test", data_dir=tmp_path / "data")
 
     async def exercise() -> None:
@@ -179,11 +173,11 @@ def test_close_waits_for_import_before_releasing_account_lock(
             initial = asyncio.create_task(
                 registry.get(ALICE, access_token="first", expires_at=expires)
             )
-            await asyncio.wait_for(import_started.wait(), timeout=1)
+            await asyncio.wait_for(initialization_started.wait(), timeout=1)
             close_task = asyncio.create_task(registry.close())
             await asyncio.sleep(0)
             assert not close_task.done()
-            allow_import.set()
+            allow_initialization.set()
             with pytest.raises(RuntimeError, match="closed"):
                 await initial
             await close_task
