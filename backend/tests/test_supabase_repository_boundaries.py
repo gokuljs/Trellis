@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import UUID
@@ -13,6 +14,7 @@ from app.application.errors import ApplicationError
 from app.core.config import Settings
 from app.domain.runtime import RunStatus, ToolApprovalDecision, ToolCallStatus
 from app.infrastructure.supabase_repository import SupabaseRepository, VerifiedTokenSource
+from tests.support import TestClient, create_app
 
 ALICE = UUID("c928705a-6f03-4aa8-9f81-c4fb50696527")
 BOB = UUID("55114a4d-aa42-4eb6-a61d-f91c7992c06d")
@@ -46,7 +48,12 @@ def test_verified_token_source_rejects_naive_expiry() -> None:
 
 @pytest.mark.parametrize(
     ("status_code", "expected_code"),
-    [(401, "cloud_access_denied"), (403, "cloud_access_denied"), (503, "database_unavailable")],
+    [
+        (401, "cloud_access_denied"),
+        (403, "cloud_access_denied"),
+        (406, "database_unavailable"),
+        (503, "database_unavailable"),
+    ],
 )
 def test_cloud_errors_do_not_expose_server_details(status_code: int, expected_code: str) -> None:
     def respond(_request: httpx.Request) -> httpx.Response:
@@ -64,6 +71,64 @@ def test_cloud_errors_do_not_expose_server_details(status_code: int, expected_co
             assert "private" not in error.value.message
 
     asyncio.run(exercise())
+
+
+def test_unexposed_schema_returns_safe_setup_guidance() -> None:
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            406,
+            json={
+                "code": "PGRST106",
+                "message": "private schema failure detail",
+                "hint": "private exposed schema list",
+                "details": "private server detail",
+            },
+        )
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            with pytest.raises(ApplicationError) as error:
+                await repository.ensure_account()
+            assert error.value.code == "database_not_configured"
+            assert "Expose the trellis schema in Supabase API settings" in error.value.message
+            assert "private" not in error.value.message
+
+    asyncio.run(exercise())
+
+
+def test_unexposed_schema_is_serialized_as_service_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def respond(
+        _client: httpx.AsyncClient, method: str, url: str, **_kwargs: object
+    ) -> httpx.Response:
+        assert method == "POST"
+        assert url == "http://localhost:54321/rest/v1/rpc/ensure_account"
+        return httpx.Response(
+            406,
+            json={
+                "code": "PGRST106",
+                "message": "private schema failure detail",
+                "hint": "private exposed schema list",
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "request", respond)
+    application = create_app(
+        SETTINGS.model_copy(update={"data_dir": tmp_path}),
+        repository_factory=SupabaseRepository,
+    )
+
+    with TestClient(application) as client:
+        response = client.get("/api/onboarding")
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "database_not_configured"
+    assert (
+        "Expose the trellis schema in Supabase API settings" in response.json()["error"]["message"]
+    )
+    assert "private" not in response.text
 
 
 def test_network_timeout_is_a_sanitized_cloud_failure() -> None:

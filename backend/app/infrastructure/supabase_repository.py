@@ -208,6 +208,12 @@ class SupabaseRepository:
                 error = _object(response.json())
         error_code = error.get("code")
         error_message = error.get("message")
+        if response.status_code == 406 and error_code == "PGRST106":
+            raise ApplicationError(
+                "database_not_configured",
+                "Cloud data needs setup. Expose the trellis schema in Supabase API settings, "
+                "then try again.",
+            )
         if response.status_code == 409:
             if error_code == "PT409" and error_message == "session_workspace_busy":
                 raise SessionWorkspaceBusy
