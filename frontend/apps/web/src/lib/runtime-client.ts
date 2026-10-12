@@ -70,11 +70,6 @@ export type StartRunInput = {
   budgetPreset?: "conservative" | "longer"
 }
 
-export type RuntimeErrorPayload = {
-  code: string
-  message: string
-}
-
 export class RuntimeError extends Error {
   readonly code: string
 

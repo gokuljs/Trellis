@@ -58,13 +58,7 @@ function visibleError(error: unknown) {
     : "Trellis could not reach the local service."
 }
 
-function appendSession(sessions: Session[], next: Session) {
-  const index = sessions.findIndex((session) => session.id === next.id)
-  if (index === -1) return [...sessions, next]
-  return sessions.map((session) => (session.id === next.id ? next : session))
-}
-
-function replaceSessionInPlace(sessions: Session[], next: Session) {
+function upsertSession(sessions: Session[], next: Session) {
   const index = sessions.findIndex((session) => session.id === next.id)
   if (index === -1) return [...sessions, next]
   return sessions.map((session) => (session.id === next.id ? next : session))
@@ -462,9 +456,7 @@ export function AppShell({
           if (isStale()) return
           restoredTranscript = detail.messages
           turn = retryFromTranscript(sessionId, restoredTranscript)
-          setSessions((current) =>
-            replaceSessionInPlace(current, detail.session)
-          )
+          setSessions((current) => upsertSession(current, detail.session))
           setActiveSession(detail.session)
           setMessages(detail.messages)
         } catch {
@@ -621,9 +613,7 @@ export function AppShell({
           if (isStale()) return
           const detail = await api.getSession(sessionId)
           if (isStale()) return
-          setSessions((current) =>
-            replaceSessionInPlace(current, detail.session)
-          )
+          setSessions((current) => upsertSession(current, detail.session))
           setActiveSession(detail.session)
           setMessages(detail.messages)
           setFailedTurn(null)
@@ -642,9 +632,7 @@ export function AppShell({
             if (!keepActive && turn) setFailedTurn(turn)
             const detail = await api.getSession(sessionId)
             if (isStale()) return
-            setSessions((current) =>
-              replaceSessionInPlace(current, detail.session)
-            )
+            setSessions((current) => upsertSession(current, detail.session))
             setActiveSession(detail.session)
             setMessages(detail.messages)
             if (
@@ -946,7 +934,7 @@ export function AppShell({
         }
       )
       const detail = await api.getSession(turn.sessionId)
-      setSessions((current) => replaceSessionInPlace(current, detail.session))
+      setSessions((current) => upsertSession(current, detail.session))
       if (activeSessionIdRef.current === turn.sessionId) {
         setActiveSession(detail.session)
         setMessages(detail.messages)
@@ -970,7 +958,7 @@ export function AppShell({
       }
       try {
         const detail = await api.getSession(turn.sessionId)
-        setSessions((current) => replaceSessionInPlace(current, detail.session))
+        setSessions((current) => upsertSession(current, detail.session))
         if (activeSessionIdRef.current === turn.sessionId) {
           setActiveSession(detail.session)
           setMessages(detail.messages)
@@ -1072,7 +1060,7 @@ export function AppShell({
         sessionLoadSequenceRef.current += 1
         activeSessionIdRef.current = createdSession.id
         setActiveSession(createdSession)
-        setSessions((current) => appendSession(current, createdSession))
+        setSessions((current) => upsertSession(current, createdSession))
         setActiveView("session")
       }
       await completeTurn(
@@ -1138,14 +1126,14 @@ export function AppShell({
     if (activeSession) {
       const updated = await api.setSessionWorkspace(activeSession.id, path)
       setActiveSession(updated)
-      setSessions((current) => replaceSessionInPlace(current, updated))
+      setSessions((current) => upsertSession(current, updated))
       return
     }
     const created = await api.createSession(path)
     sessionLoadSequenceRef.current += 1
     activeSessionIdRef.current = created.id
     setActiveSession(created)
-    setSessions((current) => appendSession(current, created))
+    setSessions((current) => upsertSession(current, created))
     setActiveView("session")
   }
 
@@ -1181,7 +1169,7 @@ export function AppShell({
     try {
       const updated = await api.setSessionWorkspace(activeSession.id, null)
       setActiveSession(updated)
-      setSessions((current) => replaceSessionInPlace(current, updated))
+      setSessions((current) => upsertSession(current, updated))
     } finally {
       workspaceSaveLockRef.current = false
       setWorkspaceSaving(false)

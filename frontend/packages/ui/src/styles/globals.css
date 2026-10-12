@@ -366,9 +366,7 @@ html.theme-ripple-fallback::before {
     line-height: 1;
   }
 
-  .sidebar-topbar-spacer,
-  .topbar-spacer,
-  .footer-spacer {
+  .sidebar-topbar-spacer {
     flex: 1;
   }
 
@@ -379,8 +377,6 @@ html.theme-ripple-fallback::before {
 
   .icon-button,
   .topbar-icon,
-  .footer-icon,
-  .composer-tool,
   .composer-add,
   .send-button,
   .mobile-menu {
@@ -407,8 +403,6 @@ html.theme-ripple-fallback::before {
   @media (hover: hover) and (pointer: fine) {
     .icon-button:hover,
     .topbar-icon:hover,
-    .footer-icon:hover,
-    .composer-tool:hover,
     .composer-add:hover,
     .mobile-menu:hover {
       color: var(--shell-text-strong);
@@ -418,8 +412,6 @@ html.theme-ripple-fallback::before {
 
   .icon-button:focus-visible,
   .topbar-icon:focus-visible,
-  .footer-icon:focus-visible,
-  .composer-tool:focus-visible,
   .composer-add:focus-visible,
   .send-button:focus-visible,
   .mobile-menu:focus-visible,
@@ -433,8 +425,6 @@ html.theme-ripple-fallback::before {
 
   .icon-button,
   .topbar-icon,
-  .footer-icon,
-  .composer-tool,
   .composer-add,
   .send-button,
   .mobile-menu,
@@ -460,19 +450,6 @@ html.theme-ripple-fallback::before {
     padding-bottom: var(--space-3);
     scrollbar-width: thin;
     scrollbar-color: var(--shell-line) transparent;
-  }
-
-  .eyebrow-row {
-    display: flex;
-    height: 28px;
-    align-items: flex-end;
-    gap: var(--space-3);
-    border-bottom: 1px solid var(--shell-line);
-    padding: 0 var(--space-4) var(--space-2);
-    color: var(--shell-text-muted);
-    font-size: 9px;
-    font-weight: 600;
-    letter-spacing: 0.08em;
   }
 
   .primary-nav {
@@ -531,21 +508,8 @@ html.theme-ripple-fallback::before {
     letter-spacing: 0;
   }
 
-  .search-field {
-    display: flex;
-    align-items: center;
-    gap: var(--space-control);
-    margin: var(--space-3) var(--space-4);
-    color: var(--shell-text-quiet);
-    font-size: 12px;
-  }
-
   .sessions-section {
     padding: var(--space-4) var(--space-2) 0;
-  }
-
-  .pinned-section {
-    padding: var(--space-6) var(--space-3) var(--space-4);
   }
 
   .section-heading {
@@ -563,27 +527,6 @@ html.theme-ripple-fallback::before {
     display: inline-flex;
     align-items: center;
     gap: var(--space-2);
-  }
-
-  .section-mark {
-    font-size: 8px;
-  }
-
-  .hint-row {
-    display: flex;
-    width: 100%;
-    align-items: center;
-    gap: var(--space-2);
-    border: 0;
-    padding: 0 var(--space-2);
-    color: var(--shell-text-faint);
-    background: transparent;
-    font-size: 11px;
-    text-align: left;
-  }
-
-  .hint-row svg {
-    color: var(--shell-text-quiet);
   }
 
   .session-group + .session-group {
@@ -667,46 +610,6 @@ html.theme-ripple-fallback::before {
     color: var(--shell-text-muted);
   }
 
-  .sidebar-footer {
-    border-top: 1px solid var(--shell-line);
-    padding: var(--space-2) var(--space-3);
-    color: var(--shell-text-faint);
-  }
-
-  .footer-actions {
-    display: flex;
-    align-items: center;
-  }
-
-  .footer-actions {
-    height: var(--space-6);
-    gap: var(--space-2);
-  }
-
-  .round-status {
-    display: inline-flex;
-    width: 22px;
-    height: 22px;
-    align-items: center;
-    justify-content: center;
-    border: 1px solid var(--shell-line);
-    border-radius: 50%;
-    color: var(--shell-text-muted);
-    background: var(--shell-hover);
-    font-size: 11px;
-  }
-
-  .footer-icon {
-    width: 17px;
-    height: 20px;
-    padding: 0;
-    color: var(--shell-text-muted);
-  }
-
-  .power-mark {
-    font-size: 12px;
-  }
-
   .workspace {
     position: relative;
     display: flex;
@@ -785,15 +688,6 @@ html.theme-ripple-fallback::before {
       color: var(--shell-text-strong);
       background: var(--shell-hover);
     }
-  }
-
-  .theme-chip {
-    display: block;
-    width: 11px;
-    height: 13px;
-    border: 1px solid currentColor;
-    border-radius: 0;
-    opacity: 0.75;
   }
 
   .workspace-content {
@@ -1144,44 +1038,6 @@ html.theme-ripple-fallback::before {
   .settings-key-panel {
     display: grid;
     gap: var(--space-3);
-  }
-
-  .welcome-panel {
-    width: min(760px, 100%);
-    margin: 0 auto;
-    text-align: left;
-  }
-
-  .welcome-kicker {
-    margin-bottom: var(--space-4);
-    color: var(--shell-text-muted);
-    font-size: 13px;
-    font-weight: 500;
-    letter-spacing: 0;
-  }
-
-  .wordmark {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
-    color: var(--shell-text-strong);
-    font-family: var(--font-sans);
-    font-size: clamp(3.5rem, 7vw, 6rem);
-    font-weight: 500;
-    letter-spacing: -0.065em;
-    line-height: 1;
-  }
-
-  .wordmark svg {
-    color: var(--shell-brand);
-  }
-
-  .welcome-copy {
-    max-width: 530px;
-    margin: var(--space-5) 0 0;
-    color: var(--shell-text-muted);
-    font-size: 15px;
-    line-height: 1.55;
   }
 
   .utility-panel {
@@ -2154,14 +2010,6 @@ html.theme-ripple-fallback::before {
     gap: var(--space-3);
   }
 
-  .model-label {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-2);
-    color: var(--shell-text-muted);
-    white-space: nowrap;
-  }
-
   .composer-select {
     max-width: 190px;
     border: 0;
@@ -2181,13 +2029,6 @@ html.theme-ripple-fallback::before {
   .composer-select:disabled {
     cursor: default;
     opacity: 0.65;
-  }
-
-  .composer-tool {
-    width: 15px;
-    height: 24px;
-    padding: 0;
-    color: var(--shell-text-muted);
   }
 
   .send-button-metal {
@@ -2215,24 +2056,13 @@ html.theme-ripple-fallback::before {
   @media (pointer: coarse), (max-width: 760px) {
     .icon-button,
     .topbar-icon,
-    .footer-icon,
     .mobile-menu,
     .composer-add,
-    .composer-tool,
     .settings-input-action,
     .composer-workspace-chip button,
     .run-activity-trigger {
       min-width: var(--space-10);
       min-height: var(--space-10);
-    }
-
-    .footer-icon {
-      width: var(--space-10);
-      height: var(--space-10);
-    }
-
-    .footer-actions {
-      height: var(--space-10);
     }
 
     .nav-item,
@@ -2962,25 +2792,6 @@ html.theme-ripple-fallback::before {
       display: none;
     }
 
-    .wordmark {
-      font-size: clamp(3rem, 13vw, 4.8rem);
-    }
-
-    .welcome-kicker {
-      margin-bottom: var(--space-4);
-      font-size: 12px;
-    }
-
-    .welcome-copy {
-      max-width: 320px;
-      margin-top: var(--space-5);
-      font-size: 14px;
-    }
-
-    .desktop-break {
-      display: none;
-    }
-
     .composer-wrap {
       width: calc(100% - 32px);
       margin: 0 auto calc(var(--space-2) + env(safe-area-inset-bottom, 0px));
@@ -2996,13 +2807,6 @@ html.theme-ripple-fallback::before {
 
     .composer-tools {
       gap: var(--space-2);
-    }
-
-    .model-label {
-      max-width: 160px;
-      overflow: hidden;
-      font-size: 12px;
-      text-overflow: ellipsis;
     }
 
     .composer-select {
@@ -3067,10 +2871,6 @@ html.theme-ripple-fallback::before {
       overflow-y: auto;
       padding-top: var(--space-4);
       padding-bottom: var(--space-2);
-    }
-
-    .wordmark {
-      font-size: clamp(2.5rem, 10vw, 3.5rem);
     }
 
     .composer-box {
