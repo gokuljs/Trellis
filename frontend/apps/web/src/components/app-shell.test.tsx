@@ -1,6 +1,7 @@
 import {
   act,
   cleanup,
+  fireEvent,
   render,
   screen,
   waitFor,
@@ -14,6 +15,7 @@ import "@trellis/ui/globals.css"
 import { AppShell } from "@/components/app-shell"
 import { GlobalToaster } from "@/components/global-toaster"
 import { ThemeProvider } from "@/components/theme-provider"
+import { api } from "@/lib/api"
 
 const auth = vi.hoisted(() => ({
   getAccessToken: vi.fn(),
@@ -294,6 +296,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   cleanup()
   toast.dismiss()
   vi.unstubAllGlobals()
@@ -303,6 +306,178 @@ afterEach(() => {
 })
 
 describe("local-first chat", () => {
+  it("does not reopen a workspace after completion unmounts its account shell", async () => {
+    const reads: string[] = []
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url) => {
+        reads.push(url)
+        if (url === "/api/onboarding")
+          return response({ current_step: "model", completed: false })
+        return undefined
+      })
+    )
+    const view = renderFirstRunApp()
+    await screen.findByRole("button", { name: "Start Trellis" })
+    const before = reads.length
+    const save = vi
+      .spyOn(api, "saveOnboardingModel")
+      .mockImplementation(async () => {
+        view.unmount()
+        return { current_step: "complete", completed: true }
+      })
+    try {
+      await userEvent.click(
+        screen.getByRole("button", { name: "Start Trellis" })
+      )
+      expect(reads).toHaveLength(before)
+    } finally {
+      save.mockRestore()
+    }
+  })
+
+  it.each([
+    "/api/profile",
+    "/api/settings",
+    "/api/onboarding",
+    "/api/sessions",
+  ])(
+    "keeps the composer hidden when bootstrap %s fails and recovers on retry",
+    async (failedPath) => {
+      let failing = true
+      vi.stubGlobal(
+        "fetch",
+        startupFetch((url) =>
+          url === failedPath && failing
+            ? response(
+                {
+                  error: {
+                    code: "unavailable",
+                    message: "Service unavailable",
+                  },
+                },
+                503
+              )
+            : undefined
+        )
+      )
+      renderApp()
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "Service unavailable"
+      )
+      expect(
+        screen.queryByRole("textbox", { name: "Message" })
+      ).not.toBeInTheDocument()
+      failing = false
+      await userEvent.click(screen.getByRole("button", { name: "Try again" }))
+      expect(
+        await screen.findByRole("textbox", { name: "Message" })
+      ).toBeInTheDocument()
+    }
+  )
+
+  it("offers retry after a stalled bootstrap and ignores its late response", async () => {
+    vi.useFakeTimers()
+    const late = deferred<Response>()
+    let failing = true
+    let signal: AbortSignal | undefined
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url, init) => {
+        if (url !== "/api/onboarding" || !failing) return undefined
+        signal = init?.signal ?? undefined
+        return late.promise
+      })
+    )
+    renderApp()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15000)
+    })
+    expect(screen.getByRole("alert")).toHaveTextContent(/too long/i)
+    expect(signal?.aborted).toBe(true)
+    expect(
+      screen.queryByRole("textbox", { name: "Message" })
+    ).not.toBeInTheDocument()
+    failing = false
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }))
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeInTheDocument()
+    await act(async () => {
+      late.resolve(response({ current_step: "intro", completed: false }))
+    })
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeInTheDocument()
+    expect(
+      screen.queryByRole("heading", { name: "Workspace setup" })
+    ).not.toBeInTheDocument()
+  })
+
+  it.each(["profile", "model"])(
+    "resumes the persisted %s onboarding step",
+    async (step) => {
+      vi.stubGlobal(
+        "fetch",
+        startupFetch((url) =>
+          url === "/api/onboarding"
+            ? response({ current_step: step, completed: false })
+            : undefined
+        )
+      )
+      renderFirstRunApp()
+      expect(
+        await screen.findByRole("heading", {
+          name: step === "profile" ? "Your profile" : "Choose a model",
+        })
+      ).toBeInTheDocument()
+      expect(
+        screen.queryByRole("textbox", { name: "Message" })
+      ).not.toBeInTheDocument()
+      if (step === "profile")
+        expect(screen.getByRole("textbox", { name: "Name" })).toHaveValue("Ada")
+    }
+  )
+
+  it("recovers a completed setup after workspace refresh fails without completing again", async () => {
+    let completed = false
+    let sessionFailure = true
+    let completions = 0
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url, init) => {
+        if (url === "/api/onboarding")
+          return response({
+            current_step: completed ? "complete" : "model",
+            completed,
+          })
+        if (url === "/api/onboarding/steps/model" && init?.method === "PUT") {
+          completed = true
+          completions += 1
+          return response({ current_step: "complete", completed: true })
+        }
+        if (url === "/api/sessions" && sessionFailure)
+          return response({ error: { message: "Chats unavailable" } }, 503)
+        return undefined
+      })
+    )
+    renderFirstRunApp()
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Start Trellis" })
+    )
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Chats unavailable"
+    )
+    expect(
+      screen.queryByRole("textbox", { name: "Message" })
+    ).not.toBeInTheDocument()
+    sessionFailure = false
+    await userEvent.click(screen.getByRole("button", { name: "Try again" }))
+    expect(
+      await screen.findByRole("textbox", { name: "Message" })
+    ).toBeInTheDocument()
+    expect(completions).toBe(1)
+  })
+
   it("reports saved activity lookup failures and retries the chat load", async () => {
     const session = {
       ...recentSession,
@@ -1572,10 +1747,14 @@ describe("local-first chat", () => {
       if (url === "/api/settings" && method === "GET")
         return response(currentSettings)
       if (url === "/api/onboarding/steps/intro" && method === "PUT")
-        return response({ current_step: "profile", completed: false })
+        return response(
+          (onboardingState = { current_step: "profile", completed: false })
+        )
       if (url === "/api/onboarding/steps/profile" && method === "PUT") {
         expect(JSON.parse(String(init?.body))).toEqual({ display_name: "Ada" })
-        return response({ current_step: "model", completed: false })
+        return response(
+          (onboardingState = { current_step: "model", completed: false })
+        )
       }
       if (url === "/api/onboarding/steps/model" && method === "PUT") {
         const submitted = JSON.parse(String(init?.body)) as {
@@ -1596,7 +1775,9 @@ describe("local-first chat", () => {
               : model
           ),
         }
-        return response({ current_step: "complete", completed: true })
+        return response(
+          (onboardingState = { current_step: "complete", completed: true })
+        )
       }
       return undefined
     })

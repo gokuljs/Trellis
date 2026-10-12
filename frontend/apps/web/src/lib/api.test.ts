@@ -18,8 +18,67 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
   vi.resetAllMocks()
+})
+
+it("bounds onboarding reads even when the response body stalls", async () => {
+  vi.useFakeTimers()
+  auth.getAccessToken.mockResolvedValue({ token: "fresh-token", userId: "ada" })
+  auth.getSnapshot.mockReturnValue({ status: "signed-in", user: { id: "ada" } })
+  const stalled = new Response("", { status: 200 })
+  vi.spyOn(stalled, "json").mockReturnValue(new Promise(() => {}))
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(stalled))
+
+  let error: unknown
+  void api.getOnboarding().catch((failure) => {
+    error = failure
+  })
+  await vi.advanceTimersByTimeAsync(15000)
+  expect(error).toMatchObject({ code: "request_timeout" })
+})
+
+it("aborts onboarding writes when their deadline expires", async () => {
+  vi.useFakeTimers()
+  auth.getAccessToken.mockResolvedValue({ token: "fresh-token", userId: "ada" })
+  auth.getSnapshot.mockReturnValue({ status: "signed-in", user: { id: "ada" } })
+  let signal: AbortSignal | undefined
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((_url, init: RequestInit) => {
+      signal = init.signal ?? undefined
+      return new Promise(() => {})
+    })
+  )
+  let error: unknown
+  void api.saveOnboardingProfile({ display_name: "Ada" }).catch((failure) => {
+    error = failure
+  })
+  await vi.advanceTimersByTimeAsync(15000)
+  expect(error).toMatchObject({ code: "request_timeout" })
+  expect(signal?.aborted).toBe(true)
+})
+
+it("cancels a bootstrap read before a delayed credential can contact the backend", async () => {
+  let resolveToken!: (value: { token: string; userId: string }) => void
+  auth.getAccessToken.mockReturnValue(
+    new Promise((resolve) => {
+      resolveToken = resolve
+    })
+  )
+  const fetch = vi.fn()
+  vi.stubGlobal("fetch", fetch)
+  const controller = new AbortController()
+  let error: unknown
+  void api.getProfile({ signal: controller.signal }).catch((failure) => {
+    error = failure
+  })
+  controller.abort()
+  await vi.waitFor(() => expect(error).toMatchObject({ name: "AbortError" }))
+  resolveToken({ token: "old-token", userId: "ada" })
+  await Promise.resolve()
+  expect(fetch).not.toHaveBeenCalled()
 })
 
 it("sends the current access token on backend HTTP requests", async () => {
@@ -89,6 +148,32 @@ it("does not sign out a newer session when an old token receives a 401", async (
     status: 401,
   })
   expect(auth.getAccessToken).toHaveBeenCalledTimes(2)
+  expect(auth.signOut).not.toHaveBeenCalled()
+})
+
+it("does not sign out after cancellation during a rejected-token recheck", async () => {
+  let resolveToken!: (value: { token: string; userId: string }) => void
+  auth.getAccessToken
+    .mockResolvedValueOnce({ token: "old-token", userId: "ada" })
+    .mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveToken = resolve
+      })
+    )
+  auth.getSnapshot.mockReturnValue({ status: "signed-in", user: { id: "ada" } })
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(new Response(null, { status: 401 }))
+  )
+  const controller = new AbortController()
+  const rejected = expect(
+    api.getProfile({ signal: controller.signal })
+  ).rejects.toMatchObject({ name: "AbortError" })
+  await vi.waitFor(() => expect(auth.getAccessToken).toHaveBeenCalledTimes(2))
+  controller.abort()
+  await rejected
+  resolveToken({ token: "old-token", userId: "ada" })
+  await new Promise((resolve) => setTimeout(resolve, 0))
   expect(auth.signOut).not.toHaveBeenCalled()
 })
 

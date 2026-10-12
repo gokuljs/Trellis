@@ -31,9 +31,65 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+type RequestOptions = {
+  signal?: AbortSignal
+  timeoutMs?: number
+}
+
+const onboardingRequestTimeout = 15000
+
+async function request<T>(
+  path: string,
+  init: RequestInit = {},
+  options: RequestOptions = {}
+): Promise<T> {
+  if (!options.signal && options.timeoutMs === undefined)
+    return authorizedRequest<T>(path, init)
+
+  const controller = new AbortController()
+  const abort = () => controller.abort(options.signal?.reason)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const aborted = new Promise<never>((_, reject) => {
+    controller.signal.addEventListener(
+      "abort",
+      () => reject(controller.signal.reason),
+      { once: true }
+    )
+  })
+  options.signal?.addEventListener("abort", abort, { once: true })
+  if (options.signal?.aborted) abort()
+  if (options.timeoutMs !== undefined) {
+    timer = setTimeout(
+      () =>
+        controller.abort(
+          new ApiError(
+            "request_timeout",
+            "Trellis took too long to respond. Try again.",
+            0
+          )
+        ),
+      options.timeoutMs
+    )
+  }
+  try {
+    return await Promise.race([
+      authorizedRequest<T>(path, { ...init, signal: controller.signal }),
+      aborted,
+    ])
+  } finally {
+    clearTimeout(timer)
+    options.signal?.removeEventListener("abort", abort)
+  }
+}
+
+async function authorizedRequest<T>(
+  path: string,
+  init: RequestInit
+): Promise<T> {
+  init.signal?.throwIfAborted()
   const auth = getAuthController()
   const { token, userId } = await auth.getAccessToken()
+  init.signal?.throwIfAborted()
   const sessionEpoch = auth.getSessionEpoch()
   const headers = new Headers(init.headers)
   headers.set("Accept", "application/json")
@@ -43,8 +99,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     ...init,
     headers,
   })
+  init.signal?.throwIfAborted()
 
   function assertCurrentUser() {
+    init.signal?.throwIfAborted()
     const current = auth.getSnapshot()
     if (
       current.status !== "signed-in" ||
@@ -97,31 +155,66 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   if (response.status === 204) return undefined as T
   const payload = (await response.json()) as T
+  init.signal?.throwIfAborted()
   assertCurrentUser()
   return payload
 }
 
 export const api = {
-  getProfile: () => request<Profile>("/api/profile"),
+  getProfile: (options: RequestOptions = {}) =>
+    request<Profile>(
+      "/api/profile",
+      {},
+      { timeoutMs: onboardingRequestTimeout, ...options }
+    ),
   updateProfile: (profile: Pick<Profile, "display_name">) =>
     request<Profile>("/api/profile", {
       method: "PUT",
       body: JSON.stringify(profile),
     }),
-  getSettings: () => request<Settings>("/api/settings"),
-  getOnboarding: () => request<OnboardingState>("/api/onboarding"),
-  completeOnboardingIntro: () =>
-    request<OnboardingState>("/api/onboarding/steps/intro", { method: "PUT" }),
-  saveOnboardingProfile: (profile: Pick<Profile, "display_name">) =>
-    request<OnboardingState>("/api/onboarding/steps/profile", {
-      method: "PUT",
-      body: JSON.stringify(profile),
-    }),
-  saveOnboardingModel: (modelId: string, apiKey: string) =>
-    request<OnboardingState>("/api/onboarding/steps/model", {
-      method: "PUT",
-      body: JSON.stringify({ model_id: modelId, api_key: apiKey || null }),
-    }),
+  getSettings: (options: RequestOptions = {}) =>
+    request<Settings>(
+      "/api/settings",
+      {},
+      { timeoutMs: onboardingRequestTimeout, ...options }
+    ),
+  getOnboarding: (options: RequestOptions = {}) =>
+    request<OnboardingState>(
+      "/api/onboarding",
+      {},
+      { timeoutMs: onboardingRequestTimeout, ...options }
+    ),
+  completeOnboardingIntro: (options: RequestOptions = {}) =>
+    request<OnboardingState>(
+      "/api/onboarding/steps/intro",
+      { method: "PUT" },
+      { timeoutMs: onboardingRequestTimeout, ...options }
+    ),
+  saveOnboardingProfile: (
+    profile: Pick<Profile, "display_name">,
+    options: RequestOptions = {}
+  ) =>
+    request<OnboardingState>(
+      "/api/onboarding/steps/profile",
+      {
+        method: "PUT",
+        body: JSON.stringify(profile),
+      },
+      { timeoutMs: onboardingRequestTimeout, ...options }
+    ),
+  saveOnboardingModel: (
+    modelId: string,
+    apiKey: string,
+    options: RequestOptions = {}
+  ) =>
+    request<OnboardingState>(
+      "/api/onboarding/steps/model",
+      {
+        method: "PUT",
+        body: JSON.stringify({ model_id: modelId, api_key: apiKey || null }),
+      },
+      { timeoutMs: onboardingRequestTimeout, ...options }
+    ),
   selectProvider: (provider: ProviderId) =>
     request<Settings>("/api/settings/provider", {
       method: "PUT",
@@ -146,7 +239,8 @@ export const api = {
     request<Settings>(`/api/settings/providers/${provider}/api-key`, {
       method: "DELETE",
     }),
-  listSessions: () => request<Session[]>("/api/sessions"),
+  listSessions: (options: RequestOptions = {}) =>
+    request<Session[]>("/api/sessions", {}, options),
   pickWorkspace: () =>
     request<{ path: string | null }>("/api/workspaces/pick", {
       method: "POST",
