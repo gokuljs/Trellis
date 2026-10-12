@@ -306,6 +306,199 @@ afterEach(() => {
 })
 
 describe("local-first chat", () => {
+  it("keeps complete live chat logs and restores the same paged events after reload", async () => {
+    const session = {
+      ...recentSession,
+      id: "session-log",
+      title: "Log persistence",
+    }
+    let turnId = ""
+    let socket!: TestWebSocket
+    let finished = false
+    const savedEvents: Array<{
+      run_id: string
+      sequence: number
+      event_type: string
+      event_version: number
+      data: Record<string, unknown>
+      created_at: string
+    }> = []
+    const emit = (
+      sequence: number,
+      eventType: string,
+      data: Record<string, unknown>
+    ) => {
+      const createdAt = `2026-10-12T10:00:0${sequence}Z`
+      savedEvents.push({
+        run_id: "run-log",
+        sequence,
+        event_type: eventType,
+        event_version: 1,
+        data,
+        created_at: createdAt,
+      })
+      socket.reply({
+        jsonrpc: "2.0",
+        method: "run.event",
+        params: {
+          runId: "run-log",
+          sequence,
+          eventType,
+          eventVersion: 1,
+          data,
+          createdAt,
+        },
+      })
+    }
+    installRuntimeServer((connection, request) => {
+      socket = connection
+      turnId = String((request.params as Record<string, unknown>).turnId)
+      connection.reply({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { runId: "run-log", status: "running", lastSequence: 0 },
+      })
+      emit(1, "run.started", { status: "running" })
+    })
+    vi.stubGlobal(
+      "fetch",
+      startupFetch((url, init) => {
+        if (url === "/api/sessions" && init?.method === "POST")
+          return response({ ...session, message_count: 0 })
+        if (url === "/api/sessions") return response(finished ? [session] : [])
+        if (url === "/api/sessions/session-log")
+          return response({
+            session,
+            messages: [
+              {
+                id: "user-log",
+                turn_id: turnId,
+                role: "user",
+                content: "Test my new chat",
+                provider: null,
+                model: null,
+                created_at: "2026-10-12T10:00:00Z",
+              },
+              ...(finished
+                ? [
+                    {
+                      id: "assistant-log",
+                      turn_id: turnId,
+                      role: "assistant",
+                      content: "Saved answer",
+                      provider: "openai",
+                      model: "gpt-5.5",
+                      created_at: "2026-10-12T10:00:05Z",
+                    },
+                  ]
+                : []),
+            ],
+          })
+        if (url.endsWith("/runs/latest"))
+          return response({
+            run_id: "run-log",
+            turn_id: turnId,
+            status: "completed",
+            last_sequence: 5,
+          })
+        if (url.includes("/runs?"))
+          return response({
+            items: [
+              {
+                run_id: "run-log",
+                turn_id: turnId,
+                retry_of: null,
+                status: "completed",
+                budget_preset: "conservative",
+                max_model_calls: 8,
+                max_tool_calls: 16,
+                max_total_tokens: 100000,
+                max_cost_usd: 2,
+                deadline_at: "2026-10-12T10:10:00Z",
+                last_sequence: 5,
+                created_at: "2026-10-12T10:00:00Z",
+                started_at: "2026-10-12T10:00:01Z",
+                finished_at: "2026-10-12T10:00:05Z",
+              },
+            ],
+            next_offset: null,
+          })
+        if (url.includes("/events?")) {
+          const after = Number(
+            new URL(url, "http://localhost").searchParams.get("after_sequence")
+          )
+          return response({
+            items: savedEvents
+              .filter((event) => event.sequence > after)
+              .slice(0, 2),
+            next_after_sequence: after + 2 < 5 ? after + 2 : null,
+          })
+        }
+        return undefined
+      })
+    )
+    const user = userEvent.setup()
+    const view = renderApp()
+    await user.type(
+      await screen.findByRole("textbox", { name: "Message" }),
+      "Test my new chat"
+    )
+    await user.click(screen.getByRole("button", { name: "Send" }))
+    await user.click(await screen.findByRole("button", { name: /Thinking/ }))
+    await user.click(screen.getByText("Event log (1)"))
+    await act(async () => {
+      emit(2, "assistant.delta", { text: "Saved answer" })
+      emit(3, "future.event", { nested: { value: "inspect me" } })
+    })
+    const liveLog = screen.getByRole("list", { name: "Complete run event log" })
+    expect(within(liveLog).getByText("assistant.delta")).toBeInTheDocument()
+    expect(within(liveLog).getByText("future.event")).toBeInTheDocument()
+    await user.click(within(liveLog).getByLabelText("Event 2: assistant.delta"))
+    expect(within(liveLog).getByLabelText("Event 2 details")).toHaveTextContent(
+      "Saved answer"
+    )
+    await act(async () => {
+      emit(4, "assistant.completed", {
+        message_id: "assistant-log",
+        content: "Saved answer",
+      })
+      finished = true
+      emit(5, "run.completed", { status: "completed" })
+    })
+    await screen.findByText("Saved answer", { selector: ".thread-markdown p" })
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled()
+    )
+    expect(
+      screen.getByRole("button", { name: /Completed/ })
+    ).toBeInTheDocument()
+    expect(screen.getByRole("list", { name: "Complete run event log" })).toBe(
+      liveLog
+    )
+    expect(within(liveLog).getByText("assistant.completed")).toBeInTheDocument()
+    expect(within(liveLog).getByLabelText("Event 2 details")).toHaveTextContent(
+      "Saved answer"
+    )
+    expect(liveLog.querySelectorAll("[data-log-sequence]")).toHaveLength(5)
+    view.unmount()
+    renderApp()
+    await openSavedSession("Log persistence")
+    await user.click(await screen.findByRole("button", { name: /Completed/ }))
+    await user.click(await screen.findByText("Event log (5)"))
+    const restored = screen.getByRole("list", {
+      name: "Complete run event log",
+    })
+    expect(
+      Array.from(restored.querySelectorAll("[data-log-sequence]")).map((row) =>
+        row.getAttribute("data-log-sequence")
+      )
+    ).toEqual(["1", "2", "3", "4", "5"])
+    await user.click(within(restored).getByLabelText("Event 3: future.event"))
+    expect(
+      within(restored).getByLabelText("Event 3 details")
+    ).toHaveTextContent("inspect me")
+  })
+
   it("shows the persisted account name and confirmed setup in the real workspace", async () => {
     let savedProfile = profile
     vi.stubGlobal(

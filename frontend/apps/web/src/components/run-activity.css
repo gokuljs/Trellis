@@ -1,0 +1,100 @@
+.run-activity-entry-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-3);
+}
+
+.run-event-time {
+  color: var(--shell-text-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.5;
+}
+
+.run-event-log {
+  margin-top: var(--space-4);
+  border-top: 1px solid var(--shell-line);
+  padding-top: var(--space-2);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.run-event-log summary {
+  min-height: 32px;
+  border-radius: 4px;
+  padding: var(--space-2) var(--space-1);
+  color: var(--shell-text-strong);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.run-event-log summary::marker {
+  color: var(--shell-text-muted);
+}
+
+.run-event-log summary:hover {
+  background: var(--shell-hover);
+}
+
+.run-event-log summary:active {
+  background: var(--shell-selected);
+}
+
+.run-event-log summary:focus-visible,
+.run-event-payload:focus-visible {
+  outline: 2px solid var(--shell-focus);
+  outline-offset: -2px;
+}
+
+.run-event-log-toggle {
+  font-weight: 600;
+}
+
+.run-event-log-list {
+  margin: var(--space-1) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.run-event-log-entry {
+  min-width: 0;
+  border-top: 1px solid var(--shell-line);
+}
+
+.run-event-sequence {
+  margin-right: var(--space-1);
+  color: var(--shell-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.run-event-type,
+.run-event-payload {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10px;
+}
+
+.run-event-log-entry .run-event-time {
+  display: block;
+  margin-left: var(--space-3);
+}
+
+.run-event-payload {
+  max-height: 240px;
+  overflow: auto;
+  margin: 0 0 var(--space-3) var(--space-3);
+  border: 1px solid var(--shell-line);
+  border-radius: 6px;
+  padding: var(--space-2);
+  color: var(--shell-text-strong);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+@media (pointer: coarse), (max-width: 760px) {
+  .run-event-log summary {
+    min-height: 44px;
+  }
+}

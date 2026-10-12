@@ -265,17 +265,12 @@ export function AppShell({
         const activity = current[turnId] ?? { events: [], runInfo: null }
         if (activity.runInfo && activity.runInfo.runId !== event.runId)
           return current
-        const retain = !["assistant.delta", "assistant.completed"].includes(
-          event.eventType
+        const events = !activity.events.some(
+          (item) =>
+            item.runId === event.runId && item.sequence === event.sequence
         )
-        const events =
-          retain &&
-          !activity.events.some(
-            (item) =>
-              item.runId === event.runId && item.sequence === event.sequence
-          )
-            ? [...activity.events, event]
-            : activity.events
+          ? [...activity.events, event]
+          : activity.events
         return {
           ...current,
           [turnId]: { ...activity, events, latestEvent: event },

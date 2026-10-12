@@ -4,6 +4,8 @@ import type {
   ToolApprovalDecision,
 } from "@/lib/runtime-client"
 import { groupRunEvents } from "@/lib/run-event-groups"
+import { RunEventLog, RunEventTimestamp } from "@/components/run-event-log"
+import "./run-activity.css"
 
 type RunActivityProps = {
   label?: string
@@ -364,7 +366,10 @@ export function RunActivity({
                   >
                     <span className="run-activity-marker" aria-hidden="true" />
                     <div className="run-activity-entry-copy">
-                      <div className="run-activity-title">{title}</div>
+                      <div className="run-activity-entry-heading">
+                        <div className="run-activity-title">{title}</div>
+                        <RunEventTimestamp createdAt={event.createdAt} />
+                      </div>
                       {detail ? (
                         <div className="run-activity-detail">{detail}</div>
                       ) : null}
@@ -376,6 +381,7 @@ export function RunActivity({
           </li>
         ))}
       </ol>
+      <RunEventLog events={ordered} />
     </section>
   )
 }
