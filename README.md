@@ -25,8 +25,8 @@ Then open `http://127.0.0.1:3000`, sign in, visit Settings, and add an OpenAI
 or Anthropic key. Chats, settings, and run history are stored in Supabase for
 the signed-in account. Provider keys and local workspace selection stay on the
 computer. `TRELLIS_DATA_DIR` controls where the backend keeps local keys and
-any private account-scoped SQLite file awaiting one-time import. The older
-shared SQLite file is left untouched; see [the migration guide](supabase/README.md).
+local account settings. Existing SQLite files are left untouched and are no
+longer imported; chats and settings are stored in Supabase.
 
 ## Formatting and pre-commit checks
 

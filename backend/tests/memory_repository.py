@@ -125,21 +125,8 @@ class MemoryRepository:
             raise RuntimeError("Account repository owner does not match authenticated user")
         self.state = state
 
-    async def initialize(self) -> None:
-        return None
-
     async def ensure_account(self) -> None:
         return None
-
-    async def import_batch(
-        self, table: str, rows: list[dict[str, object]], capability: str
-    ) -> None:
-        del table, rows, capability
-        raise RuntimeError("The in-memory repository cannot import legacy account data")
-
-    async def seal_import(self, capability: str) -> None:
-        del capability
-        raise RuntimeError("The in-memory repository cannot import legacy account data")
 
     async def get_profile(self) -> UserProfile:
         return self.state.profile
@@ -623,14 +610,6 @@ class MemoryRepository:
         )
         return self.state.runs[run_id]
 
-    async def recover_active_runs(self) -> tuple[RunEvent, ...]:
-        recovered: list[RunEvent] = []
-        for run in tuple(self.state.runs.values()):
-            if run.status in {RunStatus.QUEUED, RunStatus.RUNNING, RunStatus.CANCELLING}:
-                await self.recover_expired_run(run.id)
-                recovered.append(self.state.events[run.id][-1])
-        return tuple(recovered)
-
     async def create_model_call(
         self,
         run_id: str,
@@ -1021,5 +1000,5 @@ def memory_repository_factory(
     _client: httpx.AsyncClient,
 ) -> MemoryRepository:
     return MemoryRepository(
-        settings.data_dir / "accounts" / str(user_id) / "state.db", owner_id=user_id
+        settings.data_dir / "accounts" / str(user_id) / "memory", owner_id=user_id
     )

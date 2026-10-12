@@ -18,12 +18,23 @@ from starlette.testclient import WebSocketTestSession
 from app.api.auth import VerifiedUser
 from app.core.config import Settings
 from app.infrastructure.accounts import AccountContext
+from app.infrastructure.supabase_repository import VerifiedTokenSource
 from app.main import create_app as production_create_app
 from tests.memory_repository import memory_repository_factory
 
 TEST_USER_ID = UUID("a59673c1-78d0-4bc8-8c49-6bc2e7a01dd5")
 TEST_EMAIL = "alice@example.com"
 TEST_TOKEN = "alice"
+
+
+def make_settings(data_dir: Path) -> Settings:
+    return Settings(environment="test", data_dir=data_dir)
+
+
+def verified_token_source(user_id: UUID, token: str = "alice-token") -> VerifiedTokenSource:
+    source = VerifiedTokenSource(user_id)
+    source.record_verified(token, user_id, datetime.now(UTC) + timedelta(hours=1))
+    return source
 
 
 class StubVerifier:
@@ -77,8 +88,8 @@ def account_path(settings: Settings) -> Path:
     return settings.data_dir / "accounts" / str(TEST_USER_ID)
 
 
-def account_database_path(settings: Settings) -> Path:
-    return account_path(settings) / "state.db"
+def account_repository_key(settings: Settings) -> Path:
+    return account_path(settings) / "memory"
 
 
 def account_secrets_path(settings: Settings) -> Path:

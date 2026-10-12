@@ -21,7 +21,6 @@ Verification:
 ```bash
 bun run format
 bun run format:check
-bun run test
 bun run lint
 bun run typecheck
 bun run build

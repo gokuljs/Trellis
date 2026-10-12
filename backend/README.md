@@ -23,8 +23,6 @@ Interactive API docs are served at `/docs`, with the OpenAPI document at
 `/openapi.json`.
 
 By default, local account files are under `~/.trellis/accounts/<user-id>/`.
-`TRELLIS_DATA_DIR` changes that root. If a private PR 1 `state.db` exists for
-the signed-in account, the backend imports it once into Supabase and leaves
-the original file as a backup. The older shared `~/.trellis/state.db` is not
-imported. Keep the account directory until the import is verified; it also
-contains local provider keys and an import recovery capability.
+`TRELLIS_DATA_DIR` changes that root. Provider keys and local account settings
+stay on this computer. Existing SQLite files are left untouched and are not
+imported; cloud chats and settings are stored in Supabase.

@@ -184,8 +184,6 @@ def test_runtime_websocket_reports_account_in_use(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("error_code", "expected_status", "expected_close"),
     [
-        ("account_activity_busy", 409, 4409),
-        ("account_import_in_progress", 409, 4409),
         ("database_unavailable", 503, 1013),
     ],
 )

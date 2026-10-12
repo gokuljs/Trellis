@@ -39,13 +39,12 @@ from app.infrastructure.local_patch import LocalPatchToolExecutor
 from app.infrastructure.local_tools import LocalReadToolExecutor, read_workspace_guidance
 from app.infrastructure.runtime_events import RuntimeEventHub
 from app.infrastructure.secrets import SecretStore
-from app.infrastructure.sqlite_import import LegacyImportSink, import_locked_account
 from app.infrastructure.supabase_repository import SupabaseRepository, VerifiedTokenSource
 from app.infrastructure.workspace_bindings import LocalWorkspaceBindings
 
 
 class AccountRepository(
-    ChatRepository, OnboardingRepository, RunRepository, RunLeasePort, LegacyImportSink, Protocol
+    ChatRepository, OnboardingRepository, RunRepository, RunLeasePort, Protocol
 ):
     async def ensure_account(self) -> None: ...
 
@@ -92,9 +91,8 @@ def _prepare_account_directory(data_dir: Path, user_id: UUID) -> Path:
                 raise RuntimeError("An account data path must be a private directory")
             if metadata.st_uid != os.geteuid():
                 raise RuntimeError("An account data path must be owned by this process")
-    for filename in ("state.db", ".env"):
-        if (account_dir / filename).is_symlink():
-            raise RuntimeError("An account data file must not be a symlink")
+    if (account_dir / ".env").is_symlink():
+        raise RuntimeError("An account data file must not be a symlink")
     return account_dir
 
 
@@ -213,7 +211,6 @@ class AccountRegistry:
                     database = self._repository_factory(
                         self._settings, user_id, token_source, self._cloud_client
                     )
-                    await import_locked_account(account_dir, user_id, lock_descriptor, database)
                     await database.ensure_account()
                     secret_store = SecretStore(account_dir / ".env")
                     event_hub = RuntimeEventHub()

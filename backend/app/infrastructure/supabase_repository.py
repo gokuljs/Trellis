@@ -226,16 +226,6 @@ class SupabaseRepository:
                     "session_turn_busy",
                     "This chat has an active turn. Try again after it finishes.",
                 )
-            if error_code == "PT409" and error_message == "account_import_in_progress":
-                raise ApplicationError(
-                    "account_import_in_progress",
-                    "Account data is being imported. Try again shortly.",
-                )
-            if error_code == "PT409" and error_message == "account_activity_busy":
-                raise ApplicationError(
-                    "account_activity_busy",
-                    "An active request must finish before account data can be imported.",
-                )
             raise ValueError("The cloud record conflicts with the current state")
         if response.status_code == 400 and error_code == "22023":
             if isinstance(error_message, str) and len(error_message) <= 200:
@@ -1244,17 +1234,3 @@ class SupabaseRepository:
 
     async def ensure_account(self) -> None:
         await self._request("POST", "rpc/ensure_account", payload={})
-
-    async def import_batch(
-        self, table: str, rows: list[dict[str, object]], capability: str
-    ) -> None:
-        if not rows:
-            return
-        await self._request(
-            "POST",
-            "rpc/import_snapshot",
-            payload={"p_snapshot": {"table": table, "rows": rows}, "p_capability": capability},
-        )
-
-    async def seal_import(self, capability: str) -> None:
-        await self._request("POST", "rpc/seal_import", payload={"p_capability": capability})

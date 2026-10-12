@@ -45,8 +45,6 @@ ERROR_STATUS = {
     "session_workspace_busy": 409,
     "session_run_busy": 409,
     "session_turn_busy": 409,
-    "account_import_in_progress": 409,
-    "account_activity_busy": 409,
     "provider_not_configured": 409,
     "pricing_unavailable": 409,
     "invalid_budget_preset": 422,

@@ -27,14 +27,11 @@ from app.domain.runtime import (
 from app.infrastructure.local_tools import LocalReadToolExecutor, read_workspace_guidance
 from app.infrastructure.secrets import SecretStore
 from tests.memory_repository import MemoryRepository as Database
+from tests.support import make_settings
 
 
-def make_settings(data_dir: Path) -> Settings:
-    return Settings(environment="test", data_dir=data_dir)
-
-
-def _database_path(settings: Settings) -> Path:
-    return settings.data_dir / "state.db"
+def _repository_key(settings: Settings) -> Path:
+    return settings.data_dir / "memory"
 
 
 def _secrets_path(settings: Settings) -> Path:
@@ -252,7 +249,7 @@ class PersistBeforePublish:
 
 def test_run_service_streams_and_persists_a_provider_neutral_run(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider(
         (
@@ -279,7 +276,6 @@ def test_run_service_streams_and_persists_a_provider_neutral_run(tmp_path: Path)
     )
 
     async def run():
-        await database.initialize()
         session = await database.create_session()
         await secret_store.set("openai", "sk-runtime-secret")
         publisher = PersistBeforePublish(database)
@@ -371,7 +367,7 @@ def test_run_service_persists_read_tool_exchange_before_a_second_model_call(
     tmp_path: Path,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     (tmp_path / "README.md").write_text("Hello from the workspace.\n", encoding="utf-8")
     (tmp_path / "AGENTS.md").write_text("Read carefully.\n", encoding="utf-8")
@@ -399,7 +395,6 @@ def test_run_service_persists_read_tool_exchange_before_a_second_model_call(
     )
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -474,7 +469,7 @@ def test_budget_blocks_tool_execution_after_exhausted_or_missing_usage(
     tmp_path: Path, usage: ModelStreamEvent | None, expected_error: str
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     (tmp_path / "note.txt").write_text("Read me\n", encoding="utf-8")
     events = [
@@ -489,7 +484,6 @@ def test_budget_blocks_tool_execution_after_exhausted_or_missing_usage(
     provider = RecordingProvider(tuple(events), emit_default_usage=usage is not None)
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -544,7 +538,7 @@ def test_estimated_cost_limit_stops_before_publishing_a_final_answer(tmp_path: P
             return refreshed
 
     settings = make_settings(tmp_path)
-    database = TinyCostDatabase(_database_path(settings))
+    database = TinyCostDatabase(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider(
         (
@@ -555,7 +549,6 @@ def test_estimated_cost_limit_stops_before_publishing_a_final_answer(tmp_path: P
     )
 
     async def run():
-        await database.initialize()
         session = await database.create_session()
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -581,7 +574,7 @@ def test_approved_tool_resumes_after_restart_without_repeating_the_model_call(
     tmp_path: Path,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     (tmp_path / "note.txt").write_text("safe contents\n", encoding="utf-8")
     provider = SequencedProvider(
@@ -602,7 +595,6 @@ def test_approved_tool_resumes_after_restart_without_repeating_the_model_call(
     registry = ToolRegistry(LocalReadToolExecutor(), approval_required_names={"read_file"})
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         first_service = RunService(
@@ -626,7 +618,7 @@ def test_approved_tool_resumes_after_restart_without_repeating_the_model_call(
         )
         await first_service.close()
 
-        restarted_database = Database(_database_path(settings))
+        restarted_database = Database(_repository_key(settings))
         second_service = RunService(
             restarted_database,
             restarted_database,
@@ -662,7 +654,7 @@ def test_approved_tool_resumes_after_restart_without_repeating_the_model_call(
 
 def test_approved_tool_keeps_execution_budget_after_a_delayed_decision(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     (tmp_path / "note.txt").write_text("safe contents\n", encoding="utf-8")
     provider = SequencedProvider(
@@ -683,7 +675,6 @@ def test_approved_tool_keeps_execution_budget_after_a_delayed_decision(tmp_path:
     registry = ToolRegistry(LocalReadToolExecutor(), approval_required_names={"read_file"})
 
     async def exercise():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         first_service = RunService(
@@ -726,7 +717,7 @@ def test_approved_tool_keeps_execution_budget_after_a_delayed_decision(tmp_path:
         ]
         await first_service.close()
 
-        restarted_database = Database(_database_path(settings))
+        restarted_database = Database(_repository_key(settings))
         second_service = RunService(
             restarted_database,
             restarted_database,
@@ -764,7 +755,7 @@ def test_approved_tool_keeps_execution_budget_after_a_delayed_decision(tmp_path:
 
 def test_cancelling_while_waiting_for_approval_closes_the_tool_call(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
@@ -779,7 +770,6 @@ def test_cancelling_while_waiting_for_approval_closes_the_tool_call(tmp_path: Pa
     )
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -814,7 +804,7 @@ def test_cancelling_an_approved_run_before_it_gets_a_slot_finishes_cancellation(
     tmp_path: Path,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
@@ -829,7 +819,6 @@ def test_cancelling_an_approved_run_before_it_gets_a_slot_finishes_cancellation(
     )
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -869,7 +858,7 @@ def test_shutdown_during_approval_notification_preserves_waiting_run(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
@@ -893,7 +882,6 @@ def test_shutdown_during_approval_notification_preserves_waiting_run(
                 await asyncio.Event().wait()
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         publisher = BlockingApprovalPublisher()
@@ -924,7 +912,7 @@ def test_denial_becomes_a_tool_result_and_late_decisions_are_rejected(
     tmp_path: Path,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
@@ -955,7 +943,6 @@ def test_denial_becomes_a_tool_result_and_late_decisions_are_rejected(
     executor = CountingExecutor()
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1002,7 +989,7 @@ def test_denial_becomes_a_tool_result_and_late_decisions_are_rejected(
 
 def test_preview_failure_is_a_tool_result_without_requesting_approval(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
@@ -1027,7 +1014,6 @@ def test_preview_failure_is_a_tool_result_without_requesting_approval(tmp_path: 
             raise ToolExecutionError("path_not_found", "The file does not exist.")
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1062,7 +1048,7 @@ def test_preview_failure_is_a_tool_result_without_requesting_approval(tmp_path: 
 
 def test_secret_in_approval_preview_is_not_persisted_or_shown(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
@@ -1087,7 +1073,6 @@ def test_secret_in_approval_preview_is_not_persisted_or_shown(tmp_path: Path) ->
             return {"diff": "OPENAI_API_KEY=sk-previewsecret123"}
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1120,7 +1105,7 @@ def test_secret_in_approval_preview_is_not_persisted_or_shown(tmp_path: Path) ->
 
 def test_tool_only_response_records_two_results_before_continuing(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     (tmp_path / "one.txt").write_text("first\n", encoding="utf-8")
     provider = SequencedProvider(
@@ -1144,7 +1129,6 @@ def test_tool_only_response_records_two_results_before_continuing(tmp_path: Path
     )
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1193,7 +1177,7 @@ def test_agent_loop_rejects_sensitive_tool_arguments_before_recording_them(
     tmp_path: Path,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
@@ -1216,7 +1200,6 @@ def test_agent_loop_rejects_sensitive_tool_arguments_before_recording_them(
     )
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1252,7 +1235,7 @@ def test_streamed_secret_split_across_chunks_is_redacted_before_persistence(
     tmp_path: Path,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider(
         (
@@ -1263,7 +1246,6 @@ def test_streamed_secret_split_across_chunks_is_redacted_before_persistence(
     )
 
     async def run():
-        await database.initialize()
         session = await database.create_session()
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1291,7 +1273,7 @@ def test_streamed_secret_split_across_chunks_is_redacted_before_persistence(
 
 def test_cancelling_during_a_tool_records_a_terminal_result(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
@@ -1319,7 +1301,6 @@ def test_cancelling_during_a_tool_records_a_terminal_result(tmp_path: Path) -> N
     executor = BlockingExecutor()
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1386,7 +1367,7 @@ def test_a_tool_cannot_run_past_the_run_deadline(tmp_path: Path) -> None:
             return "unreachable", False
 
     settings = make_settings(tmp_path)
-    database = NearDeadlineDatabase(_database_path(settings))
+    database = NearDeadlineDatabase(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
@@ -1401,7 +1382,6 @@ def test_a_tool_cannot_run_past_the_run_deadline(tmp_path: Path) -> None:
     )
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1428,7 +1408,7 @@ def test_a_tool_cannot_run_past_the_run_deadline(tmp_path: Path) -> None:
 
 def test_provider_metadata_is_redacted_before_events_and_records(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider(
         (
@@ -1445,7 +1425,6 @@ def test_provider_metadata_is_redacted_before_events_and_records(tmp_path: Path)
     )
 
     async def run():
-        await database.initialize()
         session = await database.create_session()
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1468,7 +1447,7 @@ def test_provider_metadata_is_redacted_before_events_and_records(tmp_path: Path)
 
 def test_secret_looking_tool_call_id_is_rejected_before_persistence(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider(
         (
@@ -1481,7 +1460,6 @@ def test_secret_looking_tool_call_id_is_rejected_before_persistence(tmp_path: Pa
     )
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1526,12 +1504,11 @@ def test_model_stream_stops_at_tool_call_limit(tmp_path: Path) -> None:
             return generate()
 
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = TooManyToolsProvider()
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1555,7 +1532,7 @@ def test_model_stream_stops_at_tool_call_limit(tmp_path: Path) -> None:
 
 def test_model_stream_rejects_oversized_continuation_data(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider(
         (
@@ -1569,7 +1546,6 @@ def test_model_stream_rejects_oversized_continuation_data(tmp_path: Path) -> Non
     )
 
     async def run():
-        await database.initialize()
         session = await database.create_session()
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1616,13 +1592,12 @@ def test_cancellation_wins_when_provider_finishes_during_cancel_publication(
                 await self.release.wait()
 
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = CancelRaceProvider()
     publisher = BlockingCancelPublisher()
 
     async def run():
-        await database.initialize()
         session = await database.create_session()
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1662,7 +1637,7 @@ def test_truncated_tool_result_tells_the_next_model_step(tmp_path: Path) -> None
             return "partial file content", True
 
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = SequencedProvider(
         (
@@ -1681,7 +1656,6 @@ def test_truncated_tool_result_tells_the_next_model_step(tmp_path: Path) -> None
     )
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1729,12 +1703,11 @@ def test_second_model_failure_keeps_the_first_tool_exchange(tmp_path: Path) -> N
             return generate()
 
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = FailsOnSecondStep()
 
     async def run():
-        await database.initialize()
         session = await database.create_session(str(tmp_path))
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1765,7 +1738,7 @@ def test_second_model_failure_keeps_the_first_tool_exchange(tmp_path: Path) -> N
 
 def test_run_service_rejects_an_unoffered_tool_call_without_a_final_reply(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider(
         (
@@ -1779,7 +1752,6 @@ def test_run_service_rejects_an_unoffered_tool_call_without_a_final_reply(tmp_pa
     )
 
     async def run():
-        await database.initialize()
         session = await database.create_session()
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1812,12 +1784,11 @@ def test_run_service_rejects_an_unoffered_tool_call_without_a_final_reply(tmp_pa
 
 def test_provider_failure_keeps_no_partial_assistant_message(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = FailingProvider(())
 
     async def run():
-        await database.initialize()
         session = await database.create_session()
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1855,11 +1826,10 @@ def test_provider_failure_keeps_no_partial_assistant_message(tmp_path: Path) -> 
 def test_run_service_requires_selected_streaming_adapter_before_persisting(
     tmp_path: Path,
 ) -> None:
-    database = Database(_database_path(make_settings(tmp_path)))
+    database = Database(_repository_key(make_settings(tmp_path)))
     secret_store = SecretStore(_secrets_path(make_settings(tmp_path)))
 
     async def run() -> tuple[int, int]:
-        await database.initialize()
         session = await database.create_session()
         service = RunService(
             database,
@@ -1893,11 +1863,10 @@ def test_run_service_records_timeout_and_rejects_truncated_streams(
     expected_error: str,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
 
     async def run():
-        await database.initialize()
         session = await database.create_session()
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -1928,12 +1897,11 @@ def test_run_service_records_timeout_and_rejects_truncated_streams(
 
 def test_shutdown_marks_running_and_semaphore_queued_runs_interrupted(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = BlockingProvider()
 
     async def run():
-        await database.initialize()
         first_session = await database.create_session()
         second_session = await database.create_session()
         await secret_store.set("openai", "sk-runtime-secret")
@@ -1959,12 +1927,11 @@ def test_shutdown_marks_running_and_semaphore_queued_runs_interrupted(tmp_path: 
 
 def test_user_cancellation_transitions_running_run_and_cancels_model_call(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = BlockingProvider()
 
     async def run():
-        await database.initialize()
         session = await database.create_session()
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -2013,12 +1980,11 @@ def test_user_cancellation_transitions_running_run_and_cancels_model_call(tmp_pa
 
 def test_user_can_cancel_a_run_waiting_for_a_concurrency_slot(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = BlockingProvider()
 
     async def run():
-        await database.initialize()
         first_session = await database.create_session()
         second_session = await database.create_session()
         await secret_store.set("openai", "sk-runtime-secret")
@@ -2047,11 +2013,10 @@ def test_user_can_cancel_a_run_waiting_for_a_concurrency_slot(tmp_path: Path) ->
 
 def test_cancelling_orphaned_running_run_reaches_terminal_state(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
 
     async def run():
-        await database.initialize()
         session = await database.create_session()
         model = (await database.list_models())[0]
         created = await database.create_run(
@@ -2096,12 +2061,11 @@ def test_unexpected_provider_exception_does_not_expose_secret_in_logs(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = Database(_database_path(settings))
+    database = Database(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = UnexpectedFailureProvider(())
 
     async def run():
-        await database.initialize()
         session = await database.create_session()
         await secret_store.set("openai", "sk-private-runtime-key")
         service = RunService(
@@ -2129,12 +2093,11 @@ def test_prestart_repository_failure_is_persisted_without_unhandled_task_error(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     settings = make_settings(tmp_path)
-    database = OneShotGetFailureDatabase(_database_path(settings))
+    database = OneShotGetFailureDatabase(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider(())
 
     async def run():
-        await database.initialize()
         session = await database.create_session()
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(
@@ -2160,12 +2123,11 @@ def test_prestart_repository_failure_is_persisted_without_unhandled_task_error(
 
 def test_shutdown_waits_for_run_admission_before_draining_tasks(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = SlowCreateRunDatabase(_database_path(settings))
+    database = SlowCreateRunDatabase(_repository_key(settings))
     secret_store = SecretStore(_secrets_path(settings))
     provider = RecordingProvider((ModelStreamEvent(kind="text_delta", text="Will be interrupted"),))
 
     async def run():
-        await database.initialize()
         session = await database.create_session()
         await secret_store.set("openai", "sk-runtime-secret")
         service = RunService(

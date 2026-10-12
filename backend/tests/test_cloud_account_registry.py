@@ -13,7 +13,7 @@ from app.infrastructure.supabase_repository import VerifiedTokenSource
 ALICE = UUID("c928705a-6f03-4aa8-9f81-c4fb50696527")
 
 
-def test_cloud_registry_imports_before_initializing_account_and_refreshes_token(
+def test_cloud_registry_initializes_account_and_refreshes_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     events: list[str] = []
@@ -31,11 +31,7 @@ def test_cloud_registry_imports_before_initializing_account_and_refreshes_token(
         async def list_decided_approval_runs(self) -> list[str]:
             return []
 
-    async def fake_import(_directory: Path, _user_id: UUID, _lock: int, _sink: object) -> None:
-        events.append("import")
-
     monkeypatch.setattr(accounts, "SupabaseRepository", FakeRepository)
-    monkeypatch.setattr(accounts, "import_locked_account", fake_import)
     settings = Settings(
         environment="test",
         data_dir=tmp_path / "data",
@@ -50,7 +46,7 @@ def test_cloud_registry_imports_before_initializing_account_and_refreshes_token(
                 expires = datetime.now(UTC) + timedelta(hours=1)
                 first = await registry.get(ALICE, access_token="first", expires_at=expires)
                 assert await registry.get(ALICE, access_token="second", expires_at=expires) is first
-                assert events == ["import", "ensure"]
+                assert events == ["ensure"]
                 assert len(sources) == 1
                 assert first.database is not None
                 assert (
@@ -63,7 +59,6 @@ def test_cloud_registry_imports_before_initializing_account_and_refreshes_token(
                 await registry.close()
 
     asyncio.run(exercise())
-    assert not (settings.data_dir / "accounts" / str(ALICE) / "state.db").exists()
 
 
 def test_cloud_registry_requires_fresh_verified_token(tmp_path: Path) -> None:

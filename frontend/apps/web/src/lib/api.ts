@@ -215,11 +215,6 @@ export const api = {
       },
       { timeoutMs: onboardingRequestTimeout, ...options }
     ),
-  selectProvider: (provider: ProviderId) =>
-    request<Settings>("/api/settings/provider", {
-      method: "PUT",
-      body: JSON.stringify({ provider }),
-    }),
   selectModel: (modelId: string) =>
     request<Settings>("/api/settings/model", {
       method: "PUT",

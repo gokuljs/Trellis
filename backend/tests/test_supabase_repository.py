@@ -19,6 +19,7 @@ from app.domain.runtime import (
     ToolCallStatus,
 )
 from app.infrastructure.supabase_repository import SupabaseRepository, VerifiedTokenSource
+from tests.support import verified_token_source
 
 ALICE = UUID("c928705a-6f03-4aa8-9f81-c4fb50696527")
 BOB = UUID("55114a4d-aa42-4eb6-a61d-f91c7992c06d")
@@ -27,12 +28,6 @@ SETTINGS = Settings(
     supabase_url="http://localhost:54321",
     supabase_publishable_key="sb_publishable_test-key",
 )
-
-
-def _source() -> VerifiedTokenSource:
-    source = VerifiedTokenSource(ALICE)
-    source.record_verified("alice-token", ALICE, datetime.now(UTC) + timedelta(hours=1))
-    return source
 
 
 def _model() -> ModelDescriptor:
@@ -107,51 +102,6 @@ def test_verified_token_source_keeps_freshest_same_account_session() -> None:
     assert source.valid_for(30 * 60)
 
 
-def test_import_seal_uses_authenticated_rpc() -> None:
-    captured: list[httpx.Request] = []
-
-    def respond(request: httpx.Request) -> httpx.Response:
-        captured.append(request)
-        return httpx.Response(200, json={"sealed": True})
-
-    async def exercise() -> None:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
-            await repository.seal_import("private-import-capability-with-forty-characters")
-
-    asyncio.run(exercise())
-    assert len(captured) == 1
-    assert captured[0].url.path == "/rest/v1/rpc/seal_import"
-    assert captured[0].headers["Authorization"] == "Bearer alice-token"
-    assert captured[0].headers["Content-Profile"] == "trellis"
-    assert json.loads(captured[0].content) == {
-        "p_capability": "private-import-capability-with-forty-characters"
-    }
-
-
-def test_import_batch_sends_private_capability_with_rows() -> None:
-    captured: list[httpx.Request] = []
-
-    def respond(request: httpx.Request) -> httpx.Response:
-        captured.append(request)
-        return httpx.Response(200, json={"inserted": 1})
-
-    async def exercise() -> None:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
-            await repository.import_batch(
-                "profiles", [{"id": str(ALICE)}], "private-import-capability-with-forty-characters"
-            )
-
-    asyncio.run(exercise())
-    assert len(captured) == 1
-    assert captured[0].url.path == "/rest/v1/rpc/import_snapshot"
-    assert json.loads(captured[0].content) == {
-        "p_snapshot": {"table": "profiles", "rows": [{"id": str(ALICE)}]},
-        "p_capability": "private-import-capability-with-forty-characters",
-    }
-
-
 def test_profile_read_uses_authenticated_rls_request_and_maps_auth_email_separately() -> None:
     captured: list[httpx.Request] = []
 
@@ -171,7 +121,7 @@ def test_profile_read_uses_authenticated_rls_request_and_maps_auth_email_separat
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             profile = await repository.get_profile()
             assert profile.id == str(ALICE)
             assert profile.display_name == "Alice"
@@ -191,7 +141,7 @@ def test_profile_read_uses_authenticated_rls_request_and_maps_auth_email_separat
 
 def test_mutations_use_rpc_and_recheck_latest_verified_token() -> None:
     captured: list[httpx.Request] = []
-    token_source = _source()
+    token_source = verified_token_source(ALICE)
 
     def respond(request: httpx.Request) -> httpx.Response:
         captured.append(request)
@@ -246,7 +196,7 @@ def test_run_writes_require_locally_owned_capability_and_never_expose_it_in_rows
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             created = await repository.create_run(
                 str(run["chat_id"]), "turn-one", "request-one", "Hello", _model()
             )
@@ -286,7 +236,7 @@ def test_existing_run_does_not_grant_capability_to_another_process() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             created = await repository.create_run(
                 str(run["chat_id"]), "turn-one", "request-one", "Hello", _model()
             )
@@ -355,7 +305,7 @@ def test_settings_and_conversation_reads_map_cloud_rows() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             assert await repository.get_selected_provider() == "openai"
             assert await repository.get_selected_model_id() == "openai:gpt-5.5"
             assert await repository.get_default_budget_preset() == "conservative"
@@ -418,7 +368,7 @@ def test_unbounded_message_reads_fetch_all_postgrest_pages(monkeypatch: pytest.M
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             messages = await repository.list_messages(chat_id)
             assert [message.ordinal for message in messages] == [1, 2, 3]
 
@@ -473,7 +423,7 @@ def test_mutation_methods_send_one_sql_transaction_each() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             assert (
                 await repository.update_profile("Alice", "ignored@example.com")
             ).display_name == "Alice"
@@ -513,7 +463,7 @@ def test_classic_turn_writes_require_a_private_local_claim_capability() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             with pytest.raises(ApplicationError) as missing:
                 await repository.add_user_message("chat-one", "turn-one", "Hello")
             assert missing.value.code == "turn_not_owned"
@@ -558,7 +508,7 @@ def test_session_mutations_return_chat_with_message_count() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             created = await repository.create_session()
             assert created.id == chat_id
             updated = await repository.set_session_workspace(chat_id, "/home/alice/project")
@@ -602,7 +552,7 @@ def test_chat_listing_loads_counts_in_one_owned_rpc() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             sessions = await repository.list_sessions()
             assert [session.message_count for session in sessions] == list(range(5))
 
@@ -643,7 +593,7 @@ def test_chat_listing_pages_summary_rpc_without_per_chat_requests(
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             assert [chat.message_count for chat in await repository.list_sessions()] == list(
                 range(5)
             )
@@ -688,7 +638,7 @@ def test_expired_run_recovery_interrupts_without_acquiring_execution_lease() -> 
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             recovered = await repository.recover_expired_run(str(run["id"]))
             assert recovered.status == "interrupted"
             assert not repository.owns_run_lease(recovered.id)
@@ -710,7 +660,7 @@ def test_run_recovery_returns_current_row_if_lease_was_renewed() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             observed = await repository.recover_expired_run(str(run["id"]))
             assert observed.status is RunStatus.RUNNING
             assert not repository.owns_run_lease(observed.id)
@@ -801,7 +751,7 @@ def test_runtime_reads_map_rls_rows_and_omit_lease_token() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             one = await repository.get_run(run_id)
             latest = await repository.get_latest_run_for_session(str(run["chat_id"]))
             assert one is not None and one.session_id == run["chat_id"]
@@ -925,7 +875,7 @@ def test_runtime_mutations_use_same_local_capability_for_atomic_rpc_actions() ->
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             await repository.create_run(
                 str(run["chat_id"]), "turn-one", "request-one", "Hello", _model()
             )
@@ -987,7 +937,7 @@ def test_locally_known_expired_lease_cannot_start_another_tool_write() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             created = await repository.create_run(
                 str(run["chat_id"]), "turn-one", "request-one", "Hello", _model()
             )
@@ -1010,7 +960,7 @@ def test_workspace_busy_conflict_preserves_application_error_type() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             with pytest.raises(SessionWorkspaceBusy):
                 await repository.set_session_workspace(
                     "5f2b6daa-65db-43ad-b0ad-742e5c3645b9", "/tmp/project"
@@ -1024,8 +974,6 @@ def test_workspace_busy_conflict_preserves_application_error_type() -> None:
     [
         ("session_run_busy", "session_run_busy"),
         ("session_turn_busy", "session_turn_busy"),
-        ("account_import_in_progress", "account_import_in_progress"),
-        ("account_activity_busy", "account_activity_busy"),
     ],
 )
 def test_cloud_mutation_conflicts_have_public_codes(message: str, expected_code: str) -> None:
@@ -1034,7 +982,7 @@ def test_cloud_mutation_conflicts_have_public_codes(message: str, expected_code:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             with pytest.raises(ApplicationError) as conflict:
                 await repository.set_default_budget_preset("conservative")
             assert conflict.value.code == expected_code
@@ -1051,7 +999,7 @@ def test_run_conflict_preserves_existing_public_error_mapping() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             with pytest.raises(ValueError, match="conflicts with a previous payload"):
                 await repository.create_run(
                     "5f2b6daa-65db-43ad-b0ad-742e5c3645b9",
@@ -1085,7 +1033,7 @@ def test_successful_lease_renewal_can_finish_after_previous_deadline() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             run = await repository.create_run(
                 str(first["chat_id"]), "turn-one", "request-one", "Hello", _model()
             )
@@ -1111,7 +1059,7 @@ def test_rejected_lease_renewal_revokes_local_execution_immediately() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             created = await repository.create_run(
                 str(run["chat_id"]), "turn-one", "request-one", "Hello", _model()
             )

@@ -41,7 +41,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Check web schema, ownership, and import contracts
+      - name: Check web schema, ownership, and runtime contracts
         run: |
           set -euo pipefail
           for file in \
@@ -54,13 +54,14 @@ jobs:
             supabase/tests/schema_contract.sql \
             supabase/tests/rpc_security.sql \
             supabase/tests/runtime_rpc.sql \
-            supabase/tests/import_security.sql \
-            supabase/tests/import_hardening.sql \
             supabase/tests/chat_summaries.sql \
             supabase/tests/runtime_regressions.sql \
             supabase/tests/create_run_regressions.sql; do
             psql -X -v ON_ERROR_STOP=1 -f "$file"
           done
+          bash supabase/tests/import_retirement.sh
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/chat_turn_security.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/schema_contract.sql
 
   quality:
     name: Backend quality

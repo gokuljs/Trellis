@@ -111,9 +111,3 @@ export type SavedRunEvent = {
   data: Record<string, unknown>
   created_at: string
 }
-
-export type TurnResult = {
-  session: Session
-  user_message: Message
-  assistant_message: Message
-}

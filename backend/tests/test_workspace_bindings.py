@@ -18,7 +18,6 @@ def test_cloud_workspace_path_requires_a_local_selection(tmp_path: Path) -> None
     database = MemoryRepository(tmp_path / "cloud-account")
 
     async def exercise() -> None:
-        await database.initialize()
         session = await database.create_session(str(project))
         local_bindings = LocalWorkspaceBindings()
         other_computer = LocalWorkspaceBindings()
@@ -67,7 +66,6 @@ def test_cloud_workspace_metadata_cannot_offer_local_tools(tmp_path: Path) -> No
             raise NotImplementedError
 
     async def exercise() -> None:
-        await database.initialize()
         cloud_chat = await database.create_session(str(project))
         await secret_store.set("openai", "sk-local-test")
         provider = Provider()
