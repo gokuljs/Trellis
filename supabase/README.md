@@ -2,8 +2,10 @@
 
 Apply the numbered SQL files in `migrations/` in order to the Supabase project.
 Use the Supabase SQL Editor or the Supabase CLI migration workflow. In the
-project's API settings, add `trellis` to **Exposed schemas**. Never expose
-`trellis_private`. Do not put a secret or service-role key in Trellis; the
+dashboard, open **Integrations → Data API → Settings**, add `trellis` to
+**Exposed schemas**, and click **Save**. Without this setting, PostgREST rejects
+Trellis requests with `PGRST106` even after the migrations have been applied.
+Never expose `trellis_private`. Do not put a secret or service-role key in Trellis; the
 backend uses the project's publishable key together with each user's access
 token.
 

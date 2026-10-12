@@ -28,7 +28,7 @@ import {
 import type {
   LatestRun,
   Message,
-  OnboardingStep,
+  OnboardingState,
   Profile,
   Session,
   RunSummary,
@@ -36,6 +36,13 @@ import type {
   Settings,
   WorkspaceView,
 } from "@/lib/app-types"
+import "./workspace-bootstrap.css"
+
+type BootstrapState =
+  | { status: "loading" }
+  | { status: "failed"; message: string }
+  | { status: "onboarding"; progress: OnboardingState }
+  | { status: "ready"; progress: OnboardingState }
 
 type FailedTurn = {
   sessionId: string
@@ -187,7 +194,9 @@ function startNextAttempt(previous?: TurnRunActivity): TurnRunActivity {
 
 export function AppShell({
   accountControl,
-}: { accountControl?: ReactNode } = {}) {
+}: {
+  accountControl?: ReactNode | ((profile: Profile | null) => ReactNode)
+} = {}) {
   const [activeView, setActiveView] = useState<WorkspaceView>("New session")
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
@@ -197,12 +206,12 @@ export function AppShell({
   >(null)
   const [profile, setProfile] = useState<Profile | null>(null)
   const [settings, setSettings] = useState<Settings | null>(null)
-  const [onboardingRequired, setOnboardingRequired] = useState(false)
-  const [onboardingStep, setOnboardingStep] = useState<OnboardingStep>("intro")
+  const [bootstrap, setBootstrap] = useState<BootstrapState>({
+    status: "loading",
+  })
   const [sessions, setSessions] = useState<Session[]>([])
   const [activeSession, setActiveSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
-  const [loading, setLoading] = useState(true)
   const [sessionLoading, setSessionLoading] = useState(false)
   const [workspaceSaving, setWorkspaceSaving] = useState(false)
   const [pending, setPending] = useState(false)
@@ -234,6 +243,7 @@ export function AppShell({
   const cancelRequestRef = useRef(false)
   const approvalRequestRef = useRef<string | null>(null)
   const fetchingRunIdsRef = useRef(new Set<string>())
+  const bootstrapControllerRef = useRef<AbortController | null>(null)
 
   const recordRunInfo = useCallback(
     (turnId: string, runInfo: RuntimeRunInfo) =>
@@ -255,17 +265,12 @@ export function AppShell({
         const activity = current[turnId] ?? { events: [], runInfo: null }
         if (activity.runInfo && activity.runInfo.runId !== event.runId)
           return current
-        const retain = !["assistant.delta", "assistant.completed"].includes(
-          event.eventType
+        const events = !activity.events.some(
+          (item) =>
+            item.runId === event.runId && item.sequence === event.sequence
         )
-        const events =
-          retain &&
-          !activity.events.some(
-            (item) =>
-              item.runId === event.runId && item.sequence === event.sequence
-          )
-            ? [...activity.events, event]
-            : activity.events
+          ? [...activity.events, event]
+          : activity.events
         return {
           ...current,
           [turnId]: { ...activity, events, latestEvent: event },
@@ -670,87 +675,104 @@ export function AppShell({
     [recordRunEvent, recordRunInfo]
   )
 
-  const restoreSessions = useCallback(
-    async (isCancelled: () => boolean = () => false) => {
-      const restoredSessions = await api.listSessions()
-      if (isCancelled()) return
+  const restoreWorkspace = useCallback(async () => {
+    bootstrapControllerRef.current?.abort()
+    const controller = new AbortController()
+    bootstrapControllerRef.current = controller
+    const options = { signal: controller.signal }
+    const timer = setTimeout(
+      () =>
+        controller.abort(
+          new ApiError(
+            "request_timeout",
+            "Trellis took too long to open your workspace. Try again.",
+            0
+          )
+        ),
+      15000
+    )
+    const current = () => bootstrapControllerRef.current === controller
+    try {
+      const [restoredProfile, restoredSettings, restoredOnboarding] =
+        await Promise.all([
+          api.getProfile(options),
+          api.getSettings(options),
+          api.getOnboarding(options),
+        ])
+      if (!current()) return
 
+      setProfile(restoredProfile)
+      setSettings(restoredSettings)
+      if (!restoredOnboarding.completed) {
+        setBootstrap({ status: "onboarding", progress: restoredOnboarding })
+        return
+      }
+      const restoredSessions = await api.listSessions(options)
+      if (!current()) return
       setSessions(restoredSessions)
-    },
-    []
-  )
+      setBootstrap({ status: "ready", progress: restoredOnboarding })
+    } catch (restoreError) {
+      if (current()) {
+        setBootstrap({ status: "failed", message: visibleError(restoreError) })
+        controller.abort()
+      }
+    } finally {
+      clearTimeout(timer)
+    }
+  }, [])
 
   useEffect(() => {
-    let cancelled = false
-
-    const restore = async () => {
-      try {
-        const [restoredProfile, restoredSettings, restoredOnboarding] =
-          await Promise.all([
-            api.getProfile(),
-            api.getSettings(),
-            api.getOnboarding(),
-          ])
-        if (cancelled) return
-
-        setProfile(restoredProfile)
-        setSettings(restoredSettings)
-        if (!restoredOnboarding.completed) {
-          setOnboardingRequired(true)
-          setOnboardingStep(
-            restoredOnboarding.current_step === "complete"
-              ? "intro"
-              : restoredOnboarding.current_step
-          )
-          return
-        }
-        await restoreSessions(() => cancelled)
-      } catch (restoreError) {
-        if (!cancelled) setError(visibleError(restoreError))
-      } finally {
-        if (!cancelled) setLoading(false)
-      }
-    }
-
-    void restore()
+    let mounted = true
+    void Promise.resolve().then(() => {
+      if (mounted) void restoreWorkspace()
+    })
     return () => {
-      cancelled = true
+      mounted = false
+      bootstrapControllerRef.current?.abort()
+      bootstrapControllerRef.current = null
     }
-  }, [restoreSessions])
+  }, [restoreWorkspace])
 
   const completeOnboarding = async (values: OnboardingValues) => {
     if (!profile || !settings) {
       throw new Error("Trellis is still loading your local settings.")
     }
 
+    const controller = bootstrapControllerRef.current
+    if (!controller) return
     const progress = await api.saveOnboardingModel(
       values.modelId,
-      values.apiKey
+      values.apiKey,
+      { signal: controller.signal }
     )
+    if (
+      bootstrapControllerRef.current !== controller ||
+      controller.signal.aborted
+    )
+      return
     if (!progress.completed)
       throw new Error("Trellis could not complete setup.")
-    setSettings(await api.getSettings())
-    await restoreSessions()
-    setOnboardingRequired(false)
+    setBootstrap({ status: "loading" })
+    await restoreWorkspace()
   }
 
   const advanceOnboardingIntro = async () => {
-    const progress = await api.completeOnboardingIntro()
-    setOnboardingStep(
-      progress.current_step === "complete" ? "intro" : progress.current_step
-    )
+    const progress = await api.completeOnboardingIntro({
+      signal: bootstrapControllerRef.current?.signal,
+    })
+    setBootstrap({ status: "onboarding", progress })
   }
 
   const saveOnboardingProfile = async (displayName: string) => {
-    const progress = await api.saveOnboardingProfile({
-      display_name: displayName,
-    })
-    setProfile((current) =>
-      current ? { ...current, display_name: displayName } : current
+    const options = { signal: bootstrapControllerRef.current?.signal }
+    const progress = await api.saveOnboardingProfile(
+      {
+        display_name: displayName,
+      },
+      options
     )
-    setOnboardingStep(
-      progress.current_step === "complete" ? "intro" : progress.current_step
-    )
+    setProfile(await api.getProfile(options))
+    setBootstrap({ status: "onboarding", progress })
   }
 
   const startNewSession = useCallback(() => {
@@ -1166,31 +1188,62 @@ export function AppShell({
     }
   }
 
-  if (loading) {
+  const renderedAccountControl =
+    typeof accountControl === "function"
+      ? accountControl(profile)
+      : accountControl
+
+  if (bootstrap.status === "loading" || bootstrap.status === "failed") {
     return (
       <main
         className="onboarding-shell onboarding-loading-shell"
         data-theme="dark"
       >
-        {accountControl && (
+        {renderedAccountControl && (
           <header className="onboarding-topbar onboarding-account-loading">
-            {accountControl}
+            {renderedAccountControl}
           </header>
         )}
-        <div className="workspace-loading" role="status">
-          Opening your local workspace…
-        </div>
+        {bootstrap.status === "failed" ? (
+          <section
+            className="workspace-bootstrap-error"
+            aria-labelledby="workspace-bootstrap-heading"
+          >
+            <h1 id="workspace-bootstrap-heading">
+              Your workspace could not open
+            </h1>
+            <p role="alert">{bootstrap.message}</p>
+            <button
+              className="onboarding-primary-action"
+              type="button"
+              onClick={() => {
+                setBootstrap({ status: "loading" })
+                void restoreWorkspace()
+              }}
+            >
+              Try again
+            </button>
+          </section>
+        ) : (
+          <div className="workspace-loading" role="status">
+            Opening your local workspace…
+          </div>
+        )}
       </main>
     )
   }
 
-  if (onboardingRequired && profile && settings) {
+  if (bootstrap.status === "onboarding" && profile && settings) {
     return (
       <OnboardingFlow
-        accountControl={accountControl}
+        accountControl={renderedAccountControl}
         profile={profile}
         settings={settings}
-        initialStep={onboardingStep}
+        initialStep={
+          bootstrap.progress.current_step === "complete"
+            ? "intro"
+            : bootstrap.progress.current_step
+        }
         onAdvanceIntro={advanceOnboardingIntro}
         onSaveProfile={saveOnboardingProfile}
         onComplete={completeOnboarding}
@@ -1233,7 +1286,7 @@ export function AppShell({
 
       <section className="workspace">
         <WorkspaceTopbar
-          accountControl={accountControl}
+          accountControl={renderedAccountControl}
           activeView={activeView}
           activeSessionTitle={activeSession?.title ?? null}
           onNavigate={handleNavigate}
@@ -1246,6 +1299,9 @@ export function AppShell({
             <SettingsPage
               profile={profile}
               settings={settings}
+              onboarding={
+                bootstrap.status === "ready" ? bootstrap.progress : undefined
+              }
               onProfileChange={setProfile}
               onSettingsChange={setSettings}
             />

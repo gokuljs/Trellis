@@ -38,6 +38,7 @@ ERROR_STATUS = {
     "reauth_required": 401,
     "cloud_access_denied": 401,
     "database_unavailable": 503,
+    "database_not_configured": 503,
     "invalid_workspace": 422,
     "workspace_picker_unavailable": 503,
     "workspace_picker_timeout": 504,

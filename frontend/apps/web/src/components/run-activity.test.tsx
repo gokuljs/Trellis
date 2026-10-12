@@ -28,6 +28,165 @@ function event(
 afterEach(cleanup)
 
 describe("run activity", () => {
+  it("shows the server timestamp beside readable activity", () => {
+    const { container } = render(
+      <RunActivity
+        events={[
+          {
+            ...event(1, "run.started", { status: "running" }),
+            createdAt: "2026-10-07T12:00:01Z",
+          },
+        ]}
+        runInfo={null}
+        pending
+        approvalPendingToolId={null}
+        approvalError={null}
+        onApprovalDecision={vi.fn()}
+      />
+    )
+
+    const timestamp = container.querySelector("[data-run-sequence='1'] time")
+    expect(timestamp).toHaveAttribute("dateTime", "2026-10-07T12:00:01Z")
+    expect(timestamp).toHaveAttribute("title", "2026-10-07T12:00:01Z")
+    expect(timestamp).not.toHaveTextContent("Time unavailable")
+  })
+
+  it("exposes every event in sequence order and mounts payloads only when expanded", async () => {
+    const user = userEvent.setup()
+    const { container } = render(
+      <RunActivity
+        events={[
+          {
+            ...event(3, "future.event", {
+              nested: { value: "<script>hello</script>" },
+            }),
+            eventVersion: 2,
+            createdAt: "2026-10-07T12:00:03Z",
+          },
+          {
+            ...event(1, "assistant.delta", { text: "Safe answer" }),
+            createdAt: "2026-10-07T12:00:01Z",
+          },
+          {
+            ...event(2, "assistant.completed", { message_id: "message-1" }),
+            createdAt: "2026-10-07T12:00:02Z",
+          },
+        ]}
+        runInfo={null}
+        pending={false}
+        approvalPendingToolId={null}
+        approvalError={null}
+        onApprovalDecision={vi.fn()}
+      />
+    )
+
+    const logToggle = screen.getByText("Event log (3)")
+    expect(
+      screen.queryByRole("list", { name: "Complete run event log" })
+    ).not.toBeInTheDocument()
+    await user.click(logToggle)
+    const log = screen.getByRole("list", { name: "Complete run event log" })
+    expect(
+      Array.from(log.querySelectorAll("[data-log-sequence]")).map((entry) =>
+        entry.getAttribute("data-log-sequence")
+      )
+    ).toEqual(["1", "2", "3"])
+    expect(within(log).getByText("assistant.delta")).toBeInTheDocument()
+    expect(within(log).getByText("assistant.completed")).toBeInTheDocument()
+    expect(
+      within(log).queryByLabelText("Event 3 details")
+    ).not.toBeInTheDocument()
+
+    await user.click(within(log).getByLabelText("Event 3: future.event"))
+    const payload = within(log).getByLabelText("Event 3 details")
+    expect(JSON.parse(payload.textContent ?? "")).toEqual({
+      runId: "run-1",
+      sequence: 3,
+      eventType: "future.event",
+      eventVersion: 2,
+      createdAt: "2026-10-07T12:00:03Z",
+      data: { nested: { value: "<script>hello</script>" } },
+    })
+    expect(container.querySelector("script")).toBeNull()
+    expect(
+      within(log).getByLabelText("Event 3: future.event").querySelector("time")
+    ).toHaveAttribute("dateTime", "2026-10-07T12:00:03Z")
+    await user.click(within(log).getByLabelText("Event 3: future.event"))
+    expect(
+      within(log).queryByLabelText("Event 3 details")
+    ).not.toBeInTheDocument()
+    await user.click(logToggle)
+    expect(
+      screen.queryByRole("list", { name: "Complete run event log" })
+    ).not.toBeInTheDocument()
+  })
+
+  it("keeps missing and invalid timestamps inspectable without inventing a time", async () => {
+    const user = userEvent.setup()
+    render(
+      <RunActivity
+        events={[
+          event(1, "assistant.delta", { text: "Answer" }),
+          {
+            ...event(2, "assistant.completed", { message_id: "message-1" }),
+            createdAt: "invalid",
+          },
+        ]}
+        runInfo={null}
+        pending={false}
+        approvalPendingToolId={null}
+        approvalError={null}
+        onApprovalDecision={vi.fn()}
+      />
+    )
+
+    await user.click(screen.getByText("Event log (2)"))
+    const log = screen.getByRole("list", { name: "Complete run event log" })
+    expect(within(log).getAllByText("Time unavailable")).toHaveLength(2)
+    expect(log.querySelector("time")).toBeNull()
+    await user.click(within(log).getByLabelText("Event 2: assistant.completed"))
+    expect(
+      JSON.parse(
+        within(log).getByLabelText("Event 2 details").textContent ?? ""
+      ).createdAt
+    ).toBe("invalid")
+  })
+
+  it("adds incoming events to an open log and keeps an expanded payload open", async () => {
+    const user = userEvent.setup()
+    const queued = {
+      ...event(1, "run.queued", { status: "queued" }),
+      createdAt: "2026-10-07T12:00:00Z",
+    }
+    const props = {
+      runInfo: null,
+      pending: true,
+      approvalPendingToolId: null,
+      approvalError: null,
+      onApprovalDecision: vi.fn(),
+    }
+    const { rerender } = render(<RunActivity {...props} events={[queued]} />)
+
+    await user.click(screen.getByText("Event log (1)"))
+    await user.click(screen.getByLabelText("Event 1: run.queued"))
+    rerender(
+      <RunActivity
+        {...props}
+        events={[
+          queued,
+          {
+            ...event(2, "run.started", { status: "running" }),
+            createdAt: "2026-10-07T12:00:01Z",
+          },
+        ]}
+      />
+    )
+
+    expect(screen.getByText("Event log (2)")).toBeInTheDocument()
+    expect(screen.getByLabelText("Event 2: run.started")).toBeInTheDocument()
+    expect(screen.getByLabelText("Event 1 details")).toBeInTheDocument()
+  })
+
   it("keeps model, tool, and result activity in saved event order with budget usage", () => {
     const { container } = render(
       <RunActivity

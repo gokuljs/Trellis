@@ -1,5 +1,5 @@
 import { RotateCcw, Square } from "lucide-react"
-import { Fragment, useState } from "react"
+import { useState } from "react"
 import Markdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { ThinkingOrb } from "thinking-orbs"
@@ -140,6 +140,7 @@ export function ChatThread({
     if (!activity) return null
     return (
       <RunActivityDisclosure
+        key={`activity-${turnId}`}
         activity={activity}
         pending={pending && active}
         expanded={openActivityTurnId === turnId}
@@ -165,36 +166,32 @@ export function ChatThread({
       </header>
 
       <div className="thread-messages">
-        {messages.map((message) => (
-          <Fragment key={message.id}>
-            {message.role === "assistant" &&
-            firstAssistantByTurn.get(message.turn_id) === message.id
-              ? activityForTurn(message.turn_id, true)
-              : null}
-            <article
-              className={`thread-message ${message.role}`}
-              aria-label={message.role === "user" ? "Your message" : undefined}
-            >
-              <div className="thread-message-copy">
-                <div className="thread-message-meta">
-                  {message.role === "assistant" ? (
-                    <span className="thread-agent-mark" aria-hidden="true">
-                      <TrellisMark size={17} />
-                    </span>
-                  ) : null}
-                  <span>
-                    {message.role === "assistant" ? "Trellis" : "You"}
+        {messages.flatMap((message) => [
+          message.role === "assistant" &&
+          firstAssistantByTurn.get(message.turn_id) === message.id
+            ? activityForTurn(message.turn_id, true)
+            : null,
+          <article
+            key={message.id}
+            className={`thread-message ${message.role}`}
+            aria-label={message.role === "user" ? "Your message" : undefined}
+          >
+            <div className="thread-message-copy">
+              <div className="thread-message-meta">
+                {message.role === "assistant" ? (
+                  <span className="thread-agent-mark" aria-hidden="true">
+                    <TrellisMark size={17} />
                   </span>
-                </div>
-                <MessageMarkdown content={message.content} />
+                ) : null}
+                <span>{message.role === "assistant" ? "Trellis" : "You"}</span>
               </div>
-            </article>
-            {message.role === "user" &&
-            !firstAssistantByTurn.has(message.turn_id)
-              ? activityForTurn(message.turn_id)
-              : null}
-          </Fragment>
-        ))}
+              <MessageMarkdown content={message.content} />
+            </div>
+          </article>,
+          message.role === "user" && !firstAssistantByTurn.has(message.turn_id)
+            ? activityForTurn(message.turn_id)
+            : null,
+        ])}
 
         {pending && streamingText !== null ? (
           <article
