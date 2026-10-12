@@ -14,7 +14,7 @@ from app.application.errors import ApplicationError
 from app.core.config import Settings
 from app.domain.runtime import RunStatus, ToolApprovalDecision, ToolCallStatus
 from app.infrastructure.supabase_repository import SupabaseRepository, VerifiedTokenSource
-from tests.support import TestClient, create_app
+from tests.support import TestClient, create_app, verified_token_source
 
 ALICE = UUID("c928705a-6f03-4aa8-9f81-c4fb50696527")
 BOB = UUID("55114a4d-aa42-4eb6-a61d-f91c7992c06d")
@@ -23,12 +23,6 @@ SETTINGS = Settings(
     supabase_url="http://localhost:54321",
     supabase_publishable_key="sb_publishable_test-key",
 )
-
-
-def _source() -> VerifiedTokenSource:
-    source = VerifiedTokenSource(ALICE)
-    source.record_verified("alice-token", ALICE, datetime.now(UTC) + timedelta(hours=1))
-    return source
 
 
 @pytest.mark.parametrize("token", ["", "has whitespace", "nonascii-\u00e9", "x" * 16_385])
@@ -64,7 +58,7 @@ def test_cloud_errors_do_not_expose_server_details(status_code: int, expected_co
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             with pytest.raises(ApplicationError) as error:
                 await repository.get_profile()
             assert error.value.code == expected_code
@@ -87,7 +81,7 @@ def test_unexposed_schema_returns_safe_setup_guidance() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             with pytest.raises(ApplicationError) as error:
                 await repository.ensure_account()
             assert error.value.code == "database_not_configured"
@@ -137,7 +131,7 @@ def test_network_timeout_is_a_sanitized_cloud_failure() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(timeout)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             with pytest.raises(ApplicationError) as error:
                 await repository.get_profile()
             assert error.value.code == "database_unavailable"
@@ -161,7 +155,7 @@ def test_cloud_validation_error_only_returns_bounded_client_safe_text(
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             with pytest.raises(ValueError, match=expected_message):
                 await repository.set_default_budget_preset("conservative")
 
@@ -174,7 +168,7 @@ def test_cloud_success_response_with_invalid_json_is_rejected() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             with pytest.raises(RuntimeError, match="invalid JSON"):
                 await repository.get_profile()
 
@@ -197,7 +191,7 @@ def test_repository_rejects_a_cross_account_profile_even_if_rls_is_bypassed() ->
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             with pytest.raises(RuntimeError, match="another account"):
                 await repository.get_profile()
 
@@ -225,7 +219,7 @@ def test_repository_rejects_invalid_message_count() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             with pytest.raises(RuntimeError, match="invalid message count"):
                 await repository.get_session(chat_id)
 
@@ -251,7 +245,7 @@ def test_repository_rejects_another_accounts_chat_summary() -> None:
 
     async def exercise() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             with pytest.raises(RuntimeError, match="another account"):
                 await repository.list_sessions()
 
@@ -289,7 +283,7 @@ def test_decided_approvals_are_discovered_only_for_live_locally_owned_runs() -> 
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(lambda _: httpx.Response(500))
         ) as client:
-            repository = SupabaseRepository(SETTINGS, ALICE, _source(), client)
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
             repository._capabilities.update({run_id: "local-secret" for run_id in (*live, "stale")})
             repository._lease_expires.update(
                 {run_id: now + timedelta(minutes=1) for run_id in live}

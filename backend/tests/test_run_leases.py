@@ -86,8 +86,7 @@ class BlockingProvider:
 
 def test_locally_owned_run_renews_its_lease_while_streaming(tmp_path: Path) -> None:
     async def exercise() -> None:
-        database = LeaseDatabase(tmp_path / "state.db")
-        await database.initialize()
+        database = LeaseDatabase(tmp_path / "memory")
         session = await database.create_session()
         secrets = SecretStore(tmp_path / ".env")
         await secrets.set("openai", "sk-test")
@@ -115,8 +114,7 @@ def test_locally_owned_run_renews_its_lease_while_streaming(tmp_path: Path) -> N
 
 def test_foreign_queued_run_is_never_scheduled_locally(tmp_path: Path) -> None:
     async def exercise() -> None:
-        database = LeaseDatabase(tmp_path / "state.db", owns_created_run=False)
-        await database.initialize()
+        database = LeaseDatabase(tmp_path / "memory", owns_created_run=False)
         session = await database.create_session()
         secrets = SecretStore(tmp_path / ".env")
         await secrets.set("openai", "sk-test")
@@ -145,8 +143,7 @@ def test_foreign_queued_run_is_never_scheduled_locally(tmp_path: Path) -> None:
 
 def test_foreign_run_cannot_be_cancelled_or_approved_locally(tmp_path: Path) -> None:
     async def exercise() -> None:
-        database = LeaseDatabase(tmp_path / "state.db", owns_created_run=False)
-        await database.initialize()
+        database = LeaseDatabase(tmp_path / "memory", owns_created_run=False)
         session = await database.create_session()
         secrets = SecretStore(tmp_path / ".env")
         await secrets.set("openai", "sk-test")
@@ -199,8 +196,7 @@ def test_expired_foreign_run_recovers_on_read(tmp_path: Path) -> None:
             return replace(run, status=RunStatus.INTERRUPTED)
 
     async def exercise() -> None:
-        database = ExpiredDatabase(tmp_path / "state.db", owns_created_run=False)
-        await database.initialize()
+        database = ExpiredDatabase(tmp_path / "memory", owns_created_run=False)
         session = await database.create_session()
         secrets = SecretStore(tmp_path / ".env")
         await secrets.set("openai", "sk-test")
@@ -226,8 +222,7 @@ def test_expired_foreign_run_recovers_on_read(tmp_path: Path) -> None:
 
 def test_lost_lease_stops_the_local_provider_without_writing_more(tmp_path: Path) -> None:
     async def exercise() -> None:
-        database = LeaseDatabase(tmp_path / "state.db", lose_after=1)
-        await database.initialize()
+        database = LeaseDatabase(tmp_path / "memory", lose_after=1)
         session = await database.create_session()
         secrets = SecretStore(tmp_path / ".env")
         await secrets.set("openai", "sk-test")
@@ -293,8 +288,7 @@ def test_lost_lease_prevents_local_tool_execution(tmp_path: Path) -> None:
             return "unexpected", False
 
     async def exercise() -> None:
-        database = LeaseDatabase(tmp_path / "state.db", lose_after=1)
-        await database.initialize()
+        database = LeaseDatabase(tmp_path / "memory", lose_after=1)
         session = await database.create_session(str(project))
         secrets = SecretStore(tmp_path / ".env")
         await secrets.set("openai", "sk-test")

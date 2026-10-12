@@ -16,7 +16,7 @@ from app.domain.runtime import (
     ToolCallStatus,
 )
 from tests.memory_repository import MemoryRepository
-from tests.support import TestClient, account_database_path, create_app
+from tests.support import TestClient, account_repository_key, create_app
 
 
 def test_attached_workspace_offers_patch_tool_to_the_model(tmp_path: Path) -> None:
@@ -202,7 +202,7 @@ def test_approved_patch_uses_the_saved_preview_then_continues_the_run(tmp_path: 
     assert len(provider.requests) == 2
     assert provider.requests[1].messages[-1].role == "tool"
     assert provider.requests[1].messages[-1].content == "Updated src/note.txt."
-    saved_call = MemoryRepository(account_database_path(settings)).state.tool_calls[tool_call_id]
+    saved_call = MemoryRepository(account_repository_key(settings)).state.tool_calls[tool_call_id]
     assert saved_call.status is ToolCallStatus.COMPLETED
     assert saved_call.approval_preview is not None
     assert saved_call.approval_preview["target_sha256"] == preview["target_sha256"]

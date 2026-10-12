@@ -3,7 +3,6 @@ import stat
 from pathlib import Path
 from uuid import UUID
 
-from app.core.config import Settings
 from app.domain.runtime import RunStatus
 from app.infrastructure.secrets import SecretStore
 from tests.memory_repository import MemoryRepository
@@ -11,14 +10,11 @@ from tests.support import (
     TEST_EMAIL,
     TEST_USER_ID,
     TestClient,
-    account_database_path,
+    account_repository_key,
     account_secrets_path,
     create_app,
+    make_settings,
 )
-
-
-def make_settings(data_dir: Path) -> Settings:
-    return Settings(environment="test", data_dir=data_dir)
 
 
 def test_verified_profile_id_survives_application_restart(tmp_path: Path) -> None:
@@ -42,10 +38,9 @@ def test_verified_profile_id_survives_application_restart(tmp_path: Path) -> Non
 
 def test_application_restart_preserves_a_cloud_run_with_an_active_lease(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    database = MemoryRepository(account_database_path(settings), owner_id=TEST_USER_ID)
+    database = MemoryRepository(account_repository_key(settings), owner_id=TEST_USER_ID)
 
     async def create_run() -> str:
-        await database.initialize()
         session = await database.create_session()
         run = await database.create_run(
             session.id,
@@ -73,8 +68,8 @@ def test_verified_user_id_is_stable_across_data_directories(tmp_path: Path) -> N
         second_id = second_client.get("/api/profile").json()["id"]
 
     assert first_id == second_id == str(TEST_USER_ID)
-    assert not account_database_path(make_settings(tmp_path / "first")).exists()
-    assert not account_database_path(make_settings(tmp_path / "second")).exists()
+    assert not account_repository_key(make_settings(tmp_path / "first")).exists()
+    assert not account_repository_key(make_settings(tmp_path / "second")).exists()
 
 
 def test_profile_details_can_be_updated_and_restored(tmp_path: Path) -> None:
@@ -114,7 +109,7 @@ def test_api_keys_are_write_only_and_kept_outside_cloud_data(tmp_path: Path) -> 
     assert openai["key_hint"] == "••••7890"
     assert secret not in saved.text
     assert secret not in visible_settings.text
-    assert not account_database_path(settings).exists()
+    assert not account_repository_key(settings).exists()
     assert secret in account_secrets_path(settings).read_text()
     assert stat.S_IMODE(settings.data_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(account_secrets_path(settings).stat().st_mode) == 0o600
@@ -240,7 +235,7 @@ def test_onboarding_progress_and_answers_are_saved_after_each_step(tmp_path: Pat
     assert restored_profile.json()["email"] == TEST_EMAIL
     assert completed.status_code == 200
     assert final_state.json() == {"current_step": "complete", "completed": True}
-    assert not account_database_path(settings).exists()
+    assert not account_repository_key(settings).exists()
 
 
 def test_onboarding_model_step_requires_credentials_without_advancing(tmp_path: Path) -> None:

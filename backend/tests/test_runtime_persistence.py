@@ -21,7 +21,6 @@ def test_internal_tool_transcript_replays_in_order_without_polluting_public_chat
     database = MemoryRepository(tmp_path / "cloud-account")
 
     async def record() -> tuple[str, str]:
-        await database.initialize()
         session = await database.create_session()
         model = (await database.list_models())[0]
         run = await database.create_run(session.id, "turn-1", "request-1", "Inspect files", model)
