@@ -71,7 +71,7 @@ def _run_row() -> dict[str, object]:
         "max_cost_usd": 2.0,
         "deadline_at": "2026-10-10T10:10:00+00:00",
         "cancel_requested_at": None,
-        "lease_expires_at": "2026-10-10T10:01:00+00:00",
+        "lease_expires_at": (datetime.now(UTC) + timedelta(seconds=60)).isoformat(),
         "recovery_count": 0,
         "stop_reason": None,
         "last_event_sequence": 1,
