@@ -33,6 +33,7 @@ from app.application.sessions import SessionService
 from app.application.settings import SettingsService
 from app.application.tools import ToolRegistry
 from app.core.config import Settings
+from app.domain.capabilities import RuntimeCapabilities
 from app.domain.models import ProviderName
 from app.infrastructure.command_tools import LocalCommandToolExecutor
 from app.infrastructure.local_patch import LocalPatchToolExecutor
@@ -144,6 +145,7 @@ class AccountRegistry:
         repository_factory: RepositoryFactory | None = None,
     ) -> None:
         self._settings = settings
+        self._capabilities = RuntimeCapabilities(settings.enabled_capabilities)
         self._providers = providers
         self._runtime_providers = runtime_providers
         self._tool_registry_factory = tool_registry_factory
@@ -214,14 +216,23 @@ class AccountRegistry:
                     await database.ensure_account()
                     secret_store = SecretStore(account_dir / ".env")
                     event_hub = RuntimeEventHub()
-                    workspace_bindings = LocalWorkspaceBindings()
+                    workspace_bindings = (
+                        LocalWorkspaceBindings() if self._capabilities.workspace_enabled else None
+                    )
                     tools = (
                         self._tool_registry_factory(database)
                         if self._tool_registry_factory is not None
                         else ToolRegistry(
-                            LocalReadToolExecutor(),
-                            patch_executor=LocalPatchToolExecutor(),
-                            command_executor=LocalCommandToolExecutor(),
+                            LocalReadToolExecutor()
+                            if self._capabilities.allows("local_read")
+                            else None,
+                            patch_executor=LocalPatchToolExecutor()
+                            if self._capabilities.allows("local_patch")
+                            else None,
+                            command_executor=LocalCommandToolExecutor()
+                            if self._capabilities.allows("local_command")
+                            else None,
+                            capabilities=self._capabilities,
                         )
                     )
                     run_service = RunService(
@@ -233,7 +244,10 @@ class AccountRegistry:
                         self._runtime_providers,
                         event_hub,
                         tool_registry=tools,
-                        workspace_guidance_reader=read_workspace_guidance,
+                        capabilities=self._capabilities,
+                        workspace_guidance_reader=read_workspace_guidance
+                        if self._capabilities.allows("local_read")
+                        else None,
                         workspace_bindings=workspace_bindings,
                         lease_repository=database,
                     )
@@ -244,9 +258,13 @@ class AccountRegistry:
                             secret_store=secret_store,
                             profile_service=ProfileService(database),
                             session_service=SessionService(
-                                database, workspace_bindings=workspace_bindings
+                                database,
+                                workspace_bindings=workspace_bindings,
+                                capabilities=self._capabilities,
                             ),
-                            settings_service=SettingsService(database, secret_store),
+                            settings_service=SettingsService(
+                                database, secret_store, capabilities=self._capabilities
+                            ),
                             onboarding_service=OnboardingService(database, database, secret_store),
                             chat_service=ChatService(database, secret_store, self._providers),
                             run_service=run_service,

@@ -5,14 +5,45 @@ from pathlib import Path
 
 import pytest
 
+from app.domain.capabilities import RuntimeCapabilities
 from app.domain.runtime import ModelToolCall
+
+LOCAL_CAPABILITIES = RuntimeCapabilities(frozenset({"local_read", "local_patch", "local_command"}))
+
+
+def test_local_registry_is_disabled_by_default_even_for_approved_calls(tmp_path: Path) -> None:
+    from app.application.tools import ToolRegistry
+    from app.infrastructure.command_tools import LocalCommandToolExecutor
+    from app.infrastructure.local_patch import LocalPatchToolExecutor
+    from app.infrastructure.local_tools import LocalReadToolExecutor
+
+    (tmp_path / "note.txt").write_text("before\n", encoding="utf-8")
+    registry = ToolRegistry(
+        LocalReadToolExecutor(),
+        patch_executor=LocalPatchToolExecutor(),
+        command_executor=LocalCommandToolExecutor(),
+    )
+    calls = (
+        ModelToolCall("read", "read_file", {"path": "note.txt"}),
+        ModelToolCall(
+            "patch", "apply_patch", {"path": "note.txt", "old_text": "before", "new_text": "after"}
+        ),
+        ModelToolCall("command", "run_command", {"command": "touch marker"}),
+    )
+
+    assert registry.specs() == ()
+    for call in calls:
+        result = asyncio.run(registry.execute(call, tmp_path, approved=True))
+        assert result.error_code == "capability_disabled"
+    assert (tmp_path / "note.txt").read_text(encoding="utf-8") == "before\n"
+    assert not (tmp_path / "marker").exists()
 
 
 def run_tool(root: Path, name: str, **arguments: object):
     from app.application.tools import ToolRegistry
     from app.infrastructure.local_tools import LocalReadToolExecutor
 
-    registry = ToolRegistry(LocalReadToolExecutor())
+    registry = ToolRegistry(LocalReadToolExecutor(), capabilities=LOCAL_CAPABILITIES)
     return asyncio.run(
         registry.execute(ModelToolCall(id="call-1", name=name, arguments=arguments), root)
     )
@@ -25,7 +56,11 @@ def test_approval_required_tool_refuses_execution_without_a_recorded_grant(
     from app.infrastructure.local_tools import LocalReadToolExecutor
 
     (tmp_path / "note.txt").write_text("safe\n", encoding="utf-8")
-    registry = ToolRegistry(LocalReadToolExecutor(), approval_required_names={"read_file"})
+    registry = ToolRegistry(
+        LocalReadToolExecutor(),
+        approval_required_names={"read_file"},
+        capabilities=LOCAL_CAPABILITIES,
+    )
     call = ModelToolCall("call-approval", "read_file", {"path": "note.txt"})
 
     async def check() -> None:
@@ -44,7 +79,12 @@ def test_read_tools_expose_the_same_strict_schemas_used_for_execution(tmp_path: 
     from app.application.tools import ToolRegistry
     from app.infrastructure.local_tools import LocalReadToolExecutor
 
-    specs = {spec.name: spec for spec in ToolRegistry(LocalReadToolExecutor()).specs()}
+    specs = {
+        spec.name: spec
+        for spec in ToolRegistry(LocalReadToolExecutor(), capabilities=LOCAL_CAPABILITIES).specs(
+            tmp_path
+        )
+    }
 
     assert set(specs) == {"list_files", "search_files", "read_file", "inspect_git"}
     assert specs["read_file"].input_schema["additionalProperties"] is False
@@ -230,7 +270,7 @@ def test_registry_rejects_oversized_arguments_and_masks_unexpected_errors(tmp_pa
         ) -> tuple[str, bool]:
             raise RuntimeError("private executor detail")
 
-    registry = ToolRegistry(FailingExecutor())
+    registry = ToolRegistry(FailingExecutor(), capabilities=LOCAL_CAPABILITIES)
     oversized = asyncio.run(
         registry.execute(
             ModelToolCall(id="large", name="read_file", arguments={"path": "x" * 17_000}),
@@ -259,7 +299,7 @@ def test_registry_caps_output_even_if_an_executor_exceeds_its_limit(tmp_path: Pa
             return "API_KEY=hidden\n" + "a" * 25_000, False
 
     result = asyncio.run(
-        ToolRegistry(OversizedExecutor()).execute(
+        ToolRegistry(OversizedExecutor(), capabilities=LOCAL_CAPABILITIES).execute(
             ModelToolCall(id="large-result", name="read_file", arguments={"path": "note.txt"}),
             tmp_path,
         )

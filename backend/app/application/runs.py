@@ -37,6 +37,7 @@ from app.application.tools import (
     redact_record,
     redact_secrets,
 )
+from app.domain.capabilities import DEFAULT_RUNTIME_CAPABILITIES, RuntimeCapabilities
 from app.domain.models import ModelDescriptor
 from app.domain.runtime import (
     ModelCallRecord,
@@ -166,6 +167,7 @@ class RunService:
         lease_repository: RunLeasePort | None = None,
         lease_renew_interval_seconds: float = DEFAULT_LEASE_RENEW_INTERVAL_SECONDS,
         max_concurrent_runs: int = DEFAULT_MAX_CONCURRENT_RUNS,
+        capabilities: RuntimeCapabilities = DEFAULT_RUNTIME_CAPABILITIES,
     ) -> None:
         if max_concurrent_runs < 1:
             raise ValueError("maximum concurrent runs must be positive")
@@ -179,6 +181,7 @@ class RunService:
         self._providers = providers
         self._event_publisher = event_publisher
         self._tool_registry = tool_registry
+        self._capabilities = capabilities
         self._workspace_guidance_reader = workspace_guidance_reader
         self._workspace_bindings = workspace_bindings
         self._lease_repository = lease_repository
@@ -423,6 +426,24 @@ class RunService:
         if self._closing:
             raise ApplicationError("runtime_shutting_down", "The runtime is shutting down.")
         await self._require_local_control(run_id)
+        stored_call = next(
+            (call for call in await self._runs.list_tool_calls(run_id) if call.id == tool_call_id),
+            None,
+        )
+        if stored_call is not None:
+            if self._tool_registry is None:
+                raise ApplicationError(
+                    "tool_execution_unavailable", "Tool execution is unavailable."
+                )
+            try:
+                self._tool_registry.check_capabilities(
+                    ModelToolCall(
+                        stored_call.provider_call_id, stored_call.name, stored_call.arguments
+                    ),
+                    capabilities=self._capabilities,
+                )
+            except ToolExecutionError as error:
+                raise ApplicationError(error.code, error.message) from None
         try:
             tool_call, event = await self._runs.record_tool_approval_decision(
                 run_id, tool_call_id, decision
@@ -628,22 +649,21 @@ class RunService:
             session = await self._sessions.get_session(run.session_id)
             if session is None:
                 raise ApplicationError("session_not_found", "Session not found.")
-            if self._workspace_bindings is not None:
+            workspace_root = None
+            if self._capabilities.workspace_enabled and self._workspace_bindings is not None:
                 workspace_root = await self._workspace_bindings.resolve(
                     session.id, session.workspace_path
                 )
-            else:
-                workspace_root = Path(session.workspace_path) if session.workspace_path else None
             guidance = (
                 await self._workspace_guidance_reader(workspace_root)
-                if workspace_root is not None and self._workspace_guidance_reader is not None
+                if self._capabilities.allows("local_read")
+                and workspace_root is not None
+                and self._workspace_guidance_reader is not None
                 else None
             )
             offered_tools = (
-                self._tool_registry.specs()
-                if workspace_root is not None
-                and model.supports_tools
-                and self._tool_registry is not None
+                self._tool_registry.specs(workspace_root, capabilities=self._capabilities)
+                if model.supports_tools and self._tool_registry is not None
                 else ()
             )
             visible_messages = await self._sessions.list_messages(run.session_id)
@@ -755,10 +775,22 @@ class RunService:
                         await self._publish(event)
                     return
 
-                if self._tool_registry is None or workspace_root is None or not request.tools:
+                if self._tool_registry is None:
                     raise ProviderError(
                         "tool_execution_unavailable", "This run cannot execute tool requests yet."
                     )
+                for tool_request in step.tool_calls:
+                    try:
+                        self._tool_registry.check_call(
+                            tool_request, workspace_root, capabilities=self._capabilities
+                        )
+                    except ToolExecutionError as error:
+                        if error.code == "unknown_tool":
+                            raise ProviderError(
+                                "provider_invalid_response",
+                                "The provider requested an unoffered tool.",
+                            ) from None
+                        raise ProviderError(error.code, error.message) from None
                 offered_names = {tool.name for tool in request.tools}
                 if any(tool.name not in offered_names for tool in step.tool_calls):
                     raise ProviderError(
@@ -850,7 +882,7 @@ class RunService:
             raise ApplicationError("run_lease_lost", "This run is no longer active here.") from None
 
     async def _execute_pending_tools(self, run: RunSnapshot, workspace_root: Path | None) -> bool:
-        if self._tool_registry is None or workspace_root is None:
+        if self._tool_registry is None:
             raise ProviderError("tool_execution_unavailable", "Tool execution is unavailable.")
         model_calls = await self._runs.list_model_calls(run.id)
         all_tool_calls = await self._runs.list_tool_calls(run.id)
@@ -873,12 +905,18 @@ class RunService:
             tool_request = ModelToolCall(
                 stored_call.provider_call_id, stored_call.name, stored_call.arguments
             )
+            try:
+                self._tool_registry.check_call(
+                    tool_request, workspace_root, capabilities=self._capabilities
+                )
+            except ToolExecutionError as error:
+                raise ProviderError(error.code, error.message) from None
             approval_required = self._tool_registry.requires_approval(tool_request, workspace_root)
             if approval_required and stored_call.approval_decision is None:
                 try:
                     async with asyncio.timeout(remaining_seconds):
                         preview = await self._tool_registry.approval_preview(
-                            tool_request, workspace_root
+                            tool_request, workspace_root, capabilities=self._capabilities
                         )
                 except ToolExecutionError as error:
                     await self._record_tool_result(
@@ -932,6 +970,7 @@ class RunService:
                         workspace_root,
                         approved=(stored_call.approval_decision is ToolApprovalDecision.APPROVED),
                         approval_preview=stored_call.approval_preview,
+                        capabilities=self._capabilities,
                     )
             except TimeoutError:
                 raise ProviderError("provider_timeout", "The run deadline was reached.") from None

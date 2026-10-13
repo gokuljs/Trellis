@@ -3,6 +3,8 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.domain.capabilities import RuntimeCapability
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -20,3 +22,4 @@ class Settings(BaseSettings):
     supabase_url: str | None = None
     supabase_publishable_key: str | None = None
     web_origin: str | None = None
+    enabled_capabilities: frozenset[RuntimeCapability] = frozenset()

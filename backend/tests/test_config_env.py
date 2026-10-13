@@ -1,6 +1,21 @@
 from pathlib import Path
 
+import pytest
+
 from app.core.config import Settings
+
+
+def test_runtime_capabilities_are_chat_only_until_explicitly_enabled(monkeypatch) -> None:
+    monkeypatch.delenv("TRELLIS_ENABLED_CAPABILITIES", raising=False)
+    assert Settings(_env_file=None).enabled_capabilities == frozenset()
+    monkeypatch.setenv("TRELLIS_ENABLED_CAPABILITIES", '["local_read"]')
+    assert Settings(_env_file=None).enabled_capabilities == frozenset({"local_read"})
+
+
+def test_unknown_runtime_capability_is_rejected(monkeypatch) -> None:
+    monkeypatch.setenv("TRELLIS_ENABLED_CAPABILITIES", '["unrestricted_host"]')
+    with pytest.raises(ValueError):
+        Settings(_env_file=None)
 
 
 def test_settings_load_supabase_values_from_dotenv_and_prefer_process_env(

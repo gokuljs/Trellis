@@ -1,13 +1,21 @@
 from app.application.budgets import BudgetPreset
 from app.application.errors import ApplicationError
 from app.application.ports import SecretStorePort, SettingsRepository
+from app.domain.capabilities import RuntimeCapabilities
 from app.domain.models import AppSettings, ModelId, ModelStatus, ProviderName, ProviderStatus
 
 
 class SettingsService:
-    def __init__(self, repository: SettingsRepository, secret_store: SecretStorePort) -> None:
+    def __init__(
+        self,
+        repository: SettingsRepository,
+        secret_store: SecretStorePort,
+        *,
+        capabilities: RuntimeCapabilities | None = None,
+    ) -> None:
         self._repository = repository
         self._secret_store = secret_store
+        self._capabilities = capabilities or RuntimeCapabilities()
 
     async def get(self) -> AppSettings:
         descriptors = await self._repository.list_models()
@@ -49,6 +57,7 @@ class SettingsService:
             selected_model_id=await self._repository.get_selected_model_id(),
             models=statuses,
             default_budget_preset=await self._repository.get_default_budget_preset(),
+            capabilities=tuple(sorted(self._capabilities.enabled)),
         )
 
     async def select_default_budget(self, preset: BudgetPreset) -> AppSettings:

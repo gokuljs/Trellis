@@ -101,7 +101,7 @@ async def serialize_session(session: Session, service: SessionServiceDep) -> Ses
         created_at=session.created_at,
         updated_at=session.updated_at,
         message_count=session.message_count,
-        workspace_path=session.workspace_path,
+        workspace_path=session.workspace_path if service.workspace_enabled else None,
         workspace_ready=await service.workspace_ready(session),
     )
 

@@ -62,6 +62,7 @@ export type Settings = {
   selected_model_id?: ModelId
   models?: ModelStatus[]
   default_budget_preset?: "conservative" | "longer"
+  capabilities?: ("local_read" | "local_patch" | "local_command")[]
 }
 
 export type Message = {

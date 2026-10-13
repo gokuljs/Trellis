@@ -16,6 +16,7 @@ from app.application.workspaces import (
     WorkspacePickerService,
 )
 from app.core.config import Settings
+from app.domain.capabilities import RuntimeCapabilities
 from app.domain.models import ProviderName
 from app.infrastructure.accounts import AccountRegistry, RepositoryFactory
 from app.infrastructure.providers import AnthropicProvider, OpenAIProvider
@@ -40,6 +41,7 @@ ERROR_STATUS = {
     "database_unavailable": 503,
     "database_not_configured": 503,
     "invalid_workspace": 422,
+    "capability_disabled": 403,
     "workspace_picker_unavailable": 503,
     "workspace_picker_timeout": 504,
     "session_workspace_busy": 409,
@@ -77,13 +79,20 @@ def create_app(
     repository_factory: RepositoryFactory | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings()
+    capabilities = RuntimeCapabilities(resolved_settings.enabled_capabilities)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         application.state.settings = resolved_settings
-        application.state.workspace_picker = workspace_picker or WorkspacePickerService(
-            NativeFolderPicker(),
-            timeout_seconds=WORKSPACE_PICKER_TIMEOUT_SECONDS,
+        application.state.workspace_picker = (
+            workspace_picker
+            or WorkspacePickerService(
+                NativeFolderPicker(),
+                timeout_seconds=WORKSPACE_PICKER_TIMEOUT_SECONDS,
+                capabilities=capabilities,
+            )
+            if capabilities.workspace_enabled
+            else None
         )
         timeout = httpx.Timeout(connect=10, read=120, write=30, pool=10)
         async with httpx.AsyncClient(timeout=timeout) as http_client:

@@ -278,7 +278,11 @@ def test_live_account_blocks_second_registry_until_local_lock_is_released(
 
 
 def test_failed_account_setup_releases_lock(tmp_path: Path) -> None:
-    settings = Settings(environment="test", data_dir=tmp_path / "data")
+    settings = Settings(
+        environment="test",
+        data_dir=tmp_path / "data",
+        enabled_capabilities=frozenset({"local_read"}),
+    )
 
     def fail_to_build_tools(_database: object) -> Never:
         raise RuntimeError("tool setup failed")

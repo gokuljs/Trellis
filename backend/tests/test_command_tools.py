@@ -7,9 +7,12 @@ from typing import Any
 import pytest
 
 from app.application.tools import ToolExecutionError, ToolRegistry
+from app.domain.capabilities import RuntimeCapabilities
 from app.domain.runtime import ModelToolCall
 from app.infrastructure.command_tools import LocalCommandToolExecutor, run_bounded_command
 from app.infrastructure.local_tools import LocalReadToolExecutor
+
+LOCAL_CAPABILITIES = RuntimeCapabilities(frozenset({"local_read", "local_patch", "local_command"}))
 
 
 def _python(source: str) -> str:
@@ -119,7 +122,11 @@ def test_cancellation_stops_child_process_group(tmp_path: Path) -> None:
 
 
 def test_run_command_requires_approval_and_revalidates_preview(tmp_path: Path) -> None:
-    registry = ToolRegistry(LocalReadToolExecutor(), command_executor=LocalCommandToolExecutor())
+    registry = ToolRegistry(
+        LocalReadToolExecutor(),
+        command_executor=LocalCommandToolExecutor(),
+        capabilities=LOCAL_CAPABILITIES,
+    )
     call = ModelToolCall(
         "call-1",
         "run_command",
@@ -127,7 +134,7 @@ def test_run_command_requires_approval_and_revalidates_preview(tmp_path: Path) -
     )
 
     assert registry.requires_approval(call, tmp_path)
-    assert "run_command" in {spec.name for spec in registry.specs()}
+    assert "run_command" in {spec.name for spec in registry.specs(tmp_path)}
     blocked = asyncio.run(registry.execute(call, tmp_path))
     preview = asyncio.run(registry.approval_preview(call, tmp_path))
     altered = asyncio.run(
@@ -151,9 +158,13 @@ def test_run_command_requires_approval_and_revalidates_preview(tmp_path: Path) -
 def test_saved_test_command_tools_are_unavailable(
     tmp_path: Path, name: str, arguments: dict[str, object]
 ) -> None:
-    registry = ToolRegistry(LocalReadToolExecutor(), command_executor=LocalCommandToolExecutor())
+    registry = ToolRegistry(
+        LocalReadToolExecutor(),
+        command_executor=LocalCommandToolExecutor(),
+        capabilities=LOCAL_CAPABILITIES,
+    )
 
     result = asyncio.run(registry.execute(ModelToolCall("removed", name, arguments), tmp_path))
 
-    assert name not in {spec.name for spec in registry.specs()}
+    assert name not in {spec.name for spec in registry.specs(tmp_path)}
     assert result.error_code == "unknown_tool"

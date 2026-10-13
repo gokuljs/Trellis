@@ -11,6 +11,7 @@ import pytest
 
 from app.application.tools import ToolRegistry
 from app.core.config import Settings
+from app.domain.capabilities import RuntimeCapabilities
 from app.domain.models import ModelDescriptor, ProviderName
 from app.domain.runtime import ModelRequest, ModelStreamEvent, ModelToolCall, RunEvent, RunEventType
 from app.infrastructure.local_tools import LocalReadToolExecutor
@@ -261,9 +262,17 @@ def test_jsonrpc_run_respond_approves_exact_waiting_tool_and_resumes(tmp_path: P
     (project / "note.txt").write_text("safe contents\n", encoding="utf-8")
     provider = ApprovalStreamingProvider()
     app = create_app(
-        Settings(environment="test", data_dir=tmp_path / "data"),
+        Settings(
+            environment="test",
+            data_dir=tmp_path / "data",
+            enabled_capabilities=frozenset({"local_read"}),
+        ),
         provider_adapters={"openai": provider},
-        tool_registry=ToolRegistry(LocalReadToolExecutor(), approval_required_names={"read_file"}),
+        tool_registry=ToolRegistry(
+            LocalReadToolExecutor(),
+            approval_required_names={"read_file"},
+            capabilities=RuntimeCapabilities(frozenset({"local_read"})),
+        ),
     )
     with TestClient(app) as client:
         client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-approval-test"})
@@ -360,7 +369,11 @@ def test_command_waits_for_approval_then_runs_in_workspace(tmp_path: Path) -> No
         ModelToolCall("provider-command", "run_command", {"command": command})
     )
     app = create_app(
-        Settings(environment="test", data_dir=tmp_path / "data"),
+        Settings(
+            environment="test",
+            data_dir=tmp_path / "data",
+            enabled_capabilities=frozenset({"local_command"}),
+        ),
         provider_adapters={"openai": provider},
     )
     with TestClient(app) as client:
@@ -838,7 +851,11 @@ def test_unpriced_custom_model_stops_before_a_tool_continuation(tmp_path: Path) 
 
             return generate()
 
-    settings = Settings(environment="test", data_dir=tmp_path / "data")
+    settings = Settings(
+        environment="test",
+        data_dir=tmp_path / "data",
+        enabled_capabilities=frozenset({"local_read"}),
+    )
     provider = ToolingProvider()
     app = create_app(settings, streaming_provider_adapters={"openai-compatible": provider})
     with TestClient(app) as client:
@@ -1070,9 +1087,17 @@ def test_waiting_approval_is_discoverable_and_replayed_after_socket_refresh(tmp_
     (workspace / "note.txt").write_text("review this\n", encoding="utf-8")
     provider = ApprovalStreamingProvider()
     app = create_app(
-        Settings(environment="test", data_dir=tmp_path / "data"),
+        Settings(
+            environment="test",
+            data_dir=tmp_path / "data",
+            enabled_capabilities=frozenset({"local_read"}),
+        ),
         provider_adapters={"openai": provider},
-        tool_registry=ToolRegistry(LocalReadToolExecutor(), approval_required_names={"read_file"}),
+        tool_registry=ToolRegistry(
+            LocalReadToolExecutor(),
+            approval_required_names={"read_file"},
+            capabilities=RuntimeCapabilities(frozenset({"local_read"})),
+        ),
     )
     with TestClient(app) as client:
         client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-replay-test"})

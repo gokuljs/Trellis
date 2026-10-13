@@ -11,7 +11,8 @@ from app.application.errors import ApplicationError, ProviderError
 from app.application.runs import RunService
 from app.application.tools import ToolExecutionError, ToolRegistry
 from app.core.config import Settings
-from app.domain.models import ModelDescriptor, ProviderName
+from app.domain.capabilities import RuntimeCapabilities
+from app.domain.models import ModelDescriptor, ProviderName, Session
 from app.domain.runtime import (
     ModelContinuationItem,
     ModelRequest,
@@ -26,8 +27,18 @@ from app.domain.runtime import (
 )
 from app.infrastructure.local_tools import LocalReadToolExecutor, read_workspace_guidance
 from app.infrastructure.secrets import SecretStore
+from app.infrastructure.workspace_bindings import LocalWorkspaceBindings
 from tests.memory_repository import MemoryRepository as Database
 from tests.support import make_settings
+
+LOCAL_CAPABILITIES = RuntimeCapabilities(frozenset({"local_read", "local_patch", "local_command"}))
+
+
+def _selected_workspace(session: Session) -> LocalWorkspaceBindings:
+    bindings = LocalWorkspaceBindings()
+    if session.workspace_path is not None:
+        bindings.bind(session.id, Path(session.workspace_path))
+    return bindings
 
 
 def _repository_key(settings: Settings) -> Path:
@@ -337,7 +348,7 @@ def test_run_service_streams_and_persists_a_provider_neutral_run(tmp_path: Path)
     assert events[2].data["estimated_cost_usd"] == pytest.approx(0.000046)
     assert events[2].data["total_tokens"] == 6
     assert model_calls[0].provider_response_id == "response-1"
-    assert "agent-foundation-v1" in model_calls[0].request_snapshot["system_instructions"]
+    assert "agent-foundation-v2" in model_calls[0].request_snapshot["system_instructions"]
     assert "No workspace is attached" in model_calls[0].request_snapshot["system_instructions"]
     assert model_calls[0].request_snapshot["tools"] == []
     assert model_calls[0].request_snapshot["messages"] == [
@@ -404,8 +415,10 @@ def test_run_service_persists_read_tool_exchange_before_a_second_model_call(
             database,
             secret_store,
             {"openai": provider},
-            tool_registry=ToolRegistry(LocalReadToolExecutor()),
+            tool_registry=ToolRegistry(LocalReadToolExecutor(), capabilities=LOCAL_CAPABILITIES),
             workspace_guidance_reader=read_workspace_guidance,
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await service.create_run(session.id, "request-tools", "What does README say?")
         await service.wait_for_run(created.id)
@@ -493,7 +506,9 @@ def test_budget_blocks_tool_execution_after_exhausted_or_missing_usage(
             database,
             secret_store,
             {"openai": provider},
-            tool_registry=ToolRegistry(LocalReadToolExecutor()),
+            tool_registry=ToolRegistry(LocalReadToolExecutor(), capabilities=LOCAL_CAPABILITIES),
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await service.create_run(session.id, "request-budget-block", "Read note")
         await service.wait_for_run(created.id)
@@ -592,7 +607,11 @@ def test_approved_tool_resumes_after_restart_without_repeating_the_model_call(
             ),
         )
     )
-    registry = ToolRegistry(LocalReadToolExecutor(), approval_required_names={"read_file"})
+    registry = ToolRegistry(
+        LocalReadToolExecutor(),
+        approval_required_names={"read_file"},
+        capabilities=LOCAL_CAPABILITIES,
+    )
 
     async def run():
         session = await database.create_session(str(tmp_path))
@@ -605,6 +624,8 @@ def test_approved_tool_resumes_after_restart_without_repeating_the_model_call(
             secret_store,
             {"openai": provider},
             tool_registry=registry,
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await first_service.create_run(session.id, "request-approval", "Read note")
         await first_service.wait_for_run(created.id)
@@ -627,6 +648,8 @@ def test_approved_tool_resumes_after_restart_without_repeating_the_model_call(
             secret_store,
             {"openai": provider},
             tool_registry=registry,
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         await second_service.resume_decided_approvals()
         await second_service.wait_for_run(created.id)
@@ -672,7 +695,11 @@ def test_approved_tool_keeps_execution_budget_after_a_delayed_decision(tmp_path:
             ),
         )
     )
-    registry = ToolRegistry(LocalReadToolExecutor(), approval_required_names={"read_file"})
+    registry = ToolRegistry(
+        LocalReadToolExecutor(),
+        approval_required_names={"read_file"},
+        capabilities=LOCAL_CAPABILITIES,
+    )
 
     async def exercise():
         session = await database.create_session(str(tmp_path))
@@ -685,6 +712,8 @@ def test_approved_tool_keeps_execution_budget_after_a_delayed_decision(tmp_path:
             secret_store,
             {"openai": provider},
             tool_registry=registry,
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await first_service.create_run(session.id, "request-late-approval", "Read note")
         await first_service.wait_for_run(created.id)
@@ -726,6 +755,8 @@ def test_approved_tool_keeps_execution_budget_after_a_delayed_decision(tmp_path:
             secret_store,
             {"openai": provider},
             tool_registry=registry,
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         try:
             await second_service.resume_decided_approvals()
@@ -780,8 +811,12 @@ def test_cancelling_while_waiting_for_approval_closes_the_tool_call(tmp_path: Pa
             secret_store,
             {"openai": provider},
             tool_registry=ToolRegistry(
-                LocalReadToolExecutor(), approval_required_names={"read_file"}
+                LocalReadToolExecutor(),
+                approval_required_names={"read_file"},
+                capabilities=LOCAL_CAPABILITIES,
             ),
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await service.create_run(session.id, "request-cancel-approval", "Read note")
         await service.wait_for_run(created.id)
@@ -829,9 +864,13 @@ def test_cancelling_an_approved_run_before_it_gets_a_slot_finishes_cancellation(
             secret_store,
             {"openai": provider},
             tool_registry=ToolRegistry(
-                LocalReadToolExecutor(), approval_required_names={"read_file"}
+                LocalReadToolExecutor(),
+                approval_required_names={"read_file"},
+                capabilities=LOCAL_CAPABILITIES,
             ),
             max_concurrent_runs=1,
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await service.create_run(session.id, "request-slot-cancel", "Read note")
         await service.wait_for_run(created.id)
@@ -894,8 +933,12 @@ def test_shutdown_during_approval_notification_preserves_waiting_run(
             {"openai": provider},
             publisher,
             tool_registry=ToolRegistry(
-                LocalReadToolExecutor(), approval_required_names={"read_file"}
+                LocalReadToolExecutor(),
+                approval_required_names={"read_file"},
+                capabilities=LOCAL_CAPABILITIES,
             ),
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await service.create_run(session.id, "request-shutdown-approval", "Read note")
         await publisher.request_published.wait()
@@ -952,7 +995,11 @@ def test_denial_becomes_a_tool_result_and_late_decisions_are_rejected(
             database,
             secret_store,
             {"openai": provider},
-            tool_registry=ToolRegistry(executor, approval_required_names={"read_file"}),
+            tool_registry=ToolRegistry(
+                executor, approval_required_names={"read_file"}, capabilities=LOCAL_CAPABILITIES
+            ),
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await service.create_run(session.id, "request-deny", "Read note")
         await service.wait_for_run(created.id)
@@ -1009,7 +1056,11 @@ def test_preview_failure_is_a_tool_result_without_requesting_approval(tmp_path: 
 
     class FailingPreviewRegistry(ToolRegistry):
         async def approval_preview(
-            self, call: ModelToolCall, workspace_root: Path
+            self,
+            call: ModelToolCall,
+            workspace_root: Path | None,
+            *,
+            capabilities: RuntimeCapabilities | None = None,
         ) -> dict[str, object] | None:
             raise ToolExecutionError("path_not_found", "The file does not exist.")
 
@@ -1024,8 +1075,12 @@ def test_preview_failure_is_a_tool_result_without_requesting_approval(tmp_path: 
             secret_store,
             {"openai": provider},
             tool_registry=FailingPreviewRegistry(
-                LocalReadToolExecutor(), approval_required_names={"read_file"}
+                LocalReadToolExecutor(),
+                approval_required_names={"read_file"},
+                capabilities=LOCAL_CAPABILITIES,
             ),
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await service.create_run(session.id, "request-preview-failure", "Read note")
         await service.wait_for_run(created.id)
@@ -1068,7 +1123,11 @@ def test_secret_in_approval_preview_is_not_persisted_or_shown(tmp_path: Path) ->
 
     class SecretPreviewRegistry(ToolRegistry):
         async def approval_preview(
-            self, call: ModelToolCall, workspace_root: Path
+            self,
+            call: ModelToolCall,
+            workspace_root: Path | None,
+            *,
+            capabilities: RuntimeCapabilities | None = None,
         ) -> dict[str, object] | None:
             return {"diff": "OPENAI_API_KEY=sk-previewsecret123"}
 
@@ -1083,8 +1142,12 @@ def test_secret_in_approval_preview_is_not_persisted_or_shown(tmp_path: Path) ->
             secret_store,
             {"openai": provider},
             tool_registry=SecretPreviewRegistry(
-                LocalReadToolExecutor(), approval_required_names={"read_file"}
+                LocalReadToolExecutor(),
+                approval_required_names={"read_file"},
+                capabilities=LOCAL_CAPABILITIES,
             ),
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await service.create_run(session.id, "request-secret-preview", "Read note")
         await service.wait_for_run(created.id)
@@ -1138,7 +1201,9 @@ def test_tool_only_response_records_two_results_before_continuing(tmp_path: Path
             database,
             secret_store,
             {"openai": provider},
-            tool_registry=ToolRegistry(LocalReadToolExecutor()),
+            tool_registry=ToolRegistry(LocalReadToolExecutor(), capabilities=LOCAL_CAPABILITIES),
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await service.create_run(session.id, "request-two-tools", "Inspect two files")
         await service.wait_for_run(created.id)
@@ -1209,7 +1274,9 @@ def test_agent_loop_rejects_sensitive_tool_arguments_before_recording_them(
             database,
             secret_store,
             {"openai": provider},
-            tool_registry=ToolRegistry(LocalReadToolExecutor()),
+            tool_registry=ToolRegistry(LocalReadToolExecutor(), capabilities=LOCAL_CAPABILITIES),
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await service.create_run(session.id, "request-sensitive", "Inspect workspace")
         await service.wait_for_run(created.id)
@@ -1310,7 +1377,9 @@ def test_cancelling_during_a_tool_records_a_terminal_result(tmp_path: Path) -> N
             database,
             secret_store,
             {"openai": provider},
-            tool_registry=ToolRegistry(executor),
+            tool_registry=ToolRegistry(executor, capabilities=LOCAL_CAPABILITIES),
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await service.create_run(session.id, "request-cancel-tool", "Read note")
         await executor.started.wait()
@@ -1391,7 +1460,9 @@ def test_a_tool_cannot_run_past_the_run_deadline(tmp_path: Path) -> None:
             database,
             secret_store,
             {"openai": provider},
-            tool_registry=ToolRegistry(HangingExecutor()),
+            tool_registry=ToolRegistry(HangingExecutor(), capabilities=LOCAL_CAPABILITIES),
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await service.create_run(session.id, "request-deadline", "Read note")
         try:
@@ -1469,7 +1540,9 @@ def test_secret_looking_tool_call_id_is_rejected_before_persistence(tmp_path: Pa
             database,
             secret_store,
             {"openai": provider},
-            tool_registry=ToolRegistry(LocalReadToolExecutor()),
+            tool_registry=ToolRegistry(LocalReadToolExecutor(), capabilities=LOCAL_CAPABILITIES),
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await service.create_run(session.id, "secret-tool-id", "List files")
         await service.wait_for_run(created.id)
@@ -1518,7 +1591,9 @@ def test_model_stream_stops_at_tool_call_limit(tmp_path: Path) -> None:
             database,
             secret_store,
             {"openai": provider},
-            tool_registry=ToolRegistry(LocalReadToolExecutor()),
+            tool_registry=ToolRegistry(LocalReadToolExecutor(), capabilities=LOCAL_CAPABILITIES),
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await service.create_run(session.id, "tool-limit", "List files")
         await service.wait_for_run(created.id)
@@ -1665,7 +1740,9 @@ def test_truncated_tool_result_tells_the_next_model_step(tmp_path: Path) -> None
             database,
             secret_store,
             {"openai": provider},
-            tool_registry=ToolRegistry(TruncatingExecutor()),
+            tool_registry=ToolRegistry(TruncatingExecutor(), capabilities=LOCAL_CAPABILITIES),
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await service.create_run(session.id, "truncated-result", "Read a.txt")
         await service.wait_for_run(created.id)
@@ -1717,7 +1794,9 @@ def test_second_model_failure_keeps_the_first_tool_exchange(tmp_path: Path) -> N
             database,
             secret_store,
             {"openai": provider},
-            tool_registry=ToolRegistry(LocalReadToolExecutor()),
+            tool_registry=ToolRegistry(LocalReadToolExecutor(), capabilities=LOCAL_CAPABILITIES),
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         created = await service.create_run(session.id, "second-step-fails", "List files")
         await service.wait_for_run(created.id)
