@@ -53,3 +53,13 @@ Old account `.env` and SQLite files are left untouched and are no longer read
 for credentials or imported. Remove old key files yourself when no longer
 needed. `TRELLIS_DATA_DIR` controls account lock files under
 `~/.trellis/accounts/<user-id>/`; chats and settings are stored in Supabase.
+
+## Session and service errors
+
+The runtime socket authenticates before accepting run requests, checks access
+again before each request, and checks idle connections every 30 seconds.
+Invalid credentials return an error with status `401` and close code `4401`.
+Temporary authentication or data failures return status `503` and close code
+`1013`, so the web app can offer a retry without clearing a valid session.
+Recheck errors use a JSON-RPC error with `id: null` before closing the socket.
+Authentication and account checks have a five-second deadline.

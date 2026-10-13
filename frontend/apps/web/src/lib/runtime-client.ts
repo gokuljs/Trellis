@@ -1,5 +1,10 @@
 import type { RunSummary } from "@/lib/app-types"
-import { getAuthController } from "@/lib/auth-controller"
+import {
+  AuthAccessError,
+  getAuthController,
+  type AuthController,
+  type AuthCredential,
+} from "@/lib/auth-controller"
 
 export type RuntimeRunEvent = {
   runId: string
@@ -72,19 +77,25 @@ export type StartRunInput = {
 
 export class RuntimeError extends Error {
   readonly code: string
+  readonly status?: number
 
-  constructor(code: string, message: string) {
+  constructor(code: string, message: string, status?: number) {
     super(message)
     this.code = code
+    this.status = status
     this.name = "RuntimeError"
   }
 }
 
 type RpcResponse = {
   jsonrpc: "2.0"
-  id: string
+  id: string | null
   result?: Record<string, unknown>
-  error?: { code: number; message: string; data?: { code?: string } }
+  error?: {
+    code: number
+    message: string
+    data?: { code?: string; status?: number }
+  }
 }
 
 type RpcRequest = {
@@ -108,7 +119,57 @@ const rpcTimeoutMs = 30_000
 const maxBufferedEvents = 500
 
 function authenticationError() {
-  return new RuntimeError("authentication_required", "Sign in to continue.")
+  return new RuntimeError(
+    "authentication_required",
+    "Sign in to continue.",
+    401
+  )
+}
+
+function expiredAuthenticationError() {
+  return new RuntimeError(
+    "reauth_required",
+    "Your session expired. Please sign in again.",
+    401
+  )
+}
+
+function unavailableAuthenticationError() {
+  return new RuntimeError(
+    "auth_unavailable",
+    "Sign-in verification is temporarily unavailable. Please try again.",
+    503
+  )
+}
+
+function credentialError(error: unknown): RuntimeError {
+  if (error instanceof AuthAccessError) {
+    return error.code === "auth_unavailable"
+      ? unavailableAuthenticationError()
+      : expiredAuthenticationError()
+  }
+  return authenticationError()
+}
+
+function expireRejectedCredential(
+  auth: AuthController,
+  credential: AuthCredential
+) {
+  if (!auth.isCredentialCurrent(credential)) return
+  void (async () => {
+    try {
+      const current = await auth.getAccessToken()
+      if (
+        auth.isCredentialCurrent(credential) &&
+        auth.isCredentialCurrent(current) &&
+        current.token === credential.token
+      ) {
+        await auth.expireSession(credential)
+      }
+    } catch {
+      // A newer or temporarily unavailable credential must remain untouched.
+    }
+  })()
 }
 
 function runtimeUrl() {
@@ -164,11 +225,28 @@ function parseRunEvent(
   }
 }
 
-function rpcError(response: RpcResponse): RuntimeError {
-  const code = response.error?.data?.code
+function rpcError(
+  response: RpcResponse,
+  failureMessage = "Trellis could not start that run."
+): RuntimeError {
+  const error = asRecord(response.error)
+  const detail = asRecord(error?.data)
+  const code = detail?.code
+  const status = typeof detail?.status === "number" ? detail.status : undefined
+  if (code === "auth_failed" || code === "auth_required")
+    return expiredAuthenticationError()
+  if (code === "auth_unavailable") return unavailableAuthenticationError()
   return new RuntimeError(
     typeof code === "string" ? code : "runtime_request_failed",
-    response.error?.message ?? "Trellis could not start that run."
+    typeof error?.message === "string" ? error.message : failureMessage,
+    status
+  )
+}
+
+function credentialWasRejected(error: RuntimeError): boolean {
+  return (
+    error.status === 401 &&
+    (error.code === "reauth_required" || error.code === "cloud_access_denied")
   )
 }
 
@@ -207,6 +285,8 @@ function followRun(
   const reconnectLimit = options.reconnectAttempts ?? 4
   const reconnectDelay = options.reconnectDelayMs ?? 200
   const auth = getAuthController()
+  const initialUser = auth.getSnapshot().user?.id
+  const initialEpoch = auth.getSessionEpoch()
 
   return new Promise((resolve, reject) => {
     let socket: WebSocket | null = null
@@ -221,7 +301,8 @@ function followRun(
     let bufferedEventOverflowed = false
     let replayRequiredForRun: string | null = null
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
-    let userId: string | null = null
+    let openingTimer: ReturnType<typeof setTimeout> | null = null
+    let socketCredential: AuthCredential | null = null
     let unsubscribeAuth: (() => void) | null = null
     const pending = new Map<
       string,
@@ -231,7 +312,11 @@ function followRun(
 
     const stillCurrent = () => {
       const current = auth.getSnapshot()
-      return current.status === "signed-in" && current.user?.id === userId
+      return (
+        current.status === "signed-in" &&
+        current.user?.id === initialUser &&
+        auth.getSessionEpoch() === initialEpoch
+      )
     }
 
     const finish = (error?: Error) => {
@@ -240,6 +325,8 @@ function followRun(
       unsubscribeAuth?.()
       unsubscribeAuth = null
       if (reconnectTimer !== null) clearTimeout(reconnectTimer)
+      if (openingTimer !== null) clearTimeout(openingTimer)
+      openingTimer = null
       for (const request of pending.values()) {
         request.reject(
           error ?? new RuntimeError("run_finished", "Run finished.")
@@ -255,8 +342,19 @@ function followRun(
         )
     }
 
+    const failRequest = (error: RuntimeError) => {
+      const rejectedCredential = socketCredential
+      finish(error)
+      if (credentialWasRejected(error) && rejectedCredential)
+        expireRejectedCredential(auth, rejectedCredential)
+    }
+
     const processEvent = (event: RuntimeRunEvent) => {
       if (settled || !runId || event.runId !== runId) return
+      if (!stillCurrent()) {
+        finish(authenticationError())
+        return
+      }
       if (event.sequence <= lastSequence) return
       if (event.sequence !== lastSequence + 1) {
         if (socket) beginRequest(socket)
@@ -290,6 +388,8 @@ function followRun(
       method: string,
       params: Record<string, unknown>
     ) => {
+      if (settled || socket !== activeSocket || !stillCurrent())
+        return Promise.reject(authenticationError())
       const id = `runtime-${++nextRpcId}`
       const request: RpcRequest = { jsonrpc: "2.0", id, method, params }
       return new Promise<RpcResponse>((resolveRpc, rejectRpc) => {
@@ -298,7 +398,8 @@ function followRun(
           rejectRpc(
             new RuntimeError(
               "runtime_timeout",
-              "The Trellis service did not respond."
+              "The Trellis service did not respond.",
+              503
             )
           )
         }, rpcTimeoutMs)
@@ -328,6 +429,11 @@ function followRun(
     }
 
     const beginRequest = (activeSocket: WebSocket) => {
+      if (settled || socket !== activeSocket) return
+      if (!stillCurrent()) {
+        finish(authenticationError())
+        return
+      }
       if (subscriptionRequestPending) return
       subscriptionRequestPending = true
       const method = runId ? "run.resume" : "run.start"
@@ -344,6 +450,7 @@ function followRun(
       void sendRpc(activeSocket, method, params)
         .then((response) => {
           if (settled || socket !== activeSocket) return
+          if (!stillCurrent()) throw authenticationError()
           subscriptionRequestPending = false
           if (response.error) throw rpcError(response)
           const result = response.result
@@ -365,7 +472,9 @@ function followRun(
             runIdNotified = true
             options.onRunId?.(runId)
           }
+          if (settled || !stillCurrent()) return
           options.onRunInfo?.(parseRunInfo(result))
+          if (settled || !stillCurrent()) return
           subscriptionReady = true
           flushBufferedEvents()
           if (!settled && replayRequiredForRun === runId) {
@@ -383,12 +492,16 @@ function followRun(
                   "runtime_request_failed",
                   "Trellis could not start that run."
                 )
-          finish(runtimeError)
+          failRequest(runtimeError)
         })
     }
 
     const scheduleReconnect = () => {
       if (settled || reconnectTimer !== null) return
+      if (!stillCurrent()) {
+        finish(authenticationError())
+        return
+      }
       if (reconnects >= reconnectLimit) {
         finish(
           new RuntimeError(
@@ -406,6 +519,11 @@ function followRun(
     }
 
     const handleMessage = (activeSocket: WebSocket, raw: unknown) => {
+      if (settled || socket !== activeSocket) return
+      if (!stillCurrent()) {
+        finish(authenticationError())
+        return
+      }
       if (typeof raw !== "string") return
       let decoded: unknown
       try {
@@ -421,8 +539,14 @@ function followRun(
       }
       const messages = Array.isArray(decoded) ? decoded : [decoded]
       for (const value of messages) {
+        if (settled || !stillCurrent()) return
         const message = asRecord(value)
         if (!message || message.jsonrpc !== "2.0") continue
+        if (message.id === null && message.error) {
+          const error = rpcError(message as unknown as RpcResponse)
+          failRequest(error)
+          return
+        }
         if (typeof message.id === "string") {
           const request = pending.get(message.id)
           if (request) {
@@ -460,20 +584,19 @@ function followRun(
 
     async function connect() {
       if (settled) return
-      let credential: { token: string; userId: string }
+      if (!stillCurrent()) {
+        finish(authenticationError())
+        return
+      }
+      let credential: AuthCredential
       try {
         credential = await auth.getAccessToken()
-      } catch {
-        finish(authenticationError())
+      } catch (error) {
+        finish(credentialError(error))
         return
       }
       if (settled) return
-      if (userId !== null && userId !== credential.userId) {
-        finish(authenticationError())
-        return
-      }
-      userId = credential.userId
-      if (!stillCurrent()) {
+      if (!stillCurrent() || !auth.isCredentialCurrent(credential)) {
         finish(authenticationError())
         return
       }
@@ -485,18 +608,24 @@ function followRun(
         return
       }
       socket = activeSocket
+      socketCredential = null
       activeSocket.onopen = () => {
         if (socket !== activeSocket || settled) return
+        if (openingTimer !== null) clearTimeout(openingTimer)
+        openingTimer = null
         void (async () => {
           try {
             const freshCredential = await auth.getAccessToken()
             if (socket !== activeSocket || settled) return
             if (
               freshCredential.userId !== credential.userId ||
+              freshCredential.sessionEpoch !== credential.sessionEpoch ||
+              !auth.isCredentialCurrent(freshCredential) ||
               !stillCurrent()
             ) {
               throw authenticationError()
             }
+            socketCredential = freshCredential
             const response = await sendRpc(activeSocket, "auth.authenticate", {
               accessToken: freshCredential.token,
             })
@@ -506,20 +635,37 @@ function followRun(
               response.result?.userId !== credential.userId ||
               !stillCurrent()
             ) {
+              if (response.error) throw rpcError(response)
               throw authenticationError()
             }
             beginRequest(activeSocket)
-          } catch {
+          } catch (error) {
             if (socket === activeSocket && !settled)
-              finish(authenticationError())
+              failRequest(
+                error instanceof RuntimeError ? error : credentialError(error)
+              )
           }
         })()
       }
       activeSocket.onmessage = (message) =>
         handleMessage(activeSocket, message.data)
       activeSocket.onerror = () => activeSocket.close()
-      activeSocket.onclose = () => {
+      activeSocket.onclose = ({ code }) => {
         if (socket !== activeSocket || settled) return
+        if (openingTimer !== null) clearTimeout(openingTimer)
+        openingTimer = null
+        if (!stillCurrent()) {
+          finish(authenticationError())
+          return
+        }
+        if (code === 4401 || code === 1013) {
+          failRequest(
+            code === 4401
+              ? expiredAuthenticationError()
+              : unavailableAuthenticationError()
+          )
+          return
+        }
         socket = null
         subscriptionRequestPending = false
         subscriptionReady = false
@@ -532,10 +678,22 @@ function followRun(
         pending.clear()
         scheduleReconnect()
       }
+      openingTimer = setTimeout(() => {
+        if (socket !== activeSocket || settled) return
+        finish(
+          stillCurrent()
+            ? new RuntimeError(
+                "runtime_timeout",
+                "Connection to Trellis timed out. Please try again.",
+                503
+              )
+            : authenticationError()
+        )
+      }, rpcTimeoutMs)
     }
 
     unsubscribeAuth = auth.subscribe(() => {
-      if (userId !== null && !stillCurrent()) finish(authenticationError())
+      if (!stillCurrent()) finish(authenticationError())
     })
     void connect()
   })
@@ -567,19 +725,24 @@ async function requestRunAction(
   failureMessage: string
 ): Promise<Record<string, unknown>> {
   const auth = getAuthController()
-  let credential: { token: string; userId: string }
-  try {
-    credential = await auth.getAccessToken()
-  } catch {
-    throw authenticationError()
-  }
+  const initialUser = auth.getSnapshot().user?.id
+  const initialEpoch = auth.getSessionEpoch()
   const stillCurrent = () => {
     const current = auth.getSnapshot()
     return (
-      current.status === "signed-in" && current.user?.id === credential.userId
+      current.status === "signed-in" &&
+      current.user?.id === initialUser &&
+      auth.getSessionEpoch() === initialEpoch
     )
   }
-  if (!stillCurrent()) throw authenticationError()
+  let credential: AuthCredential
+  try {
+    credential = await auth.getAccessToken()
+  } catch (error) {
+    throw credentialError(error)
+  }
+  if (!stillCurrent() || !auth.isCredentialCurrent(credential))
+    throw authenticationError()
   let socket: WebSocket
   try {
     socket = new WebSocket(runtimeUrl())
@@ -589,6 +752,7 @@ async function requestRunAction(
   return new Promise((resolve, reject) => {
     let settled = false
     let authenticated = false
+    let socketCredential: AuthCredential | null = null
     let unsubscribeAuth: (() => void) | null = null
     const finish = (result?: Record<string, unknown>, error?: RuntimeError) => {
       if (settled) return
@@ -597,8 +761,11 @@ async function requestRunAction(
       unsubscribeAuth = null
       clearTimeout(timeout)
       socket.close()
-      if (error) reject(error)
-      else if (result) resolve(result)
+      if (error) {
+        reject(error)
+        if (credentialWasRejected(error) && socketCredential)
+          expireRejectedCredential(auth, socketCredential)
+      } else if (result) resolve(result)
       else
         reject(
           new RuntimeError(
@@ -612,24 +779,32 @@ async function requestRunAction(
         undefined,
         new RuntimeError(
           "runtime_timeout",
-          "The Trellis service did not respond."
+          "The Trellis service did not respond.",
+          503
         )
       )
     }, rpcTimeoutMs)
     socket.onopen = () => {
+      if (settled) return
       void (async () => {
-        let freshCredential: { token: string; userId: string }
+        let freshCredential: AuthCredential
         try {
           freshCredential = await auth.getAccessToken()
-        } catch {
-          finish(undefined, authenticationError())
+        } catch (error) {
+          finish(undefined, credentialError(error))
           return
         }
         if (settled) return
-        if (freshCredential.userId !== credential.userId || !stillCurrent()) {
+        if (
+          freshCredential.userId !== credential.userId ||
+          freshCredential.sessionEpoch !== credential.sessionEpoch ||
+          !auth.isCredentialCurrent(freshCredential) ||
+          !stillCurrent()
+        ) {
           finish(undefined, authenticationError())
           return
         }
+        socketCredential = freshCredential
         try {
           socket.send(
             JSON.stringify({
@@ -651,6 +826,11 @@ async function requestRunAction(
       })()
     }
     socket.onmessage = ({ data }) => {
+      if (settled) return
+      if (!stillCurrent()) {
+        finish(undefined, authenticationError())
+        return
+      }
       if (typeof data !== "string") return
       let response: unknown
       try {
@@ -667,10 +847,17 @@ async function requestRunAction(
       }
       const envelope = asRecord(response)
       if (!envelope) return
+      if (envelope.id === null && envelope.error) {
+        finish(undefined, rpcError(envelope as unknown as RpcResponse))
+        return
+      }
       if (envelope.id === "runtime-auth") {
         if (authenticated) return
+        if (envelope.error) {
+          finish(undefined, rpcError(envelope as unknown as RpcResponse))
+          return
+        }
         if (
-          envelope.error ||
           asRecord(envelope.result)?.userId !== credential.userId ||
           !stillCurrent()
         ) {
@@ -699,16 +886,9 @@ async function requestRunAction(
         return
       }
       if (envelope.error) {
-        const error = asRecord(envelope.error)
-        const detail = asRecord(error?.data)
         finish(
           undefined,
-          new RuntimeError(
-            typeof detail?.code === "string"
-              ? detail.code
-              : "runtime_request_failed",
-            typeof error?.message === "string" ? error.message : failureMessage
-          )
+          rpcError(envelope as unknown as RpcResponse, failureMessage)
         )
         return
       }
@@ -720,10 +900,19 @@ async function requestRunAction(
         new RuntimeError("connection_lost", "Connection to Trellis was lost.")
       )
     }
-    socket.onclose = () => {
+    socket.onclose = ({ code }) => {
       finish(
         undefined,
-        new RuntimeError("connection_lost", "Connection to Trellis was lost.")
+        !stillCurrent()
+          ? authenticationError()
+          : code === 4401
+            ? expiredAuthenticationError()
+            : code === 1013
+              ? unavailableAuthenticationError()
+              : new RuntimeError(
+                  "connection_lost",
+                  "Connection to Trellis was lost."
+                )
       )
     }
     unsubscribeAuth = auth.subscribe(() => {

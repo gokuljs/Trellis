@@ -113,6 +113,25 @@ def test_runtime_websocket_authenticates_before_run_rpc(tmp_path: Path) -> None:
         assert reply["result"] == {"userId": "a59673c1-78d0-4bc8-8c49-6bc2e7a01dd5"}
 
 
+def test_runtime_websocket_auth_frame_timeout_does_not_reject_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_app(Settings(environment="test", data_dir=tmp_path), auth_verifier=StubVerifier())
+    monkeypatch.setattr(runtime, "_AUTH_TIMEOUT_SECONDS", 0.05)
+    with (
+        TestClient(app) as client,
+        client.websocket_connect(
+            "/api/runtime", headers={"origin": "http://localhost:3000"}
+        ) as socket,
+    ):
+        reply = socket.receive_json()
+        assert reply["id"] is None
+        assert reply["error"]["data"] == {"code": "auth_unavailable", "status": 503}
+        with pytest.raises(WebSocketDisconnect) as closed:
+            socket.receive_json()
+        assert closed.value.code == 1013
+
+
 @pytest.mark.parametrize(
     ("auth_status", "expected_code"), [(401, "auth_failed"), (503, "auth_unavailable")]
 )
@@ -145,7 +164,8 @@ def test_runtime_websocket_rejects_invalid_or_unavailable_sign_in(
         assert reply["error"]["data"]["code"] == expected_code
         with pytest.raises(WebSocketDisconnect) as closed:
             socket.receive_json()
-        assert closed.value.code == 4401
+        assert reply["error"]["data"]["status"] == auth_status
+        assert closed.value.code == (1013 if auth_status == 503 else 4401)
 
 
 def test_runtime_websocket_reports_account_in_use(tmp_path: Path) -> None:
@@ -179,6 +199,180 @@ def test_runtime_websocket_reports_account_in_use(tmp_path: Path) -> None:
             with pytest.raises(WebSocketDisconnect) as closed:
                 second_socket.receive_json()
             assert closed.value.code == 4409
+
+
+@pytest.mark.parametrize("failure", ["timeout", "unexpected", "deadline"])
+def test_runtime_websocket_reports_verifier_failures_as_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    cancelled = Event()
+
+    class UnavailableVerifier(StubVerifier):
+        async def verify_token(self, token: str) -> VerifiedUser:
+            del token
+            if failure == "timeout":
+                raise TimeoutError("private verification details")
+            if failure == "deadline":
+                try:
+                    await asyncio.sleep(60)
+                finally:
+                    cancelled.set()
+            raise RuntimeError("private verification details")
+
+    app = create_app(
+        Settings(environment="test", data_dir=tmp_path), auth_verifier=UnavailableVerifier()
+    )
+    monkeypatch.setattr(runtime, "_AUTH_TIMEOUT_SECONDS", 0.05)
+    with (
+        TestClient(app) as client,
+        client.websocket_connect(
+            "/api/runtime", headers={"origin": "http://localhost:3000"}
+        ) as socket,
+    ):
+        socket.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": "auth",
+                "method": "auth.authenticate",
+                "params": {"accessToken": "alice"},
+            }
+        )
+        reply = socket.receive_json()
+        assert reply["error"]["data"] == {"code": "auth_unavailable", "status": 503}
+        assert "private" not in str(reply)
+        with pytest.raises(WebSocketDisconnect) as closed:
+            socket.receive_json()
+        assert closed.value.code == 1013
+        if failure == "deadline":
+            assert cancelled.is_set()
+
+
+@pytest.mark.parametrize("failure", ["unexpected", "deadline"])
+def test_runtime_websocket_bounds_account_startup_and_hides_private_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    cancelled = Event()
+    app = create_app(Settings(environment="test", data_dir=tmp_path), auth_verifier=StubVerifier())
+    monkeypatch.setattr(runtime, "_AUTH_TIMEOUT_SECONDS", 0.05)
+
+    async def unavailable_account(*_args: object, **_kwargs: object):
+        if failure == "deadline":
+            try:
+                await asyncio.sleep(60)
+            finally:
+                cancelled.set()
+        raise RuntimeError("private service details")
+
+    with TestClient(app) as client:
+        monkeypatch.setattr(app.state.account_registry, "get", unavailable_account)
+        with client.websocket_connect(
+            "/api/runtime", headers={"origin": "http://localhost:3000"}
+        ) as socket:
+            socket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "auth",
+                    "method": "auth.authenticate",
+                    "params": {"accessToken": "alice"},
+                }
+            )
+            reply = socket.receive_json()
+            assert reply["error"]["data"] == {"code": "database_unavailable", "status": 503}
+            assert "private" not in str(reply)
+            with pytest.raises(WebSocketDisconnect) as closed:
+                socket.receive_json()
+            assert closed.value.code == 1013
+            if failure == "deadline":
+                assert cancelled.is_set()
+
+
+@pytest.mark.parametrize("trigger", ["request", "idle"])
+@pytest.mark.parametrize(
+    ("failure", "expected_code", "expected_status", "expected_close"),
+    [
+        ("invalid", "auth_failed", 401, 4401),
+        ("unavailable", "auth_unavailable", 503, 1013),
+        ("timeout", "auth_unavailable", 503, 1013),
+        ("unexpected", "auth_unavailable", 503, 1013),
+        ("database", "database_unavailable", 503, 1013),
+        ("cloud_expired", "cloud_access_denied", 401, 4401),
+        ("account_in_use", "account_in_use", 409, 4409),
+    ],
+)
+def test_runtime_websocket_distinguishes_access_failures_after_sign_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trigger: str,
+    failure: str,
+    expected_code: str,
+    expected_status: int,
+    expected_close: int,
+) -> None:
+    broken = Event()
+
+    class UnavailableVerifier(StubVerifier):
+        async def verify_token(self, token: str) -> VerifiedUser:
+            if broken.is_set():
+                if failure in {"invalid", "unavailable"}:
+                    raise HTTPException(status_code=401 if failure == "invalid" else 503)
+                if failure == "timeout":
+                    raise TimeoutError("private verification details")
+                if failure == "unexpected":
+                    raise RuntimeError("private verification details")
+            return await super().verify_token(token)
+
+    app = create_app(
+        Settings(environment="test", data_dir=tmp_path), auth_verifier=UnavailableVerifier()
+    )
+    monkeypatch.setattr(runtime, "_AUTH_RECHECK_SECONDS", 0.05 if trigger == "idle" else 60)
+    with (
+        TestClient(app) as client,
+        client.websocket_connect(
+            "/api/runtime", headers={"origin": "http://localhost:3000"}
+        ) as socket,
+    ):
+        socket.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": "auth",
+                "method": "auth.authenticate",
+                "params": {"accessToken": "alice"},
+            }
+        )
+        assert "result" in socket.receive_json()
+        original_get = app.state.account_registry.get
+
+        async def get_account(*args: object, **kwargs: object):
+            if broken.is_set() and failure in {"database", "cloud_expired", "account_in_use"}:
+                error_code = {
+                    "database": "database_unavailable",
+                    "cloud_expired": "cloud_access_denied",
+                    "account_in_use": "account_in_use",
+                }[failure]
+                raise ApplicationError(error_code, "private service details")
+            return await original_get(*args, **kwargs)
+
+        monkeypatch.setattr(app.state.account_registry, "get", get_account)
+        broken.set()
+        if trigger == "request":
+            socket.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "resume",
+                    "method": "run.resume",
+                    "params": {"runId": "missing", "afterSequence": 0},
+                }
+            )
+        reply = socket.receive_json()
+        assert reply["id"] is None
+        assert reply["error"]["data"] == {
+            "code": expected_code,
+            "status": expected_status,
+        }
+        assert "private" not in str(reply)
+        with pytest.raises(WebSocketDisconnect) as closed:
+            socket.receive_json()
+        assert closed.value.code == expected_close
 
 
 @pytest.mark.parametrize(
@@ -222,6 +416,56 @@ def test_runtime_websocket_reports_cloud_account_startup_failures(
             assert closed.value.code == expected_close
 
 
+@pytest.mark.parametrize(
+    ("error_code", "expected_status", "expected_close"),
+    [("database_unavailable", 503, 1013), ("cloud_access_denied", 401, 4401)],
+)
+def test_runtime_websocket_reports_access_failures_during_run_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    expected_status: int,
+    expected_close: int,
+) -> None:
+    app = create_app(Settings(environment="test", data_dir=tmp_path), auth_verifier=StubVerifier())
+    with (
+        TestClient(app) as client,
+        client.websocket_connect(
+            "/api/runtime", headers={"origin": "http://localhost:3000"}
+        ) as socket,
+    ):
+        socket.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": "auth",
+                "method": "auth.authenticate",
+                "params": {"accessToken": "alice"},
+            }
+        )
+        user_id = UUID(socket.receive_json()["result"]["userId"])
+
+        async def unavailable_run(_run_id: str):
+            raise ApplicationError(error_code, "private service details")
+
+        monkeypatch.setattr(
+            app.state.account_registry._contexts[user_id].run_service, "get_run", unavailable_run
+        )
+        socket.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": "resume",
+                "method": "run.resume",
+                "params": {"runId": "missing", "afterSequence": 0},
+            }
+        )
+        reply = socket.receive_json()
+        assert reply["error"]["data"] == {"code": error_code, "status": expected_status}
+        assert "private" not in str(reply)
+        with pytest.raises(WebSocketDisconnect) as closed:
+            socket.receive_json()
+        assert closed.value.code == expected_close
+
+
 @pytest.mark.parametrize("change", ["revoked", "changed_user"])
 def test_runtime_websocket_closes_idle_connection_when_auth_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
@@ -261,6 +505,10 @@ def test_runtime_websocket_closes_idle_connection_when_auth_changes(
         )
         probe.start()
         try:
+            assert socket.receive_json()["error"]["data"] == {
+                "code": "auth_failed",
+                "status": 401,
+            }
             with pytest.raises(WebSocketDisconnect) as closed:
                 socket.receive_json()
             assert closed.value.code == 4401
@@ -366,6 +614,10 @@ def test_runtime_websocket_rechecks_auth_before_dispatching_run_rpc(
                 "params": {"runId": "missing", "afterSequence": 0},
             }
         )
+        assert socket.receive_json()["error"]["data"] == {
+            "code": "auth_failed",
+            "status": 401,
+        }
         with pytest.raises(WebSocketDisconnect) as closed:
             socket.receive_json()
         assert closed.value.code == 4401
@@ -423,6 +675,10 @@ def test_runtime_websocket_rechecks_auth_between_batched_run_rpcs(
                 },
             ]
         )
+        assert socket.receive_json()["error"]["data"] == {
+            "code": "auth_failed",
+            "status": 401,
+        }
         with pytest.raises(WebSocketDisconnect) as closed:
             socket.receive_json()
         assert closed.value.code == 4401
