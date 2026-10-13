@@ -385,7 +385,7 @@ export function createAuthController(
               ...emptyState,
               status: "error",
               error:
-                "Sign-out timed out. Your workspace is locked. Try again to finish signing out.",
+                "Sign-out timed out. Your chats are locked. Try again to finish signing out.",
             })
             return
           }

@@ -9,21 +9,14 @@ import { ArrowUp } from "lucide-react"
 import { BEND, MetalFx, useMetalBend } from "metal-fx"
 
 import { useTheme } from "@/components/theme-provider"
-import { WorkspaceAttachment } from "@/components/workspace-attachment"
 
 type BudgetPreset = "conservative" | "longer"
 
 type ComposerProps = {
   value: string
   placeholder: string
-  workspacePath: string | null
-  workspaceReady: boolean
-  workspaceSessionKey: string
   onChange: (value: string) => void
   onSubmit: () => void
-  onPickWorkspace: () => Promise<boolean>
-  onSaveWorkspace: (path: string) => Promise<void>
-  onRemoveWorkspace: () => Promise<void>
   disabled?: boolean
   budgetPreset: BudgetPreset
   onBudgetChange: (preset: BudgetPreset) => void
@@ -51,14 +44,8 @@ function usePrefersReducedMotion() {
 export function Composer({
   value,
   placeholder,
-  workspacePath,
-  workspaceReady,
-  workspaceSessionKey,
   onChange,
   onSubmit,
-  onPickWorkspace,
-  onSaveWorkspace,
-  onRemoveWorkspace,
   disabled = false,
   budgetPreset,
   onBudgetChange,
@@ -87,15 +74,6 @@ export function Composer({
   return (
     <div className="composer-wrap">
       <div className="composer-box">
-        <WorkspaceAttachment
-          key={workspaceSessionKey}
-          workspacePath={workspacePath}
-          workspaceReady={workspaceReady}
-          disabled={disabled}
-          onPickWorkspace={onPickWorkspace}
-          onSave={onSaveWorkspace}
-          onRemove={onRemoveWorkspace}
-        />
         <textarea
           aria-label="Message"
           value={value}

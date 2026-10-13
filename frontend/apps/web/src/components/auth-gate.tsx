@@ -166,9 +166,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
           </>
         )}
       </section>
-      <p className="auth-footer">
-        Your account opens your local Trellis workspace.
-      </p>
+      <p className="auth-footer">Your account opens your chats in Trellis.</p>
     </main>
   )
 }

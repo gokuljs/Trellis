@@ -298,7 +298,7 @@ function followRun(
           rejectRpc(
             new RuntimeError(
               "runtime_timeout",
-              "The local service did not respond."
+              "The Trellis service did not respond."
             )
           )
         }, rpcTimeoutMs)
@@ -351,13 +351,13 @@ function followRun(
           if (!result || typeof responseRunId !== "string") {
             throw new RuntimeError(
               "runtime_protocol_error",
-              "The local service returned an invalid run."
+              "The Trellis service returned an invalid run."
             )
           }
           if (runId && responseRunId !== runId) {
             throw new RuntimeError(
               "runtime_protocol_error",
-              "The local service resumed a different run."
+              "The Trellis service resumed a different run."
             )
           }
           if (!runId) runId = responseRunId
@@ -414,7 +414,7 @@ function followRun(
         finish(
           new RuntimeError(
             "runtime_protocol_error",
-            "The local service sent invalid data."
+            "The Trellis service sent invalid data."
           )
         )
         return
@@ -603,7 +603,7 @@ async function requestRunAction(
         reject(
           new RuntimeError(
             "runtime_protocol_error",
-            "The local service returned an invalid run."
+            "The Trellis service returned an invalid run."
           )
         )
     }
@@ -612,7 +612,7 @@ async function requestRunAction(
         undefined,
         new RuntimeError(
           "runtime_timeout",
-          "The local service did not respond."
+          "The Trellis service did not respond."
         )
       )
     }, rpcTimeoutMs)
@@ -660,7 +660,7 @@ async function requestRunAction(
           undefined,
           new RuntimeError(
             "runtime_protocol_error",
-            "The local service sent invalid data."
+            "The Trellis service sent invalid data."
           )
         )
         return
@@ -746,7 +746,7 @@ export async function cancelRun(
   if (typeof result.runId !== "string" || typeof result.status !== "string") {
     throw new RuntimeError(
       "runtime_protocol_error",
-      "The local service returned an invalid run."
+      "The Trellis service returned an invalid run."
     )
   }
   return { runId: result.runId, status: result.status }
@@ -775,7 +775,7 @@ export async function respondToToolApproval(
   ) {
     throw new RuntimeError(
       "runtime_protocol_error",
-      "The local service returned a different approval."
+      "The Trellis service returned a different approval."
     )
   }
   return { runId, toolCallId, decision }

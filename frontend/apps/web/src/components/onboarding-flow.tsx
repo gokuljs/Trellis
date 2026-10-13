@@ -209,10 +209,10 @@ export function OnboardingFlow({
                   <h1
                     id="onboarding-intro-heading"
                     ref={headingRef}
-                    aria-label="Workspace setup"
+                    aria-label="Set up Trellis"
                     tabIndex={-1}
                   >
-                    <span>Workspace setup</span>
+                    <span>Set up Trellis</span>
                   </h1>
                   <p className="onboarding-intro-copy">
                     Create your profile and choose a model.

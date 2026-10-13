@@ -22,8 +22,6 @@ export type Session = {
   created_at: string
   updated_at: string
   message_count: number
-  workspace_path: string | null
-  workspace_ready: boolean
 }
 
 export type Profile = {

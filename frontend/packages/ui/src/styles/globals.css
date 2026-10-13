@@ -377,7 +377,6 @@ html.theme-ripple-fallback::before {
 
   .icon-button,
   .topbar-icon,
-  .composer-add,
   .send-button,
   .mobile-menu {
     display: inline-flex;
@@ -403,7 +402,6 @@ html.theme-ripple-fallback::before {
   @media (hover: hover) and (pointer: fine) {
     .icon-button:hover,
     .topbar-icon:hover,
-    .composer-add:hover,
     .mobile-menu:hover {
       color: var(--shell-text-strong);
       background: var(--shell-hover);
@@ -412,7 +410,6 @@ html.theme-ripple-fallback::before {
 
   .icon-button:focus-visible,
   .topbar-icon:focus-visible,
-  .composer-add:focus-visible,
   .send-button:focus-visible,
   .mobile-menu:focus-visible,
   .settings-input-action:focus-visible,
@@ -425,7 +422,6 @@ html.theme-ripple-fallback::before {
 
   .icon-button,
   .topbar-icon,
-  .composer-add,
   .send-button,
   .mobile-menu,
   .settings-input-action {
@@ -434,7 +430,6 @@ html.theme-ripple-fallback::before {
 
   .icon-button:active,
   .topbar-icon:active,
-  .composer-add:active,
   .send-button:active,
   .mobile-menu:active,
   .settings-input-action:active {
@@ -1789,194 +1784,6 @@ html.theme-ripple-fallback::before {
       background-color 140ms ease;
   }
 
-  .composer-workspace-chip {
-    display: inline-flex;
-    max-width: min(280px, 72vw);
-    align-items: center;
-    align-self: flex-start;
-    gap: var(--space-1);
-    margin: 0 0 2px var(--space-1);
-    border: 1px solid
-      color-mix(in srgb, var(--shell-accent) 30%, var(--shell-line));
-    border-radius: 8px;
-    padding: var(--space-1) var(--space-1) var(--space-1) var(--space-2);
-    color: var(--shell-text-strong);
-    background: color-mix(in srgb, var(--shell-accent) 9%, var(--shell-input));
-    font-size: 12px;
-    line-height: 1.3;
-  }
-
-  .composer-workspace-chip > span {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .composer-workspace-chip button {
-    display: inline-flex;
-    width: 20px;
-    height: 20px;
-    flex: 0 0 20px;
-    align-items: center;
-    justify-content: center;
-    border-radius: 5px;
-    color: var(--shell-text-muted);
-  }
-
-  .composer-workspace-chip button:hover:not(:disabled) {
-    color: var(--destructive);
-    background: var(--shell-hover);
-  }
-
-  .composer-workspace-chip button:focus-visible,
-  .composer-workspace-menu button:focus-visible,
-  .composer-workspace-menu input:focus-visible {
-    outline: 2px solid var(--shell-focus);
-    outline-offset: 2px;
-  }
-
-  .composer-workspace-chip button:disabled,
-  .composer-workspace-reconnect button:disabled,
-  .composer-workspace-menu button:disabled,
-  .composer-workspace-menu input:disabled {
-    cursor: not-allowed;
-    opacity: 0.55;
-  }
-
-  .composer-workspace-reconnect {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: 2px var(--space-2);
-    margin: 2px var(--space-1) var(--space-2);
-    color: var(--shell-text-muted);
-    font-size: 12px;
-    line-height: 1.45;
-  }
-
-  .composer-workspace-reconnect button {
-    color: var(--shell-accent);
-    font-weight: 600;
-    text-decoration: underline;
-    text-underline-offset: 2px;
-  }
-
-  .composer-workspace-reconnect button:focus-visible {
-    outline: 2px solid var(--shell-focus);
-    outline-offset: 2px;
-    border-radius: 2px;
-  }
-
-  .composer-workspace-anchor {
-    position: absolute;
-    z-index: 30;
-    bottom: 4px;
-    left: 16px;
-  }
-
-  .composer-workspace-menu {
-    position: absolute;
-    z-index: 31;
-    bottom: calc(100% + var(--space-2));
-    left: 0;
-    width: min(280px, calc(100vw - 38px));
-    border: 1px solid var(--shell-line);
-    border-radius: 12px;
-    padding: var(--space-2);
-    color: var(--shell-text-strong);
-    background: var(--shell-input);
-    box-shadow: 0 12px 30px color-mix(in srgb, #000 32%, transparent);
-  }
-
-  .composer-workspace-menu-item {
-    display: flex;
-    width: 100%;
-    min-height: 36px;
-    align-items: center;
-    gap: var(--space-2);
-    border-radius: 8px;
-    padding: var(--space-2);
-    color: var(--shell-text-strong);
-    text-align: left;
-    font: inherit;
-    font-size: 13px;
-  }
-
-  .composer-workspace-menu-item:hover:not(:disabled) {
-    background: var(--shell-hover);
-  }
-
-  .composer-workspace-menu [role="alert"] {
-    margin: var(--space-1);
-    color: var(--destructive);
-    font-size: 12px;
-  }
-
-  .composer-workspace-status {
-    padding: var(--space-2) var(--space-2) var(--space-1);
-    color: var(--shell-text-muted);
-    font-size: 12px;
-  }
-
-  .composer-workspace-form {
-    display: grid;
-    gap: var(--space-2);
-    padding: var(--space-1);
-  }
-
-  .composer-workspace-form label {
-    color: var(--shell-text-strong);
-    font-size: 12px;
-    font-weight: 600;
-  }
-
-  .composer-workspace-form input {
-    width: 100%;
-    min-width: 0;
-    border: 1px solid var(--shell-line);
-    border-radius: 7px;
-    padding: var(--space-2);
-    color: var(--shell-text-bright);
-    background: var(--shell-bg);
-    font: inherit;
-    font-size: 12px;
-  }
-
-  .composer-workspace-form-actions {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: var(--space-1) var(--space-2);
-  }
-
-  .composer-workspace-form-actions button {
-    border-radius: 6px;
-    padding: var(--space-2);
-    color: var(--shell-accent);
-    font-size: 12px;
-    font-weight: 600;
-  }
-
-  .composer-workspace-form-actions button[type="submit"] {
-    color: var(--primary-foreground);
-    background: var(--shell-accent);
-  }
-
-  .composer-workspace-form-actions button:hover:not(:disabled) {
-    filter: brightness(1.08);
-  }
-
-  .composer-workspace-form-actions button[type="button"]:hover:not(:disabled) {
-    text-decoration: underline;
-  }
-
-  .composer-add {
-    width: 30px;
-    height: 30px;
-    flex: 0 0 30px;
-    color: var(--shell-text-muted);
-  }
-
   .composer-box textarea {
     width: 100%;
     min-height: 65px;
@@ -2057,9 +1864,7 @@ html.theme-ripple-fallback::before {
     .icon-button,
     .topbar-icon,
     .mobile-menu,
-    .composer-add,
     .settings-input-action,
-    .composer-workspace-chip button,
     .run-activity-trigger {
       min-width: var(--space-10);
       min-height: var(--space-10);
@@ -2075,19 +1880,8 @@ html.theme-ripple-fallback::before {
     .settings-remove,
     .chat-error button,
     .cancel-run-button,
-    .run-approval-actions button,
-    .composer-workspace-menu-item {
+    .run-approval-actions button {
       min-height: var(--space-10);
-    }
-
-    .composer-add {
-      width: var(--space-10);
-      height: var(--space-10);
-      flex-basis: var(--space-10);
-    }
-
-    .composer-workspace-anchor {
-      bottom: 9px;
     }
 
     .composer-tools {
@@ -2125,12 +1919,6 @@ html.theme-ripple-fallback::before {
     cursor: not-allowed;
     color: var(--shell-disabled-text);
     background: var(--shell-input);
-  }
-
-  .composer-add:disabled {
-    cursor: not-allowed;
-    color: var(--shell-disabled-text);
-    opacity: 1;
   }
 
   .composer-footnote {
@@ -2913,7 +2701,6 @@ html.theme-ripple-fallback::before {
     .topbar-icon:active,
     .nav-item:active,
     .session-row:active,
-    .composer-add:active,
     .send-button:active,
     .mobile-menu:active,
     .settings-input-action:active {
