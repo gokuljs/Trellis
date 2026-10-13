@@ -1,13 +1,21 @@
 from app.application.budgets import BudgetPreset
 from app.application.errors import ApplicationError
 from app.application.ports import SecretStorePort, SettingsRepository
+from app.domain.capabilities import RuntimeCapabilities
 from app.domain.models import AppSettings, ModelId, ModelStatus, ProviderName, ProviderStatus
 
 
 class SettingsService:
-    def __init__(self, repository: SettingsRepository, secret_store: SecretStorePort) -> None:
+    def __init__(
+        self,
+        repository: SettingsRepository,
+        secret_store: SecretStorePort,
+        *,
+        capabilities: RuntimeCapabilities | None = None,
+    ) -> None:
         self._repository = repository
         self._secret_store = secret_store
+        self._capabilities = capabilities or RuntimeCapabilities()
 
     async def get(self) -> AppSettings:
         descriptors = await self._repository.list_models()
@@ -25,7 +33,7 @@ class SettingsService:
                         name=model.provider_name,
                         model=model.name,
                         configured=credential[0],
-                        key_hint=credential[1],
+                        key_hint=None,
                     )
                 )
             statuses.append(
@@ -40,7 +48,7 @@ class SettingsService:
                     supports_streaming=model.supports_streaming,
                     supports_tools=model.supports_tools,
                     configured=credential[0],
-                    key_hint=credential[1],
+                    key_hint=None,
                 )
             )
         return AppSettings(
@@ -49,6 +57,7 @@ class SettingsService:
             selected_model_id=await self._repository.get_selected_model_id(),
             models=statuses,
             default_budget_preset=await self._repository.get_default_budget_preset(),
+            capabilities=tuple(sorted(self._capabilities.enabled)),
         )
 
     async def select_default_budget(self, preset: BudgetPreset) -> AppSettings:
@@ -66,25 +75,4 @@ class SettingsService:
     async def select_model(self, model_id: ModelId) -> AppSettings:
         if not await self._repository.set_selected_model(model_id):
             raise ApplicationError("model_not_available", "The selected model is not available.")
-        return await self.get()
-
-    async def save_api_key(self, provider: ProviderName, api_key: str) -> AppSettings:
-        if not any(model.provider_id == provider for model in await self._repository.list_models()):
-            raise ApplicationError(
-                "provider_not_available", "The selected provider is not available."
-            )
-        if not api_key or len(api_key) > 10_000:
-            raise ApplicationError(
-                "invalid_api_key",
-                "API key must contain 1 to 10,000 characters",
-            )
-        await self._secret_store.set(provider, api_key)
-        return await self.get()
-
-    async def remove_api_key(self, provider: ProviderName) -> AppSettings:
-        if not any(model.provider_id == provider for model in await self._repository.list_models()):
-            raise ApplicationError(
-                "provider_not_available", "The selected provider is not available."
-            )
-        await self._secret_store.delete(provider)
         return await self.get()

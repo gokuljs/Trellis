@@ -9,6 +9,7 @@ import pytest
 from app.application.errors import ApplicationError
 from app.application.runs import RunService
 from app.application.tools import ToolRegistry
+from app.domain.capabilities import RuntimeCapabilities
 from app.domain.runtime import (
     ModelRequest,
     ModelStreamEvent,
@@ -19,6 +20,9 @@ from app.domain.runtime import (
 )
 from app.infrastructure.secrets import SecretStore
 from tests.memory_repository import MemoryRepository as Database
+from tests.test_runtime_service import _selected_workspace
+
+LOCAL_CAPABILITIES = RuntimeCapabilities(frozenset({"local_read", "local_patch", "local_command"}))
 
 
 class LeaseDatabase(Database):
@@ -301,9 +305,11 @@ def test_lost_lease_prevents_local_tool_execution(tmp_path: Path) -> None:
             database,
             secrets,
             {"openai": provider},
-            tool_registry=ToolRegistry(executor),
+            tool_registry=ToolRegistry(executor, capabilities=LOCAL_CAPABILITIES),
             lease_repository=database,
             lease_renew_interval_seconds=60,
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
         )
         try:
             created = await service.create_run(session.id, "request", "Read note")

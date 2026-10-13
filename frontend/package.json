@@ -9,7 +9,8 @@
     "lint": "turbo lint",
     "format": "prettier --write \"**/*.{js,jsx,ts,tsx,css,html,json,md,yml,yaml}\"",
     "format:check": "prettier --check \"**/*.{js,jsx,ts,tsx,css,html,json,md,yml,yaml}\"",
-    "typecheck": "turbo typecheck"
+    "typecheck": "turbo typecheck",
+    "test:contracts": "bun test tests/*.test.js"
   },
   "devDependencies": {
     "git-format-staged": "4.0.1",

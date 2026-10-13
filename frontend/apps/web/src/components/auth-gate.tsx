@@ -67,7 +67,10 @@ export function AuthGate({ children }: { children: ReactNode }) {
 
   if (signedIn && auth.user) {
     return (
-      <div className="authenticated-workspace" key={auth.user.id}>
+      <div
+        className="authenticated-workspace"
+        key={`${auth.user.id}:${auth.sessionEpoch}`}
+      >
         {children}
       </div>
     )
@@ -166,9 +169,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
           </>
         )}
       </section>
-      <p className="auth-footer">
-        Your account opens your local Trellis workspace.
-      </p>
+      <p className="auth-footer">Your account opens your chats in Trellis.</p>
     </main>
   )
 }

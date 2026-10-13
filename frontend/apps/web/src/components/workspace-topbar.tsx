@@ -68,7 +68,7 @@ export function WorkspaceTopbar({
     <div className="workspace-topbar">
       <nav className="topbar-breadcrumb" aria-label="Breadcrumb">
         <MessageSquare size={17} strokeWidth={1.7} aria-hidden="true" />
-        <span>{activeView === "Settings" ? "Workspace" : "Chat"}</span>
+        <span>{activeView === "Settings" ? "Trellis" : "Chat"}</span>
         <span className="topbar-divider" aria-hidden="true">
           /
         </span>

@@ -30,13 +30,13 @@ from app.application.ports import (
     StreamingProviderAdapter,
     WorkspaceBindingPort,
 )
+from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
 from app.application.tools import (
     MAX_ARGUMENT_BYTES,
     ToolExecutionError,
     ToolRegistry,
-    redact_record,
-    redact_secrets,
 )
+from app.domain.capabilities import DEFAULT_RUNTIME_CAPABILITIES, RuntimeCapabilities
 from app.domain.models import ModelDescriptor
 from app.domain.runtime import (
     ModelCallRecord,
@@ -112,6 +112,7 @@ def _usage_measure(model_id: str, usage: dict[str, int | None]) -> tuple[int | N
 
 def _prepare_tool_calls(
     calls: tuple[ModelToolCall, ...],
+    redactor: SecretRedactor = COMMON_SECRET_REDACTOR,
 ) -> tuple[tuple[ModelToolCall, ...], dict[str, ToolResult]]:
     safe_calls: list[ModelToolCall] = []
     errors: dict[str, ToolResult] = {}
@@ -119,8 +120,8 @@ def _prepare_tool_calls(
         if (
             len(call.id) > 200
             or len(call.name) > 100
-            or redact_secrets(call.id) != call.id
-            or redact_secrets(call.name) != call.name
+            or redactor.redact_text(call.id) != call.id
+            or redactor.redact_text(call.name) != call.name
         ):
             raise ProviderError(
                 "provider_invalid_response", "The provider returned an invalid tool call."
@@ -136,7 +137,7 @@ def _prepare_tool_calls(
                 call.id, call.name, "Tool arguments are invalid.", True, "invalid_tool_arguments"
             )
         else:
-            safe_arguments = cast(dict[str, object], redact_record(call.arguments))
+            safe_arguments = cast(dict[str, object], redactor.redact_record(call.arguments))
             if safe_arguments != call.arguments:
                 errors[call.id] = ToolResult(
                     call.id,
@@ -166,6 +167,8 @@ class RunService:
         lease_repository: RunLeasePort | None = None,
         lease_renew_interval_seconds: float = DEFAULT_LEASE_RENEW_INTERVAL_SECONDS,
         max_concurrent_runs: int = DEFAULT_MAX_CONCURRENT_RUNS,
+        capabilities: RuntimeCapabilities = DEFAULT_RUNTIME_CAPABILITIES,
+        redactor: SecretRedactor | None = None,
     ) -> None:
         if max_concurrent_runs < 1:
             raise ValueError("maximum concurrent runs must be positive")
@@ -179,6 +182,8 @@ class RunService:
         self._providers = providers
         self._event_publisher = event_publisher
         self._tool_registry = tool_registry
+        self._capabilities = capabilities
+        self._redactor = redactor or COMMON_SECRET_REDACTOR
         self._workspace_guidance_reader = workspace_guidance_reader
         self._workspace_bindings = workspace_bindings
         self._lease_repository = lease_repository
@@ -205,7 +210,7 @@ class RunService:
         session = await self._sessions.get_session(session_id)
         if session is None:
             raise ApplicationError("session_not_found", "Session not found.")
-        normalized_content = content.strip()
+        normalized_content = self._redactor.redact_text(content.strip())
         if not normalized_content:
             raise ApplicationError("message_empty", "Message content cannot be empty.")
 
@@ -228,7 +233,7 @@ class RunService:
         if model.requires_api_key and api_key is None:
             raise ApplicationError(
                 "provider_not_configured",
-                "Add an API key for the selected provider in Settings.",
+                "The selected provider is not configured on this server.",
             )
 
         async with self._admission_lock:
@@ -423,6 +428,24 @@ class RunService:
         if self._closing:
             raise ApplicationError("runtime_shutting_down", "The runtime is shutting down.")
         await self._require_local_control(run_id)
+        stored_call = next(
+            (call for call in await self._runs.list_tool_calls(run_id) if call.id == tool_call_id),
+            None,
+        )
+        if stored_call is not None:
+            if self._tool_registry is None:
+                raise ApplicationError(
+                    "tool_execution_unavailable", "Tool execution is unavailable."
+                )
+            try:
+                self._tool_registry.check_capabilities(
+                    ModelToolCall(
+                        stored_call.provider_call_id, stored_call.name, stored_call.arguments
+                    ),
+                    capabilities=self._capabilities,
+                )
+            except ToolExecutionError as error:
+                raise ApplicationError(error.code, error.message) from None
         try:
             tool_call, event = await self._runs.record_tool_approval_decision(
                 run_id, tool_call_id, decision
@@ -622,28 +645,27 @@ class RunService:
             if model.requires_api_key and api_key is None:
                 raise ApplicationError(
                     "provider_not_configured",
-                    "Add an API key for the selected provider in Settings.",
+                    "The selected provider is not configured on this server.",
                 )
             profile = await self._profiles.get_profile()
             session = await self._sessions.get_session(run.session_id)
             if session is None:
                 raise ApplicationError("session_not_found", "Session not found.")
-            if self._workspace_bindings is not None:
+            workspace_root = None
+            if self._capabilities.workspace_enabled and self._workspace_bindings is not None:
                 workspace_root = await self._workspace_bindings.resolve(
                     session.id, session.workspace_path
                 )
-            else:
-                workspace_root = Path(session.workspace_path) if session.workspace_path else None
             guidance = (
                 await self._workspace_guidance_reader(workspace_root)
-                if workspace_root is not None and self._workspace_guidance_reader is not None
+                if self._capabilities.allows("local_read")
+                and workspace_root is not None
+                and self._workspace_guidance_reader is not None
                 else None
             )
             offered_tools = (
-                self._tool_registry.specs()
-                if workspace_root is not None
-                and model.supports_tools
-                and self._tool_registry is not None
+                self._tool_registry.specs(workspace_root, capabilities=self._capabilities)
+                if model.supports_tools and self._tool_registry is not None
                 else ()
             )
             visible_messages = await self._sessions.list_messages(run.session_id)
@@ -674,6 +696,7 @@ class RunService:
                     workspace_guidance=guidance,
                     run_tool_calls=prior_tool_calls,
                     tools=offered_tools,
+                    redactor=self._redactor,
                 )
                 request = ModelRequest(
                     provider_id=run.provider_id,
@@ -703,8 +726,10 @@ class RunService:
                     raise ProviderError(
                         "provider_invalid_response", "The provider returned an empty response."
                     )
-                safe_calls, preflight_errors = _prepare_tool_calls(step.tool_calls)
-                step = replace(step, content=redact_secrets(step.content), tool_calls=safe_calls)
+                safe_calls, preflight_errors = _prepare_tool_calls(step.tool_calls, self._redactor)
+                step = replace(
+                    step, content=self._redactor.redact_text(step.content), tool_calls=safe_calls
+                )
                 _step_tokens, step_cost = _usage_measure(run.model_id, step.usage)
                 call = await self._runs.update_model_call(
                     call.id,
@@ -740,7 +765,7 @@ class RunService:
                     cost_usd=total_cost,
                 )
                 if not step.tool_calls:
-                    final_content = redact_secrets(step.content).strip()
+                    final_content = self._redactor.redact_text(step.content).strip()
                     if not final_content:
                         raise ProviderError(
                             "provider_invalid_response", "The provider returned an empty response."
@@ -755,10 +780,22 @@ class RunService:
                         await self._publish(event)
                     return
 
-                if self._tool_registry is None or workspace_root is None or not request.tools:
+                if self._tool_registry is None:
                     raise ProviderError(
                         "tool_execution_unavailable", "This run cannot execute tool requests yet."
                     )
+                for tool_request in step.tool_calls:
+                    try:
+                        self._tool_registry.check_call(
+                            tool_request, workspace_root, capabilities=self._capabilities
+                        )
+                    except ToolExecutionError as error:
+                        if error.code == "unknown_tool":
+                            raise ProviderError(
+                                "provider_invalid_response",
+                                "The provider requested an unoffered tool.",
+                            ) from None
+                        raise ProviderError(error.code, error.message) from None
                 offered_names = {tool.name for tool in request.tools}
                 if any(tool.name not in offered_names for tool in step.tool_calls):
                     raise ProviderError(
@@ -786,7 +823,7 @@ class RunService:
                 )
                 assistant_message = ModelMessage(
                     role="assistant",
-                    content=redact_secrets(step.content),
+                    content=self._redactor.redact_text(step.content),
                     tool_calls=step.tool_calls,
                     continuation_items=step.continuation_items,
                 )
@@ -850,7 +887,7 @@ class RunService:
             raise ApplicationError("run_lease_lost", "This run is no longer active here.") from None
 
     async def _execute_pending_tools(self, run: RunSnapshot, workspace_root: Path | None) -> bool:
-        if self._tool_registry is None or workspace_root is None:
+        if self._tool_registry is None:
             raise ProviderError("tool_execution_unavailable", "Tool execution is unavailable.")
         model_calls = await self._runs.list_model_calls(run.id)
         all_tool_calls = await self._runs.list_tool_calls(run.id)
@@ -873,12 +910,18 @@ class RunService:
             tool_request = ModelToolCall(
                 stored_call.provider_call_id, stored_call.name, stored_call.arguments
             )
+            try:
+                self._tool_registry.check_call(
+                    tool_request, workspace_root, capabilities=self._capabilities
+                )
+            except ToolExecutionError as error:
+                raise ProviderError(error.code, error.message) from None
             approval_required = self._tool_registry.requires_approval(tool_request, workspace_root)
             if approval_required and stored_call.approval_decision is None:
                 try:
                     async with asyncio.timeout(remaining_seconds):
                         preview = await self._tool_registry.approval_preview(
-                            tool_request, workspace_root
+                            tool_request, workspace_root, capabilities=self._capabilities
                         )
                 except ToolExecutionError as error:
                     await self._record_tool_result(
@@ -893,7 +936,7 @@ class RunService:
                     raise ProviderError(
                         "provider_timeout", "The run deadline was reached."
                     ) from None
-                safe_preview = cast(dict[str, object] | None, redact_record(preview))
+                safe_preview = cast(dict[str, object] | None, self._redactor.redact_record(preview))
                 if safe_preview != preview:
                     await self._record_tool_result(
                         run.id,
@@ -932,6 +975,7 @@ class RunService:
                         workspace_root,
                         approved=(stored_call.approval_decision is ToolApprovalDecision.APPROVED),
                         approval_preview=stored_call.approval_preview,
+                        capabilities=self._capabilities,
                     )
             except TimeoutError:
                 raise ProviderError("provider_timeout", "The run deadline was reached.") from None
@@ -956,14 +1000,13 @@ class RunService:
         _message, _call, event = await self._runs.record_tool_result(
             run_id,
             stored_call.id,
-            result_content,
+            self._redactor.redact_text(result_content),
             status=status
             or (ToolCallStatus.FAILED if result.is_error else ToolCallStatus.COMPLETED),
         )
         await self._publish(event)
 
-    @staticmethod
-    def _request_snapshot(request: ModelRequest) -> dict[str, object]:
+    def _request_snapshot(self, request: ModelRequest) -> dict[str, object]:
         snapshot: dict[str, object] = {
             "provider_id": request.provider_id,
             "model_id": request.model_id,
@@ -973,7 +1016,7 @@ class RunService:
             "messages": [
                 {
                     "role": message.role,
-                    "content": redact_secrets(message.content),
+                    "content": self._redactor.redact_text(message.content),
                     **(
                         {"tool_call_id": message.tool_call_id}
                         if message.tool_call_id is not None
@@ -1004,12 +1047,11 @@ class RunService:
             ],
             "max_output_tokens": request.max_output_tokens,
         }
-        return cast(dict[str, object], redact_record(snapshot))
+        return cast(dict[str, object], self._redactor.redact_record(snapshot))
 
-    @staticmethod
-    def _response_snapshot(step: _ModelStep) -> dict[str, object]:
+    def _response_snapshot(self, step: _ModelStep) -> dict[str, object]:
         snapshot: dict[str, object] = {
-            "content": redact_secrets(step.content),
+            "content": self._redactor.redact_text(step.content),
             "tool_calls": [
                 {"id": tool.id, "name": tool.name, "arguments": tool.arguments}
                 for tool in step.tool_calls
@@ -1026,7 +1068,7 @@ class RunService:
             "finish_reason": step.finish_reason,
             "provider_response_id": step.provider_response_id,
         }
-        return cast(dict[str, object], redact_record(snapshot))
+        return cast(dict[str, object], self._redactor.redact_record(snapshot))
 
     async def _stream_model_step(
         self,
@@ -1093,7 +1135,7 @@ class RunService:
                         continuation_bytes += len(item.payload_json.encode("utf-8"))
                         if (
                             continuation_bytes > MAX_CONTINUATION_BYTES
-                            or redact_secrets(item.payload_json) != item.payload_json
+                            or self._redactor.redact_text(item.payload_json) != item.payload_json
                         ):
                             raise ProviderError(
                                 "provider_invalid_response",
@@ -1175,15 +1217,14 @@ class RunService:
             finish_reason=finish_reason,
         )
 
-    @staticmethod
-    def _safe_provider_metadata(value: str | None) -> str | None:
+    def _safe_provider_metadata(self, value: str | None) -> str | None:
         if value is None:
             return None
         if len(value) > 200:
             raise ProviderError(
                 "provider_invalid_response", "The provider returned invalid response metadata."
             )
-        return redact_secrets(value)
+        return self._redactor.redact_text(value)
 
     @staticmethod
     def _remaining_seconds(run: RunSnapshot) -> float:
@@ -1293,7 +1334,9 @@ class RunService:
         event_type: RunEventType,
         data: dict[str, object],
     ) -> RunEvent:
-        event = await self._runs.append_run_event(run_id, event_type, data)
+        event = await self._runs.append_run_event(
+            run_id, event_type, cast(dict[str, object], self._redactor.redact_record(data))
+        )
         await self._publish(event)
         return event
 
@@ -1302,9 +1345,12 @@ class RunService:
             return
         try:
             await self._event_publisher.publish(event)
-        except Exception:
-            logger.exception(
-                "Could not publish persisted event %s for run %s", event.sequence, event.run_id
+        except Exception as error:
+            logger.error(
+                "Could not publish persisted event %s for run %s (error type: %s)",
+                event.sequence,
+                event.run_id,
+                type(error).__name__,
             )
 
     async def _fail(
@@ -1314,6 +1360,8 @@ class RunService:
         error_code: str,
         error_message: str,
     ) -> None:
+        error_code = self._redactor.redact_text(error_code)
+        error_message = self._redactor.redact_text(error_message)
         if call is not None and call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
             call_status = (
                 ModelCallStatus.TIMED_OUT

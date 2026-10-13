@@ -1,9 +1,8 @@
 # Trellis backend
 
 FastAPI service for Trellis web chat. Authenticated account data is stored in
-Supabase. Provider keys remain in a private account-scoped local `.env` file
-and are managed through the Settings API. Local folders must be selected on
-each computer before file or command tools can use them.
+Supabase. Provider keys come from backend secrets managed by the operator.
+Users sign in, choose an available model, and chat.
 
 From this directory:
 
@@ -22,7 +21,45 @@ Supabase's API settings. The service is available at `http://127.0.0.1:8000`.
 Interactive API docs are served at `/docs`, with the OpenAPI document at
 `/openapi.json`.
 
-By default, local account files are under `~/.trellis/accounts/<user-id>/`.
-`TRELLIS_DATA_DIR` changes that root. Provider keys and local account settings
-stay on this computer. Existing SQLite files are left untouched and are not
-imported; cloud chats and settings are stored in Supabase.
+## Runtime capabilities
+
+The backend starts in chat-only mode with `TRELLIS_ENABLED_CAPABILITIES=[]`.
+Folder selection and local tools are unavailable in this mode, including for
+chats that already have saved folder paths or tool approvals.
+
+For a trusted local installation, explicitly enable the capabilities you need,
+for example `TRELLIS_ENABLED_CAPABILITIES=["local_read","local_patch","local_command"]`.
+Restart the backend after changing this setting. Account preferences and tool
+approvals cannot enable a capability. Keep the empty list for hosted chat.
+
+## Provider credentials
+
+Set `TRELLIS_OPENAI_API_KEY` and/or `TRELLIS_ANTHROPIC_API_KEY` in the backend's
+deployment secrets. For development, these may be set in the ignored
+`backend/.env` file. Never put provider keys in frontend environment variables,
+source control, or the browser bundle. Models with a configured provider are
+available to signed-in users; configuration status does not verify a key with
+the provider. The settings API returns status only, with no key hints.
+
+To replace or rotate a key, update the server secret and restart every backend
+process. Revoke the old key with the provider after replacement, or immediately
+if it is compromised. To remove access, delete the server secret and restart
+every backend process; revoke the key upstream to stop any request still using
+it. Account preferences cannot replace or delete server credentials. The old
+key-changing API routes return `403 provider_credentials_managed`; onboarding
+accepts only a model selection. Encrypted user-owned credentials are deferred.
+
+Old account `.env` and SQLite files are left untouched and are no longer read
+for credentials or imported. Remove old key files yourself when no longer
+needed. `TRELLIS_DATA_DIR` controls account lock files under
+`~/.trellis/accounts/<user-id>/`; chats and settings are stored in Supabase.
+
+## Session and service errors
+
+The runtime socket authenticates before accepting run requests, checks access
+again before each request, and checks idle connections every 30 seconds.
+Invalid credentials return an error with status `401` and close code `4401`.
+Temporary authentication or data failures return status `503` and close code
+`1013`, so the web app can offer a retry without clearing a valid session.
+Recheck errors use a JSON-RPC error with `id: null` before closing the socket.
+Authentication and account checks have a five-second deadline.

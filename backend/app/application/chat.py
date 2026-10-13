@@ -1,11 +1,14 @@
 import asyncio
+import logging
 from collections.abc import Mapping, Sequence
 
 from app.application.errors import ApplicationError, ProviderError
 from app.application.ports import ChatRepository, ProviderAdapter, SecretStorePort
+from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
 from app.domain.models import Message, ProviderName, Session, TurnResult
 
 _CLASSIC_TURN_TIMEOUT_SECONDS = 240
+logger = logging.getLogger(__name__)
 
 
 class ChatService:
@@ -14,17 +17,20 @@ class ChatService:
         database: ChatRepository,
         secret_store: SecretStorePort,
         providers: Mapping[ProviderName, ProviderAdapter],
+        *,
+        redactor: SecretRedactor | None = None,
     ) -> None:
         self._database = database
         self._secret_store = secret_store
         self._providers = providers
+        self._redactor = redactor or COMMON_SECRET_REDACTOR
 
     async def complete_turn(self, session_id: str, turn_id: str, content: str) -> TurnResult:
         session = await self._database.get_session(session_id)
         if session is None:
             raise ApplicationError("session_not_found", "Session not found")
 
-        normalized_content = content.strip()
+        normalized_content = self._redactor.redact_text(content.strip())
         if not normalized_content:
             raise ApplicationError("message_empty", "Message content cannot be empty")
         existing = await self._database.get_turn_messages(session_id, turn_id)
@@ -61,7 +67,7 @@ class ChatService:
         if api_key is None:
             raise ApplicationError(
                 "provider_not_configured",
-                "Add an API key for the selected provider in Settings.",
+                "The selected provider is not configured on this server.",
             )
         provider = self._providers.get(provider_name)
         if provider is None:
@@ -82,14 +88,25 @@ class ChatService:
         try:
             assistant_content = (await provider.complete(history, api_key, profile.id)).strip()
         except ProviderError as error:
-            raise ApplicationError(error.code, error.message) from None
+            raise ApplicationError(
+                self._redactor.redact_text(error.code), self._redactor.redact_text(error.message)
+            ) from None
+        except Exception as error:
+            logger.error("Provider completion failed (%s)", type(error).__name__)
+            raise ApplicationError(
+                "provider_upstream_failed", "The provider could not complete this turn."
+            ) from None
         if not assistant_content:
             raise ApplicationError(
                 "provider_invalid_response",
                 "The provider returned an empty response.",
             )
         assistant_message = await self._database.add_assistant_message(
-            session_id, turn_id, assistant_content, provider.name, provider.model
+            session_id,
+            turn_id,
+            self._redactor.redact_text(assistant_content),
+            provider.name,
+            provider.model,
         )
         refreshed = await self._require_session(session_id)
         return TurnResult(

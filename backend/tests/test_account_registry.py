@@ -51,8 +51,10 @@ class AccountRegistry:
         await self._client.aclose()
 
 
-def test_registry_separates_cloud_rows_and_local_provider_keys(tmp_path: Path) -> None:
-    settings = Settings(environment="test", data_dir=tmp_path / "data")
+def test_registry_separates_cloud_rows_with_shared_server_credentials(tmp_path: Path) -> None:
+    settings = Settings(
+        environment="test", data_dir=tmp_path / "data", openai_api_key="operator-key"
+    )
 
     async def exercise() -> None:
         registry = AccountRegistry(settings)
@@ -65,12 +67,10 @@ def test_registry_separates_cloud_rows_and_local_provider_keys(tmp_path: Path) -
             assert (await bob.profile_service.get()).id == str(BOB)
 
             session = await alice.session_service.create()
-            await alice.secret_store.set("openai", "sk-alice-private")
-
             assert [item.id for item in await alice.session_service.list_sessions()] == [session.id]
             assert await bob.session_service.list_sessions() == []
-            assert await bob.secret_store.get("openai") is None
-            assert await alice.secret_store.get("openai") == "sk-alice-private"
+            assert await bob.secret_store.get("openai") == "operator-key"
+            assert await alice.secret_store.get("openai") == "operator-key"
         finally:
             await registry.close()
 
@@ -79,7 +79,7 @@ def test_registry_separates_cloud_rows_and_local_provider_keys(tmp_path: Path) -
     alice_dir = settings.data_dir / "accounts" / str(ALICE)
     assert stat.S_IMODE((settings.data_dir / "accounts").stat().st_mode) == 0o700
     assert stat.S_IMODE(alice_dir.stat().st_mode) == 0o700
-    assert stat.S_IMODE((alice_dir / ".env").stat().st_mode) == 0o600
+    assert not (alice_dir / ".env").exists()
 
 
 def test_registry_restores_only_the_matching_users_cloud_rows(tmp_path: Path) -> None:
@@ -107,7 +107,7 @@ def test_registry_restores_only_the_matching_users_cloud_rows(tmp_path: Path) ->
     asyncio.run(exercise())
 
 
-def test_registry_rejects_symlinked_account_secret_file(tmp_path: Path) -> None:
+def test_registry_leaves_unused_symlinked_account_secret_file_untouched(tmp_path: Path) -> None:
     settings = Settings(environment="test", data_dir=tmp_path / "data")
     account_dir = settings.data_dir / "accounts" / str(ALICE)
     account_dir.parent.mkdir(parents=True, mode=0o700)
@@ -119,8 +119,8 @@ def test_registry_rejects_symlinked_account_secret_file(tmp_path: Path) -> None:
     async def exercise() -> None:
         registry = AccountRegistry(settings)
         try:
-            with pytest.raises(RuntimeError, match="symlink"):
-                await registry.get(ALICE)
+            alice = await registry.get(ALICE)
+            assert await alice.secret_store.get("openai") is None
         finally:
             await registry.close()
 
@@ -278,7 +278,11 @@ def test_live_account_blocks_second_registry_until_local_lock_is_released(
 
 
 def test_failed_account_setup_releases_lock(tmp_path: Path) -> None:
-    settings = Settings(environment="test", data_dir=tmp_path / "data")
+    settings = Settings(
+        environment="test",
+        data_dir=tmp_path / "data",
+        enabled_capabilities=frozenset({"local_read"}),
+    )
 
     def fail_to_build_tools(_database: object) -> Never:
         raise RuntimeError("tool setup failed")

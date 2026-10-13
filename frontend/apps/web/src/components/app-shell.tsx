@@ -55,7 +55,7 @@ type FailedTurn = {
 function visibleError(error: unknown) {
   return error instanceof ApiError || error instanceof RuntimeError
     ? error.message
-    : "Trellis could not reach the local service."
+    : "Trellis could not reach the service."
 }
 
 function upsertSession(sessions: Session[], next: Session) {
@@ -207,7 +207,6 @@ export function AppShell({
   const [activeSession, setActiveSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [sessionLoading, setSessionLoading] = useState(false)
-  const [workspaceSaving, setWorkspaceSaving] = useState(false)
   const [pending, setPending] = useState(false)
   const [streamingText, setStreamingText] = useState<string | null>(null)
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
@@ -229,7 +228,6 @@ export function AppShell({
   const activeSessionIdRef = useRef<string | null>(null)
   const sessionLoadSequenceRef = useRef(0)
   const submissionLockRef = useRef(false)
-  const workspaceSaveLockRef = useRef(false)
   const activeRunRef = useRef<{ runId: string; lastSequence: number } | null>(
     null
   )
@@ -440,7 +438,7 @@ export function AppShell({
       } catch {
         if (isStale()) return
         waitForDiscovery(
-          "Trellis could not check the previous run. Reconnect when the local service returns."
+          "Trellis could not check the previous run. Reconnect when the service returns."
         )
         return
       }
@@ -462,7 +460,7 @@ export function AppShell({
         } catch {
           if (isStale()) return
           waitForDiscovery(
-            "Trellis could not load the active run's messages. Reconnect when the local service returns."
+            "Trellis could not load the active run's messages. Reconnect when the service returns."
           )
           return
         }
@@ -590,7 +588,7 @@ export function AppShell({
                 currentStatus = currentRun.status
               } catch (lookupError) {
                 if (lookupError === streamError) throw streamError
-                // The local service may still be restarting; retry the stream.
+                // The service may still be restarting; retry the stream.
               }
               reconnectAttempts += 1
               if (reconnectAttempts >= maxRestoredReconnectAttempts) {
@@ -645,7 +643,7 @@ export function AppShell({
           } catch {
             keepActive = true
             setReconnectAvailable(true)
-            // The run may still be active while the local service is unavailable.
+            // The run may still be active while the service is unavailable.
           }
         } finally {
           if (!isStale() && !keepActive) {
@@ -673,7 +671,7 @@ export function AppShell({
         controller.abort(
           new ApiError(
             "request_timeout",
-            "Trellis took too long to open your workspace. Try again.",
+            "Trellis took too long to load your chats. Try again.",
             0
           )
         ),
@@ -723,16 +721,14 @@ export function AppShell({
 
   const completeOnboarding = async (values: OnboardingValues) => {
     if (!profile || !settings) {
-      throw new Error("Trellis is still loading your local settings.")
+      throw new Error("Trellis is still loading your settings.")
     }
 
     const controller = bootstrapControllerRef.current
     if (!controller) return
-    const progress = await api.saveOnboardingModel(
-      values.modelId,
-      values.apiKey,
-      { signal: controller.signal }
-    )
+    const progress = await api.saveOnboardingModel(values.modelId, {
+      signal: controller.signal,
+    })
     if (
       bootstrapControllerRef.current !== controller ||
       controller.signal.aborted
@@ -764,7 +760,6 @@ export function AppShell({
   }
 
   const startNewSession = useCallback(() => {
-    if (workspaceSaveLockRef.current) return
     runGenerationRef.current += 1
     sessionLoadSequenceRef.current += 1
     activeSessionIdRef.current = null
@@ -794,7 +789,6 @@ export function AppShell({
   }, [])
 
   const handleNavigate = (view: WorkspaceView) => {
-    if (workspaceSaveLockRef.current) return
     if (view === "New session") {
       startNewSession()
       return
@@ -804,7 +798,7 @@ export function AppShell({
   }
 
   const selectSession = async (sessionId: string) => {
-    if (pending || workspaceSaveLockRef.current) return
+    if (pending) return
     runGenerationRef.current += 1
     const loadSequence = sessionLoadSequenceRef.current + 1
     sessionLoadSequenceRef.current = loadSequence
@@ -964,7 +958,7 @@ export function AppShell({
           setMessages(detail.messages)
         }
       } catch {
-        // Keep the optimistic user message if the local transcript cannot be refreshed.
+        // Keep the optimistic user message if the saved transcript cannot be refreshed.
       }
       if (
         (turnError instanceof ApiError || turnError instanceof RuntimeError) &&
@@ -1027,13 +1021,7 @@ export function AppShell({
 
   const submitComposer = async () => {
     const content = composerValue.trim()
-    if (
-      !content ||
-      pending ||
-      sessionLoading ||
-      submissionLockRef.current ||
-      workspaceSaveLockRef.current
-    )
+    if (!content || pending || sessionLoading || submissionLockRef.current)
       return
     const model = settings?.models?.find((item) => item.id === selectedModelId)
     const provider = settings?.providers.find(
@@ -1043,7 +1031,7 @@ export function AppShell({
     if (!model || (model.requires_api_key && !configured)) {
       setError(
         model
-          ? "The selected model needs to be configured in Settings before starting a session."
+          ? "The selected model is unavailable. Choose a ready-to-use model in Settings and try again."
           : "Open Settings before starting a session."
       )
       return
@@ -1122,60 +1110,6 @@ export function AppShell({
   const selectedBudgetPreset =
     runBudgetChoice ?? settings?.default_budget_preset ?? "conservative"
 
-  const persistWorkspace = async (path: string) => {
-    if (activeSession) {
-      const updated = await api.setSessionWorkspace(activeSession.id, path)
-      setActiveSession(updated)
-      setSessions((current) => upsertSession(current, updated))
-      return
-    }
-    const created = await api.createSession(path)
-    sessionLoadSequenceRef.current += 1
-    activeSessionIdRef.current = created.id
-    setActiveSession(created)
-    setSessions((current) => upsertSession(current, created))
-    setActiveView("session")
-  }
-
-  const saveWorkspace = async (path: string) => {
-    workspaceSaveLockRef.current = true
-    setWorkspaceSaving(true)
-    try {
-      await persistWorkspace(path)
-    } finally {
-      workspaceSaveLockRef.current = false
-      setWorkspaceSaving(false)
-    }
-  }
-
-  const pickWorkspace = async () => {
-    workspaceSaveLockRef.current = true
-    setWorkspaceSaving(true)
-    try {
-      const { path } = await api.pickWorkspace()
-      if (path === null) return false
-      await persistWorkspace(path)
-      return true
-    } finally {
-      workspaceSaveLockRef.current = false
-      setWorkspaceSaving(false)
-    }
-  }
-
-  const removeWorkspace = async () => {
-    if (!activeSession) return
-    workspaceSaveLockRef.current = true
-    setWorkspaceSaving(true)
-    try {
-      const updated = await api.setSessionWorkspace(activeSession.id, null)
-      setActiveSession(updated)
-      setSessions((current) => upsertSession(current, updated))
-    } finally {
-      workspaceSaveLockRef.current = false
-      setWorkspaceSaving(false)
-    }
-  }
-
   const renderedAccountControl =
     typeof accountControl === "function"
       ? accountControl(profile)
@@ -1197,9 +1131,7 @@ export function AppShell({
             className="workspace-bootstrap-error"
             aria-labelledby="workspace-bootstrap-heading"
           >
-            <h1 id="workspace-bootstrap-heading">
-              Your workspace could not open
-            </h1>
+            <h1 id="workspace-bootstrap-heading">Your chats could not open</h1>
             <p role="alert">{bootstrap.message}</p>
             <button
               className="onboarding-primary-action"
@@ -1214,7 +1146,7 @@ export function AppShell({
           </section>
         ) : (
           <div className="workspace-loading" role="status">
-            Opening your local workspace…
+            Loading your chats…
           </div>
         )}
       </main>
@@ -1234,6 +1166,7 @@ export function AppShell({
         }
         onAdvanceIntro={advanceOnboardingIntro}
         onSaveProfile={saveOnboardingProfile}
+        onRetryModels={restoreWorkspace}
         onComplete={completeOnboarding}
       />
     )
@@ -1341,15 +1274,9 @@ export function AppShell({
                   ? "What are we building?"
                   : "Adjust or continue"
               }
-              workspacePath={activeSession?.workspace_path ?? null}
-              workspaceReady={activeSession?.workspace_ready ?? false}
-              workspaceSessionKey={activeSession?.id ?? "new-session"}
               onChange={setComposerValue}
               onSubmit={() => void submitComposer()}
-              onPickWorkspace={pickWorkspace}
-              onSaveWorkspace={saveWorkspace}
-              onRemoveWorkspace={removeWorkspace}
-              disabled={pending || sessionLoading || workspaceSaving}
+              disabled={pending || sessionLoading}
               budgetPreset={selectedBudgetPreset}
               onBudgetChange={setRunBudgetChoice}
             />

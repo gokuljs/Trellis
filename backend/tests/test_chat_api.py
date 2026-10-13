@@ -8,11 +8,10 @@ from uuid import uuid4
 import pytest
 
 from app.application import chat as chat_module
-from app.core.config import Settings
 from app.domain.models import Message, ProviderName
 from app.infrastructure.providers import ProviderError
 from tests.memory_repository import MemoryRepository as Database
-from tests.support import TestClient, create_app
+from tests.support import TestClient, create_app, make_settings
 
 
 class RecordingProvider:
@@ -86,9 +85,11 @@ class FlakyProvider(RecordingProvider):
         return await super().complete(messages, api_key, user_id)
 
 
-def configured_client(tmp_path: Path, provider: RecordingProvider) -> TestClient:
+def configured_client(
+    tmp_path: Path, provider: RecordingProvider, *, api_key: str | None = "sk-local-test"
+) -> TestClient:
     app = create_app(
-        Settings(environment="test", data_dir=tmp_path),
+        make_settings(tmp_path, openai_api_key=api_key),
         provider_adapters={"openai": provider},
     )
     return TestClient(app)
@@ -100,10 +101,6 @@ def test_turns_persist_complete_ordered_history_and_restore_after_restart(tmp_pa
     second_turn_id = str(uuid4())
 
     with configured_client(tmp_path, provider) as client:
-        client.put(
-            "/api/settings/providers/openai/api-key",
-            json={"api_key": "sk-local-test"},
-        )
         profile_id = client.get("/api/profile").json()["id"]
         session = client.post("/api/sessions").json()
         first_turn = client.post(
@@ -156,10 +153,6 @@ def test_duplicate_turn_id_returns_existing_messages_without_calling_provider_tw
     turn_id = str(uuid4())
 
     with configured_client(tmp_path, provider) as client:
-        client.put(
-            "/api/settings/providers/openai/api-key",
-            json={"api_key": "sk-local-test"},
-        )
         session_id = client.post("/api/sessions").json()["id"]
         first = client.post(
             f"/api/sessions/{session_id}/turns",
@@ -180,10 +173,6 @@ def test_duplicate_turn_id_rejects_different_content(tmp_path: Path) -> None:
     turn_id = str(uuid4())
 
     with configured_client(tmp_path, provider) as client:
-        client.put(
-            "/api/settings/providers/openai/api-key",
-            json={"api_key": "sk-local-test"},
-        )
         session_id = client.post("/api/sessions").json()["id"]
         client.post(
             f"/api/sessions/{session_id}/turns",
@@ -203,10 +192,6 @@ def test_failed_turn_resumes_without_duplicating_the_user_message(tmp_path: Path
     turn_id = str(uuid4())
 
     with configured_client(tmp_path, provider) as client:
-        client.put(
-            "/api/settings/providers/openai/api-key",
-            json={"api_key": "sk-local-test"},
-        )
         session_id = client.post("/api/sessions").json()["id"]
         failed = client.post(
             f"/api/sessions/{session_id}/turns",
@@ -240,7 +225,6 @@ def test_classic_turn_times_out_before_its_cloud_claim_expires(
     monkeypatch.setattr(chat_module, "_CLASSIC_TURN_TIMEOUT_SECONDS", 0.01, raising=False)
     provider = SlowOnceProvider()
     with configured_client(tmp_path, provider) as client:
-        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-local-test"})
         session_id = client.post("/api/sessions").json()["id"]
         turn_id = str(uuid4())
         timed_out = client.post(
@@ -271,7 +255,6 @@ def test_classic_turn_deadline_also_bounds_cloud_history_reads(
     monkeypatch.setattr(Database, "list_messages", slow_list_messages)
     provider = RecordingProvider(["Recovered reply"])
     with configured_client(tmp_path, provider) as client:
-        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-local-test"})
         session_id = client.post("/api/sessions").json()["id"]
         turn_id = str(uuid4())
         timed_out = client.post(
@@ -297,10 +280,6 @@ def test_first_message_title_is_normalized_and_capped_at_eighty_characters(
     content = "  " + "A   long title " * 10
 
     with configured_client(tmp_path, provider) as client:
-        client.put(
-            "/api/settings/providers/openai/api-key",
-            json={"api_key": "sk-local-test"},
-        )
         session_id = client.post("/api/sessions").json()["id"]
         response = client.post(
             f"/api/sessions/{session_id}/turns",
@@ -315,7 +294,7 @@ def test_first_message_title_is_normalized_and_capped_at_eighty_characters(
 def test_missing_provider_key_does_not_persist_user_message(tmp_path: Path) -> None:
     provider = RecordingProvider()
 
-    with configured_client(tmp_path, provider) as client:
+    with configured_client(tmp_path, provider, api_key=None) as client:
         session_id = client.post("/api/sessions").json()["id"]
         response = client.post(
             f"/api/sessions/{session_id}/turns",
@@ -333,10 +312,6 @@ def test_whitespace_only_message_is_rejected_without_persistence(tmp_path: Path)
     provider = RecordingProvider()
 
     with configured_client(tmp_path, provider) as client:
-        client.put(
-            "/api/settings/providers/openai/api-key",
-            json={"api_key": "sk-local-test"},
-        )
         session_id = client.post("/api/sessions").json()["id"]
         response = client.post(
             f"/api/sessions/{session_id}/turns",
@@ -367,10 +342,6 @@ def test_provider_failures_preserve_only_the_user_message(
     provider = FailingProvider(error_code)
 
     with configured_client(tmp_path, provider) as client:
-        client.put(
-            "/api/settings/providers/openai/api-key",
-            json={"api_key": "sk-local-test"},
-        )
         session_id = client.post("/api/sessions").json()["id"]
         response = client.post(
             f"/api/sessions/{session_id}/turns",
@@ -387,10 +358,6 @@ def test_empty_provider_response_is_sanitized_and_preserves_user_message(tmp_pat
     provider = RecordingProvider(["   "])
 
     with configured_client(tmp_path, provider) as client:
-        client.put(
-            "/api/settings/providers/openai/api-key",
-            json={"api_key": "sk-local-test"},
-        )
         session_id = client.post("/api/sessions").json()["id"]
         response = client.post(
             f"/api/sessions/{session_id}/turns",
@@ -408,10 +375,6 @@ def test_second_concurrent_turn_for_same_session_is_rejected(tmp_path: Path) -> 
 
     provider = BlockingProvider()
     with configured_client(tmp_path, provider) as client:
-        client.put(
-            "/api/settings/providers/openai/api-key",
-            json={"api_key": "sk-local-test"},
-        )
         session_id = client.post("/api/sessions").json()["id"]
 
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -438,19 +401,15 @@ def test_second_application_cannot_open_account_during_active_turn(tmp_path: Pat
 
     provider = BlockingProvider()
     first_app = create_app(
-        Settings(environment="test", data_dir=tmp_path),
+        make_settings(tmp_path, openai_api_key="sk-local-test"),
         provider_adapters={"openai": provider},
     )
     second_app = create_app(
-        Settings(environment="test", data_dir=tmp_path),
+        make_settings(tmp_path, openai_api_key="sk-local-test"),
         provider_adapters={"openai": RecordingProvider()},
     )
 
     with TestClient(first_app) as first_client, TestClient(second_app) as second_client:
-        first_client.put(
-            "/api/settings/providers/openai/api-key",
-            json={"api_key": "sk-local-test"},
-        )
         session_id = first_client.post("/api/sessions").json()["id"]
         with ThreadPoolExecutor(max_workers=1) as executor:
             first_future = executor.submit(

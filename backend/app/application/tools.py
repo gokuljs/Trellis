@@ -1,54 +1,33 @@
 """Provider-neutral definitions and validation for local read tools."""
 
 import json
-import re
 import shlex
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
+from app.domain.capabilities import (
+    DEFAULT_RUNTIME_CAPABILITIES,
+    RuntimeCapabilities,
+    RuntimeCapability,
+)
 from app.domain.runtime import ModelToolCall, ModelToolSpec, ToolResult
 
 MAX_ARGUMENT_BYTES = 16_384
 MAX_RESULT_BYTES = 20_000
 MAX_COMMAND_BYTES = 2_048
 MAX_COMMAND_ARGUMENTS = 64
-_BEARER_TOKEN = re.compile(r"(?i)\b(Bearer\s+)([A-Za-z0-9._~+/-]{6,})")
-_KEY_ASSIGNMENT = re.compile(
-    r"(?i)\b([A-Za-z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)"
-    r"[A-Za-z0-9_]*[\"']?\s*[:=]\s*[\"']?)([^\s\"';,}]+)"
-)
-_STANDALONE_TOKEN = re.compile(
-    r"\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{12,}|"
-    r"github_pat_[A-Za-z0-9_]{12,})\b"
-)
 
 
 def redact_secrets(content: str) -> str:
-    content = _BEARER_TOKEN.sub(lambda match: f"{match[1]}[REDACTED]", content)
-    content = _KEY_ASSIGNMENT.sub(lambda match: f"{match[1]}[REDACTED]", content)
-    return _STANDALONE_TOKEN.sub("[REDACTED]", content)
+    return COMMON_SECRET_REDACTOR.redact_text(content)
 
 
 def redact_record(value: object) -> object:
-    """Redact common credentials in nested model and tool records."""
-    if isinstance(value, dict):
-        redacted: dict[str, object] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                continue
-            normalized = key.casefold().replace("-", "_")
-            sensitive = normalized in {"token", "secret", "password", "credential", "api_key"} or (
-                normalized.endswith(("_token", "_secret", "_password", "_credential", "_api_key"))
-            )
-            redacted[key] = "[REDACTED]" if sensitive else redact_record(item)
-        return redacted
-    if isinstance(value, list | tuple):
-        return [redact_record(item) for item in value]
-    if isinstance(value, str):
-        return redact_secrets(value)
-    return value
+    return COMMON_SECRET_REDACTOR.redact_record(value)
 
 
 class _StrictArguments(BaseModel):
@@ -126,6 +105,15 @@ _COMMAND_DEFINITIONS: tuple[tuple[str, str, type[_StrictArguments]], ...] = (
     ),
 )
 
+_LOCAL_CAPABILITIES: dict[str, RuntimeCapability] = {
+    "list_files": "local_read",
+    "search_files": "local_read",
+    "read_file": "local_read",
+    "inspect_git": "local_read",
+    "apply_patch": "local_patch",
+    "run_command": "local_command",
+}
+
 
 class ReadToolExecutor(Protocol):
     async def execute(
@@ -150,6 +138,28 @@ class CommandToolExecutor(Protocol):
     async def execute(
         self, name: str, arguments: dict[str, object], workspace_root: Path
     ) -> tuple[str, bool]: ...
+
+
+class ToolExecutor(Protocol):
+    async def execute(
+        self, name: str, arguments: dict[str, object], workspace_root: Path | None
+    ) -> tuple[str, bool]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRegistration:
+    name: str
+    description: str
+    arguments_model: type[BaseModel]
+    executor: ToolExecutor
+    required_capabilities: frozenset[RuntimeCapability] = frozenset()
+    requires_workspace: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolRequirements:
+    required_capabilities: frozenset[RuntimeCapability]
+    requires_workspace: bool
 
 
 class ToolExecutionError(Exception):
@@ -188,19 +198,37 @@ def parse_command(command: str) -> tuple[str, ...]:
 class ToolRegistry:
     def __init__(
         self,
-        executor: ReadToolExecutor,
+        executor: ReadToolExecutor | None = None,
         *,
         patch_executor: PatchToolExecutor | None = None,
         command_executor: CommandToolExecutor | None = None,
         approval_required_names: frozenset[str] | set[str] = frozenset(),
+        capabilities: RuntimeCapabilities = DEFAULT_RUNTIME_CAPABILITIES,
+        additional_tools: tuple[ToolRegistration, ...] = (),
+        redactor: SecretRedactor | None = None,
     ) -> None:
         self._executor = executor
+        self._capabilities = capabilities
+        self._redactor = redactor or COMMON_SECRET_REDACTOR
         self._patch_executor = patch_executor
         self._command_executor = command_executor
-        self._available_definitions = (
-            *_DEFINITIONS,
+        self._generic_executors: dict[str, ToolExecutor] = {}
+        self._requirements = {
+            name: _ToolRequirements(frozenset({capability}), True)
+            for name, capability in _LOCAL_CAPABILITIES.items()
+        }
+        for tool in additional_tools:
+            if not tool.name or tool.name in self._requirements:
+                raise ValueError("Tool names must be nonempty and unique")
+            self._generic_executors[tool.name] = tool.executor
+            self._requirements[tool.name] = _ToolRequirements(
+                tool.required_capabilities, tool.requires_workspace
+            )
+        self._available_definitions: tuple[tuple[str, str, type[BaseModel]], ...] = (
+            *(_DEFINITIONS if executor is not None else ()),
             *((_PATCH_DEFINITION,) if patch_executor is not None else ()),
             *(_COMMAND_DEFINITIONS if command_executor is not None else ()),
+            *((tool.name, tool.description, tool.arguments_model) for tool in additional_tools),
         )
         self._definitions = {
             name: model for name, _description, model in self._available_definitions
@@ -216,8 +244,15 @@ class ToolRegistry:
         return call.name in self._approval_required_names
 
     async def approval_preview(
-        self, call: ModelToolCall, workspace_root: Path
+        self,
+        call: ModelToolCall,
+        workspace_root: Path | None,
+        *,
+        capabilities: RuntimeCapabilities | None = None,
     ) -> dict[str, object] | None:
+        self.check_call(call, workspace_root, capabilities=capabilities)
+        if workspace_root is None:
+            return None
         if call.name == "apply_patch" and self._patch_executor is not None:
             return await self._patch_executor.approval_preview(
                 self._validated_arguments(call), workspace_root
@@ -232,10 +267,53 @@ class ToolRegistry:
             }
         return None
 
-    def specs(self) -> tuple[ModelToolSpec, ...]:
+    def check_capabilities(
+        self,
+        call: ModelToolCall,
+        *,
+        capabilities: RuntimeCapabilities | None = None,
+    ) -> None:
+        requirements = self._requirements.get(call.name)
+        if requirements is None:
+            raise ToolExecutionError("unknown_tool", "This tool is not available.")
+        if not self._capabilities.allows_all(requirements.required_capabilities) or (
+            capabilities is not None
+            and not capabilities.allows_all(requirements.required_capabilities)
+        ):
+            raise ToolExecutionError(
+                "capability_disabled", "This tool is disabled by the operator."
+            )
+        if call.name not in self._definitions:
+            raise ToolExecutionError("unknown_tool", "This tool is not available.")
+
+    def check_call(
+        self,
+        call: ModelToolCall,
+        workspace_root: Path | None,
+        *,
+        capabilities: RuntimeCapabilities | None = None,
+    ) -> None:
+        self.check_capabilities(call, capabilities=capabilities)
+        if self._requirements[call.name].requires_workspace and workspace_root is None:
+            raise ToolExecutionError(
+                "workspace_required", "This tool requires a selected workspace."
+            )
+
+    def specs(
+        self,
+        workspace_root: Path | None = None,
+        *,
+        capabilities: RuntimeCapabilities | None = None,
+    ) -> tuple[ModelToolSpec, ...]:
         return tuple(
             ModelToolSpec(name, description, model.model_json_schema())
             for name, description, model in self._available_definitions
+            if (not self._requirements[name].requires_workspace or workspace_root is not None)
+            and self._capabilities.allows_all(self._requirements[name].required_capabilities)
+            and (
+                capabilities is None
+                or capabilities.allows_all(self._requirements[name].required_capabilities)
+            )
         )
 
     def _validated_arguments(self, call: ModelToolCall) -> dict[str, object]:
@@ -252,23 +330,36 @@ class ToolRegistry:
                 "invalid_tool_arguments", "Tool arguments are invalid."
             ) from None
 
-    @staticmethod
-    def _safe_error(call: ModelToolCall, error: ToolExecutionError) -> ToolResult:
-        content = redact_secrets(error.message)
+    def _safe_error(self, call: ModelToolCall, error: ToolExecutionError) -> ToolResult:
+        content = self._redactor.redact_text(error.message)
         encoded = content.encode("utf-8")
         truncated = len(encoded) > MAX_RESULT_BYTES
         if truncated:
             content = encoded[:MAX_RESULT_BYTES].decode("utf-8", errors="ignore")
-        return ToolResult(call.id, call.name, content, True, error.code, truncated)
+        return ToolResult(
+            call.id, call.name, content, True, self._redactor.redact_text(error.code), truncated
+        )
 
     async def execute(
         self,
         call: ModelToolCall,
-        workspace_root: Path,
+        workspace_root: Path | None,
         *,
         approved: bool = False,
         approval_preview: dict[str, object] | None = None,
+        capabilities: RuntimeCapabilities | None = None,
     ) -> ToolResult:
+        try:
+            self.check_call(call, workspace_root, capabilities=capabilities)
+        except ToolExecutionError as error:
+            return self._safe_error(call, error)
+        if workspace_root is None and self._requirements[call.name].requires_workspace:
+            return self._safe_error(
+                call,
+                ToolExecutionError(
+                    "workspace_required", "This tool requires a selected workspace."
+                ),
+            )
         if self.requires_approval(call, workspace_root) and not approved:
             return ToolResult(
                 call.id,
@@ -288,7 +379,16 @@ class ToolRegistry:
         except ToolExecutionError as error:
             return self._safe_error(call, error)
         try:
-            if call.name == "apply_patch":
+            generic_executor = self._generic_executors.get(call.name)
+            if generic_executor is not None:
+                content, truncated = await generic_executor.execute(
+                    call.name, arguments, workspace_root
+                )
+            elif workspace_root is None:
+                raise ToolExecutionError(
+                    "workspace_required", "This tool requires a selected workspace."
+                )
+            elif call.name == "apply_patch":
                 if self._patch_executor is None:
                     raise ToolExecutionError("unknown_tool", "This tool is not available.")
                 content, truncated = await self._patch_executor.execute(
@@ -301,6 +401,8 @@ class ToolRegistry:
                     call.name, arguments, workspace_root
                 )
             else:
+                if self._executor is None:
+                    raise ToolExecutionError("unknown_tool", "This tool is not available.")
                 content, truncated = await self._executor.execute(
                     call.name, arguments, workspace_root
                 )
@@ -310,7 +412,7 @@ class ToolRegistry:
             return ToolResult(
                 call.id, call.name, "The tool could not complete.", True, "tool_failed"
             )
-        safe_content = redact_secrets(content)
+        safe_content = self._redactor.redact_text(content)
         encoded = safe_content.encode("utf-8")
         if len(encoded) > MAX_RESULT_BYTES:
             safe_content = encoded[:MAX_RESULT_BYTES].decode("utf-8", errors="ignore")

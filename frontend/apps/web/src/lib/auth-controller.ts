@@ -7,18 +7,41 @@ import {
 
 export type AuthProvider = "google" | "github"
 
+export type AuthCredential = {
+  readonly token: string
+  readonly userId: string
+  readonly sessionEpoch: number
+}
+
+export class AuthAccessError extends Error {
+  readonly code: "reauth_required" | "auth_unavailable"
+
+  constructor(code: "reauth_required" | "auth_unavailable", message: string) {
+    super(message)
+    this.name = "AuthAccessError"
+    this.code = code
+  }
+}
+
+const expiredMessage = "Your session expired. Please sign in again"
+const unavailableMessage =
+  "Authentication is temporarily unavailable. Try again."
+
 export interface AuthState {
-  status:
+  readonly status:
     "loading" | "signed-out" | "signed-in" | "configuration-error" | "error"
-  user: User | null
-  error: string | null
-  pendingProvider: AuthProvider | null
+  readonly user: User | null
+  readonly error: string | null
+  readonly pendingProvider: AuthProvider | null
+  readonly sessionEpoch: number
 }
 
 export interface AuthController {
   getSnapshot: () => AuthState
   getSessionEpoch: () => number
-  getAccessToken: () => Promise<{ token: string; userId: string }>
+  getAccessToken: () => Promise<AuthCredential>
+  isCredentialCurrent: (credential: AuthCredential) => boolean
+  expireSession: (credential: AuthCredential) => Promise<void>
   subscribe: (listener: () => void) => () => void
   signIn: (provider: AuthProvider) => Promise<void>
   signOut: () => Promise<void>
@@ -30,6 +53,7 @@ const emptyState: AuthState = {
   user: null,
   error: null,
   pendingProvider: null,
+  sessionEpoch: 0,
 }
 
 class AuthTimeoutError extends Error {}
@@ -90,22 +114,10 @@ function failure(error: unknown): {
         "This sign-in link has expired or was already used. Please sign in again.",
     }
   }
-  if (
-    [
-      "session_expired",
-      "session_not_found",
-      "bad_jwt",
-      "user_not_found",
-      "refresh_token_not_found",
-    ].includes(code) ||
-    (typeof error === "object" &&
-      error !== null &&
-      "status" in error &&
-      (error.status === 401 || error.status === 403))
-  ) {
+  if (isInvalidSession(error)) {
     return {
       status: "signed-out",
-      message: "Your session is no longer valid. Please sign in again.",
+      message: expiredMessage,
     }
   }
   if (error instanceof AuthTimeoutError) {
@@ -125,6 +137,24 @@ function failure(error: unknown): {
     message:
       "We could not verify your sign-in. Check your connection and try again.",
   }
+}
+
+function isInvalidSession(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false
+  const code = "code" in error ? String(error.code) : ""
+  return (
+    ("name" in error && error.name === "AuthSessionMissingError") ||
+    [
+      "session_expired",
+      "session_not_found",
+      "bad_jwt",
+      "user_not_found",
+      "refresh_token_not_found",
+      "refresh_token_already_used",
+      "reauth_required",
+    ].includes(code) ||
+    ("status" in error && (error.status === 401 || error.status === 403))
+  )
 }
 
 function consumeCallback(): {
@@ -177,6 +207,10 @@ export function createAuthController(
   let signingOut: Promise<void> | null = null
   let signOutRecoveryRequired = false
   let accessGeneration = 0
+  let currentAccessToken: string | null = null
+  let validatedAccessToken: string | null = null
+  let expiryCleanup: Promise<void> | null = null
+  let expiryRecoveryRequired = false
 
   const publish = (next: AuthState) => {
     if (
@@ -185,12 +219,54 @@ export function createAuthController(
     ) {
       accessGeneration += 1
     }
-    state = next
+    if (next.status !== "signed-in") {
+      currentAccessToken = null
+      validatedAccessToken = null
+    }
+    state = { ...next, sessionEpoch: accessGeneration }
     for (const listener of listeners) listener()
+  }
+
+  const isCredentialCurrent = (credential: AuthCredential) =>
+    state.status === "signed-in" &&
+    state.user?.id === credential.userId &&
+    accessGeneration === credential.sessionEpoch
+
+  const cleanupExpiredSession = (): Promise<void> => {
+    if (expiryCleanup) return expiryCleanup
+    const expectedVersion = version
+    const cleanup = withDeadline(async () => {
+      const { error } = await client.auth.signOut({ scope: "local" })
+      if (error) throw error
+    })
+      .then(() => {
+        if (version === expectedVersion) expiryRecoveryRequired = false
+      })
+      .catch(() => {
+        // Cleanup cannot restore credentials that have already been rejected.
+      })
+      .finally(() => {
+        if (expiryCleanup === cleanup) expiryCleanup = null
+      })
+    expiryCleanup = cleanup
+    return cleanup
+  }
+
+  const expireCurrentSession = (): Promise<void> => {
+    version += 1
+    rejectLateAuthEvents = true
+    signOutRecoveryRequired = false
+    expiryRecoveryRequired = true
+    publish({ ...emptyState, status: "signed-out", error: expiredMessage })
+    return cleanupExpiredSession()
   }
 
   const publishFailure = (error: unknown, expectedVersion: number) => {
     if (version !== expectedVersion) return
+    if (isInvalidSession(error)) {
+      void expireCurrentSession()
+      return
+    }
     if (error instanceof AuthTimeoutError) {
       rejectLateAuthEvents = true
       version += 1
@@ -202,12 +278,17 @@ export function createAuthController(
   const validateSession = async (session: Session, expectedVersion: number) => {
     const { data, error } = await client.auth.getUser(session.access_token)
     if (error) throw error
-    if (!data.user) throw new Error("Authenticated user missing")
+    if (!data.user || data.user.id !== session.user.id)
+      throw new AuthAccessError("reauth_required", expiredMessage)
     if (version !== expectedVersion) return
+    currentAccessToken = session.access_token
+    validatedAccessToken = session.access_token
     publish({ ...emptyState, status: "signed-in", user: data.user })
   }
 
   const initialize = (): Promise<void> => {
+    if (state.status === "signed-out" && state.error === expiredMessage)
+      return Promise.resolve()
     if (initialization) return initialization
     const expectedVersion = version
     initialization = withDeadline(async () => {
@@ -260,6 +341,12 @@ export function createAuthController(
     const { data } = client.auth.onAuthStateChange((event, session) => {
       if (event === "INITIAL_SESSION") return
       if (event === "SIGNED_OUT" || !session) {
+        if (state.status === "signed-out" && state.error === expiredMessage)
+          return
+        if (state.status === "signed-in" && !signingOut) {
+          void expireCurrentSession()
+          return
+        }
         version += 1
         rejectLateAuthEvents = true
         signOutRecoveryRequired = false
@@ -268,7 +355,11 @@ export function createAuthController(
       }
       if (rejectLateAuthEvents) return
       const expectedVersion = ++version
-      if (state.status !== "signed-in" || state.user?.id !== session.user.id) {
+      if (
+        state.status !== "signed-in" ||
+        state.user?.id !== session.user.id ||
+        (event === "SIGNED_IN" && validatedAccessToken !== session.access_token)
+      ) {
         publish({ ...emptyState, status: "loading" })
       }
       // Supabase holds an auth lock during callbacks. Validation starts after
@@ -289,22 +380,57 @@ export function createAuthController(
   const controller: AuthController = {
     getSnapshot: () => state,
     getSessionEpoch: () => accessGeneration,
+    isCredentialCurrent,
+    expireSession: (credential) => {
+      if (
+        !isCredentialCurrent(credential) ||
+        currentAccessToken !== credential.token
+      )
+        return Promise.resolve()
+      return expireCurrentSession()
+    },
     getAccessToken: async () => {
       const user = state.status === "signed-in" ? state.user : null
-      if (!user) throw new Error("Sign in to continue.")
+      if (!user) throw new AuthAccessError("reauth_required", expiredMessage)
       const expectedGeneration = accessGeneration
-      const { data, error } = await withDeadline(() => client.auth.getSession())
-      if (
-        error ||
-        !data.session?.access_token ||
-        data.session.user.id !== user.id ||
-        state.status !== "signed-in" ||
-        state.user?.id !== user.id ||
-        accessGeneration !== expectedGeneration
-      ) {
-        throw new Error("Sign in to continue.")
+      const expectedVersion = version
+      const current = () =>
+        state.status === "signed-in" &&
+        state.user?.id === user.id &&
+        accessGeneration === expectedGeneration
+      let result: Awaited<ReturnType<typeof client.auth.getSession>>
+      try {
+        result = await withDeadline(() => client.auth.getSession())
+      } catch (error) {
+        if (!current())
+          throw new AuthAccessError("reauth_required", expiredMessage)
+        if (isInvalidSession(error) && version === expectedVersion) {
+          void expireCurrentSession()
+          throw new AuthAccessError("reauth_required", expiredMessage)
+        }
+        throw new AuthAccessError("auth_unavailable", unavailableMessage)
       }
-      return { token: data.session.access_token, userId: user.id }
+      if (!current())
+        throw new AuthAccessError("reauth_required", expiredMessage)
+      const { data, error } = result
+      if (error) {
+        if (isInvalidSession(error) && version === expectedVersion) {
+          void expireCurrentSession()
+          throw new AuthAccessError("reauth_required", expiredMessage)
+        }
+        throw new AuthAccessError("auth_unavailable", unavailableMessage)
+      }
+      if (!data.session?.access_token || data.session.user.id !== user.id) {
+        if (version === expectedVersion) void expireCurrentSession()
+        throw new AuthAccessError("reauth_required", expiredMessage)
+      }
+      if (version === expectedVersion)
+        currentAccessToken = data.session.access_token
+      return {
+        token: data.session.access_token,
+        userId: user.id,
+        sessionEpoch: expectedGeneration,
+      }
     },
     subscribe: (listener) => {
       const subscriptionListener = () => listener()
@@ -324,6 +450,14 @@ export function createAuthController(
     },
     signIn: async (provider) => {
       if (state.pendingProvider || state.status === "signed-in") return
+      if (expiryRecoveryRequired || expiryCleanup) {
+        publish({ ...state, pendingProvider: provider })
+        await cleanupExpiredSession()
+        if (expiryRecoveryRequired) {
+          publish({ ...state, pendingProvider: null })
+          return
+        }
+      }
       const expectedVersion = ++version
       rejectLateAuthEvents = false
       signOutRecoveryRequired = false
@@ -378,6 +512,7 @@ export function createAuthController(
         })
         .catch((error: unknown) => {
           if (version !== expectedVersion) return
+          if (isInvalidSession(error)) return expireCurrentSession()
           if (error instanceof AuthTimeoutError) {
             version += 1
             signOutRecoveryRequired = true
@@ -385,7 +520,7 @@ export function createAuthController(
               ...emptyState,
               status: "error",
               error:
-                "Sign-out timed out. Your workspace is locked. Try again to finish signing out.",
+                "Sign-out timed out. Your chats are locked. Try again to finish signing out.",
             })
             return
           }
@@ -401,6 +536,12 @@ export function createAuthController(
       return signingOut
     },
     retry: async () => {
+      if (expiryRecoveryRequired || expiryCleanup) {
+        await cleanupExpiredSession()
+        return
+      }
+      if (state.status === "signed-out" && state.error === expiredMessage)
+        return
       if (signOutRecoveryRequired) return controller.signOut()
       if (initialization) return initialization
       version += 1
@@ -429,8 +570,13 @@ export function getAuthController(): AuthController {
       getSnapshot: () => state,
       getSessionEpoch: () => 0,
       getAccessToken: async () => {
-        throw new Error("Sign in to continue.")
+        throw new AuthAccessError(
+          "auth_unavailable",
+          state.error ?? unavailableMessage
+        )
       },
+      isCredentialCurrent: () => false,
+      expireSession: async () => {},
       subscribe: () => () => {},
       signIn: async () => {},
       signOut: async () => {},

@@ -13,6 +13,7 @@ from uuid import UUID
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient as FastAPITestClient
+from pydantic import SecretStr
 from starlette.testclient import WebSocketTestSession
 
 from app.api.auth import VerifiedUser
@@ -27,8 +28,19 @@ TEST_EMAIL = "alice@example.com"
 TEST_TOKEN = "alice"
 
 
-def make_settings(data_dir: Path) -> Settings:
-    return Settings(environment="test", data_dir=data_dir)
+def make_settings(
+    data_dir: Path,
+    *,
+    openai_api_key: str | None = None,
+    anthropic_api_key: str | None = None,
+) -> Settings:
+    return Settings(
+        _env_file=None,
+        environment="test",
+        data_dir=data_dir,
+        openai_api_key=SecretStr(openai_api_key) if openai_api_key is not None else None,
+        anthropic_api_key=SecretStr(anthropic_api_key) if anthropic_api_key is not None else None,
+    )
 
 
 def verified_token_source(user_id: UUID, token: str = "alice-token") -> VerifiedTokenSource:

@@ -9,7 +9,11 @@ from tests.support import TEST_USER_ID, TestClient, account_repository_key, crea
 
 
 def test_session_workspace_is_canonical_and_survives_restart(tmp_path: Path) -> None:
-    settings = Settings(environment="test", data_dir=tmp_path / "data")
+    settings = Settings(
+        environment="test",
+        data_dir=tmp_path / "data",
+        enabled_capabilities=frozenset({"local_read"}),
+    )
     project = tmp_path / "project"
     project.mkdir()
     alias = tmp_path / "project-link"
@@ -46,7 +50,11 @@ def test_session_workspace_is_canonical_and_survives_restart(tmp_path: Path) -> 
 
 
 def test_synced_workspace_requires_selection_on_each_backend_instance(tmp_path: Path) -> None:
-    settings = Settings(environment="test", data_dir=tmp_path / "data")
+    settings = Settings(
+        environment="test",
+        data_dir=tmp_path / "data",
+        enabled_capabilities=frozenset({"local_read"}),
+    )
     project = tmp_path / "project"
     project.mkdir()
 
@@ -77,7 +85,11 @@ def test_synced_workspace_requires_selection_on_each_backend_instance(tmp_path: 
 def test_session_creation_rejects_invalid_workspace_paths(
     tmp_path: Path, workspace_path: str
 ) -> None:
-    settings = Settings(environment="test", data_dir=tmp_path / "data")
+    settings = Settings(
+        environment="test",
+        data_dir=tmp_path / "data",
+        enabled_capabilities=frozenset({"local_read"}),
+    )
     file_path = tmp_path / "file"
     file_path.write_text("data")
     supplied = {
@@ -96,7 +108,11 @@ def test_session_creation_rejects_invalid_workspace_paths(
 
 
 def test_workspace_cannot_change_during_an_active_run(tmp_path: Path) -> None:
-    settings = Settings(environment="test", data_dir=tmp_path / "data")
+    settings = Settings(
+        environment="test",
+        data_dir=tmp_path / "data",
+        enabled_capabilities=frozenset({"local_read"}),
+    )
     project = tmp_path / "project"
     project.mkdir()
     database = Database(account_repository_key(settings), owner_id=TEST_USER_ID)

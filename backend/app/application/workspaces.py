@@ -2,6 +2,7 @@ import asyncio
 
 from app.application.errors import ApplicationError
 from app.application.ports import WorkspaceDirectoryPicker
+from app.domain.capabilities import RuntimeCapabilities
 
 DEFAULT_WORKSPACE_PICKER_TIMEOUT_SECONDS = 15 * 60
 
@@ -11,11 +12,16 @@ class WorkspacePickerService:
         self,
         picker: WorkspaceDirectoryPicker,
         timeout_seconds: float = DEFAULT_WORKSPACE_PICKER_TIMEOUT_SECONDS,
+        *,
+        capabilities: RuntimeCapabilities | None = None,
     ) -> None:
         self._picker = picker
         self._timeout_seconds = timeout_seconds
+        self._capabilities = capabilities or RuntimeCapabilities()
 
     async def pick_directory(self) -> str | None:
+        if not self._capabilities.workspace_enabled:
+            raise ApplicationError("capability_disabled", "Local workspace access is disabled.")
         try:
             return await asyncio.wait_for(
                 self._picker.pick_directory(), timeout=self._timeout_seconds

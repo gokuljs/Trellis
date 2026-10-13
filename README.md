@@ -21,12 +21,14 @@ The frontend is served at `http://127.0.0.1:3000` and the backend at
 `http://127.0.0.1:8000`. The command uses plain streamed logs so both services
 remain readable in one terminal. Press `Ctrl-C` once to stop both services.
 
-Then open `http://127.0.0.1:3000`, sign in, visit Settings, and add an OpenAI
-or Anthropic key. Chats, settings, and run history are stored in Supabase for
-the signed-in account. Provider keys and local workspace selection stay on the
-computer. `TRELLIS_DATA_DIR` controls where the backend keeps local keys and
-local account settings. Existing SQLite files are left untouched and are no
-longer imported; chats and settings are stored in Supabase.
+Set `TRELLIS_OPENAI_API_KEY` and/or `TRELLIS_ANTHROPIC_API_KEY` in backend
+secrets (or the ignored `backend/.env` for development). Keep these keys out
+of frontend variables. Then open `http://127.0.0.1:3000`, sign in, and choose an
+available model. Chats, settings, and run history are stored in Supabase for
+the signed-in account. The backend defaults to chat-only capabilities.
+Old account key files and SQLite files are left untouched and no longer read.
+See [backend credential instructions](backend/README.md#provider-credentials)
+for replacement, rotation, and deletion.
 
 ## Formatting and pre-commit checks
 

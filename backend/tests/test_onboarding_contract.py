@@ -4,13 +4,54 @@ from pathlib import Path
 
 import pytest
 
-from app.core.config import Settings
 from tests.memory_repository import MemoryRepository
-from tests.support import TestClient, account_context, create_app
+from tests.support import TestClient, account_context, create_app, make_settings
+
+
+@pytest.mark.parametrize(
+    "api_key", ["opaque-private-value", None, {"secret": "opaque-private-value"}]
+)
+def test_onboarding_rejects_user_credentials_without_echo_or_advancing(
+    tmp_path: Path, api_key: object
+) -> None:
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        client.put("/api/onboarding/steps/intro")
+        client.put("/api/onboarding/steps/profile", json={"display_name": "Alice"})
+        rejected = client.put(
+            "/api/onboarding/steps/model",
+            json={"model_id": "openai:gpt-5.5", "api_key": api_key},
+        )
+        progress = client.get("/api/onboarding")
+        models = client.get("/api/settings").json()["models"]
+
+    assert rejected.status_code == 422
+    assert "opaque-private-value" not in rejected.text
+    assert "input" not in rejected.text
+    assert "ctx" not in rejected.text
+    assert progress.json() == {"current_step": "model", "completed": False}
+    assert all(not model["configured"] for model in models)
+
+
+def test_validation_errors_do_not_echo_nested_or_malformed_request_inputs(tmp_path: Path) -> None:
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        invalid_value = client.put(
+            "/api/onboarding/steps/profile", json={"display_name": {"secret": "opaque-value"}}
+        )
+        malformed = client.put(
+            "/api/onboarding/steps/model",
+            content='{"api_key":"opaque-value",',
+            headers={"Content-Type": "application/json"},
+        )
+
+    for response in (invalid_value, malformed):
+        assert response.status_code == 422
+        assert "opaque-value" not in response.text
+        assert "input" not in response.text
+        assert "ctx" not in response.text
 
 
 def test_onboarding_rejects_invalid_order_and_unavailable_model(tmp_path: Path) -> None:
-    app = create_app(Settings(environment="test", data_dir=tmp_path))
+    app = create_app(make_settings(tmp_path))
     with TestClient(app) as client:
         before_intro = client.put("/api/onboarding/steps/profile", json={"display_name": "Alice"})
         assert before_intro.status_code == 409
@@ -40,7 +81,7 @@ def test_onboarding_rejects_invalid_order_and_unavailable_model(tmp_path: Path) 
 
 
 def test_completed_onboarding_is_idempotent_only_for_selected_model(tmp_path: Path) -> None:
-    app = create_app(Settings(environment="test", data_dir=tmp_path))
+    app = create_app(make_settings(tmp_path, openai_api_key="operator-openai"))
     with TestClient(app) as client:
         assert client.put("/api/onboarding/steps/intro").status_code == 200
         assert (
@@ -48,16 +89,9 @@ def test_completed_onboarding_is_idempotent_only_for_selected_model(tmp_path: Pa
             == 200
         )
 
-        oversized_key = client.put(
-            "/api/onboarding/steps/model",
-            json={"model_id": "openai:gpt-5.5", "api_key": "x" * 10_001},
-        )
-        assert oversized_key.status_code == 422
-        assert oversized_key.json()["error"]["code"] == "invalid_api_key"
-
         selected = client.put(
             "/api/onboarding/steps/model",
-            json={"model_id": "openai:gpt-5.5", "api_key": "sk-test-secret"},
+            json={"model_id": "openai:gpt-5.5"},
         )
         repeated = client.put("/api/onboarding/steps/model", json={"model_id": "openai:gpt-5.5"})
         changed = client.put(
@@ -75,17 +109,11 @@ def test_completed_onboarding_is_idempotent_only_for_selected_model(tmp_path: Pa
 def test_onboarding_reports_a_lost_model_commit_without_completing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    app = create_app(Settings(environment="test", data_dir=tmp_path))
+    app = create_app(make_settings(tmp_path, openai_api_key="operator-openai"))
     with TestClient(app) as client:
         assert client.put("/api/onboarding/steps/intro").status_code == 200
         assert (
             client.put("/api/onboarding/steps/profile", json={"display_name": "Alice"}).status_code
-            == 200
-        )
-        assert (
-            client.put(
-                "/api/settings/providers/openai/api-key", json={"api_key": "sk-test-secret"}
-            ).status_code
             == 200
         )
         repository = account_context(app).database

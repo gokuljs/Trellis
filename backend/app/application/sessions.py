@@ -3,6 +3,7 @@ from pathlib import Path
 
 from app.application.errors import ApplicationError
 from app.application.ports import SessionRepository, WorkspaceBindingPort
+from app.domain.capabilities import RuntimeCapabilities
 from app.domain.models import Session, SessionDetail, SessionWorkspaceBusy
 
 
@@ -27,27 +28,40 @@ class SessionService:
         repository: SessionRepository,
         *,
         workspace_bindings: WorkspaceBindingPort | None = None,
+        capabilities: RuntimeCapabilities | None = None,
     ) -> None:
         self._repository = repository
         self._workspace_bindings = workspace_bindings
+        self._capabilities = capabilities or RuntimeCapabilities()
+
+    @property
+    def workspace_enabled(self) -> bool:
+        return self._capabilities.workspace_enabled
+
+    def _require_workspace(self) -> None:
+        if not self.workspace_enabled:
+            raise ApplicationError("capability_disabled", "Local workspace access is disabled.")
 
     async def list_sessions(self) -> list[Session]:
         return await self._repository.list_sessions()
 
     async def create(self, workspace_path: str | None = None) -> Session:
+        if workspace_path is not None:
+            self._require_workspace()
         resolved = (
             await asyncio.to_thread(_resolved_workspace, workspace_path)
             if workspace_path is not None
             else None
         )
         session = await self._repository.create_session(resolved)
-        if self._workspace_bindings is not None:
+        if self.workspace_enabled and self._workspace_bindings is not None:
             self._workspace_bindings.bind(
                 session.id, Path(resolved) if resolved is not None else None
             )
         return session
 
     async def set_workspace(self, session_id: str, workspace_path: str | None) -> Session:
+        self._require_workspace()
         resolved = (
             await asyncio.to_thread(_resolved_workspace, workspace_path)
             if workspace_path is not None
@@ -77,7 +91,11 @@ class SessionService:
         )
 
     async def workspace_ready(self, session: Session) -> bool:
-        if session.workspace_path is None or self._workspace_bindings is None:
+        if (
+            not self.workspace_enabled
+            or session.workspace_path is None
+            or self._workspace_bindings is None
+        ):
             return False
         return (
             await self._workspace_bindings.resolve(session.id, session.workspace_path) is not None

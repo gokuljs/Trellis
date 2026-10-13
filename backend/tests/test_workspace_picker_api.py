@@ -40,7 +40,11 @@ def make_picker_client(
 ) -> TestClient:
     monkeypatch.setattr("app.main.NativeFolderPicker", lambda: picker, raising=False)
     monkeypatch.setattr("app.main.WORKSPACE_PICKER_TIMEOUT_SECONDS", timeout_seconds, raising=False)
-    settings = Settings(environment="test", data_dir=tmp_path / "data")
+    settings = Settings(
+        environment="test",
+        data_dir=tmp_path / "data",
+        enabled_capabilities=frozenset({"local_read"}),
+    )
     return TestClient(create_app(settings))
 
 

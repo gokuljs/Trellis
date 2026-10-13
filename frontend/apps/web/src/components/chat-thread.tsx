@@ -160,7 +160,7 @@ export function ChatThread({
   return (
     <div className="chat-thread" aria-live="polite">
       <header className="sr-only">
-        <div className="utility-kicker">LOCAL SESSION</div>
+        <div className="utility-kicker">Saved chat</div>
         <h1>{session.title}</h1>
         <span>{session.message_count} saved messages</span>
       </header>

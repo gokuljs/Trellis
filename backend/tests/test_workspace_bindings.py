@@ -5,6 +5,7 @@ from pathlib import Path
 from app.application.runs import RunService
 from app.application.sessions import SessionService
 from app.application.tools import ToolRegistry
+from app.domain.capabilities import RuntimeCapabilities
 from app.domain.runtime import ModelRequest, ModelStreamEvent, RunStatus
 from app.infrastructure.local_tools import LocalReadToolExecutor, read_workspace_guidance
 from app.infrastructure.secrets import SecretStore
@@ -21,7 +22,11 @@ def test_cloud_workspace_path_requires_a_local_selection(tmp_path: Path) -> None
         session = await database.create_session(str(project))
         local_bindings = LocalWorkspaceBindings()
         other_computer = LocalWorkspaceBindings()
-        service = SessionService(database, workspace_bindings=local_bindings)
+        service = SessionService(
+            database,
+            workspace_bindings=local_bindings,
+            capabilities=RuntimeCapabilities(frozenset({"local_read"})),
+        )
 
         assert await local_bindings.resolve(session.id, session.workspace_path) is None
         await service.set_workspace(session.id, str(project))
@@ -76,7 +81,11 @@ def test_cloud_workspace_metadata_cannot_offer_local_tools(tmp_path: Path) -> No
             database,
             secret_store,
             {"openai": provider},
-            tool_registry=ToolRegistry(LocalReadToolExecutor()),
+            capabilities=RuntimeCapabilities(frozenset({"local_read"})),
+            tool_registry=ToolRegistry(
+                LocalReadToolExecutor(),
+                capabilities=RuntimeCapabilities(frozenset({"local_read"})),
+            ),
             workspace_guidance_reader=read_workspace_guidance,
             workspace_bindings=LocalWorkspaceBindings(),
         )

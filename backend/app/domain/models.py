@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Literal
 
+from app.domain.capabilities import RuntimeCapability
+
 # Provider and model identifiers are owned by Trellis' catalog and are deliberately
 # open-ended so adding a provider does not require changing the domain types.
 ProviderName = str
@@ -104,6 +106,7 @@ class AppSettings:
     selected_model_id: ModelId
     models: list[ModelStatus]
     default_budget_preset: Literal["conservative", "longer"] = "conservative"
+    capabilities: tuple[RuntimeCapability, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

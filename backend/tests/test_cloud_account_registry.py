@@ -49,10 +49,8 @@ def test_cloud_registry_initializes_account_and_refreshes_token(
                 assert events == ["ensure"]
                 assert len(sources) == 1
                 assert first.database is not None
-                assert (
-                    first.run_service._workspace_bindings
-                    is first.session_service._workspace_bindings
-                )
+                assert first.run_service._workspace_bindings is None
+                assert first.session_service._workspace_bindings is None
                 assert first.run_service._lease_repository is first.database
                 assert sources[0].get_token() == "second"
             finally:

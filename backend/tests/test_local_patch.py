@@ -5,8 +5,10 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 from app.core.config import Settings
+from app.domain.capabilities import RuntimeCapabilities
 from app.domain.models import ProviderName
 from app.domain.runtime import (
     ModelRequest,
@@ -17,6 +19,8 @@ from app.domain.runtime import (
 )
 from tests.memory_repository import MemoryRepository
 from tests.support import TestClient, account_repository_key, create_app
+
+LOCAL_CAPABILITIES = RuntimeCapabilities(frozenset({"local_read", "local_patch", "local_command"}))
 
 
 def test_attached_workspace_offers_patch_tool_to_the_model(tmp_path: Path) -> None:
@@ -46,11 +50,15 @@ def test_attached_workspace_offers_patch_tool_to_the_model(tmp_path: Path) -> No
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     app = create_app(
-        Settings(environment="test", data_dir=tmp_path / "data"),
+        Settings(
+            environment="test",
+            data_dir=tmp_path / "data",
+            openai_api_key=SecretStr("sk-patch-test"),
+            enabled_capabilities=LOCAL_CAPABILITIES.enabled,
+        ),
         provider_adapters={"openai": provider},
     )
     with TestClient(app) as client:
-        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-patch-test"})
         session = client.post("/api/sessions", json={"workspace_path": str(workspace)}).json()
         with client.websocket_connect("/api/runtime") as websocket:
             websocket.send_json(
@@ -126,11 +134,15 @@ def test_approved_patch_uses_the_saved_preview_then_continues_the_run(tmp_path: 
     target.write_text("before\n", encoding="utf-8")
     (source / "AGENTS.md").write_text("Review the diff.\n", encoding="utf-8")
     provider = PatchProvider()
-    settings = Settings(environment="test", data_dir=tmp_path / "data")
+    settings = Settings(
+        environment="test",
+        data_dir=tmp_path / "data",
+        openai_api_key=SecretStr("sk-patch-test"),
+        enabled_capabilities=LOCAL_CAPABILITIES.enabled,
+    )
     app = create_app(settings, provider_adapters={"openai": provider})
 
     with TestClient(app) as client:
-        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-patch-test"})
         session_id = client.post("/api/sessions", json={"workspace_path": str(workspace)}).json()[
             "id"
         ]
@@ -221,6 +233,7 @@ def test_patch_tool_is_offered_with_strict_args_and_requires_approved_preview(
         LocalReadToolExecutor(),
         patch_executor=LocalPatchToolExecutor(),
         approval_required_names={"apply_patch"},
+        capabilities=LOCAL_CAPABILITIES,
     )
     arguments: dict[str, object] = {
         "path": "note.txt",
@@ -229,7 +242,7 @@ def test_patch_tool_is_offered_with_strict_args_and_requires_approved_preview(
     }
     call = ModelToolCall("edit-1", "apply_patch", arguments)
 
-    spec = next(spec for spec in registry.specs() if spec.name == "apply_patch")
+    spec = next(spec for spec in registry.specs(tmp_path) if spec.name == "apply_patch")
     assert spec.input_schema["additionalProperties"] is False
     assert spec.input_schema["required"] == ["path", "old_text", "new_text"]
     assert registry.requires_approval(call)
@@ -579,7 +592,7 @@ def test_temporary_patch_files_are_hidden_from_read_tools(tmp_path: Path) -> Non
 
     (tmp_path / ".trellis-patch-incomplete").write_text("private candidate", encoding="utf-8")
     (tmp_path / "visible.txt").write_text("public", encoding="utf-8")
-    registry = ToolRegistry(LocalReadToolExecutor())
+    registry = ToolRegistry(LocalReadToolExecutor(), capabilities=LOCAL_CAPABILITIES)
 
     listed = asyncio.run(registry.execute(ModelToolCall("list", "list_files", {}), tmp_path))
     searched = asyncio.run(

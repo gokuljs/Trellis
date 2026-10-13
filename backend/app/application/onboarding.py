@@ -34,7 +34,7 @@ class OnboardingService:
             raise ApplicationError("invalid_profile", "Name cannot be empty.")
         return await self._repository.save_onboarding_profile(normalized_name, email)
 
-    async def save_model(self, model_id: ModelId, api_key: str | None) -> OnboardingProgress:
+    async def save_model(self, model_id: ModelId) -> OnboardingProgress:
         progress = await self.get()
         selected_model_id = await self._settings_repository.get_selected_model_id()
         if progress.current_step == "complete":
@@ -61,19 +61,12 @@ class OnboardingService:
         if model is None:
             raise ApplicationError("model_not_available", "The selected model is not available.")
 
-        normalized_key = (api_key or "").strip()
-        if len(normalized_key) > 10_000:
-            raise ApplicationError(
-                "invalid_api_key", "API key must contain at most 10,000 characters"
-            )
-        if normalized_key:
-            await self._secret_store.set(model.provider_id, normalized_key)
         if model.requires_api_key:
             configured, _ = await self._secret_store.status(model.provider_id)
             if not configured:
                 raise ApplicationError(
                     "provider_not_configured",
-                    f"Add an API key for {model.provider_name} to finish setup.",
+                    f"{model.provider_name} is unavailable. Contact the Trellis operator.",
                 )
         if not await self._repository.complete_onboarding(model_id):
             raise ApplicationError(
