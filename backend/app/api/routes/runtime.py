@@ -6,6 +6,7 @@ from contextlib import suppress
 from typing import cast
 from urllib.parse import urlsplit
 
+import anyio
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
 from app.application.budgets import BudgetPreset
@@ -32,6 +33,8 @@ _TERMINAL_EVENTS = frozenset(
 _WEB_ORIGINS = frozenset({"http://localhost:3000", "http://127.0.0.1:3000"})
 _AUTH_TIMEOUT_SECONDS = 5
 _AUTH_RECHECK_SECONDS = 30
+_AUTH_MONITOR_CANCEL_REASON = "runtime authentication ended"
+_CLEANUP_TIMEOUT_SECONDS = 5
 _MAX_AUTH_FRAME_BYTES = 20_000
 
 
@@ -323,6 +326,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             logger.error("Runtime authentication close timed out")
 
     handler_task = asyncio.current_task()
+    teardown_started = False
 
     async def monitor_auth() -> None:
         while True:
@@ -331,8 +335,12 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                 try:
                     await close_for_access(error)
                 finally:
-                    if handler_task is not None:
-                        handler_task.cancel()
+                    if (
+                        not teardown_started
+                        and handler_task is not None
+                        and not handler_task.cancelling()
+                    ):
+                        handler_task.cancel(_AUTH_MONITOR_CANCEL_REASON)
                 return
 
     auth_task = asyncio.create_task(monitor_auth(), name="trellis-websocket-auth")
@@ -580,19 +588,26 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                 await send(responses if is_batch else responses[0])
     except WebSocketDisconnect:
         pass
-    except asyncio.CancelledError:
-        if not auth_lost.is_set():
+    except asyncio.CancelledError as error:
+        if (
+            error.args != (_AUTH_MONITOR_CANCEL_REASON,)
+            or handler_task is None
+            or handler_task.cancelling() != 1
+        ):
             raise
+        handler_task.uncancel()
     finally:
+        teardown_started = True
         auth_task.cancel()
-        await asyncio.gather(auth_task, return_exceptions=True)
         subscriptions = tuple(active_subscriptions.values())
         active_subscriptions.clear()
         for subscription, task in subscriptions:
             event_hub.unsubscribe(subscription)
             task.cancel()
-        if subscriptions:
+        # ASGI disconnect cancellation must not interrupt joining our child tasks.
+        with anyio.move_on_after(_CLEANUP_TIMEOUT_SECONDS, shield=True):
             await asyncio.gather(
+                auth_task,
                 *(task for _subscription, task in subscriptions),
                 return_exceptions=True,
             )
