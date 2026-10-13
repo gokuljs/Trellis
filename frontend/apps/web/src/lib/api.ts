@@ -4,7 +4,6 @@ import type {
   RunSummary,
   SavedRunEvent,
   OnboardingState,
-  ProviderId,
   Session,
   SessionDetail,
   Settings,
@@ -202,16 +201,12 @@ export const api = {
       },
       { timeoutMs: onboardingRequestTimeout, ...options }
     ),
-  saveOnboardingModel: (
-    modelId: string,
-    apiKey: string,
-    options: RequestOptions = {}
-  ) =>
+  saveOnboardingModel: (modelId: string, options: RequestOptions = {}) =>
     request<OnboardingState>(
       "/api/onboarding/steps/model",
       {
         method: "PUT",
-        body: JSON.stringify({ model_id: modelId, api_key: apiKey || null }),
+        body: JSON.stringify({ model_id: modelId }),
       },
       { timeoutMs: onboardingRequestTimeout, ...options }
     ),
@@ -224,15 +219,6 @@ export const api = {
     request<Settings>("/api/settings/budget", {
       method: "PUT",
       body: JSON.stringify({ budget_preset: budgetPreset }),
-    }),
-  saveApiKey: (provider: ProviderId, apiKey: string) =>
-    request<Settings>(`/api/settings/providers/${provider}/api-key`, {
-      method: "PUT",
-      body: JSON.stringify({ api_key: apiKey }),
-    }),
-  removeApiKey: (provider: ProviderId) =>
-    request<Settings>(`/api/settings/providers/${provider}/api-key`, {
-      method: "DELETE",
     }),
   listSessions: (options: RequestOptions = {}) =>
     request<Session[]>("/api/sessions", {}, options),

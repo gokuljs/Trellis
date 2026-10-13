@@ -33,7 +33,7 @@ class SettingsService:
                         name=model.provider_name,
                         model=model.name,
                         configured=credential[0],
-                        key_hint=credential[1],
+                        key_hint=None,
                     )
                 )
             statuses.append(
@@ -48,7 +48,7 @@ class SettingsService:
                     supports_streaming=model.supports_streaming,
                     supports_tools=model.supports_tools,
                     configured=credential[0],
-                    key_hint=credential[1],
+                    key_hint=None,
                 )
             )
         return AppSettings(
@@ -75,25 +75,4 @@ class SettingsService:
     async def select_model(self, model_id: ModelId) -> AppSettings:
         if not await self._repository.set_selected_model(model_id):
             raise ApplicationError("model_not_available", "The selected model is not available.")
-        return await self.get()
-
-    async def save_api_key(self, provider: ProviderName, api_key: str) -> AppSettings:
-        if not any(model.provider_id == provider for model in await self._repository.list_models()):
-            raise ApplicationError(
-                "provider_not_available", "The selected provider is not available."
-            )
-        if not api_key or len(api_key) > 10_000:
-            raise ApplicationError(
-                "invalid_api_key",
-                "API key must contain 1 to 10,000 characters",
-            )
-        await self._secret_store.set(provider, api_key)
-        return await self.get()
-
-    async def remove_api_key(self, provider: ProviderName) -> AppSettings:
-        if not any(model.provider_id == provider for model in await self._repository.list_models()):
-            raise ApplicationError(
-                "provider_not_available", "The selected provider is not available."
-            )
-        await self._secret_store.delete(provider)
         return await self.get()

@@ -4,10 +4,12 @@ from typing import Protocol, cast
 
 import httpx
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.api import router
 from app.api.auth import SupabaseAuthVerifier, VerifiedUser
+from app.api.errors import ApiErrorResponse
 from app.application.errors import ApplicationError
 from app.application.ports import ProviderAdapter, StreamingProviderAdapter
 from app.application.tools import ToolRegistry
@@ -48,6 +50,7 @@ ERROR_STATUS = {
     "session_run_busy": 409,
     "session_turn_busy": 409,
     "provider_not_configured": 409,
+    "provider_credentials_managed": 403,
     "pricing_unavailable": 409,
     "invalid_budget_preset": 422,
     "provider_not_available": 503,
@@ -61,7 +64,6 @@ ERROR_STATUS = {
     "turn_not_owned": 409,
     "account_in_use": 409,
     "message_empty": 422,
-    "invalid_api_key": 422,
     "invalid_profile": 422,
     "onboarding_step_out_of_order": 409,
     "onboarding_already_complete": 409,
@@ -132,6 +134,7 @@ def create_app(
         debug=resolved_settings.debug,
         version="0.1.0",
         lifespan=lifespan,
+        responses={422: {"model": ApiErrorResponse, "description": "Invalid request"}},
     )
 
     @application.exception_handler(ApplicationError)
@@ -139,6 +142,17 @@ def create_app(
         return JSONResponse(
             status_code=ERROR_STATUS.get(error.code, 500),
             content={"error": {"code": error.code, "message": error.message}},
+        )
+
+    @application.exception_handler(RequestValidationError)
+    async def handle_validation_error(
+        _request: Request, _error: RequestValidationError
+    ) -> JSONResponse:
+        # Error inputs, locations, contexts, and validator messages can contain
+        # arbitrary request values. Do not serialize or log the exception/body.
+        return JSONResponse(
+            status_code=422,
+            content={"error": {"code": "invalid_request", "message": "The request is invalid."}},
         )
 
     application.include_router(router)

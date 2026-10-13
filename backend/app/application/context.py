@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.application.tools import redact_secrets
+from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
 from app.domain.models import Message
 from app.domain.runtime import ModelMessage, ModelToolSpec, RunMessageRecord, ToolCallRecord
 
@@ -34,6 +34,7 @@ def build_model_context(
     workspace_guidance: str | None = None,
     run_tool_calls: Sequence[ToolCallRecord] = (),
     tools: Sequence[ModelToolSpec],
+    redactor: SecretRedactor = COMMON_SECRET_REDACTOR,
 ) -> ModelContext:
     """Combine the visible transcript and durable exchanges for one model step."""
     if workspace_guidance is not None and workspace_root is None:
@@ -41,9 +42,9 @@ def build_model_context(
     guidance = workspace_guidance.strip() if workspace_guidance is not None else ""
     if len(guidance.encode("utf-8")) > MAX_WORKSPACE_GUIDANCE_BYTES:
         raise ValueError("workspace guidance exceeds the size limit")
-    guidance = redact_secrets(guidance)
+    guidance = redactor.redact_text(guidance)
     visible = tuple(
-        ModelMessage(role=message.role, content=message.content)
+        ModelMessage(role=message.role, content=redactor.redact_text(message.content))
         for message in sorted(history, key=lambda item: (item.ordinal, item.id))
     )
     provider_call_ids = {call.id: call.provider_call_id for call in run_tool_calls}
@@ -58,7 +59,7 @@ def build_model_context(
     exchange = tuple(
         ModelMessage(
             role=message.role,
-            content=message.content,
+            content=redactor.redact_text(message.content),
             tool_call_id=provider_tool_call_id(message),
             tool_calls=message.tool_calls,
             continuation_items=message.continuation_items,
@@ -81,7 +82,7 @@ def build_model_context(
 
     return ModelContext(
         instruction_version=SYSTEM_INSTRUCTIONS_VERSION,
-        system_instructions=(
+        system_instructions=redactor.redact_text(
             f"Trellis instructions version: {SYSTEM_INSTRUCTIONS_VERSION}\n"
             f"{_BASE_INSTRUCTIONS}\n\n{workspace_instruction}"
         ),

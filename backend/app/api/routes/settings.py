@@ -1,8 +1,10 @@
 from fastapi import APIRouter
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel
 
-from app.api.dependencies import SettingsServiceDep
+from app.api.dependencies import CurrentUserDep, SettingsServiceDep
+from app.api.errors import ApiErrorResponse
 from app.application.budgets import BudgetPreset
+from app.application.errors import ApplicationError
 from app.domain.capabilities import RuntimeCapability
 from app.domain.models import AppSettings, ModelId, ProviderName
 
@@ -50,10 +52,6 @@ class BudgetSelection(BaseModel):
     budget_preset: BudgetPreset
 
 
-class ApiKeyUpdate(BaseModel):
-    api_key: SecretStr
-
-
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 
@@ -66,7 +64,7 @@ def serialize_settings(settings: AppSettings) -> SettingsResponse:
                 name=provider.name,
                 model=provider.model,
                 configured=provider.configured,
-                key_hint=provider.key_hint,
+                key_hint=None,
             )
             for provider in settings.providers
         ],
@@ -85,7 +83,7 @@ def serialize_settings(settings: AppSettings) -> SettingsResponse:
                 supports_streaming=model.supports_streaming,
                 supports_tools=model.supports_tools,
                 configured=model.configured,
-                key_hint=model.key_hint,
+                key_hint=None,
             )
             for model in settings.models
         ],
@@ -121,19 +119,33 @@ async def select_default_budget(
     return serialize_settings(await service.select_default_budget(payload.budget_preset))
 
 
-@router.put("/providers/{provider}/api-key")
+@router.put(
+    "/providers/{provider}/api-key",
+    status_code=403,
+    response_model=ApiErrorResponse,
+    deprecated=True,
+)
 async def update_api_key(
     provider: str,
-    payload: ApiKeyUpdate,
-    service: SettingsServiceDep,
-) -> SettingsResponse:
-    api_key = payload.api_key.get_secret_value()
-    return serialize_settings(await service.save_api_key(provider, api_key))
+    _user: CurrentUserDep,
+) -> None:
+    raise ApplicationError(
+        "provider_credentials_managed",
+        "Provider access is managed by the Trellis operator.",
+    )
 
 
-@router.delete("/providers/{provider}/api-key")
+@router.delete(
+    "/providers/{provider}/api-key",
+    status_code=403,
+    response_model=ApiErrorResponse,
+    deprecated=True,
+)
 async def delete_api_key(
     provider: str,
-    service: SettingsServiceDep,
-) -> SettingsResponse:
-    return serialize_settings(await service.remove_api_key(provider))
+    _user: CurrentUserDep,
+) -> None:
+    raise ApplicationError(
+        "provider_credentials_managed",
+        "Provider access is managed by the Trellis operator.",
+    )

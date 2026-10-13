@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from pydantic import SecretStr
 
 from app.application.tools import ToolRegistry
 from app.core.config import Settings
@@ -78,6 +79,7 @@ class BlockingStreamingProvider(StreamingProvider):
 class GappedStreamingProvider(StreamingProvider):
     def __init__(self) -> None:
         super().__init__()
+        self.begin_stream = threading.Event()
         self.continue_stream = threading.Event()
 
     def stream(
@@ -90,6 +92,7 @@ class GappedStreamingProvider(StreamingProvider):
         del api_key, user_id
 
         async def generate() -> AsyncGenerator[ModelStreamEvent]:
+            assert await asyncio.to_thread(self.begin_stream.wait, 5)
             yield ModelStreamEvent(kind="text_delta", text="dropped delta")
             yield ModelStreamEvent(kind="usage", input_tokens=1, output_tokens=1)
             await asyncio.to_thread(self.continue_stream.wait)
@@ -133,7 +136,7 @@ class ApprovalStreamingProvider(StreamingProvider):
 
 def configured_client(tmp_path: Path, provider: StreamingProvider) -> TestClient:
     app = create_app(
-        Settings(environment="test", data_dir=tmp_path),
+        Settings(environment="test", data_dir=tmp_path, openai_api_key=SecretStr("sk-server-test")),
         provider_adapters={"openai": provider},
     )
     return TestClient(app)
@@ -174,7 +177,6 @@ def start_completed_run(client: TestClient, session_id: str, request_id: str) ->
 
 def test_session_run_history_pages_summaries_and_events(tmp_path: Path) -> None:
     with configured_client(tmp_path, StreamingProvider()) as client:
-        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-history"})
         session_id = client.post("/api/sessions").json()["id"]
         first_id = start_completed_run(client, session_id, "history-first")
         second_id = start_completed_run(client, session_id, "history-second")
@@ -214,7 +216,6 @@ def test_run_event_cursor_uses_page_lookahead_when_snapshot_is_stale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     with configured_client(tmp_path, StreamingProvider()) as client:
-        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-history"})
         session_id = client.post("/api/sessions").json()["id"]
         run_id = start_completed_run(client, session_id, "stale-snapshot")
         database = account_context(client.app).database
@@ -235,7 +236,6 @@ def test_run_event_cursor_uses_page_lookahead_when_snapshot_is_stale(
 
 def test_session_run_history_rejects_other_sessions_and_invalid_pages(tmp_path: Path) -> None:
     with configured_client(tmp_path, StreamingProvider()) as client:
-        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-history"})
         owner_id = client.post("/api/sessions").json()["id"]
         other_id = client.post("/api/sessions").json()["id"]
         run_id = start_completed_run(client, owner_id, "owned-run")
@@ -265,6 +265,7 @@ def test_jsonrpc_run_respond_approves_exact_waiting_tool_and_resumes(tmp_path: P
         Settings(
             environment="test",
             data_dir=tmp_path / "data",
+            openai_api_key=SecretStr("sk-server-test"),
             enabled_capabilities=frozenset({"local_read"}),
         ),
         provider_adapters={"openai": provider},
@@ -275,7 +276,6 @@ def test_jsonrpc_run_respond_approves_exact_waiting_tool_and_resumes(tmp_path: P
         ),
     )
     with TestClient(app) as client:
-        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-approval-test"})
         session_id = client.post("/api/sessions", json={"workspace_path": str(project)}).json()[
             "id"
         ]
@@ -372,12 +372,12 @@ def test_command_waits_for_approval_then_runs_in_workspace(tmp_path: Path) -> No
         Settings(
             environment="test",
             data_dir=tmp_path / "data",
+            openai_api_key=SecretStr("sk-server-test"),
             enabled_capabilities=frozenset({"local_command"}),
         ),
         provider_adapters={"openai": provider},
     )
     with TestClient(app) as client:
-        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-approval-test"})
         session_id = client.post("/api/sessions", json={"workspace_path": str(project)}).json()[
             "id"
         ]
@@ -433,10 +433,6 @@ def test_command_waits_for_approval_then_runs_in_workspace(tmp_path: Path) -> No
 def test_jsonrpc_websocket_streams_a_durable_run(tmp_path: Path) -> None:
     provider = StreamingProvider()
     with configured_client(tmp_path, provider) as client:
-        client.put(
-            "/api/settings/providers/openai/api-key",
-            json={"api_key": "sk-jsonrpc-test"},
-        )
         session_id = client.post("/api/sessions").json()["id"]
         with client.websocket_connect("/api/runtime") as websocket:
             websocket.send_json(
@@ -485,7 +481,6 @@ def test_jsonrpc_websocket_streams_a_durable_run(tmp_path: Path) -> None:
 def test_jsonrpc_start_selects_a_budget_preset_and_rejects_unknown_names(tmp_path: Path) -> None:
     provider = StreamingProvider()
     with configured_client(tmp_path, provider) as client:
-        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-budget-test"})
         session_id = client.post("/api/sessions").json()["id"]
         with client.websocket_connect("/api/runtime") as websocket:
             websocket.send_json(
@@ -530,7 +525,6 @@ def test_jsonrpc_start_selects_a_budget_preset_and_rejects_unknown_names(tmp_pat
 
 def test_jsonrpc_start_uses_settings_budget_default_when_unspecified(tmp_path: Path) -> None:
     with configured_client(tmp_path, StreamingProvider()) as client:
-        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-budget"})
         client.put("/api/settings/budget", json={"budget_preset": "longer"})
         session_id = client.post("/api/sessions").json()["id"]
         with client.websocket_connect("/api/runtime") as websocket:
@@ -557,12 +551,15 @@ def test_jsonrpc_start_selects_a_model_for_one_run_without_changing_settings(
 ) -> None:
     provider = StreamingProvider()
     app = create_app(
-        Settings(environment="test", data_dir=tmp_path),
+        Settings(
+            environment="test",
+            data_dir=tmp_path,
+            openai_api_key=SecretStr("sk-default"),
+            anthropic_api_key=SecretStr("sk-model-test"),
+        ),
         provider_adapters={"openai": provider, "anthropic": provider},
     )
     with TestClient(app) as client:
-        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-default"})
-        client.put("/api/settings/providers/anthropic/api-key", json={"api_key": "sk-model-test"})
         session_id = client.post("/api/sessions").json()["id"]
         with client.websocket_connect("/api/runtime") as websocket:
             websocket.send_json(
@@ -627,10 +624,6 @@ def test_jsonrpc_start_rejects_invalid_or_unknown_model_choice(tmp_path: Path) -
 def test_jsonrpc_resume_replays_persisted_events_after_disconnect(tmp_path: Path) -> None:
     provider = StreamingProvider()
     with configured_client(tmp_path, provider) as client:
-        client.put(
-            "/api/settings/providers/openai/api-key",
-            json={"api_key": "sk-jsonrpc-test"},
-        )
         session_id = client.post("/api/sessions").json()["id"]
         with client.websocket_connect("/api/runtime") as websocket:
             websocket.send_json(
@@ -682,10 +675,7 @@ def test_jsonrpc_resume_replays_persisted_events_after_disconnect(tmp_path: Path
 def test_jsonrpc_replays_when_a_live_event_sequence_has_a_gap(tmp_path: Path) -> None:
     provider = GappedStreamingProvider()
     with configured_client(tmp_path, provider) as client:
-        client.put(
-            "/api/settings/providers/openai/api-key",
-            json={"api_key": "sk-jsonrpc-gap"},
-        )
+        client.get("/api/profile")
         event_hub: RuntimeEventHub = account_context(client.app).event_hub
         dropped = threading.Event()
 
@@ -723,6 +713,7 @@ def test_jsonrpc_replays_when_a_live_event_sequence_has_a_gap(tmp_path: Path) ->
                 ),
             )
             result = next(item["result"] for item in initial if item.get("id") == "gap-start")
+            provider.begin_stream.set()
             assert dropped.wait(timeout=5)
             provider.continue_stream.set()
             replay_request = receive_until(
@@ -962,10 +953,6 @@ def test_event_hub_closes_a_slow_subscriber_for_persisted_replay() -> None:
 def test_jsonrpc_can_cancel_a_streaming_run(tmp_path: Path) -> None:
     provider = BlockingStreamingProvider()
     with configured_client(tmp_path, provider) as client:
-        client.put(
-            "/api/settings/providers/openai/api-key",
-            json={"api_key": "sk-jsonrpc-test"},
-        )
         session_id = client.post("/api/sessions").json()["id"]
         with client.websocket_connect("/api/runtime") as websocket:
             websocket.send_json(
@@ -1021,7 +1008,6 @@ def test_jsonrpc_can_cancel_a_streaming_run(tmp_path: Path) -> None:
 def test_session_latest_run_lookup_tracks_active_and_terminal_runs(tmp_path: Path) -> None:
     provider = BlockingStreamingProvider()
     with configured_client(tmp_path, provider) as client:
-        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-lookup-test"})
         session_id = client.post("/api/sessions").json()["id"]
         latest_url = f"/api/sessions/{session_id}/runs/latest"
         assert client.get(latest_url).json() is None
@@ -1090,6 +1076,7 @@ def test_waiting_approval_is_discoverable_and_replayed_after_socket_refresh(tmp_
         Settings(
             environment="test",
             data_dir=tmp_path / "data",
+            openai_api_key=SecretStr("sk-server-test"),
             enabled_capabilities=frozenset({"local_read"}),
         ),
         provider_adapters={"openai": provider},
@@ -1100,7 +1087,6 @@ def test_waiting_approval_is_discoverable_and_replayed_after_socket_refresh(tmp_
         ),
     )
     with TestClient(app) as client:
-        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-replay-test"})
         session_id = client.post("/api/sessions", json={"workspace_path": str(workspace)}).json()[
             "id"
         ]
@@ -1179,10 +1165,6 @@ def test_waiting_approval_is_discoverable_and_replayed_after_socket_refresh(tmp_
 
 def test_jsonrpc_rejects_resume_cursor_ahead_of_current_run(tmp_path: Path) -> None:
     with configured_client(tmp_path, StreamingProvider()) as client:
-        client.put(
-            "/api/settings/providers/openai/api-key",
-            json={"api_key": "sk-jsonrpc-test"},
-        )
         session_id = client.post("/api/sessions").json()["id"]
         with client.websocket_connect("/api/runtime") as websocket:
             websocket.send_json(

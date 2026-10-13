@@ -1,7 +1,6 @@
 """Provider-neutral definitions and validation for local read tools."""
 
 import json
-import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +8,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
 from app.domain.capabilities import (
     DEFAULT_RUNTIME_CAPABILITIES,
     RuntimeCapabilities,
@@ -20,41 +20,14 @@ MAX_ARGUMENT_BYTES = 16_384
 MAX_RESULT_BYTES = 20_000
 MAX_COMMAND_BYTES = 2_048
 MAX_COMMAND_ARGUMENTS = 64
-_BEARER_TOKEN = re.compile(r"(?i)\b(Bearer\s+)([A-Za-z0-9._~+/-]{6,})")
-_KEY_ASSIGNMENT = re.compile(
-    r"(?i)\b([A-Za-z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)"
-    r"[A-Za-z0-9_]*[\"']?\s*[:=]\s*[\"']?)([^\s\"';,}]+)"
-)
-_STANDALONE_TOKEN = re.compile(
-    r"\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{12,}|"
-    r"github_pat_[A-Za-z0-9_]{12,})\b"
-)
 
 
 def redact_secrets(content: str) -> str:
-    content = _BEARER_TOKEN.sub(lambda match: f"{match[1]}[REDACTED]", content)
-    content = _KEY_ASSIGNMENT.sub(lambda match: f"{match[1]}[REDACTED]", content)
-    return _STANDALONE_TOKEN.sub("[REDACTED]", content)
+    return COMMON_SECRET_REDACTOR.redact_text(content)
 
 
 def redact_record(value: object) -> object:
-    """Redact common credentials in nested model and tool records."""
-    if isinstance(value, dict):
-        redacted: dict[str, object] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                continue
-            normalized = key.casefold().replace("-", "_")
-            sensitive = normalized in {"token", "secret", "password", "credential", "api_key"} or (
-                normalized.endswith(("_token", "_secret", "_password", "_credential", "_api_key"))
-            )
-            redacted[key] = "[REDACTED]" if sensitive else redact_record(item)
-        return redacted
-    if isinstance(value, list | tuple):
-        return [redact_record(item) for item in value]
-    if isinstance(value, str):
-        return redact_secrets(value)
-    return value
+    return COMMON_SECRET_REDACTOR.redact_record(value)
 
 
 class _StrictArguments(BaseModel):
@@ -232,9 +205,11 @@ class ToolRegistry:
         approval_required_names: frozenset[str] | set[str] = frozenset(),
         capabilities: RuntimeCapabilities = DEFAULT_RUNTIME_CAPABILITIES,
         additional_tools: tuple[ToolRegistration, ...] = (),
+        redactor: SecretRedactor | None = None,
     ) -> None:
         self._executor = executor
         self._capabilities = capabilities
+        self._redactor = redactor or COMMON_SECRET_REDACTOR
         self._patch_executor = patch_executor
         self._command_executor = command_executor
         self._generic_executors: dict[str, ToolExecutor] = {}
@@ -355,14 +330,15 @@ class ToolRegistry:
                 "invalid_tool_arguments", "Tool arguments are invalid."
             ) from None
 
-    @staticmethod
-    def _safe_error(call: ModelToolCall, error: ToolExecutionError) -> ToolResult:
-        content = redact_secrets(error.message)
+    def _safe_error(self, call: ModelToolCall, error: ToolExecutionError) -> ToolResult:
+        content = self._redactor.redact_text(error.message)
         encoded = content.encode("utf-8")
         truncated = len(encoded) > MAX_RESULT_BYTES
         if truncated:
             content = encoded[:MAX_RESULT_BYTES].decode("utf-8", errors="ignore")
-        return ToolResult(call.id, call.name, content, True, error.code, truncated)
+        return ToolResult(
+            call.id, call.name, content, True, self._redactor.redact_text(error.code), truncated
+        )
 
     async def execute(
         self,
@@ -436,7 +412,7 @@ class ToolRegistry:
             return ToolResult(
                 call.id, call.name, "The tool could not complete.", True, "tool_failed"
             )
-        safe_content = redact_secrets(content)
+        safe_content = self._redactor.redact_text(content)
         encoded = safe_content.encode("utf-8")
         if len(encoded) > MAX_RESULT_BYTES:
             safe_content = encoded[:MAX_RESULT_BYTES].decode("utf-8", errors="ignore")

@@ -5,6 +5,7 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 from app.core.config import Settings
 from app.domain.capabilities import RuntimeCapabilities
@@ -52,12 +53,12 @@ def test_attached_workspace_offers_patch_tool_to_the_model(tmp_path: Path) -> No
         Settings(
             environment="test",
             data_dir=tmp_path / "data",
+            openai_api_key=SecretStr("sk-patch-test"),
             enabled_capabilities=LOCAL_CAPABILITIES.enabled,
         ),
         provider_adapters={"openai": provider},
     )
     with TestClient(app) as client:
-        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-patch-test"})
         session = client.post("/api/sessions", json={"workspace_path": str(workspace)}).json()
         with client.websocket_connect("/api/runtime") as websocket:
             websocket.send_json(
@@ -136,12 +137,12 @@ def test_approved_patch_uses_the_saved_preview_then_continues_the_run(tmp_path: 
     settings = Settings(
         environment="test",
         data_dir=tmp_path / "data",
+        openai_api_key=SecretStr("sk-patch-test"),
         enabled_capabilities=LOCAL_CAPABILITIES.enabled,
     )
     app = create_app(settings, provider_adapters={"openai": provider})
 
     with TestClient(app) as client:
-        client.put("/api/settings/providers/openai/api-key", json={"api_key": "sk-patch-test"})
         session_id = client.post("/api/sessions", json={"workspace_path": str(workspace)}).json()[
             "id"
         ]

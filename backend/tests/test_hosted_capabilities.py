@@ -46,7 +46,7 @@ def test_default_chat_settings_and_sessions_do_not_initialize_local_capabilities
     monkeypatch.setattr(accounts, "read_workspace_guidance", local_access_forbidden)
 
     app = create_app(
-        Settings(environment="test", data_dir=tmp_path),
+        Settings(environment="test", data_dir=tmp_path, openai_api_key="sk-chat-only-test"),
         provider_adapters={"openai": ChatProvider()},
     )
     with TestClient(app) as client:
@@ -54,12 +54,6 @@ def test_default_chat_settings_and_sessions_do_not_initialize_local_capabilities
         settings = client.get("/api/settings")
         assert settings.status_code == 200
         assert settings.json()["capabilities"] == []
-        assert (
-            client.put(
-                "/api/settings/providers/openai/api-key", json={"api_key": "sk-chat-only-test"}
-            ).status_code
-            == 200
-        )
 
         created = client.post("/api/sessions")
         assert created.status_code == 201

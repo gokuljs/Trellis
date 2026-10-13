@@ -1,4 +1,4 @@
-import { ArrowUpRight, Eye, EyeOff, KeyRound } from "lucide-react"
+import { ArrowUpRight } from "lucide-react"
 import { useEffect, useRef, useState, type ReactNode } from "react"
 
 import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
@@ -13,7 +13,6 @@ import type {
 
 export type OnboardingValues = {
   modelId: ModelId
-  apiKey: string
 }
 
 type OnboardingFlowProps = {
@@ -23,6 +22,7 @@ type OnboardingFlowProps = {
   initialStep: OnboardingStep
   onAdvanceIntro: () => Promise<void>
   onSaveProfile: (displayName: string) => Promise<void>
+  onRetryModels: () => Promise<void>
   onComplete: (values: OnboardingValues) => Promise<void>
 }
 
@@ -50,6 +50,7 @@ export function OnboardingFlow({
   initialStep,
   onAdvanceIntro,
   onSaveProfile,
+  onRetryModels,
   onComplete,
 }: OnboardingFlowProps) {
   const [step, setStep] = useState<OnboardingStep>(initialStep)
@@ -73,14 +74,17 @@ export function OnboardingFlow({
   const [modelId, setModelId] = useState<ModelId>(
     settings.selected_model_id ?? modelOptions[0]?.id ?? ""
   )
-  const [apiKey, setApiKey] = useState("")
-  const [showApiKey, setShowApiKey] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const [checkingModels, setCheckingModels] = useState(false)
   const headingRef = useRef<HTMLHeadingElement>(null)
   const modelRefs = useRef<Array<HTMLButtonElement | null>>([])
 
   const selectedModel = modelOptions.find((item) => item.id === modelId)
+  const selectedModelReady =
+    selectedModel &&
+    (selectedModel.configured || !selectedModel.requires_api_key)
+  const busy = submitting || checkingModels
 
   useEffect(() => {
     headingRef.current?.focus()
@@ -132,9 +136,19 @@ export function OnboardingFlow({
 
   const selectModel = (nextModel: ModelId) => {
     setModelId(nextModel)
-    setApiKey("")
-    setShowApiKey(false)
     setError(null)
+  }
+
+  const retryModels = async () => {
+    setCheckingModels(true)
+    setError(null)
+    try {
+      await onRetryModels()
+    } catch (retryError) {
+      setError(errorMessage(retryError))
+    } finally {
+      setCheckingModels(false)
+    }
   }
 
   const submit = async () => {
@@ -142,13 +156,10 @@ export function OnboardingFlow({
       setError("Choose a model.")
       return
     }
-    const trimmedKey = apiKey.trim()
-    if (
-      selectedModel.requires_api_key &&
-      !selectedModel.configured &&
-      !trimmedKey
-    ) {
-      setError(`Add an API key for ${selectedModel.provider_name}.`)
+    if (!selectedModelReady) {
+      setError(
+        "This model is unavailable. Choose another model or check availability again."
+      )
       return
     }
 
@@ -157,7 +168,6 @@ export function OnboardingFlow({
     try {
       await onComplete({
         modelId: selectedModel.id,
-        apiKey: selectedModel.configured ? "" : trimmedKey,
       })
     } catch (submitError) {
       setError(errorMessage(submitError))
@@ -205,7 +215,7 @@ export function OnboardingFlow({
                     <span>Workspace setup</span>
                   </h1>
                   <p className="onboarding-intro-copy">
-                    Create your profile and connect a model.
+                    Create your profile and choose a model.
                   </p>
                   <button
                     className="onboarding-primary-action"
@@ -314,7 +324,13 @@ export function OnboardingFlow({
                           type="button"
                           role="radio"
                           aria-checked={item.id === modelId}
-                          tabIndex={item.id === modelId ? 0 : -1}
+                          tabIndex={
+                            item.id === modelId ||
+                            (!selectedModel && index === 0)
+                              ? 0
+                              : -1
+                          }
+                          disabled={busy}
                           onClick={() => selectModel(item.id)}
                           onKeyDown={(event) => {
                             let nextIndex: number | null = null
@@ -347,47 +363,32 @@ export function OnboardingFlow({
                           <span>{item.provider_name}</span>
                           <span>{item.name}</span>
                           <span>
-                            {item.configured
-                              ? "Configured"
-                              : item.requires_api_key
-                                ? "API key required"
-                                : "Ready to use"}
+                            {item.configured || !item.requires_api_key
+                              ? "Ready to use"
+                              : "Unavailable"}
                           </span>
                         </button>
                       ))}
                     </div>
 
-                    {selectedModel &&
-                    selectedModel.requires_api_key &&
-                    !selectedModel.configured ? (
-                      <label className="onboarding-field">
-                        <span>{selectedModel.provider_name} API key</span>
-                        <span className="onboarding-key-input">
-                          <KeyRound size={15} aria-hidden="true" />
-                          <input
-                            aria-label={`${selectedModel.provider_name} API key`}
-                            type={showApiKey ? "text" : "password"}
-                            value={apiKey}
-                            autoComplete="new-password"
-                            spellCheck={false}
-                            onChange={(event) => setApiKey(event.target.value)}
-                          />
-                          <button
-                            className="onboarding-key-toggle"
-                            type="button"
-                            aria-label={
-                              showApiKey ? "Hide API key" : "Show API key"
-                            }
-                            onClick={() => setShowApiKey((visible) => !visible)}
-                          >
-                            {showApiKey ? (
-                              <EyeOff size={15} aria-hidden="true" />
-                            ) : (
-                              <Eye size={15} aria-hidden="true" />
-                            )}
-                          </button>
+                    {!selectedModelReady ? (
+                      <div className="onboarding-model-status">
+                        <span role="status">
+                          {selectedModel
+                            ? `${selectedModel.name} is unavailable. Choose another model or check availability again.`
+                            : modelOptions.length
+                              ? "Choose a model to continue."
+                              : "No models are available right now. Check availability to try again."}
                         </span>
-                      </label>
+                        <button
+                          className="onboarding-secondary-action"
+                          type="button"
+                          disabled={busy}
+                          onClick={() => void retryModels()}
+                        >
+                          {checkingModels ? "Checking…" : "Check availability"}
+                        </button>
+                      </div>
                     ) : null}
 
                     {error ? (
@@ -399,7 +400,7 @@ export function OnboardingFlow({
                       <button
                         className="onboarding-secondary-action"
                         type="button"
-                        disabled={submitting}
+                        disabled={busy}
                         onClick={() => changeStep("profile", "back")}
                       >
                         Back
@@ -407,7 +408,7 @@ export function OnboardingFlow({
                       <button
                         className="onboarding-primary-action"
                         type="submit"
-                        disabled={submitting}
+                        disabled={busy || !selectedModelReady}
                       >
                         {submitting ? "Starting…" : "Start Trellis"}
                       </button>

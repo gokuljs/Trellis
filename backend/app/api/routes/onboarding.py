@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.dependencies import CurrentUserDep, OnboardingServiceDep
 from app.domain.models import OnboardingStep
@@ -17,8 +17,9 @@ class OnboardingProfileUpdate(BaseModel):
 
 
 class OnboardingModelUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     model_id: str = Field(min_length=1, max_length=200)
-    api_key: SecretStr | None = None
 
 
 router = APIRouter(prefix="/api/onboarding", tags=["onboarding"])
@@ -60,6 +61,5 @@ async def save_model(
     payload: OnboardingModelUpdate,
     service: OnboardingServiceDep,
 ) -> OnboardingStateResponse:
-    api_key = payload.api_key.get_secret_value() if payload.api_key else None
-    progress = await service.save_model(payload.model_id, api_key)
+    progress = await service.save_model(payload.model_id)
     return serialize_progress(progress.current_step, progress.completed)

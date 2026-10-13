@@ -242,11 +242,9 @@ class ChatRepository(ProfileRepository, SettingsRepository, SessionRepository, P
 
 
 class SecretStorePort(Protocol):
+    """Read-only, account-bound provider credential access."""
+
     async def get(self, provider: ProviderName) -> str | None: ...
-
-    async def set(self, provider: ProviderName, value: str) -> None: ...
-
-    async def delete(self, provider: ProviderName) -> None: ...
 
     async def status(self, provider: ProviderName) -> tuple[bool, str | None]: ...
 

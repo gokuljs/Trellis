@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.domain.capabilities import RuntimeCapability
@@ -13,6 +13,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     app_name: str = "Trellis API"
@@ -23,3 +24,5 @@ class Settings(BaseSettings):
     supabase_publishable_key: str | None = None
     web_origin: str | None = None
     enabled_capabilities: frozenset[RuntimeCapability] = frozenset()
+    openai_api_key: SecretStr | None = Field(default=None, repr=False)
+    anthropic_api_key: SecretStr | None = Field(default=None, repr=False)

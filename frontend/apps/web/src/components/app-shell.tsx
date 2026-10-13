@@ -728,11 +728,9 @@ export function AppShell({
 
     const controller = bootstrapControllerRef.current
     if (!controller) return
-    const progress = await api.saveOnboardingModel(
-      values.modelId,
-      values.apiKey,
-      { signal: controller.signal }
-    )
+    const progress = await api.saveOnboardingModel(values.modelId, {
+      signal: controller.signal,
+    })
     if (
       bootstrapControllerRef.current !== controller ||
       controller.signal.aborted
@@ -1043,7 +1041,7 @@ export function AppShell({
     if (!model || (model.requires_api_key && !configured)) {
       setError(
         model
-          ? "The selected model needs to be configured in Settings before starting a session."
+          ? "The selected model is unavailable. Choose a ready-to-use model in Settings and try again."
           : "Open Settings before starting a session."
       )
       return
@@ -1234,6 +1232,7 @@ export function AppShell({
         }
         onAdvanceIntro={advanceOnboardingIntro}
         onSaveProfile={saveOnboardingProfile}
+        onRetryModels={restoreWorkspace}
         onComplete={completeOnboarding}
       />
     )

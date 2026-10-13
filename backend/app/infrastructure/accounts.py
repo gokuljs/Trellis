@@ -25,10 +25,12 @@ from app.application.ports import (
     ProviderAdapter,
     RunLeasePort,
     RunRepository,
+    SecretStorePort,
     StreamingProviderAdapter,
 )
 from app.application.profile import ProfileService
 from app.application.runs import RunService
+from app.application.secret_redaction import SecretRedactor
 from app.application.sessions import SessionService
 from app.application.settings import SettingsService
 from app.application.tools import ToolRegistry
@@ -39,7 +41,7 @@ from app.infrastructure.command_tools import LocalCommandToolExecutor
 from app.infrastructure.local_patch import LocalPatchToolExecutor
 from app.infrastructure.local_tools import LocalReadToolExecutor, read_workspace_guidance
 from app.infrastructure.runtime_events import RuntimeEventHub
-from app.infrastructure.secrets import SecretStore
+from app.infrastructure.server_credentials import ServerCredentialStore
 from app.infrastructure.supabase_repository import SupabaseRepository, VerifiedTokenSource
 from app.infrastructure.workspace_bindings import LocalWorkspaceBindings
 
@@ -58,7 +60,7 @@ RepositoryFactory = Callable[
 @dataclass(frozen=True, slots=True)
 class AccountContext:
     database: AccountRepository
-    secret_store: SecretStore
+    secret_store: SecretStorePort
     profile_service: ProfileService
     session_service: SessionService
     settings_service: SettingsService
@@ -92,8 +94,6 @@ def _prepare_account_directory(data_dir: Path, user_id: UUID) -> Path:
                 raise RuntimeError("An account data path must be a private directory")
             if metadata.st_uid != os.geteuid():
                 raise RuntimeError("An account data path must be owned by this process")
-    if (account_dir / ".env").is_symlink():
-        raise RuntimeError("An account data file must not be a symlink")
     return account_dir
 
 
@@ -146,6 +146,14 @@ class AccountRegistry:
     ) -> None:
         self._settings = settings
         self._capabilities = RuntimeCapabilities(settings.enabled_capabilities)
+        self._credentials = ServerCredentialStore(settings)
+        self._redactor = SecretRedactor(
+            *(
+                key.get_secret_value().strip()
+                for key in (settings.openai_api_key, settings.anthropic_api_key)
+                if key is not None
+            )
+        )
         self._providers = providers
         self._runtime_providers = runtime_providers
         self._tool_registry_factory = tool_registry_factory
@@ -214,7 +222,7 @@ class AccountRegistry:
                         self._settings, user_id, token_source, self._cloud_client
                     )
                     await database.ensure_account()
-                    secret_store = SecretStore(account_dir / ".env")
+                    secret_store = self._credentials
                     event_hub = RuntimeEventHub()
                     workspace_bindings = (
                         LocalWorkspaceBindings() if self._capabilities.workspace_enabled else None
@@ -233,6 +241,7 @@ class AccountRegistry:
                             if self._capabilities.allows("local_command")
                             else None,
                             capabilities=self._capabilities,
+                            redactor=self._redactor,
                         )
                     )
                     run_service = RunService(
@@ -245,6 +254,7 @@ class AccountRegistry:
                         event_hub,
                         tool_registry=tools,
                         capabilities=self._capabilities,
+                        redactor=self._redactor,
                         workspace_guidance_reader=read_workspace_guidance
                         if self._capabilities.allows("local_read")
                         else None,
@@ -266,7 +276,9 @@ class AccountRegistry:
                                 database, secret_store, capabilities=self._capabilities
                             ),
                             onboarding_service=OnboardingService(database, database, secret_store),
-                            chat_service=ChatService(database, secret_store, self._providers),
+                            chat_service=ChatService(
+                                database, secret_store, self._providers, redactor=self._redactor
+                            ),
                             run_service=run_service,
                             event_hub=event_hub,
                         )

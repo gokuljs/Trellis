@@ -1,8 +1,11 @@
 import asyncio
-import stat
 from pathlib import Path
 from uuid import UUID
 
+import pytest
+from pydantic import SecretStr
+
+from app.core.config import Settings
 from app.domain.runtime import RunStatus
 from app.infrastructure.secrets import SecretStore
 from tests.memory_repository import MemoryRepository
@@ -89,56 +92,83 @@ def test_profile_details_can_be_updated_and_restored(tmp_path: Path) -> None:
     assert restored.json()["email"] == TEST_EMAIL
 
 
-def test_api_keys_are_write_only_and_kept_outside_cloud_data(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path)
+def test_server_credentials_expose_status_without_hints_or_account_files(tmp_path: Path) -> None:
     secret = "sk-test-super-secret-7890"
+    settings = Settings(environment="test", data_dir=tmp_path, openai_api_key=SecretStr(secret))
 
     with TestClient(create_app(settings)) as client:
-        saved = client.put(
-            "/api/settings/providers/openai/api-key",
-            json={"api_key": secret},
-        )
         visible_settings = client.get("/api/settings")
 
-    assert saved.status_code == 200
     assert visible_settings.status_code == 200
     openai = next(
         provider for provider in visible_settings.json()["providers"] if provider["id"] == "openai"
     )
     assert openai["configured"] is True
-    assert openai["key_hint"] == "••••7890"
-    assert secret not in saved.text
+    assert openai["key_hint"] is None
+    assert all(model["key_hint"] is None for model in visible_settings.json()["models"])
     assert secret not in visible_settings.text
+    assert "7890" not in visible_settings.text
     assert not account_repository_key(settings).exists()
-    assert secret in account_secrets_path(settings).read_text()
-    assert stat.S_IMODE(settings.data_dir.stat().st_mode) == 0o700
-    assert stat.S_IMODE(account_secrets_path(settings).stat().st_mode) == 0o600
+    assert not account_secrets_path(settings).exists()
 
 
-def test_rejected_api_key_is_not_disclosed_in_validation_response(tmp_path: Path) -> None:
-    rejected_secret = "sk-" + ("private" * 2_000)
+@pytest.mark.parametrize("method", ["PUT", "DELETE"])
+@pytest.mark.parametrize("body", ['{"api_key":"opaque-private-value"}', '{"api_key":'])
+def test_legacy_key_mutation_is_denied_without_parsing_body(
+    tmp_path: Path, method: str, body: str
+) -> None:
+    settings = Settings(environment="test", data_dir=tmp_path, openai_api_key=SecretStr("operator"))
 
-    with TestClient(create_app(make_settings(tmp_path))) as client:
-        response = client.put(
+    with TestClient(create_app(settings)) as client:
+        response = client.request(
+            method,
             "/api/settings/providers/openai/api-key",
-            json={"api_key": rejected_secret},
+            content=body,
+            headers={"Content-Type": "application/json"},
+        )
+        client.headers.pop("Authorization")
+        unauthenticated = client.request(
+            method,
+            "/api/settings/providers/openai/api-key",
+            content=body,
+            headers={"Content-Type": "application/json"},
         )
 
-    assert response.status_code == 422
-    assert rejected_secret not in response.text
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "provider_credentials_managed"
+    assert "opaque-private-value" not in response.text
+    assert unauthenticated.status_code == 401
+    assert not account_secrets_path(settings).exists()
 
 
-def test_provider_selection_and_key_removal_are_persistent(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path)
+def test_public_schema_rejects_onboarding_keys_and_documents_safe_credential_errors(
+    tmp_path: Path,
+) -> None:
+    schema = create_app(make_settings(tmp_path)).openapi()
+    model_update = schema["components"]["schemas"]["OnboardingModelUpdate"]
+    assert set(model_update["properties"]) == {"model_id"}
+    assert model_update["additionalProperties"] is False
+    for method in ("put", "delete"):
+        operation = schema["paths"]["/api/settings/providers/{provider}/api-key"][method]
+        assert operation["deprecated"] is True
+        assert "requestBody" not in operation
+        assert "403" in operation["responses"]
+        assert "200" not in operation["responses"]
+    validation_response = schema["paths"]["/api/onboarding/steps/model"]["put"]["responses"]["422"]
+    assert validation_response["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ApiErrorResponse"
+    )
+
+
+def test_provider_selection_cannot_remove_operator_credentials(tmp_path: Path) -> None:
+    settings = Settings(
+        environment="test", data_dir=tmp_path, anthropic_api_key=SecretStr("operator-anthropic")
+    )
 
     with TestClient(create_app(settings)) as client:
         selected = client.put(
             "/api/settings/provider",
             json={"provider": "anthropic"},
-        )
-        client.put(
-            "/api/settings/providers/anthropic/api-key",
-            json={"api_key": "sk-ant-temporary"},
         )
         removed = client.delete("/api/settings/providers/anthropic/api-key")
 
@@ -149,9 +179,9 @@ def test_provider_selection_and_key_removal_are_persistent(tmp_path: Path) -> No
         provider for provider in restored.json()["providers"] if provider["id"] == "anthropic"
     )
     assert selected.status_code == 200
-    assert removed.status_code == 200
+    assert removed.status_code == 403
     assert restored.json()["selected_provider"] == "anthropic"
-    assert anthropic["configured"] is False
+    assert anthropic["configured"] is True
     assert anthropic["key_hint"] is None
 
 
@@ -201,7 +231,7 @@ def test_default_run_budget_can_be_changed_and_survives_restart(tmp_path: Path) 
 
 
 def test_onboarding_progress_and_answers_are_saved_after_each_step(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path)
+    settings = make_settings(tmp_path, openai_api_key="sk-onboarding-secret")
 
     with TestClient(create_app(settings)) as client:
         initial = client.get("/api/onboarding")
@@ -222,7 +252,7 @@ def test_onboarding_progress_and_answers_are_saved_after_each_step(tmp_path: Pat
         )
         completed = restarted_client.put(
             "/api/onboarding/steps/model",
-            json={"model_id": model["id"], "api_key": "sk-onboarding-secret"},
+            json={"model_id": model["id"]},
         )
         final_state = restarted_client.get("/api/onboarding")
 
@@ -248,7 +278,7 @@ def test_onboarding_model_step_requires_credentials_without_advancing(tmp_path: 
         model = client.get("/api/settings").json()["models"][0]
         response = client.put(
             "/api/onboarding/steps/model",
-            json={"model_id": model["id"], "api_key": None},
+            json={"model_id": model["id"]},
         )
         state = client.get("/api/onboarding")
 

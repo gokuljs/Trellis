@@ -1,4 +1,4 @@
-import { Check, Eye, EyeOff, KeyRound, Sparkles, Trash2 } from "lucide-react"
+import { Check, Sparkles } from "lucide-react"
 import { useState } from "react"
 
 import { ApiError, api } from "@/lib/api"
@@ -33,8 +33,6 @@ export function SettingsPage({
   onSettingsChange,
 }: SettingsPageProps) {
   const [displayName, setDisplayName] = useState(profile.display_name ?? "")
-  const [apiKey, setApiKey] = useState("")
-  const [showApiKey, setShowApiKey] = useState(false)
   const [saving, setSaving] = useState<string | null>(null)
   const models: ModelStatus[] =
     settings.models ??
@@ -54,25 +52,14 @@ export function SettingsPage({
   const selectedModelId =
     settings.selected_model_id ?? settings.selected_provider
   const selectedModel = models.find((model) => model.id === selectedModelId)
-  const selectedProviderStatus = settings.providers.find(
-    (provider) => provider.id === selectedModel?.provider_id
-  )
-  const credentialConfigured =
-    selectedProviderStatus?.configured ?? selectedModel?.configured ?? false
-  const credentialHint =
-    selectedProviderStatus?.key_hint ?? selectedModel?.key_hint
+  const selectedModelReady =
+    selectedModel &&
+    (selectedModel.configured || !selectedModel.requires_api_key)
   const setupStatus = onboarding
     ? onboarding.completed
       ? "Complete"
       : "In progress"
     : "Setup status unavailable"
-  const localKeyStatus = !selectedModel
-    ? "Select an available model to check its key"
-    : !selectedModel.requires_api_key
-      ? "Not required"
-      : credentialConfigured
-        ? `Configured on this computer${credentialHint ? ` · ${credentialHint}` : ""}`
-        : "Not configured on this computer"
 
   const runUpdate = async (
     label: string,
@@ -100,14 +87,15 @@ export function SettingsPage({
   const selectModel = (modelId: string) => {
     const nextModel = models.find((item) => item.id === modelId)
     if (!nextModel) return
-    setApiKey("")
-    setShowApiKey(false)
     void runUpdate(
       "model",
       {
         kind: "info",
         title: `${nextModel.name} selected`,
-        description: `${nextModel.provider_name} will power new messages.`,
+        description:
+          nextModel.configured || !nextModel.requires_api_key
+            ? `${nextModel.provider_name} will power new messages.`
+            : "Your selection is saved. This model is currently unavailable.",
       },
       async () => {
         onSettingsChange(await api.selectModel(modelId))
@@ -120,7 +108,7 @@ export function SettingsPage({
       <h1 className="sr-only">Settings</h1>
       <header className="settings-header">
         <div className="utility-kicker">SETTINGS</div>
-        <p>Manage your account, model, and local provider keys.</p>
+        <p>Manage your account, model, and run preferences.</p>
       </header>
 
       <div className="settings-sections">
@@ -162,8 +150,8 @@ export function SettingsPage({
                   </dd>
                 </div>
                 <div>
-                  <dt>Local API key</dt>
-                  <dd>{localKeyStatus}</dd>
+                  <dt>Model availability</dt>
+                  <dd>{selectedModelReady ? "Ready to use" : "Unavailable"}</dd>
                 </div>
               </dl>
             </section>
@@ -245,9 +233,13 @@ export function SettingsPage({
             role="radiogroup"
             aria-label="Available models"
           >
-            {!selectedModel ? (
+            {!selectedModelReady ? (
               <p className="settings-field-help">
-                Choose an available model to use for new turns.
+                {selectedModel
+                  ? "This model is unavailable right now. Choose a model marked Ready to use."
+                  : models.length
+                    ? "Choose an available model to use for new turns."
+                    : "No models are available right now. Try again later."}
               </p>
             ) : null}
             {models.map((item) => {
@@ -268,11 +260,9 @@ export function SettingsPage({
                   <span className="provider-details">
                     <span className="provider-name">{item.provider_name}</span>
                     <span className="provider-description">
-                      {item.configured
-                        ? `Key configured ${item.key_hint ?? ""}`
-                        : item.requires_api_key
-                          ? "API key required"
-                          : "Ready to use"}
+                      {item.configured || !item.requires_api_key
+                        ? "Ready to use"
+                        : "Unavailable"}
                     </span>
                   </span>
                   <span className="provider-model">{item.name}</span>
@@ -324,118 +314,6 @@ export function SettingsPage({
             </span>
           </label>
         </section>
-
-        {selectedModel?.requires_api_key ? (
-          <section
-            className="settings-section"
-            aria-labelledby="api-key-heading"
-          >
-            <div className="settings-section-copy">
-              <div className="settings-section-label">API KEY</div>
-              <h2 id="api-key-heading">
-                Connect {selectedModel.provider_name}
-              </h2>
-              <p>
-                Keys are stored separately from chat history in the private
-                local secrets file.
-              </p>
-            </div>
-
-            <div className="settings-key-panel">
-              <label className="settings-field">
-                <span className="settings-field-label">
-                  {selectedModel.provider_name} API key
-                </span>
-                <span className="settings-input-wrap">
-                  <KeyRound size={15} strokeWidth={1.7} aria-hidden="true" />
-                  <input
-                    type={showApiKey ? "text" : "password"}
-                    value={apiKey}
-                    onChange={(event) => setApiKey(event.target.value)}
-                    placeholder="Enter API key"
-                    autoComplete="new-password"
-                    name={`${selectedModel.provider_id}-api-key`}
-                    spellCheck={false}
-                    aria-label={`${selectedModel.provider_name} API key`}
-                  />
-                  <button
-                    className="settings-input-action"
-                    type="button"
-                    aria-label={showApiKey ? "Hide API key" : "Show API key"}
-                    onClick={() => setShowApiKey((visible) => !visible)}
-                  >
-                    {showApiKey ? (
-                      <EyeOff size={15} aria-hidden="true" />
-                    ) : (
-                      <Eye size={15} aria-hidden="true" />
-                    )}
-                  </button>
-                </span>
-                <span className="settings-field-help">
-                  {credentialConfigured
-                    ? `Configured · ${credentialHint ?? "saved"}`
-                    : "Not configured. The key is write-only and will not be shown again."}
-                </span>
-              </label>
-              <div className="settings-actions">
-                <button
-                  className="settings-save"
-                  type="button"
-                  disabled={!apiKey.trim() || saving !== null}
-                  onClick={() => {
-                    void runUpdate(
-                      "key",
-                      {
-                        title: `${selectedModel.provider_name} key saved`,
-                        description:
-                          "Stored in your private local secrets file.",
-                      },
-                      async () => {
-                        onSettingsChange(
-                          await api.saveApiKey(
-                            selectedModel.provider_id,
-                            apiKey.trim()
-                          )
-                        )
-                        setApiKey("")
-                        setShowApiKey(false)
-                      }
-                    )
-                  }}
-                >
-                  {saving === "key"
-                    ? "Saving…"
-                    : `Save ${selectedModel.provider_name} key`}
-                </button>
-                {credentialConfigured ? (
-                  <button
-                    className="settings-remove"
-                    type="button"
-                    disabled={saving !== null}
-                    onClick={() => {
-                      void runUpdate(
-                        "remove",
-                        {
-                          kind: "info",
-                          title: `${selectedModel.provider_name} key removed`,
-                          description: "New messages will require another key.",
-                        },
-                        async () => {
-                          onSettingsChange(
-                            await api.removeApiKey(selectedModel.provider_id)
-                          )
-                          setApiKey("")
-                        }
-                      )
-                    }}
-                  >
-                    <Trash2 size={13} aria-hidden="true" /> Remove key
-                  </button>
-                ) : null}
-              </div>
-            </div>
-          </section>
-        ) : null}
       </div>
     </div>
   )
