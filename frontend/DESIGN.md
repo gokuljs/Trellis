@@ -11,12 +11,12 @@ colors:
   success-light: "#15803d"
   warning-light: "#925f00"
   danger-light: "#b42318"
-  canvas-dark: "#0a0a0a"
-  ink-dark: "#ededed"
-  panel-dark: "#171717"
-  line-dark: "#2e2e2e"
-  focus-dark: "#0072f5"
-  info-dark: "#52a8ff"
+  canvas-dark: "#000000"
+  ink-dark: "#ffffff"
+  panel-dark: "#111111"
+  line-dark: "#262626"
+  focus-dark: "#eefd50"
+  info-dark: "#d4d4d4"
   success-dark: "#4ade80"
   warning-dark: "#ffb224"
   danger-dark: "#ff6369"
@@ -53,8 +53,10 @@ refining individual screens.
 
 ## Colors
 
-The palette is neutral in both themes; blue marks focus and information, while
-green, amber, and red distinguish status.
+The palette is neutral in both themes. Light mode uses blue for focus and
+information. Dark mode follows the user's black-and-white reference, with a
+sparse yellow-green accent for focus, selected actions, and links. Green, amber,
+and red retain their status meanings.
 
 ### Light theme
 
@@ -68,13 +70,18 @@ green, amber, and red distinguish status.
 
 ### Dark theme
 
-- **Canvas** (`#0a0a0a`): Main workspace and rail.
-- **Ink** (`#ededed`): Primary text and high-emphasis actions.
-- **Panel** (`#171717`): Cards, messages, and raised tonal surfaces.
-- **Line** (`#2e2e2e`): Dividers and borders.
-- **Focus** (`#0072f5`): Keyboard focus treatment.
-- **Status** (`#52a8ff`, `#4ade80`, `#ffb224`, `#ff6369`): Information, success,
+- **Canvas** (`#000000`): Main workspace and rail.
+- **Ink** (`#ffffff`): Primary text, branding, and neutral actions.
+- **Panel** (`#111111`): Cards, inputs, and raised tonal surfaces. Messages and
+  selections use `#1c1c1c`.
+- **Line** (`#262626`): Dividers and borders.
+- **Highlight** (`#eefd50`): Sampled from the reference's yellow-green endpoint;
+  reserved for keyboard focus, selected actions, and links.
+- **Status** (`#d4d4d4`, `#4ade80`, `#ffb224`, `#ff6369`): Information, success,
   warning, and destructive states.
+
+Dark mode and the always-dark onboarding screens share the `--dark-*` palette
+in the shared stylesheet. Keep those colors in one place.
 
 ## Typography
 
@@ -121,14 +128,16 @@ only where the existing component calls for them.
 
 ### Buttons and icon controls
 
-- **Primary:** High-contrast neutral surface with a clear text or icon label.
+- **Primary:** High-contrast neutral surface with a clear text or icon label;
+  selected actions use the yellow-green highlight in dark mode.
 - **Quiet controls:** Transparent at rest; use a subtle tonal surface on hover.
-- **Focus:** Keep the 2px blue outline and 3px offset visible for keyboard use.
+- **Focus:** Keep the 2px theme-colored outline and 3px offset visible for
+  keyboard use: blue in light mode, yellow-green in dark mode.
 
 ### Cards and fields
 
 - Use the theme's canvas or panel surface with a 1px line.
-- Keep field focus distinct with the existing blue focus token.
+- Keep field focus distinct with the theme's focus token.
 - Use padding proportionate to content density; avoid empty space that weakens
   grouping.
 

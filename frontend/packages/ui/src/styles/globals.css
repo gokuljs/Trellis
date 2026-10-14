@@ -57,6 +57,19 @@
 
 :root {
   color-scheme: light;
+  /* Shared by dark mode and the always-dark onboarding screens. */
+  --dark-canvas: #000000;
+  --dark-ink: #ffffff;
+  --dark-panel: #111111;
+  --dark-hover: #171717;
+  --dark-selected: #1c1c1c;
+  --dark-pressed: #262626;
+  --dark-line: #262626;
+  --dark-muted: #a1a1a1;
+  --dark-faint: #8f8f8f;
+  --dark-highlight: #eefd50;
+  --dark-highlight-hover: #e0ee47;
+  --dark-highlight-pressed: #cbd83d;
   /* Shared 4px-based rhythm for controls, groups, sections, and page gutters. */
   --space-1: 0.25rem;
   --space-2: 0.5rem;
@@ -145,68 +158,68 @@
 
 .dark {
   color-scheme: dark;
-  --background: #0a0a0a;
-  --foreground: #ededed;
-  --card: #171717;
-  --card-foreground: #ededed;
-  --popover: #171717;
-  --popover-foreground: #ededed;
-  --primary: #ededed;
-  --primary-foreground: #0a0a0a;
-  --secondary: #1f1f1f;
-  --secondary-foreground: #ededed;
-  --muted: #1f1f1f;
-  --muted-foreground: #a1a1a1;
-  --accent: #1f1f1f;
-  --accent-foreground: #ededed;
+  --background: var(--dark-canvas);
+  --foreground: var(--dark-ink);
+  --card: var(--dark-panel);
+  --card-foreground: var(--dark-ink);
+  --popover: var(--dark-panel);
+  --popover-foreground: var(--dark-ink);
+  --primary: var(--dark-ink);
+  --primary-foreground: var(--dark-canvas);
+  --secondary: var(--dark-selected);
+  --secondary-foreground: var(--dark-ink);
+  --muted: var(--dark-selected);
+  --muted-foreground: var(--dark-muted);
+  --accent: var(--dark-selected);
+  --accent-foreground: var(--dark-ink);
   --destructive: #ff6369;
   --success: #4ade80;
-  --info: #52a8ff;
+  --info: #d4d4d4;
   --warning: #ffb224;
-  --border: #2e2e2e;
-  --input: #2e2e2e;
-  --ring: #0072f5;
-  --chart-1: #52a8ff;
-  --chart-2: #4ade80;
+  --border: var(--dark-line);
+  --input: var(--dark-line);
+  --ring: var(--dark-highlight);
+  --chart-1: var(--dark-ink);
+  --chart-2: var(--dark-highlight);
   --chart-3: #ffb224;
   --chart-4: #ff6369;
-  --chart-5: #8f8f8f;
-  --sidebar: #0a0a0a;
-  --sidebar-foreground: #ededed;
-  --sidebar-primary: #ededed;
-  --sidebar-primary-foreground: #0a0a0a;
-  --sidebar-accent: #1f1f1f;
-  --sidebar-accent-foreground: #ededed;
-  --sidebar-border: #2e2e2e;
-  --sidebar-ring: #0072f5;
+  --chart-5: var(--dark-faint);
+  --sidebar: var(--dark-canvas);
+  --sidebar-foreground: var(--dark-ink);
+  --sidebar-primary: var(--dark-ink);
+  --sidebar-primary-foreground: var(--dark-canvas);
+  --sidebar-accent: var(--dark-selected);
+  --sidebar-accent-foreground: var(--dark-ink);
+  --sidebar-border: var(--dark-line);
+  --sidebar-ring: var(--dark-highlight);
 
-  --shell-bg: #0a0a0a;
-  --shell-rail: #0a0a0a;
-  --shell-line: #2e2e2e;
-  --shell-text: #a1a1a1;
-  --shell-text-strong: #ededed;
-  --shell-text-bright: #ededed;
-  --shell-text-muted: #a1a1a1;
-  --shell-text-faint: #8f8f8f;
-  --shell-text-quiet: #8f8f8f;
-  --shell-accent: #ededed;
-  --shell-accent-strong: #ededed;
-  --shell-brand: #ededed;
-  --shell-hover: #171717;
-  --shell-selected: #1f1f1f;
-  --shell-pressed: #292929;
-  --shell-focus: #0072f5;
-  --shell-accent-hover: #d6d6d6;
-  --shell-accent-pressed: #c6c6c6;
-  --shell-disabled-surface: #171717;
-  --shell-disabled-text: #8f8f8f;
+  --shell-bg: var(--dark-canvas);
+  --shell-rail: var(--dark-canvas);
+  --shell-line: var(--dark-line);
+  --shell-text: var(--dark-muted);
+  --shell-text-strong: var(--dark-ink);
+  --shell-text-bright: var(--dark-ink);
+  --shell-text-muted: var(--dark-muted);
+  --shell-text-faint: var(--dark-faint);
+  --shell-text-quiet: var(--dark-faint);
+  --shell-accent: var(--dark-highlight);
+  --shell-accent-strong: var(--dark-highlight);
+  --shell-brand: var(--dark-ink);
+  --shell-hover: var(--dark-hover);
+  --shell-selected: var(--dark-selected);
+  --shell-pressed: var(--dark-pressed);
+  --shell-focus: var(--dark-highlight);
+  --shell-accent-hover: var(--dark-highlight-hover);
+  --shell-accent-pressed: var(--dark-highlight-pressed);
+  --shell-disabled-surface: var(--dark-panel);
+  --shell-disabled-text: var(--dark-faint);
   --shell-danger-hover: #2a1314;
-  --shell-user-message: #1f1f1f;
-  --shell-user-message-text: #ededed;
-  --shell-card: #171717;
-  --shell-input: #111111;
-  --shell-send: #2e2e2e;
-  --shell-send-ready: #ededed;
+  --shell-user-message: var(--dark-selected);
+  --shell-user-message-text: var(--dark-ink);
+  --shell-card: var(--dark-panel);
+  --shell-input: var(--dark-panel);
+  --shell-send: var(--dark-line);
+  --shell-send-ready: var(--dark-highlight);
   --shell-blue: var(--info);
   --shell-agent: var(--shell-accent-strong);
 }
@@ -218,6 +231,15 @@
   body {
     @apply bg-background text-foreground;
     min-width: 320px;
+  }
+  .dark ::selection,
+  .onboarding-shell ::selection {
+    color: var(--dark-canvas);
+    background: var(--dark-highlight);
+  }
+  .dark :is(input, textarea),
+  .onboarding-shell :is(input, textarea) {
+    caret-color: var(--dark-highlight);
   }
   button:not(:disabled),
   [role="button"]:not(:disabled) {
@@ -1950,21 +1972,21 @@ html.theme-ripple-fallback::before {
 
 @layer components {
   .onboarding-shell {
-    --onboarding-bg: #0a0a0a;
-    --onboarding-surface: #0a0a0a;
-    --onboarding-panel: #171717;
-    --onboarding-hover: #1f1f1f;
-    --onboarding-pressed: #292929;
-    --onboarding-focus: #0072f5;
-    --onboarding-brand: #ededed;
-    --onboarding-accent-hover: #d6d6d6;
-    --onboarding-accent-pressed: #c6c6c6;
-    --onboarding-disabled-surface: #171717;
-    --onboarding-disabled-text: #8f8f8f;
-    --onboarding-line: #2e2e2e;
-    --onboarding-text: #ededed;
-    --onboarding-muted: #a1a1a1;
-    --onboarding-faint: #8f8f8f;
+    --onboarding-bg: var(--dark-canvas);
+    --onboarding-surface: var(--dark-canvas);
+    --onboarding-panel: var(--dark-panel);
+    --onboarding-hover: var(--dark-hover);
+    --onboarding-pressed: var(--dark-pressed);
+    --onboarding-focus: var(--dark-highlight);
+    --onboarding-brand: var(--dark-ink);
+    --onboarding-accent-hover: #e5e5e5;
+    --onboarding-accent-pressed: #d4d4d4;
+    --onboarding-disabled-surface: var(--dark-panel);
+    --onboarding-disabled-text: var(--dark-faint);
+    --onboarding-line: var(--dark-line);
+    --onboarding-text: var(--dark-ink);
+    --onboarding-muted: var(--dark-muted);
+    --onboarding-faint: var(--dark-faint);
 
     position: relative;
     display: flex;
@@ -1995,7 +2017,7 @@ html.theme-ripple-fallback::before {
     min-width: 0;
     min-height: 100svh;
     overflow: hidden;
-    background: #0a0a0a;
+    background: var(--onboarding-bg);
   }
 
   .onboarding-image {
