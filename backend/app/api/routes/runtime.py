@@ -424,17 +424,31 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             sequence = event.sequence
             return event.event_type in _TERMINAL_EVENTS
 
+        async def replay_persisted(through_sequence: int | None = None) -> bool:
+            while True:
+                previous_sequence = sequence
+                batch = await service.list_run_events(run_id, sequence)
+                for event in batch:
+                    if await emit_event(event):
+                        return True
+                if len(batch) < 500 and (through_sequence is None or sequence >= through_sequence):
+                    return False
+                if sequence == previous_sequence:
+                    await send(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "run.replay_required",
+                            "params": {"runId": run_id, "afterSequence": sequence},
+                        }
+                    )
+                    return True
+
         try:
             run = await service.get_run(run_id)
             if run is None:
                 return
-            while True:
-                batch = await service.list_run_events(run_id, sequence)
-                for event in batch:
-                    if await emit_event(event):
-                        return
-                if len(batch) < 500:
-                    break
+            if await replay_persisted(run.last_event_sequence):
+                return
 
             if is_terminal_run_status(run.status):
                 return
@@ -444,12 +458,16 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                 except TimeoutError:
                     # Durable events are authoritative. Polling closes the rare gap where
                     # persistence succeeds but in-process fanout is interrupted.
-                    batch = await service.list_run_events(run_id, sequence)
-                    for persisted_event in batch:
-                        if await emit_event(persisted_event):
-                            return
+                    if await replay_persisted():
+                        return
                     current_run = await service.get_run(run_id)
-                    if current_run is None or is_terminal_run_status(current_run.status):
+                    if current_run is None:
+                        return
+                    if is_terminal_run_status(current_run.status):
+                        # Completion may commit after the last page was read. Drain
+                        # through its durable cursor before ending the subscription.
+                        if sequence < current_run.last_event_sequence:
+                            await replay_persisted(current_run.last_event_sequence)
                         return
                     continue
                 if event is None:
