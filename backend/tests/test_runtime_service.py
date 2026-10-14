@@ -329,9 +329,11 @@ def test_run_service_streams_and_persists_a_provider_neutral_run(tmp_path: Path)
     assert [event.event_type for event in events] == [
         RunEventType.QUEUED,
         RunEventType.STARTED,
+        RunEventType.PHASE,
         RunEventType.MODEL_USAGE,
         RunEventType.ASSISTANT_DELTA,
         RunEventType.MODEL_COMPLETED,
+        RunEventType.PHASE,
         RunEventType.ASSISTANT_COMPLETED,
         RunEventType.COMPLETED,
     ]
@@ -346,8 +348,9 @@ def test_run_service_streams_and_persists_a_provider_neutral_run(tmp_path: Path)
     assert (model_calls[0].input_tokens, model_calls[0].output_tokens) == (5, 1)
     assert model_calls[0].cached_tokens == 2
     assert model_calls[0].estimated_cost == pytest.approx(0.000046)
-    assert events[2].data["estimated_cost_usd"] == pytest.approx(0.000046)
-    assert events[2].data["total_tokens"] == 6
+    usage_event = next(event for event in events if event.event_type is RunEventType.MODEL_USAGE)
+    assert usage_event.data["estimated_cost_usd"] == pytest.approx(0.000046)
+    assert usage_event.data["total_tokens"] == 6
     assert model_calls[0].provider_response_id == "response-1"
     assert "agent-foundation-v2" in model_calls[0].request_snapshot["system_instructions"]
     assert "No workspace is attached" in model_calls[0].request_snapshot["system_instructions"]
@@ -472,6 +475,12 @@ def test_run_service_persists_read_tool_exchange_before_a_second_model_call(
     assert [
         event.data["text"] for event in events if event.event_type is RunEventType.ASSISTANT_DELTA
     ] == ["Checking the file.", "The README says hello."]
+    assert [event.data["phase"] for event in events if event.event_type.value == "run.phase"] == [
+        "answering",
+        "tool_use",
+        "answering",
+        "finishing",
+    ]
 
 
 @pytest.mark.parametrize(

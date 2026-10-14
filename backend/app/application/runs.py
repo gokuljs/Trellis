@@ -717,6 +717,9 @@ class RunService:
                     run.id, step_index, model, self._request_snapshot(request)
                 )
                 call = await self._runs.update_model_call(call.id, ModelCallStatus.STREAMING)
+                await self._append_and_publish(
+                    run.id, RunEventType.PHASE, {"phase": "answering", "model_call_id": call.id}
+                )
                 step = await self._stream_model_step(
                     run,
                     call,
@@ -784,6 +787,9 @@ class RunService:
                         raise ProviderError(
                             "provider_invalid_response", "The provider returned an empty response."
                         )
+                    await self._append_and_publish(
+                        run.id, RunEventType.PHASE, {"phase": "finishing", "model_call_id": call.id}
+                    )
                     _message, completion_events = await self._runs.complete_run(
                         run.id, final_content
                     )
@@ -908,6 +914,9 @@ class RunService:
             if stored_call.status is not ToolCallStatus.PENDING:
                 continue
             await self._renew_before_local_tool(run.id)
+            await self._append_and_publish(
+                run.id, RunEventType.PHASE, {"phase": "tool_use", "tool_call_id": stored_call.id}
+            )
             self._check_budget(
                 run,
                 kind="tool",

@@ -10,6 +10,26 @@ export type ActivityStatus = {
   terminal: boolean
 }
 
+type StatusCopy = Pick<ActivityStatus, "label" | "orb">
+
+const phaseStates = new Map<string, StatusCopy>([
+  ["answering", { label: "Answering", orb: "composing" }],
+  ["tool_use", { label: "Using tools", orb: "weaving" }],
+  ["waiting", { label: "Waiting", orb: "listening" }],
+  ["finishing", { label: "Finishing", orb: "shaping" }],
+  ["compacting", { label: "Compacting conversation", orb: "shaping" }],
+])
+
+const summaryEvents: Record<string, string> = {
+  queued: "run.queued",
+  waiting_for_approval: "tool.approval_requested",
+  cancelling: "run.cancellation_requested",
+  completed: "run.completed",
+  failed: "run.failed",
+  cancelled: "run.cancelled",
+  interrupted: "run.interrupted",
+}
+
 const terminalEvents = new Set([
   "run.completed",
   "run.failed",
@@ -27,12 +47,14 @@ function elapsedLabel(milliseconds: number): string {
   return `${hours}h ${String(minutes % 60).padStart(2, "0")}m`
 }
 
-function currentState(
-  event: RuntimeRunEvent
-): Pick<ActivityStatus, "label" | "orb"> {
+function currentState(event: RuntimeRunEvent): StatusCopy | null {
   switch (event.eventType) {
+    case "run.phase":
+      return typeof event.data.phase === "string"
+        ? (phaseStates.get(event.data.phase) ?? null)
+        : null
     case "run.queued":
-      return { label: "Queued", orb: "connecting" }
+      return { label: "Waiting", orb: "connecting" }
     case "run.started":
     case "run.resumed":
       return { label: "Thinking", orb: "working" }
@@ -53,7 +75,7 @@ function currentState(
     case "tool.result":
       return { label: "Using tools", orb: "weaving" }
     case "tool.approval_requested":
-      return { label: "Needs approval", orb: "listening" }
+      return { label: "Waiting for approval", orb: "listening" }
     case "tool.approval_decided":
       return { label: "Thinking", orb: "working" }
     case "run.cancellation_requested":
@@ -67,7 +89,7 @@ function currentState(
     case "run.interrupted":
       return { label: "Interrupted", orb: "shaping" }
     default:
-      return { label: "Thinking", orb: "working" }
+      return null
   }
 }
 
@@ -80,28 +102,19 @@ export function describeActivity(
 ): ActivityStatus {
   if (events.length === 0 && !latestEvent) {
     if (summary) {
-      const eventType =
-        {
-          queued: "run.queued",
-          waiting_for_approval: "tool.approval_requested",
-          cancelling: "run.cancellation_requested",
-          completed: "run.completed",
-          failed: "run.failed",
-          cancelled: "run.cancelled",
-          interrupted: "run.interrupted",
-        }[summary.status] ?? "run.started"
+      const eventType = summaryEvents[summary.status] ?? "run.started"
       const terminal = terminalEvents.has(eventType)
       const start = Date.parse(summary.created_at)
       const finish =
         terminal && summary.finished_at ? Date.parse(summary.finished_at) : now
       return {
-        ...currentState({
+        ...(currentState({
           runId: summary.run_id,
           sequence: summary.last_sequence,
           eventType,
           eventVersion: 1,
           data: {},
-        }),
+        }) ?? { label: "Thinking", orb: "working" }),
         duration:
           Number.isFinite(start) && Number.isFinite(finish)
             ? elapsedLabel(finish - start)
@@ -123,25 +136,88 @@ export function describeActivity(
     (left, right) => left.sequence - right.sequence
   )
   const latest = ordered.at(-1)!
-  const terminal = terminalEvents.has(latest.eventType)
-  const queued =
-    ordered.find((event) => event.eventType === "run.queued") ?? ordered[0]
-  const start = queued.createdAt
-    ? Date.parse(queued.createdAt)
-    : summary
-      ? Date.parse(summary.created_at)
-      : Number.NaN
+  const matchingSummary = summary?.run_id === latest.runId ? summary : undefined
+  const terminalEvent = ordered.findLast((event) =>
+    terminalEvents.has(event.eventType)
+  )
+  const summaryEvent = matchingSummary
+    ? summaryEvents[matchingSummary.status]
+    : undefined
+  const summaryIsTerminal =
+    summaryEvent !== undefined && terminalEvents.has(summaryEvent)
+  const terminal = Boolean(terminalEvent || summaryIsTerminal)
+  const queued = ordered.find((event) => event.eventType === "run.queued")
+  const startedAt =
+    queued?.createdAt ?? matchingSummary?.created_at ?? ordered[0].createdAt
+  const start = startedAt ? Date.parse(startedAt) : Number.NaN
+  const terminalAt =
+    summaryIsTerminal &&
+    (!terminalEvent || matchingSummary!.last_sequence >= terminalEvent.sequence)
+      ? matchingSummary!.finished_at
+      : terminalEvent?.createdAt
   const finish = terminal
-    ? latest.createdAt
-      ? Date.parse(latest.createdAt)
-      : summary?.finished_at
-        ? Date.parse(summary.finished_at)
-        : Number.NaN
+    ? terminalAt
+      ? Date.parse(terminalAt)
+      : Number.NaN
     : now
   const duration =
     Number.isFinite(start) && Number.isFinite(finish)
       ? elapsedLabel(finish - start)
       : null
-
-  return { ...currentState(latest), duration, terminal }
+  let state: StatusCopy = { label: "Thinking", orb: "working" }
+  let hasPhase = false
+  let stopping = false
+  let awaitingApproval = false
+  for (const event of ordered) {
+    if (event.eventType === "run.cancellation_requested") {
+      stopping = true
+      state = { label: "Stopping", orb: "shaping" }
+      continue
+    }
+    if (stopping) continue
+    if (event.eventType === "tool.approval_requested") {
+      awaitingApproval = true
+      state = { label: "Waiting for approval", orb: "listening" }
+      continue
+    }
+    if (event.eventType === "tool.approval_decided") {
+      awaitingApproval = false
+      state = { label: "Waiting", orb: "working" }
+      continue
+    }
+    if (awaitingApproval) continue
+    const incoming = currentState(event)
+    if (event.eventType === "run.phase") {
+      if (incoming) {
+        state = incoming
+        hasPhase = true
+      }
+    } else if (!hasPhase && incoming) state = incoming
+  }
+  if (matchingSummary?.status === "cancelling")
+    state = { label: "Stopping", orb: "shaping" }
+  if (
+    matchingSummary?.status === "waiting_for_approval" &&
+    !ordered.some(
+      (event) =>
+        event.sequence > matchingSummary.last_sequence &&
+        (event.eventType === "tool.approval_decided" ||
+          (event.eventType === "run.phase" && currentState(event) !== null))
+    )
+  )
+    state = { label: "Waiting for approval", orb: "listening" }
+  if (terminalEvent) state = currentState(terminalEvent)!
+  if (
+    summaryIsTerminal &&
+    (!terminalEvent || matchingSummary!.last_sequence >= terminalEvent.sequence)
+  ) {
+    state = currentState({
+      runId: latest.runId,
+      sequence: matchingSummary!.last_sequence,
+      eventType: summaryEvent!,
+      eventVersion: 1,
+      data: {},
+    })!
+  }
+  return { ...state, duration, terminal }
 }

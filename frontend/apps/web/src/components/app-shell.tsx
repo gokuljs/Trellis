@@ -41,6 +41,12 @@ import type {
   Settings,
   WorkspaceView,
 } from "@/lib/app-types"
+import {
+  ownsRun,
+  recoveryTranscript,
+  turnFailureAction,
+  type TerminalRunOutcome,
+} from "@/lib/run-recovery"
 import "./workspace-bootstrap.css"
 
 type BootstrapState =
@@ -419,25 +425,27 @@ export function AppShell({
     async (
       sessionId: string,
       transcript: Message[],
-      isCancelled: () => boolean
+      isCancelled: () => boolean,
+      ownerGeneration?: number
     ) => {
-      const generation = ++runGenerationRef.current
+      const generation = ownerGeneration ?? ++runGenerationRef.current
       const isStale = () =>
         isCancelled() || runGenerationRef.current !== generation
       setReconnectAvailable(false)
-      setActiveRunTurnId(null)
+      if (!activeRunRef.current) setActiveRunTurnId(null)
       setApprovalPendingToolId(null)
       setApprovalError(null)
       approvalRequestRef.current = null
       const waitForDiscovery = (message: string) => {
         setPending(true)
         setStreamingText(null)
-        setActiveRunId(null)
-        setActiveRunTurnId(null)
+        if (!activeRunRef.current) {
+          setActiveRunId(null)
+          setActiveRunTurnId(null)
+        }
         setApprovalPendingToolId(null)
         setApprovalError(null)
         approvalRequestRef.current = null
-        activeRunRef.current = null
         setFailedTurn(null)
         setError(message)
         setReconnectAvailable(true)
@@ -785,6 +793,7 @@ export function AppShell({
 
   const startNewSession = useCallback(() => {
     runGenerationRef.current += 1
+    submissionLockRef.current = false
     sessionLoadSequenceRef.current += 1
     activeSessionIdRef.current = null
     setComposerValue("")
@@ -902,7 +911,15 @@ export function AppShell({
   }
 
   const completeTurn = async (turn: FailedTurn, optimistic: boolean) => {
-    runGenerationRef.current += 1
+    const owner = {
+      sessionId: turn.sessionId,
+      generation: ++runGenerationRef.current,
+    }
+    const isCurrent = () =>
+      ownsRun(owner, {
+        sessionId: activeSessionIdRef.current,
+        generation: runGenerationRef.current,
+      })
     setError(null)
     setStreamingText(null)
     setActiveRunId(null)
@@ -933,6 +950,9 @@ export function AppShell({
       ])
     }
 
+    const lifecycle: { terminal: TerminalRunOutcome | null } = {
+      terminal: null,
+    }
     try {
       await streamRun(
         {
@@ -945,18 +965,35 @@ export function AppShell({
         },
         {
           onRunId: (runId) => {
+            if (!isCurrent()) return
             activeRunRef.current = { runId, lastSequence: 0 }
             setActiveRunId(runId)
           },
-          onRunInfo: (runInfo) => recordRunInfo(turn.turnId, runInfo),
+          onRunInfo: (runInfo) => {
+            if (isCurrent()) recordRunInfo(turn.turnId, runInfo)
+          },
           onEvent: (event) => {
+            if (!isCurrent()) return
             if (activeRunRef.current?.runId !== event.runId) return
             activeRunRef.current.lastSequence = event.sequence
+            if (event.eventType === "run.completed")
+              lifecycle.terminal = "completed"
+            else if (event.eventType === "run.failed")
+              lifecycle.terminal = "failed"
+            else if (event.eventType === "run.cancelled")
+              lifecycle.terminal = "cancelled"
+            else if (event.eventType === "run.interrupted")
+              lifecycle.terminal = "interrupted"
             recordRunEvent(turn.turnId, event)
           },
         }
       )
+      if (!isCurrent()) return true
+      lifecycle.terminal = "completed"
+      setActiveRunId(null)
+      activeRunRef.current = null
       const detail = await api.getSession(turn.sessionId)
+      if (!isCurrent()) return true
       setSessions((current) => upsertSession(current, detail.session))
       if (activeSessionIdRef.current === turn.sessionId) {
         setActiveSession(detail.session)
@@ -973,17 +1010,64 @@ export function AppShell({
       cancelRequestRef.current = false
       activeRunRef.current = null
     } catch (turnError) {
+      if (!isCurrent()) return true
+      const failureAction = turnFailureAction(
+        turnError instanceof ApiError || turnError instanceof RuntimeError
+          ? turnError.code
+          : undefined,
+        lifecycle.terminal
+      )
+      if (
+        failureAction === "reconnect" &&
+        activeSessionIdRef.current === turn.sessionId
+      ) {
+        setPending(true)
+        setFailedTurn(null)
+        setError("Connection to Trellis is unavailable. Reconnecting…")
+        setReconnectAvailable(false)
+        let transcript = recoveryTranscript(messages, turn)
+        try {
+          const detail = await api.getSession(turn.sessionId)
+          if (!isCurrent()) return true
+          transcript = detail.messages
+          setSessions((current) => upsertSession(current, detail.session))
+          setActiveSession(detail.session)
+          setMessages(detail.messages)
+          setAssistantOutputState((current) =>
+            mergeSavedAssistantOutputs(current, detail.assistant_outputs ?? [])
+          )
+        } catch {
+          if (!isCurrent()) return true
+          // Discovery still has the accepted turn when its transcript is unavailable.
+        }
+        await restoreSessionRun(
+          turn.sessionId,
+          transcript,
+          () => !isCurrent(),
+          owner.generation
+        )
+        return true
+      }
       setStreamingText(null)
       setActiveRunId(null)
       setCancellingRun(false)
       cancelRequestRef.current = false
       activeRunRef.current = null
       if (activeSessionIdRef.current === turn.sessionId) {
-        setError(visibleError(turnError))
-        setFailedTurn(turn)
+        setError(
+          failureAction === "reload"
+            ? "Your answer is saved, but Trellis could not reload the messages. Reconnect to try again."
+            : visibleError(turnError)
+        )
+        setFailedTurn(failureAction === "reload" ? null : turn)
+        if (failureAction === "reload") {
+          setReconnectAvailable(true)
+          return false
+        }
       }
       try {
         const detail = await api.getSession(turn.sessionId)
+        if (!isCurrent()) return true
         setSessions((current) => upsertSession(current, detail.session))
         if (activeSessionIdRef.current === turn.sessionId) {
           setActiveSession(detail.session)
@@ -993,6 +1077,7 @@ export function AppShell({
           )
         }
       } catch {
+        if (!isCurrent()) return true
         // Keep the optimistic user message if the saved transcript cannot be refreshed.
       }
       if (
@@ -1004,16 +1089,29 @@ export function AppShell({
         }
       }
     }
+    return false
   }
 
   const cancelActiveRun = async () => {
     const activeRun = activeRunRef.current
     if (!activeRun || cancelRequestRef.current) return
+    const owner = {
+      sessionId: activeSessionIdRef.current,
+      generation: runGenerationRef.current,
+    }
     cancelRequestRef.current = true
     setCancellingRun(true)
     try {
       await cancelRun(activeRun.runId, activeRun.lastSequence)
     } catch (cancelError) {
+      if (
+        !ownsRun(owner, {
+          sessionId: activeSessionIdRef.current,
+          generation: runGenerationRef.current,
+        }) ||
+        activeRunRef.current?.runId !== activeRun.runId
+      )
+        return
       cancelRequestRef.current = false
       setCancellingRun(false)
       if (activeSessionIdRef.current) setError(visibleError(cancelError))
@@ -1031,6 +1129,15 @@ export function AppShell({
       approvalPendingToolId
     )
       return
+    const owner = {
+      sessionId: activeSessionIdRef.current,
+      generation: runGenerationRef.current,
+    }
+    const isCurrent = () =>
+      ownsRun(owner, {
+        sessionId: activeSessionIdRef.current,
+        generation: runGenerationRef.current,
+      }) && activeRunRef.current?.runId === activeRun.runId
     approvalRequestRef.current = toolCallId
     setApprovalPendingToolId(toolCallId)
     setApprovalError(null)
@@ -1042,14 +1149,14 @@ export function AppShell({
         activeRun.lastSequence
       )
     } catch (responseError) {
-      if (approvalRequestRef.current === toolCallId) {
+      if (isCurrent() && approvalRequestRef.current === toolCallId) {
         setApprovalError(visibleError(responseError))
         setApprovalPendingToolId((current) =>
           current === toolCallId ? null : current
         )
       }
     } finally {
-      if (approvalRequestRef.current === toolCallId)
+      if (isCurrent() && approvalRequestRef.current === toolCallId)
         approvalRequestRef.current = null
     }
   }
@@ -1075,10 +1182,21 @@ export function AppShell({
     submissionLockRef.current = true
     setPending(true)
     setComposerValue("")
+    let preservePending = false
+    let owner = {
+      sessionId: activeSessionIdRef.current,
+      generation: runGenerationRef.current,
+    }
+    const isCurrent = () =>
+      ownsRun(owner, {
+        sessionId: activeSessionIdRef.current,
+        generation: runGenerationRef.current,
+      })
     try {
       let session = activeSession
       if (!session) {
         const createdSession = await api.createSession()
+        if (!isCurrent()) return
         session = createdSession
         sessionLoadSequenceRef.current += 1
         activeSessionIdRef.current = createdSession.id
@@ -1086,7 +1204,7 @@ export function AppShell({
         setSessions((current) => upsertSession(current, createdSession))
         setActiveView("session")
       }
-      await completeTurn(
+      const completion = completeTurn(
         {
           sessionId: session.id,
           turnId: crypto.randomUUID(),
@@ -1096,12 +1214,20 @@ export function AppShell({
         },
         true
       )
+      owner = {
+        sessionId: session.id,
+        generation: runGenerationRef.current,
+      }
+      preservePending = await completion
     } catch (submitError) {
+      if (!isCurrent()) return
       setComposerValue(content)
       setError(visibleError(submitError))
     } finally {
-      submissionLockRef.current = false
-      setPending(false)
+      if (isCurrent()) {
+        submissionLockRef.current = false
+        if (!preservePending) setPending(false)
+      }
     }
   }
 
@@ -1109,23 +1235,54 @@ export function AppShell({
     if (!failedTurn || pending || submissionLockRef.current) return
     submissionLockRef.current = true
     setPending(true)
+    let preservePending = false
+    const completion = completeTurn(failedTurn, false)
+    const owner = {
+      sessionId: failedTurn.sessionId,
+      generation: runGenerationRef.current,
+    }
     try {
-      await completeTurn(failedTurn, false)
+      preservePending = await completion
     } finally {
-      submissionLockRef.current = false
-      setPending(false)
+      if (
+        ownsRun(owner, {
+          sessionId: activeSessionIdRef.current,
+          generation: runGenerationRef.current,
+        })
+      ) {
+        submissionLockRef.current = false
+        if (!preservePending) setPending(false)
+      }
     }
   }
 
   const reconnectRestoredRun = () => {
     const sessionId = activeSessionIdRef.current
     if (!sessionId || !reconnectAvailable) return
-    const recovery = restoreSessionRun(
-      sessionId,
-      messages,
-      () => activeSessionIdRef.current !== sessionId
-    )
-    const generation = runGenerationRef.current
+    setReconnectAvailable(false)
+    setError("Reconnecting to Trellis…")
+    let generation = runGenerationRef.current
+    const recovery = (async () => {
+      const detail = await api.getSession(sessionId)
+      if (
+        activeSessionIdRef.current !== sessionId ||
+        runGenerationRef.current !== generation
+      )
+        return
+      setSessions((current) => upsertSession(current, detail.session))
+      setActiveSession(detail.session)
+      setMessages(detail.messages)
+      setAssistantOutputState((current) =>
+        mergeSavedAssistantOutputs(current, detail.assistant_outputs ?? [])
+      )
+      const following = restoreSessionRun(
+        sessionId,
+        detail.messages,
+        () => activeSessionIdRef.current !== sessionId
+      )
+      generation = runGenerationRef.current
+      await following
+    })()
     void recovery.catch((restoreError) => {
       if (
         activeSessionIdRef.current !== sessionId ||
