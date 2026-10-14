@@ -226,6 +226,28 @@ def test_send_lock_wait_has_its_own_deadline(monkeypatch: pytest.MonkeyPatch) ->
     asyncio.run(exercise())
 
 
+def test_simultaneous_send_deadlines_do_not_escape_transport_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_send = runtime_routes._send_with_deadline
+
+    async def colliding_deadline_send(websocket, payload, send_lock=None, *, before_send=None):
+        waiting_reply = isinstance(payload, dict) and payload.get("id") == "locked-send"
+        if waiting_reply:
+            # Keep the waiter alive until the stalled relay closes the transport.
+            monkeypatch.setattr(runtime_routes, "_SEND_TIMEOUT_SECONDS", 1)
+        try:
+            await original_send(websocket, payload, send_lock, before_send=before_send)
+        except asyncio.CancelledError as error:
+            if waiting_reply and error.args == (runtime_routes._SLOW_TRANSPORT_CANCEL_REASON,):
+                # Concurrent asyncio.timeout scopes can lose the cancellation message.
+                raise asyncio.CancelledError() from None
+            raise
+
+    monkeypatch.setattr(runtime_routes, "_send_with_deadline", colliding_deadline_send)
+    test_send_lock_wait_has_its_own_deadline(monkeypatch)
+
+
 def test_authentication_reply_has_a_send_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runtime_routes, "_SEND_TIMEOUT_SECONDS", 0.01)
 

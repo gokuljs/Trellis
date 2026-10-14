@@ -316,18 +316,22 @@ async def runtime_websocket(websocket: WebSocket) -> None:
     auth_lost = asyncio.Event()
     active_subscriptions: dict[str, tuple[RuntimeEventSubscription, asyncio.Task[None]]] = {}
     transport_lost = asyncio.Event()
+    transport_cancel_requested = False
     handler_task = asyncio.current_task()
 
     async def close_slow_transport() -> None:
+        nonlocal transport_cancel_requested
         if transport_lost.is_set():
             return
         transport_lost.set()
         await _close_transport(websocket, 1013)
         if (
-            handler_task is not None
+            not teardown_started
+            and handler_task is not None
             and handler_task is not asyncio.current_task()
             and not handler_task.cancelling()
         ):
+            transport_cancel_requested = True
             handler_task.cancel(_SLOW_TRANSPORT_CANCEL_REASON)
 
     async def send(payload: object) -> None:
@@ -675,8 +679,12 @@ async def runtime_websocket(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     except asyncio.CancelledError as error:
+        owned_transport_cancel = transport_cancel_requested and error.args in (
+            (),
+            (_SLOW_TRANSPORT_CANCEL_REASON,),
+        )
         if (
-            error.args not in ((_AUTH_MONITOR_CANCEL_REASON,), (_SLOW_TRANSPORT_CANCEL_REASON,))
+            (error.args != (_AUTH_MONITOR_CANCEL_REASON,) and not owned_transport_cancel)
             or handler_task is None
             or handler_task.cancelling() != 1
         ):
