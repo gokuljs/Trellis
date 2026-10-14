@@ -254,6 +254,7 @@ def test_openai_stream_normalizes_deltas_usage_and_model_snapshot() -> None:
             kind="completed",
             finish_reason="completed",
             provider_response_id="resp_123",
+            finish_kind="final",
         ),
     ]
 
@@ -302,6 +303,7 @@ def test_openai_refusal_stream_is_preserved_as_assistant_text() -> None:
             kind="completed",
             finish_reason="completed",
             provider_response_id="resp_refusal",
+            finish_kind="final",
         ),
     ]
 
@@ -536,7 +538,10 @@ def test_openai_stream_assembles_multiple_function_calls_after_response_completi
             kind="usage", input_tokens=12, output_tokens=8, provider_response_id="resp_tools"
         ),
         ModelStreamEvent(
-            kind="completed", finish_reason="completed", provider_response_id="resp_tools"
+            kind="completed",
+            finish_reason="completed",
+            provider_response_id="resp_tools",
+            finish_kind="tool",
         ),
     ]
 
@@ -583,7 +588,10 @@ def test_openai_stream_accepts_tool_only_completion() -> None:
             tool_call=ModelToolCall(id="call_1", name="inspect_git", arguments={}),
         ),
         ModelStreamEvent(
-            kind="completed", finish_reason="completed", provider_response_id="resp_tool_only"
+            kind="completed",
+            finish_reason="completed",
+            provider_response_id="resp_tool_only",
+            finish_kind="tool",
         ),
     ]
 
@@ -1041,6 +1049,7 @@ def test_anthropic_stream_normalizes_sse_events_and_cumulative_usage() -> None:
             kind="completed",
             finish_reason="end_turn",
             provider_response_id="msg_456",
+            finish_kind="final",
         ),
     ]
 
@@ -1192,7 +1201,10 @@ def test_anthropic_stream_replays_tool_exchange_and_assembles_mixed_blocks() -> 
             provider_response_id="msg_tools",
         ),
         ModelStreamEvent(
-            kind="completed", finish_reason="tool_use", provider_response_id="msg_tools"
+            kind="completed",
+            finish_reason="tool_use",
+            provider_response_id="msg_tools",
+            finish_kind="tool",
         ),
     ]
 
@@ -1235,7 +1247,10 @@ def test_anthropic_stream_accepts_tool_only_completion() -> None:
             tool_call=ModelToolCall(id="toolu_1", name="inspect_git", arguments={}),
         ),
         ModelStreamEvent(
-            kind="completed", finish_reason="tool_use", provider_response_id="msg_only"
+            kind="completed",
+            finish_reason="tool_use",
+            provider_response_id="msg_only",
+            finish_kind="tool",
         ),
     ]
 

@@ -1,7 +1,10 @@
+from typing import cast
+
 import pytest
 
 from app.domain.runtime import (
     ModelContinuationItem,
+    ModelFinishKind,
     ModelMessage,
     ModelRequest,
     ModelStreamEvent,
@@ -110,6 +113,16 @@ def test_model_request_carries_tools_and_their_round_trip_messages() -> None:
 def test_stream_rejects_tool_call_event_without_a_complete_call() -> None:
     with pytest.raises(ValueError, match="tool_call events require a tool call"):
         ModelStreamEvent(kind="tool_call")
+
+
+def test_stream_rejects_finish_classification_before_completion() -> None:
+    with pytest.raises(ValueError, match="finish kind requires a completed event"):
+        ModelStreamEvent(kind="text_delta", text="hello", finish_kind="final")
+
+
+def test_stream_rejects_unknown_finish_classification() -> None:
+    with pytest.raises(ValueError, match="invalid model finish kind"):
+        ModelStreamEvent(kind="completed", finish_kind=cast(ModelFinishKind, "future"))
 
 
 def test_opaque_model_continuation_can_move_from_stream_to_next_request() -> None:

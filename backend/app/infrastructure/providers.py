@@ -719,6 +719,13 @@ async def _stream_openai(
                 kind="completed",
                 finish_reason=finish_reason,
                 provider_response_id=response_id,
+                finish_kind=(
+                    "incomplete"
+                    if event_type == "response.incomplete"
+                    else "tool"
+                    if completed_calls
+                    else "final"
+                ),
             )
             break
         elif event_type in {"response.failed", "error"}:
@@ -915,6 +922,13 @@ async def _stream_anthropic(
                 kind="completed",
                 finish_reason=finish_reason,
                 provider_response_id=response_id,
+                finish_kind=(
+                    "tool"
+                    if tool_uses
+                    else "final"
+                    if finish_reason in {"end_turn", "stop_sequence", "refusal"}
+                    else "incomplete"
+                ),
             )
             break
         elif event_type == "error":

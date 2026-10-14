@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import aclosing
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,6 +43,7 @@ from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
     ModelContinuationItem,
+    ModelFinishKind,
     ModelMessage,
     ModelRequest,
     ModelToolCall,
@@ -73,6 +75,7 @@ class _ModelStep:
     usage: dict[str, int | None]
     provider_response_id: str | None
     finish_reason: str | None
+    finish_kind: ModelFinishKind
 
 
 def _usage_measure(model_id: str, usage: dict[str, int | None]) -> tuple[int | None, float | None]:
@@ -751,6 +754,7 @@ class RunService:
                         "model_call_id": call.id,
                         "provider_response_id": step.provider_response_id,
                         "finish_reason": step.finish_reason,
+                        "finish_kind": step.finish_kind,
                     },
                 )
                 total_tokens, total_cost = self._budget_totals(
@@ -764,6 +768,16 @@ class RunService:
                     tokens=total_tokens,
                     cost_usd=total_cost,
                 )
+                if step.finish_kind == "incomplete":
+                    raise ProviderError(
+                        "provider_response_incomplete",
+                        "The provider stopped before completing the answer. Try again.",
+                    )
+                if (step.finish_kind == "tool") != bool(step.tool_calls):
+                    raise ProviderError(
+                        "provider_invalid_response",
+                        "The provider returned an inconsistent completion.",
+                    )
                 if not step.tool_calls:
                     final_content = self._redactor.redact_text(step.content).strip()
                     if not final_content:
@@ -1066,6 +1080,7 @@ class RunService:
             ],
             "usage": step.usage,
             "finish_reason": step.finish_reason,
+            "finish_kind": step.finish_kind,
             "provider_response_id": step.provider_response_id,
         }
         return cast(dict[str, object], self._redactor.redact_record(snapshot))
@@ -1095,14 +1110,18 @@ class RunService:
         }
         provider_response_id: str | None = None
         finish_reason: str | None = None
+        finish_kind: ModelFinishKind | None = None
         received_completion = False
         timeout_seconds = self._remaining_seconds(run)
         if timeout_seconds <= 0:
             raise ProviderError("provider_timeout", "The run deadline was reached.")
 
         try:
-            async with asyncio.timeout(timeout_seconds):
-                async for event in provider.stream(request, api_key, user_id):
+            async with (
+                asyncio.timeout(timeout_seconds),
+                aclosing(provider.stream(request, api_key, user_id)) as stream,
+            ):
+                async for event in stream:
                     if event.kind == "text_delta":
                         if event.text is None:
                             raise ProviderError(
@@ -1201,6 +1220,8 @@ class RunService:
                             or provider_response_id
                         )
                         finish_reason = self._safe_provider_metadata(event.finish_reason)
+                        finish_kind = event.finish_kind
+                        break
         except TimeoutError:
             raise ProviderError("provider_timeout", "The run deadline was reached.") from None
 
@@ -1215,6 +1236,7 @@ class RunService:
             usage=usage,
             provider_response_id=provider_response_id,
             finish_reason=finish_reason,
+            finish_kind=finish_kind or ("tool" if tool_calls else "final"),
         )
 
     def _safe_provider_metadata(self, value: str | None) -> str | None:

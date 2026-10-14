@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
+ModelFinishKind = Literal["final", "tool", "incomplete"]
+
 
 class RunStatus(StrEnum):
     QUEUED = "queued"
@@ -243,8 +245,14 @@ class ModelStreamEvent:
     cache_creation_tokens: int | None = None
     finish_reason: str | None = None
     provider_response_id: str | None = None
+    finish_kind: ModelFinishKind | None = None
 
     def __post_init__(self) -> None:
+        if self.finish_kind is not None:
+            if self.kind != "completed":
+                raise ValueError("finish kind requires a completed event")
+            if self.finish_kind not in {"final", "tool", "incomplete"}:
+                raise ValueError("invalid model finish kind")
         if self.kind == "text_delta" and self.text is None:
             raise ValueError("text_delta events require text")
         if self.kind == "tool_call" and self.tool_call is None:
