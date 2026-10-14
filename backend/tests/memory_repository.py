@@ -182,6 +182,9 @@ class MemoryRepository:
     async def list_models(self) -> list[ModelDescriptor]:
         return list(self.state.models)
 
+    async def list_catalog_models(self) -> list[ModelDescriptor]:
+        return list(self.state.models)
+
     async def set_selected_model(self, model_id: ModelId) -> bool:
         model = next((item for item in self.state.models if item.id == model_id), None)
         if model is None:

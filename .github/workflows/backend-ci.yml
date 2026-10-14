@@ -63,6 +63,8 @@ jobs:
           psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610150001_assistant_outputs.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610150002_output_event_identities.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/assistant_outputs.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610150003_model_catalog.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/model_catalog.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/chat_turn_security.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/schema_contract.sql
 

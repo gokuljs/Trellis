@@ -63,3 +63,23 @@ Temporary authentication or data failures return status `503` and close code
 `1013`, so the web app can offer a retry without clearing a valid session.
 Recheck errors use a JSON-RPC error with `id: null` before closing the socket.
 Authentication and account checks have a five-second deadline.
+
+Model choices include verified context/output limits, native-compaction support,
+metadata readiness, verification sources and dates, and the latest cached
+provider availability. Settings includes pending choices with `selectable=false`
+and a reason; runtime model lookup returns only enabled, verified choices.
+Unknown IDs never inherit another model's limits or prices. The existing two
+choices remain enabled until a successful discovery refresh confirms availability.
+
+`app/application/model_catalog.py` owns reviewed first-party token prices and
+limits as of 2026-10-15. The matching database documents live in migration
+`202610150003_model_catalog.sql`; changes to a profile must update both together.
+Input budgets reserve up to 4096 output tokens, keep a 2% safety margin (at least
+2048 tokens), and compact at 80% of usable input space. A provider's separate
+input cap can reduce that space. Pricing distinguishes cache reads, five-minute
+and one-hour writes, long-context thresholds, and the actual served tier.
+Unpublished tier prices or missing required usage produce an unavailable cost.
+Legacy calls without an Anthropic write TTL retain the conservative one-hour
+price. GPT-5.5 callers retain the highest session pricing context after compaction.
+Token estimates exclude provider tools, regional premiums, taxes and negotiated
+rates.

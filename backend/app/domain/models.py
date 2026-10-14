@@ -83,6 +83,16 @@ class ModelDescriptor:
     supports_streaming: bool
     supports_tools: bool
     enabled: bool
+    context_window_tokens: int | None = None
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None = None
+    supports_native_compaction: bool | None = None
+    metadata_status: Literal["ready", "pending"] | None = None
+    pending_reasons: tuple[str, ...] = ()
+    verification_sources: tuple[str, ...] = ()
+    metadata_verified_at: str | None = None
+    availability: Literal["available", "unavailable", "unknown"] = "unknown"
+    availability_checked_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +108,19 @@ class ModelStatus:
     supports_tools: bool
     configured: bool
     key_hint: str | None
+
+    enabled: bool = True
+    selectable: bool = False
+    context_window_tokens: int | None = None
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None = None
+    supports_native_compaction: bool | None = None
+    metadata_status: Literal["ready", "pending"] = "pending"
+    pending_reasons: tuple[str, ...] = ()
+    verification_sources: tuple[str, ...] = ()
+    metadata_verified_at: str | None = None
+    availability: Literal["available", "unavailable", "unknown"] = "unknown"
+    availability_checked_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

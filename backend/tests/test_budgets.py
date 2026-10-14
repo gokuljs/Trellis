@@ -120,3 +120,32 @@ def test_cost_estimate_rejects_unknown_rates_and_incomplete_usage() -> None:
     with pytest.raises(ValueError, match="cached tokens exceed input tokens"):
         estimate_model_cost("openai:gpt-5.5", 10, 5, 11)
     assert count_total_tokens("anthropic:claude-sonnet-5", 10, 5, 11) == 26
+
+
+def test_catalog_prices_new_models_and_actual_service_tier() -> None:
+    assert estimate_model_cost("openai:gpt-6.1-sol", 1000, 100, 200) == pytest.approx(0.00262)
+    assert estimate_model_cost(
+        "openai:gpt-6.1-sol", 1000, 100, 200, service_tier="priority"
+    ) == pytest.approx(0.00524)
+    assert (
+        estimate_model_cost("openai:gpt-6.1-sol", 1000, 100, 200, service_tier="unpublished")
+        is None
+    )
+
+
+def test_catalog_cost_accounts_for_long_context_and_cache_write_ttl() -> None:
+    assert estimate_model_cost(
+        "openai:gpt-5.5", 1000, 100, 200, pricing_context_tokens=272001
+    ) == pytest.approx(0.0127)
+    assert estimate_model_cost(
+        "anthropic:claude-sonnet-5", 1000, 100, 200, 300, cache_creation_1h_tokens=0
+    ) == pytest.approx(0.00379)
+    assert estimate_model_cost(
+        "anthropic:claude-sonnet-5", 1000, 100, 200, 300, cache_creation_1h_tokens=100
+    ) == pytest.approx(0.00394)
+    assert count_total_tokens("openai:gpt-6.1-sol", 1000, 100, 200, 300) == 1100
+
+
+def test_legacy_gpt55_usage_without_optional_cache_counts_remains_billable() -> None:
+    assert estimate_model_cost("openai:gpt-5.5", 1, 1, None, None) == pytest.approx(0.000035)
+    assert count_total_tokens("openai:gpt-5.5", 1, 1, None, None) == 2

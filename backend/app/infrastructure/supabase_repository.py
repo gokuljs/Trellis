@@ -9,14 +9,16 @@ import json
 import secrets
 from collections.abc import Mapping
 from contextlib import suppress
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
-from typing import cast
+from typing import Literal, cast
 from uuid import UUID
 
 import httpx
 
 from app.application.budgets import BudgetPreset, limits_for_preset
 from app.application.errors import ApplicationError
+from app.application.model_catalog import profile_for_model
 from app.core.config import Settings
 from app.core.supabase import project_base_url
 from app.domain.models import (
@@ -374,29 +376,77 @@ class SupabaseRepository:
         return _text(await self._settings_row(), "selected_model_id")
 
     async def list_models(self) -> list[ModelDescriptor]:
+        return [model for model in await self._models(ready_only=True) if model.enabled]
+
+    async def list_catalog_models(self) -> list[ModelDescriptor]:
+        return await self._models(ready_only=False)
+
+    async def _models(self, *, ready_only: bool) -> list[ModelDescriptor]:
+        filters = {"order": "catalog_order.asc,id.asc"}
+        if ready_only:
+            filters.update({"enabled": "eq.true", "metadata_status": "eq.ready"})
         rows = await self._read(
             "models",
             select=(
                 "id,provider_id,provider_name,adapter_kind,upstream_model_id,name,"
-                "requires_api_key,supports_streaming,supports_tools,enabled"
+                "requires_api_key,supports_streaming,supports_tools,enabled,"
+                "trusted_metadata,metadata_status,metadata_verified_at,availability,"
+                "availability_checked_at"
             ),
-            filters={"enabled": "eq.true", "order": "catalog_order.asc"},
+            filters=filters,
         )
-        return [
-            ModelDescriptor(
-                id=_text(row, "id"),
-                provider_id=_text(row, "provider_id"),
-                provider_name=_text(row, "provider_name"),
-                adapter_kind=_text(row, "adapter_kind"),
-                upstream_model_id=_text(row, "upstream_model_id"),
-                name=_text(row, "name"),
-                requires_api_key=row.get("requires_api_key") is True,
-                supports_streaming=row.get("supports_streaming") is True,
-                supports_tools=row.get("supports_tools") is True,
-                enabled=row.get("enabled") is True,
+        models: list[ModelDescriptor] = []
+        for row in rows:
+            profile = profile_for_model(_text(row, "id"))
+            identity_matches = (
+                profile is not None
+                and profile.provider_id == row.get("provider_id")
+                and profile.upstream_model_id == row.get("upstream_model_id")
+                and row.get("adapter_kind") == profile.provider_id
             )
-            for row in rows
-        ]
+            # Old fixtures have no metadata columns. Production migrations store
+            # the exact reviewed profile; a changed document cannot redefine it.
+            ready = bool(identity_matches and profile is not None and profile.metadata_ready)
+            if "metadata_status" in row:
+                ready = bool(
+                    ready
+                    and profile is not None
+                    and row.get("metadata_status") == "ready"
+                    and row.get("trusted_metadata") == json.loads(json.dumps(asdict(profile)))
+                    and row.get("metadata_verified_at")
+                )
+            availability = row.get("availability", "unknown")
+            if availability not in {"available", "unavailable", "unknown"}:
+                raise RuntimeError("Supabase returned invalid model availability")
+            models.append(
+                ModelDescriptor(
+                    id=_text(row, "id"),
+                    provider_id=_text(row, "provider_id"),
+                    provider_name=_text(row, "provider_name"),
+                    adapter_kind=_text(row, "adapter_kind"),
+                    upstream_model_id=_text(row, "upstream_model_id"),
+                    name=_text(row, "name"),
+                    requires_api_key=row.get("requires_api_key") is True,
+                    supports_streaming=row.get("supports_streaming") is True,
+                    supports_tools=row.get("supports_tools") is True,
+                    enabled=row.get("enabled") is True and ready and availability != "unavailable",
+                    context_window_tokens=profile.context_window_tokens
+                    if ready and profile
+                    else None,
+                    max_input_tokens=profile.max_input_tokens if ready and profile else None,
+                    max_output_tokens=profile.max_output_tokens if ready and profile else None,
+                    supports_native_compaction=profile.supports_native_compaction
+                    if ready and profile
+                    else None,
+                    metadata_status="ready" if ready else "pending",
+                    pending_reasons=() if ready else ("metadata_unverified",),
+                    verification_sources=profile.sources if ready and profile else (),
+                    metadata_verified_at=_nullable_text(row, "metadata_verified_at"),
+                    availability=cast(Literal["available", "unavailable", "unknown"], availability),
+                    availability_checked_at=_nullable_text(row, "availability_checked_at"),
+                )
+            )
+        return models
 
     async def set_selected_model(self, model_id: ModelId) -> bool:
         return await self._rpc("set_selected_model", {"model_id": model_id}) is True

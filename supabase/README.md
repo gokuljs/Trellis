@@ -50,3 +50,10 @@ fixed local-only UUIDs and must run on a disposable database.
 
 Hosted verification still requires applying the migrations to the chosen
 project, exposing `trellis`, and testing with two actual Supabase accounts.
+
+Migration `202610150003_model_catalog.sql` stores exact reviewed profiles in the
+private schema and adds trusted metadata, verification timestamps, and cached
+availability to model rows. Authenticated users can read pending model choices,
+but cannot write catalog tables. A trigger prevents enabling arbitrary upstream
+IDs or replacing reviewed limits/prices. Missing profiles remain disabled. The
+existing model-selection RPCs continue using the enabled-model invariant.

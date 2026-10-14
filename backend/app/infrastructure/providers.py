@@ -677,6 +677,7 @@ async def _stream_openai(
             input_tokens = _optional_integer(usage.get("input_tokens"))
             output_tokens = _optional_integer(usage.get("output_tokens"))
             cached_tokens = _optional_integer(input_details.get("cached_tokens"))
+            cache_creation_tokens = _optional_integer(input_details.get("cache_write_tokens"))
             reasoning_tokens = _optional_integer(output_details.get("reasoning_tokens"))
             usage_event = None
             if any(
@@ -685,6 +686,7 @@ async def _stream_openai(
                     input_tokens,
                     output_tokens,
                     cached_tokens,
+                    cache_creation_tokens,
                     reasoning_tokens,
                 )
             ):
@@ -694,6 +696,7 @@ async def _stream_openai(
                     output_tokens=output_tokens,
                     reasoning_tokens=reasoning_tokens,
                     cached_tokens=cached_tokens,
+                    cache_creation_tokens=cache_creation_tokens,
                     provider_response_id=response_id,
                 )
             incomplete_reason = _mapping(response.get("incomplete_details")).get("reason")
