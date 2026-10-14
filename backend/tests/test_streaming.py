@@ -71,6 +71,10 @@ def test_terminal_flush_suppresses_an_unfinished_known_secret() -> None:
     assert collect(["answer ", "env-key-"], secrets=("env-key-complete",)) == ("answer [REDACTED]")
 
 
+def test_completed_ordinary_word_does_not_redact_one_letter_secret_prefix() -> None:
+    assert collect(["Streaming works"], secrets=("sk-server-test",)) == "Streaming works"
+
+
 def test_large_input_chunks_produce_bounded_utf8_batches() -> None:
     content = "hello 😀\n" * 30_000
     batcher = TextStreamBatcher()

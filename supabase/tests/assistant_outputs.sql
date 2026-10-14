@@ -57,6 +57,9 @@ BEGIN
     IF duplicate IS DISTINCT FROM result THEN RAISE EXCEPTION 'finalization retry changed output'; END IF;
     result:=trellis.mutate('complete_run',jsonb_build_object('run_id',run,'content',E' answer\n'),cap);
     IF result->'message'->>'content' IS DISTINCT FROM E' answer\n' THEN RAISE EXCEPTION 'answer whitespace changed'; END IF;
+    IF result->'events'->0->'data'->>'output_id' IS DISTINCT FROM output::text THEN
+        RAISE EXCEPTION 'completion output identity missing';
+    END IF;
     IF NOT EXISTS(SELECT 1 FROM trellis.run_assistant_outputs WHERE id=output AND status='complete'
         AND promoted_message_id=(result->'message'->>'id')::uuid) THEN RAISE EXCEPTION 'promotion missing'; END IF;
     result:=trellis.mutate('create_run',jsonb_build_object('session_id',chat,'turn_id','output-two',

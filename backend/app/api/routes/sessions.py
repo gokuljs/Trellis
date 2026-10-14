@@ -38,6 +38,7 @@ class AssistantOutputResponse(BaseModel):
     run_id: str
     model_call_id: str
     step_index: int
+    next_batch_index: int
     content: str
     status: str
     stop_reason: str | None

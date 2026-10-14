@@ -1,8 +1,8 @@
 import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable, Mapping
-from contextlib import aclosing
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from contextlib import aclosing, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,6 +32,7 @@ from app.application.ports import (
     WorkspaceBindingPort,
 )
 from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
+from app.application.streaming import TextStreamBatcher
 from app.application.tools import (
     MAX_ARGUMENT_BYTES,
     ToolExecutionError,
@@ -46,6 +47,7 @@ from app.domain.runtime import (
     ModelFinishKind,
     ModelMessage,
     ModelRequest,
+    ModelStreamEvent,
     ModelToolCall,
     RunEvent,
     RunEventType,
@@ -730,9 +732,7 @@ class RunService:
                         "provider_invalid_response", "The provider returned an empty response."
                     )
                 safe_calls, preflight_errors = _prepare_tool_calls(step.tool_calls, self._redactor)
-                step = replace(
-                    step, content=self._redactor.redact_text(step.content), tool_calls=safe_calls
-                )
+                step = replace(step, tool_calls=safe_calls)
                 _step_tokens, step_cost = _usage_measure(run.model_id, step.usage)
                 call = await self._runs.update_model_call(
                     call.id,
@@ -779,14 +779,11 @@ class RunService:
                         "The provider returned an inconsistent completion.",
                     )
                 if not step.tool_calls:
-                    final_content = self._redactor.redact_text(step.content).strip()
-                    if not final_content:
+                    final_content = step.content
+                    if not final_content.strip():
                         raise ProviderError(
                             "provider_invalid_response", "The provider returned an empty response."
                         )
-                    await self._append_and_publish(
-                        run.id, RunEventType.ASSISTANT_DELTA, {"text": final_content}
-                    )
                     _message, completion_events = await self._runs.complete_run(
                         run.id, final_content
                     )
@@ -837,10 +834,11 @@ class RunService:
                 )
                 assistant_message = ModelMessage(
                     role="assistant",
-                    content=self._redactor.redact_text(step.content),
+                    content=step.content,
                     tool_calls=step.tool_calls,
                     continuation_items=step.continuation_items,
                 )
+                await self._runs.finish_assistant_output(run.id, call.id)
                 _assistant, stored_calls, stored_events = await self._runs.record_assistant_message(
                     run.id, call.id, assistant_message
                 )
@@ -1097,6 +1095,19 @@ class RunService:
         prior_cost: float | None,
     ) -> _ModelStep:
         output_parts: list[str] = []
+        batcher = TextStreamBatcher(secrets=(*self._redactor.streaming_secrets, api_key))
+        batch_index = 0
+
+        async def publish_batches(batches: Iterable[str]) -> None:
+            nonlocal batch_index
+            for text in batches:
+                _output, saved_event = await self._runs.append_assistant_batch(
+                    run.id, call.id, batch_index, text
+                )
+                batch_index += 1
+                output_parts.append(text)
+                await self._publish(saved_event)
+
         output_bytes = 0
         continuation_bytes = 0
         tool_calls: list[ModelToolCall] = []
@@ -1116,112 +1127,132 @@ class RunService:
         if timeout_seconds <= 0:
             raise ProviderError("provider_timeout", "The run deadline was reached.")
 
+        async def process_event(event: ModelStreamEvent) -> None:
+            nonlocal output_bytes, continuation_bytes, provider_response_id, finish_reason
+            nonlocal finish_kind, received_completion, call
+            if event.kind == "text_delta":
+                if event.text is None:
+                    raise ProviderError(
+                        "provider_invalid_response", "The provider returned invalid text."
+                    )
+                output_bytes += len(event.text.encode("utf-8"))
+                if output_bytes > MAX_MODEL_RESPONSE_BYTES:
+                    raise ProviderError(
+                        "provider_invalid_response", "The provider response is too large."
+                    )
+                await publish_batches(
+                    batcher.push(event.text, now=asyncio.get_running_loop().time())
+                )
+            elif event.kind == "tool_call":
+                if event.tool_call is None:
+                    raise ProviderError(
+                        "provider_invalid_response",
+                        "The provider returned an invalid tool call.",
+                    )
+                if len(tool_calls) >= run.max_tool_calls:
+                    raise ProviderError("tool_call_limit", "The run reached its tool-call limit.")
+                tool_calls.append(event.tool_call)
+            elif event.kind == "continuation_item":
+                if event.continuation_item is None:
+                    raise ProviderError(
+                        "provider_invalid_response",
+                        "The provider returned invalid continuation data.",
+                    )
+                item = event.continuation_item
+                continuation_bytes += len(item.payload_json.encode("utf-8"))
+                if (
+                    continuation_bytes > MAX_CONTINUATION_BYTES
+                    or self._redactor.redact_text(item.payload_json) != item.payload_json
+                ):
+                    raise ProviderError(
+                        "provider_invalid_response",
+                        "The provider returned invalid continuation data.",
+                    )
+                continuation_items.append(item)
+            elif event.kind == "usage":
+                incoming_usage = {
+                    "input_tokens": event.input_tokens,
+                    "output_tokens": event.output_tokens,
+                    "reasoning_tokens": event.reasoning_tokens,
+                    "cached_tokens": event.cached_tokens,
+                    "cache_creation_tokens": event.cache_creation_tokens,
+                }
+                usage.update(
+                    {key: value for key, value in incoming_usage.items() if value is not None}
+                )
+                provider_response_id = (
+                    self._safe_provider_metadata(event.provider_response_id) or provider_response_id
+                )
+                step_tokens, step_cost = _usage_measure(run.model_id, usage)
+                call = await self._runs.update_model_call(
+                    call.id,
+                    ModelCallStatus.STREAMING,
+                    provider_response_id=provider_response_id,
+                    input_tokens=usage["input_tokens"],
+                    output_tokens=usage["output_tokens"],
+                    reasoning_tokens=usage["reasoning_tokens"],
+                    cached_tokens=usage["cached_tokens"],
+                    cache_creation_tokens=usage["cache_creation_tokens"],
+                    estimated_cost=step_cost,
+                )
+                await self._append_and_publish(
+                    run.id,
+                    RunEventType.MODEL_USAGE,
+                    {
+                        **{key: value for key, value in usage.items() if value is not None},
+                        "estimated_cost_usd": step_cost,
+                        "total_estimated_cost_usd": (
+                            prior_cost + step_cost
+                            if step_cost is not None and prior_cost is not None
+                            else None
+                        ),
+                        "total_tokens": (
+                            prior_tokens + step_tokens if step_tokens is not None else None
+                        ),
+                        **(
+                            {"provider_response_id": provider_response_id}
+                            if provider_response_id is not None
+                            else {}
+                        ),
+                    },
+                )
+            elif event.kind == "completed":
+                received_completion = True
+                provider_response_id = (
+                    self._safe_provider_metadata(event.provider_response_id) or provider_response_id
+                )
+                finish_reason = self._safe_provider_metadata(event.finish_reason)
+                finish_kind = event.finish_kind
+
         try:
             async with (
                 asyncio.timeout(timeout_seconds),
                 aclosing(provider.stream(request, api_key, user_id)) as stream,
             ):
-                async for event in stream:
-                    if event.kind == "text_delta":
-                        if event.text is None:
-                            raise ProviderError(
-                                "provider_invalid_response", "The provider returned invalid text."
-                            )
-                        output_bytes += len(event.text.encode("utf-8"))
-                        if output_bytes > MAX_MODEL_RESPONSE_BYTES:
-                            raise ProviderError(
-                                "provider_invalid_response", "The provider response is too large."
-                            )
-                        output_parts.append(event.text)
-                    elif event.kind == "tool_call":
-                        if event.tool_call is None:
-                            raise ProviderError(
-                                "provider_invalid_response",
-                                "The provider returned an invalid tool call.",
-                            )
-                        if len(tool_calls) >= run.max_tool_calls:
-                            raise ProviderError(
-                                "tool_call_limit", "The run reached its tool-call limit."
-                            )
-                        tool_calls.append(event.tool_call)
-                    elif event.kind == "continuation_item":
-                        if event.continuation_item is None:
-                            raise ProviderError(
-                                "provider_invalid_response",
-                                "The provider returned invalid continuation data.",
-                            )
-                        item = event.continuation_item
-                        continuation_bytes += len(item.payload_json.encode("utf-8"))
-                        if (
-                            continuation_bytes > MAX_CONTINUATION_BYTES
-                            or self._redactor.redact_text(item.payload_json) != item.payload_json
-                        ):
-                            raise ProviderError(
-                                "provider_invalid_response",
-                                "The provider returned invalid continuation data.",
-                            )
-                        continuation_items.append(item)
-                    elif event.kind == "usage":
-                        incoming_usage = {
-                            "input_tokens": event.input_tokens,
-                            "output_tokens": event.output_tokens,
-                            "reasoning_tokens": event.reasoning_tokens,
-                            "cached_tokens": event.cached_tokens,
-                            "cache_creation_tokens": event.cache_creation_tokens,
-                        }
-                        usage.update(
-                            {
-                                key: value
-                                for key, value in incoming_usage.items()
-                                if value is not None
-                            }
-                        )
-                        provider_response_id = (
-                            self._safe_provider_metadata(event.provider_response_id)
-                            or provider_response_id
-                        )
-                        step_tokens, step_cost = _usage_measure(run.model_id, usage)
-                        call = await self._runs.update_model_call(
-                            call.id,
-                            ModelCallStatus.STREAMING,
-                            provider_response_id=provider_response_id,
-                            input_tokens=usage["input_tokens"],
-                            output_tokens=usage["output_tokens"],
-                            reasoning_tokens=usage["reasoning_tokens"],
-                            cached_tokens=usage["cached_tokens"],
-                            cache_creation_tokens=usage["cache_creation_tokens"],
-                            estimated_cost=step_cost,
-                        )
-                        await self._append_and_publish(
-                            run.id,
-                            RunEventType.MODEL_USAGE,
-                            {
-                                **{key: value for key, value in usage.items() if value is not None},
-                                "estimated_cost_usd": step_cost,
-                                "total_estimated_cost_usd": (
-                                    prior_cost + step_cost
-                                    if step_cost is not None and prior_cost is not None
-                                    else None
-                                ),
-                                "total_tokens": (
-                                    prior_tokens + step_tokens if step_tokens is not None else None
-                                ),
-                                **(
-                                    {"provider_response_id": provider_response_id}
-                                    if provider_response_id is not None
-                                    else {}
-                                ),
-                            },
-                        )
-                    elif event.kind == "completed":
-                        received_completion = True
-                        provider_response_id = (
-                            self._safe_provider_metadata(event.provider_response_id)
-                            or provider_response_id
-                        )
-                        finish_reason = self._safe_provider_metadata(event.finish_reason)
-                        finish_kind = event.finish_kind
-                        break
+                pending = asyncio.create_task(anext(stream, None))
+                try:
+                    while True:
+                        now = asyncio.get_running_loop().time()
+                        deadline = batcher.next_flush_at
+                        delay = None if deadline is None else max(0.0, deadline - now)
+                        done, _ = await asyncio.wait({pending}, timeout=delay)
+                        if not done:
+                            await publish_batches(batcher.flush())
+                            continue
+                        event = pending.result()
+                        if event is None:
+                            break
+                        # Processing remains ordered; only one provider read is in flight.
+                        await process_event(event)
+                        if received_completion:
+                            break
+                        pending = asyncio.create_task(anext(stream, None))
+                finally:
+                    if not pending.done():
+                        pending.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await pending
+                await publish_batches(batcher.finish())
         except TimeoutError:
             raise ProviderError("provider_timeout", "The run deadline was reached.") from None
 

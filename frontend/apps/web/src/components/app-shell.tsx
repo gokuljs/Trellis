@@ -13,6 +13,11 @@ import { WelcomePanel } from "@/components/welcome-panel"
 import { WorkspaceTopbar } from "@/components/workspace-topbar"
 import { ApiError, api } from "@/lib/api"
 import {
+  mergeSavedAssistantOutputs,
+  newAssistantOutputState,
+  reduceAssistantOutputEvent,
+} from "@/lib/assistant-outputs"
+import {
   RuntimeError,
   cancelRun,
   mergeRunEvents,
@@ -206,6 +211,9 @@ export function AppShell({
   const [sessions, setSessions] = useState<Session[]>([])
   const [activeSession, setActiveSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
+  const [assistantOutputState, setAssistantOutputState] = useState(
+    newAssistantOutputState
+  )
   const [sessionLoading, setSessionLoading] = useState(false)
   const [pending, setPending] = useState(false)
   const [streamingText, setStreamingText] = useState<string | null>(null)
@@ -253,6 +261,9 @@ export function AppShell({
 
   const recordRunEvent = useCallback(
     (turnId: string, event: RuntimeRunEvent) => {
+      setAssistantOutputState((current) =>
+        reduceAssistantOutputEvent(current, event, turnId)
+      )
       setRunActivities((current) => {
         const activity = current[turnId] ?? { events: [], runInfo: null }
         if (activity.runInfo && activity.runInfo.runId !== event.runId)
@@ -293,6 +304,7 @@ export function AppShell({
       }
       if (
         event.eventType === "assistant.delta" &&
+        typeof event.data.output_id !== "string" &&
         typeof event.data.text === "string"
       ) {
         setStreamingText((current) => (current ?? "") + event.data.text)
@@ -457,6 +469,9 @@ export function AppShell({
           setSessions((current) => upsertSession(current, detail.session))
           setActiveSession(detail.session)
           setMessages(detail.messages)
+          setAssistantOutputState((current) =>
+            mergeSavedAssistantOutputs(current, detail.assistant_outputs ?? [])
+          )
         } catch {
           if (isStale()) return
           waitForDiscovery(
@@ -614,6 +629,9 @@ export function AppShell({
           setSessions((current) => upsertSession(current, detail.session))
           setActiveSession(detail.session)
           setMessages(detail.messages)
+          setAssistantOutputState((current) =>
+            mergeSavedAssistantOutputs(current, detail.assistant_outputs ?? [])
+          )
           setFailedTurn(null)
           setError(null)
           setReconnectAvailable(false)
@@ -633,6 +651,12 @@ export function AppShell({
             setSessions((current) => upsertSession(current, detail.session))
             setActiveSession(detail.session)
             setMessages(detail.messages)
+            setAssistantOutputState((current) =>
+              mergeSavedAssistantOutputs(
+                current,
+                detail.assistant_outputs ?? []
+              )
+            )
             if (
               !keepActive &&
               !retryFromTranscript(sessionId, detail.messages)
@@ -766,6 +790,7 @@ export function AppShell({
     setComposerValue("")
     setActiveSession(null)
     setMessages([])
+    setAssistantOutputState(newAssistantOutputState())
     setPending(false)
     setStreamingText(null)
     setActiveRunId(null)
@@ -809,6 +834,7 @@ export function AppShell({
       sessions.find((session) => session.id === sessionId) ?? null
     )
     setMessages([])
+    setAssistantOutputState(newAssistantOutputState())
     setStreamingText(null)
     setActiveRunId(null)
     setRunActivities({})
@@ -844,6 +870,9 @@ export function AppShell({
       }
       setActiveSession(detail.session)
       setMessages(detail.messages)
+      setAssistantOutputState((current) =>
+        mergeSavedAssistantOutputs(current, detail.assistant_outputs ?? [])
+      )
       setRunActivities(activitiesFromSummaries(history.summaries))
       setActivityHistoryError(history.error)
       await restoreSessionRun(
@@ -932,6 +961,9 @@ export function AppShell({
       if (activeSessionIdRef.current === turn.sessionId) {
         setActiveSession(detail.session)
         setMessages(detail.messages)
+        setAssistantOutputState((current) =>
+          mergeSavedAssistantOutputs(current, detail.assistant_outputs ?? [])
+        )
         setFailedTurn(null)
         setComposerValue("")
       }
@@ -956,6 +988,9 @@ export function AppShell({
         if (activeSessionIdRef.current === turn.sessionId) {
           setActiveSession(detail.session)
           setMessages(detail.messages)
+          setAssistantOutputState((current) =>
+            mergeSavedAssistantOutputs(current, detail.assistant_outputs ?? [])
+          )
         }
       } catch {
         // Keep the optimistic user message if the saved transcript cannot be refreshed.
@@ -1230,6 +1265,7 @@ export function AppShell({
             <ChatThread
               session={activeSession}
               messages={messages}
+              assistantOutputs={assistantOutputState.outputs}
               pending={pending}
               streamingText={streamingText}
               error={error}

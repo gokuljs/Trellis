@@ -3,8 +3,9 @@
 Unfinished tokens and configured-secret prefixes stay private until their boundary
 is known. Only checked text reaches the publication buffer. Callers must consume
 ``push`` immediately, flush that buffer on its deadline, and use ``finish`` on
-completion, provider failure, or cancellation. Terminal flushing suppresses
-unfinished credential candidates; it never makes partial output complete.
+normal provider termination. Exceptional exits can discard unpublished data.
+Terminal flushing suppresses unfinished credential candidates; it never makes
+partial output complete. Already published batches remain durable.
 """
 
 import math
@@ -108,7 +109,9 @@ class TextStreamBatcher:
         if self._closed:
             return
         self._closed = True
-        cutoff = self._known_prefix_cutoff()
+        # A terminal one-letter overlap is ordinary text, not a credential.
+        # Recognizable credential forms below still fail closed at any length.
+        cutoff = self._known_prefix_cutoff(minimum_length=6)
         bearer = _PENDING_BEARER.search(self._raw)
         if bearer is not None and bearer.group(1):
             cutoff = min(cutoff, bearer.start(1))
@@ -171,10 +174,10 @@ class TextStreamBatcher:
                     start = self._raw.find(secret, start + 1)
         return cutoff
 
-    def _known_prefix_cutoff(self) -> int:
+    def _known_prefix_cutoff(self, minimum_length: int = 1) -> int:
         cutoff = len(self._raw)
         for secret in self._secrets:
-            for length in range(min(len(self._raw), len(secret) - 1), 0, -1):
+            for length in range(min(len(self._raw), len(secret) - 1), minimum_length - 1, -1):
                 if self._raw.endswith(secret[:length]):
                     cutoff = min(cutoff, len(self._raw) - length)
                     break

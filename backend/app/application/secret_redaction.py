@@ -19,6 +19,10 @@ class SecretRedactor:
             sorted({secret for secret in secrets if secret}, key=len, reverse=True)
         )
 
+    @property
+    def streaming_secrets(self) -> tuple[str, ...]:
+        return self._secrets
+
     def redact_text(self, content: str) -> str:
         for secret in self._secrets:
             content = content.replace(secret, "[REDACTED]")

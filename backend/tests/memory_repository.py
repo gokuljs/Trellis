@@ -553,7 +553,16 @@ class MemoryRepository:
                 stop_reason="final_response",
                 promoted_message_id=message.id,
             )
-        first = self._event(run_id, RunEventType.ASSISTANT_COMPLETED, {"message_id": message.id})
+        completion_data: dict[str, object] = {"message_id": message.id}
+        if output is not None:
+            completion_data.update(
+                output_id=output.id,
+                model_call_id=output.model_call_id,
+                status="complete",
+                stop_reason="final_response",
+                promoted_message_id=message.id,
+            )
+        first = self._event(run_id, RunEventType.ASSISTANT_COMPLETED, completion_data)
         second = await self.transition_run_record(
             run_id,
             RunStatus.COMPLETED,
@@ -881,6 +890,15 @@ class MemoryRepository:
                     "message_id": assistant.id,
                     "model_call_id": model_call_id,
                     "content": message.content,
+                    **(
+                        {
+                            "output_id": self.state.assistant_outputs[model_call_id].id,
+                            "status": "complete",
+                            "stop_reason": "tool_continuation",
+                        }
+                        if model_call_id in self.state.assistant_outputs
+                        else {}
+                    ),
                 },
             )
         ]

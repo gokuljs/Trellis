@@ -6,7 +6,8 @@ import { ThinkingOrb } from "thinking-orbs"
 
 import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 import { RunActivityDisclosure } from "@/components/run-activity-disclosure"
-import type { Message, Session } from "@/lib/app-types"
+import type { AssistantOutput, Message, Session } from "@/lib/app-types"
+import { outputStatusLabel, threadMessages } from "@/lib/assistant-outputs"
 import type {
   ToolApprovalDecision,
   TurnRunActivity,
@@ -15,6 +16,7 @@ import type {
 type ChatThreadProps = {
   session: Session
   messages: Message[]
+  assistantOutputs?: AssistantOutput[]
   pending: boolean
   streamingText: string | null
   error: string | null
@@ -88,6 +90,7 @@ function MessageMarkdown({ content }: { content: string }) {
 export function ChatThread({
   session,
   messages,
+  assistantOutputs = [],
   pending,
   streamingText,
   error,
@@ -110,8 +113,22 @@ export function ChatThread({
   const [openActivityTurnId, setOpenActivityTurnId] = useState<string | null>(
     null
   )
+  const runOrderByTurn = Object.fromEntries(
+    Object.entries(runActivities).map(([turnId, activity]) => [
+      turnId,
+      [
+        ...(activity.priorAttempts ?? []).map((attempt) => attempt.runId),
+        activity.runInfo?.runId ?? activity.summary?.run_id,
+      ].filter((runId): runId is string => typeof runId === "string"),
+    ])
+  )
+  const displayMessages = threadMessages(
+    messages,
+    assistantOutputs,
+    runOrderByTurn
+  )
   const firstAssistantByTurn = new Map<string, string>()
-  for (const message of messages) {
+  for (const message of displayMessages) {
     if (
       message.role === "assistant" &&
       !firstAssistantByTurn.has(message.turn_id)
@@ -166,15 +183,25 @@ export function ChatThread({
       </header>
 
       <div className="thread-messages">
-        {messages.flatMap((message) => [
+        {displayMessages.flatMap((message) => [
           message.role === "assistant" &&
           firstAssistantByTurn.get(message.turn_id) === message.id
             ? activityForTurn(message.turn_id, true)
             : null,
           <article
             key={message.id}
-            className={`thread-message ${message.role}`}
-            aria-label={message.role === "user" ? "Your message" : undefined}
+            className={[
+              "thread-message",
+              message.role,
+              ...(message.output?.status === "streaming" ? ["pending"] : []),
+            ].join(" ")}
+            aria-label={
+              message.role === "user"
+                ? "Your message"
+                : message.output
+                  ? `Assistant response${message.attemptNumber ? `, attempt ${message.attemptNumber}` : ""}, ${outputStatusLabel(message.output) || "completed"}`
+                  : undefined
+            }
           >
             <div className="thread-message-copy">
               <div className="thread-message-meta">
@@ -183,7 +210,15 @@ export function ChatThread({
                     <TrellisMark size={17} />
                   </span>
                 ) : null}
-                <span>{message.role === "assistant" ? "Trellis" : "You"}</span>
+                <span>
+                  {message.role === "assistant" ? "Trellis" : "You"}
+                  {message.attemptNumber
+                    ? ` · Attempt ${message.attemptNumber}`
+                    : ""}
+                  {message.output && outputStatusLabel(message.output)
+                    ? ` · ${outputStatusLabel(message.output)}`
+                    : ""}
+                </span>
               </div>
               <MessageMarkdown content={message.content} />
             </div>
@@ -208,7 +243,12 @@ export function ChatThread({
               <MessageMarkdown content={streamingText} />
             </div>
           </article>
-        ) : pending && !waitingForApproval && !activeActivity ? (
+        ) : pending &&
+          !waitingForApproval &&
+          !activeActivity &&
+          !displayMessages.some(
+            (message) => message.output?.status === "streaming"
+          ) ? (
           <article
             className="thread-message assistant pending"
             aria-label="Assistant response pending"

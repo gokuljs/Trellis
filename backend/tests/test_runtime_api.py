@@ -466,8 +466,8 @@ def test_jsonrpc_websocket_streams_a_durable_run(tmp_path: Path) -> None:
         RunEventType.QUEUED.value,
         RunEventType.STARTED.value,
         RunEventType.MODEL_USAGE.value,
-        RunEventType.MODEL_COMPLETED.value,
         RunEventType.ASSISTANT_DELTA.value,
+        RunEventType.MODEL_COMPLETED.value,
         RunEventType.ASSISTANT_COMPLETED.value,
         RunEventType.COMPLETED.value,
     ]

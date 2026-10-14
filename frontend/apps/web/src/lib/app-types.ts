@@ -76,6 +76,21 @@ export type Message = {
 export type SessionDetail = {
   session: Session
   messages: Message[]
+  assistant_outputs?: AssistantOutput[]
+}
+
+export type AssistantOutput = {
+  id: string
+  turn_id: string
+  run_id: string
+  model_call_id: string
+  step_index: number
+  content: string
+  status: "streaming" | "complete" | "partial"
+  stop_reason: string | null
+  promoted_message_id: string | null
+  created_at: string
+  next_batch_index?: number
 }
 
 export type LatestRun = {

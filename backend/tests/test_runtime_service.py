@@ -330,8 +330,8 @@ def test_run_service_streams_and_persists_a_provider_neutral_run(tmp_path: Path)
         RunEventType.QUEUED,
         RunEventType.STARTED,
         RunEventType.MODEL_USAGE,
-        RunEventType.MODEL_COMPLETED,
         RunEventType.ASSISTANT_DELTA,
+        RunEventType.MODEL_COMPLETED,
         RunEventType.ASSISTANT_COMPLETED,
         RunEventType.COMPLETED,
     ]
@@ -471,7 +471,7 @@ def test_run_service_persists_read_tool_exchange_before_a_second_model_call(
     )
     assert [
         event.data["text"] for event in events if event.event_type is RunEventType.ASSISTANT_DELTA
-    ] == ["The README says hello."]
+    ] == ["Checking the file.", "The README says hello."]
 
 
 @pytest.mark.parametrize(
