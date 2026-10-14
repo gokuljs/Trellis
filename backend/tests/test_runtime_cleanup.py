@@ -10,7 +10,7 @@ import pytest
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 
 from app.api.routes import runtime as runtime_routes
-from app.domain.runtime import RunEvent, RunStatus
+from app.domain.runtime import RunEvent, RunEventType, RunStatus
 from app.infrastructure.runtime_events import RuntimeEventHub, RuntimeEventSubscription
 
 
@@ -141,6 +141,187 @@ def assert_runtime_children_gone(hub: RecordingHub) -> None:
         task for task in asyncio.all_tasks() if task.get_name().startswith("trellis-websocket")
     ]
     assert children == []
+
+
+def test_slow_send_closes_socket_and_joins_runtime_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runtime_routes, "_SEND_TIMEOUT_SECONDS", 0.01, raising=False)
+
+    async def exercise() -> None:
+        send_started = asyncio.Event()
+        send_cancelled = asyncio.Event()
+        closed_codes: list[int] = []
+
+        async def send_payload(payload: object) -> None:
+            if isinstance(payload, dict) and payload.get("method") == "run.event":
+                send_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    send_cancelled.set()
+
+        async def close_socket(code: int) -> None:
+            closed_codes.append(code)
+
+        async def receive_after_resume() -> str:
+            await hub.relay_started.wait()
+            await hub.publish(RunEvent("test-run", 1, RunEventType.STARTED, 1, {}, "created"))
+            await asyncio.Event().wait()
+            raise AssertionError("slow transport must cancel the socket receiver")
+
+        hub = RecordingHub()
+        socket = PeerSocket(
+            hub, receive_after_resume, send_payload=send_payload, close_socket=close_socket
+        )
+        handler = asyncio.create_task(runtime_routes.runtime_websocket(cast(WebSocket, socket)))
+        try:
+            await asyncio.wait_for(send_started.wait(), timeout=1)
+            await asyncio.wait_for(asyncio.shield(handler), timeout=0.25)
+        finally:
+            handler.cancel()
+            await asyncio.gather(handler, return_exceptions=True)
+        assert send_cancelled.is_set()
+        assert closed_codes == [1013]
+        assert_runtime_children_gone(hub)
+
+    asyncio.run(exercise())
+
+
+def test_send_lock_wait_has_its_own_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runtime_routes, "_SEND_TIMEOUT_SECONDS", 0.01, raising=False)
+
+    async def exercise() -> None:
+        send_started = asyncio.Event()
+        closed_codes: list[int] = []
+
+        async def send_payload(payload: object) -> None:
+            if isinstance(payload, dict) and payload.get("method") == "run.event":
+                send_started.set()
+                await asyncio.Event().wait()
+
+        async def close_socket(code: int) -> None:
+            closed_codes.append(code)
+
+        async def receive_after_resume() -> str:
+            await hub.relay_started.wait()
+            await hub.publish(RunEvent("test-run", 1, RunEventType.STARTED, 1, {}, "created"))
+            await send_started.wait()
+            return json.dumps({"jsonrpc": "2.0", "id": "locked-send", "method": "unknown"})
+
+        hub = RecordingHub()
+        socket = PeerSocket(
+            hub, receive_after_resume, send_payload=send_payload, close_socket=close_socket
+        )
+        handler = asyncio.create_task(runtime_routes.runtime_websocket(cast(WebSocket, socket)))
+        try:
+            await asyncio.wait_for(send_started.wait(), timeout=1)
+            await asyncio.wait_for(asyncio.shield(handler), timeout=0.25)
+        finally:
+            handler.cancel()
+            await asyncio.gather(handler, return_exceptions=True)
+        assert closed_codes == [1013]
+        assert_runtime_children_gone(hub)
+
+    asyncio.run(exercise())
+
+
+def test_authentication_reply_has_a_send_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runtime_routes, "_SEND_TIMEOUT_SECONDS", 0.01)
+
+    async def exercise() -> None:
+        closed_codes: list[int] = []
+
+        async def send_payload(payload: object) -> None:
+            if isinstance(payload, dict) and payload.get("id") == "authenticate":
+                await asyncio.Event().wait()
+
+        async def close_socket(code: int) -> None:
+            closed_codes.append(code)
+
+        async def receive_after_auth() -> str:
+            raise AssertionError("authentication send must time out first")
+
+        hub = RecordingHub()
+        socket = PeerSocket(
+            hub,
+            receive_after_auth,
+            send_payload=send_payload,
+            close_socket=close_socket,
+            resume_run=False,
+        )
+        handler = asyncio.create_task(runtime_routes.runtime_websocket(cast(WebSocket, socket)))
+        try:
+            await asyncio.wait_for(asyncio.shield(handler), timeout=0.25)
+        finally:
+            handler.cancel()
+            await asyncio.gather(handler, return_exceptions=True)
+        assert closed_codes == [1013]
+        assert_runtime_children_gone(hub)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("method", ["run.resume", "run.start"])
+def test_socket_limits_active_run_subscriptions(method: str) -> None:
+    async def exercise() -> None:
+        responses: list[object] = []
+        created_runs: list[str] = []
+        requests = iter(range(1, 9))
+
+        async def receive_more_requests() -> str:
+            index = next(requests, None)
+            if index is None:
+                raise WebSocketDisconnect(code=1000)
+            return json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": f"resume-{index}",
+                    "method": method,
+                    "params": (
+                        {"runId": f"run-{index}", "afterSequence": 0}
+                        if method == "run.resume"
+                        else {
+                            "sessionId": "test-session",
+                            "clientRequestId": f"run-{index}",
+                            "content": "Answer",
+                        }
+                    ),
+                }
+            )
+
+        async def send_payload(payload: object) -> None:
+            responses.append(payload)
+
+        hub = RecordingHub()
+        socket = PeerSocket(hub, receive_more_requests, send_payload=send_payload)
+        account = await socket.app.state.account_registry.get(
+            UUID("00000000-0000-0000-0000-000000000001")
+        )
+        run = await account.run_service.get_run("test-run")
+
+        async def get_run(run_id: str) -> SimpleNamespace:
+            return SimpleNamespace(**(vars(run) | {"id": run_id}))
+
+        async def create_run(
+            session_id: str, client_request_id: str, content: str, **kwargs: object
+        ) -> SimpleNamespace:
+            created_runs.append(client_request_id)
+            return await get_run(client_request_id)
+
+        account.run_service.get_run = get_run
+        account.run_service.create_run = create_run
+        await runtime_routes.runtime_websocket(cast(WebSocket, socket))
+        last_response = cast(dict[str, object], responses[-1])
+        assert last_response["id"] == "resume-8"
+        assert "error" in last_response
+        error = cast(dict[str, object], last_response["error"])
+        assert error["data"] == {"code": "subscription_limit", "status": 429}
+        if method == "run.start":
+            assert len(created_runs) == 7
+        assert_runtime_children_gone(hub)
+
+    asyncio.run(exercise())
 
 
 async def exercise_cancelled_peer(hub: RecordingHub, *, peer_disconnect: bool) -> bool:
