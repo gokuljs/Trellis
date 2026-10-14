@@ -30,6 +30,7 @@ from app.domain.models import (
     SessionWorkspaceBusy,
     UserProfile,
 )
+from app.domain.outputs import AssistantOutput, validate_assistant_batch
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -968,7 +969,7 @@ class SupabaseRepository:
         result = _object(
             await self._rpc(
                 "complete_run",
-                {"run_id": run_id, "content": content.strip()},
+                {"run_id": run_id, "content": content},
                 capability=self._run_capability(run_id),
             )
         )
@@ -1176,6 +1177,71 @@ class SupabaseRepository:
             )
         )
         return self._run(_object(result.get("run"))), self._event(_object(result.get("event")))
+
+    def _assistant_output(self, row: dict[str, object]) -> AssistantOutput:
+        self._owned(row)
+        status = _text(row, "status")
+        if status not in {"streaming", "complete", "partial"}:
+            raise RuntimeError("Supabase returned an invalid assistant output status")
+        return AssistantOutput(
+            id=_text(row, "id"),
+            session_id=_text(row, "chat_id"),
+            turn_id=_text(row, "turn_id"),
+            run_id=_text(row, "run_id"),
+            model_call_id=_text(row, "model_call_id"),
+            step_index=_integer(row, "step_index"),
+            content=_text(row, "content"),
+            status=status,
+            next_batch_index=_integer(row, "next_batch_index"),
+            stop_reason=_nullable_text(row, "stop_reason"),
+            promoted_message_id=_nullable_text(row, "promoted_message_id"),
+            created_at=_text(row, "created_at"),
+        )
+
+    async def append_assistant_batch(
+        self, run_id: str, model_call_id: str, batch_index: int, text: str
+    ) -> tuple[AssistantOutput, RunEvent]:
+        validate_assistant_batch(batch_index, text)
+        result = _object(
+            await self._rpc(
+                "append_assistant_batch",
+                {
+                    "run_id": run_id,
+                    "model_call_id": model_call_id,
+                    "batch_index": batch_index,
+                    "text": text,
+                },
+                capability=self._run_capability(run_id),
+            )
+        )
+        return self._assistant_output(_object(result.get("output"))), self._event(
+            _object(result.get("event"))
+        )
+
+    async def finish_assistant_output(
+        self, run_id: str, model_call_id: str, *, stop_reason: str = "tool_continuation"
+    ) -> AssistantOutput | None:
+        result = await self._rpc(
+            "finish_assistant_output",
+            {"run_id": run_id, "model_call_id": model_call_id, "stop_reason": stop_reason},
+            capability=self._run_capability(run_id),
+        )
+        return None if result is None else self._assistant_output(_object(result))
+
+    async def list_assistant_outputs(self, session_id: str) -> list[AssistantOutput]:
+        rows = await self._read(
+            "run_assistant_outputs",
+            select="id,user_id,chat_id,turn_id,run_id,model_call_id,step_index,content,status,next_batch_index,stop_reason,promoted_message_id,created_at",
+            filters={
+                "user_id": f"eq.{self._user_id}",
+                "chat_id": f"eq.{session_id}",
+                "order": "created_at.asc,id.asc",
+            },
+        )
+        outputs = [self._assistant_output(row) for row in rows]
+        if any(item.session_id != session_id for item in outputs):
+            raise RuntimeError("Supabase returned assistant output from another chat")
+        return outputs
 
     async def request_run_cancellation(self, run_id: str) -> tuple[RunSnapshot, RunEvent | None]:
         result = _object(

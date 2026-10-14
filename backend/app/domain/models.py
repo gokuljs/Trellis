@@ -1,7 +1,8 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from app.domain.capabilities import RuntimeCapability
+from app.domain.outputs import AssistantOutput
 
 # Provider and model identifiers are owned by Trellis' catalog and are deliberately
 # open-ended so adding a provider does not require changing the domain types.
@@ -113,3 +114,4 @@ class AppSettings:
 class SessionDetail:
     session: Session
     messages: list[Message]
+    assistant_outputs: list[AssistantOutput] = field(default_factory=list)

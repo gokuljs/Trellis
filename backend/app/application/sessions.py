@@ -88,6 +88,7 @@ class SessionService:
         return SessionDetail(
             session=session,
             messages=await self._repository.list_messages(session_id),
+            assistant_outputs=await self._repository.list_assistant_outputs(session_id),
         )
 
     async def workspace_ready(self, session: Session) -> bool:

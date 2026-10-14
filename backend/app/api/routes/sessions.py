@@ -32,9 +32,23 @@ class MessageResponse(BaseModel):
     created_at: str
 
 
+class AssistantOutputResponse(BaseModel):
+    id: str
+    turn_id: str
+    run_id: str
+    model_call_id: str
+    step_index: int
+    content: str
+    status: str
+    stop_reason: str | None
+    promoted_message_id: str | None
+    created_at: str
+
+
 class SessionDetailResponse(BaseModel):
     session: SessionResponse
     messages: list[MessageResponse]
+    assistant_outputs: list[AssistantOutputResponse] = Field(default_factory=list)
 
 
 class LatestRunResponse(BaseModel):
@@ -149,6 +163,10 @@ async def get_session(session_id: str, service: SessionServiceDep) -> SessionDet
     return SessionDetailResponse(
         session=await serialize_session(detail.session, service),
         messages=[serialize_message(message) for message in detail.messages],
+        assistant_outputs=[
+            AssistantOutputResponse.model_validate(output, from_attributes=True)
+            for output in detail.assistant_outputs
+        ],
     )
 
 

@@ -30,6 +30,7 @@ from app.domain.models import (
     SessionWorkspaceBusy,
     UserProfile,
 )
+from app.domain.outputs import MAX_ASSISTANT_OUTPUT_BYTES, AssistantOutput, validate_assistant_batch
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -104,6 +105,8 @@ class MemoryState:
     run_messages: dict[str, list[RunMessageRecord]] = field(default_factory=dict)
     tool_calls: dict[str, ToolCallRecord] = field(default_factory=dict)
     waiting_tool_call_id: dict[str, str] = field(default_factory=dict)
+    assistant_outputs: dict[str, AssistantOutput] = field(default_factory=dict)
+    assistant_batches: dict[tuple[str, int], RunEvent] = field(default_factory=dict)
 
 
 class MemoryRepository:
@@ -520,6 +523,11 @@ class MemoryRepository:
             finished_at=now if is_terminal_run_status(next_status) else None,
         )
         if is_terminal_run_status(next_status):
+            for key, output in tuple(self.state.assistant_outputs.items()):
+                if output.run_id == run_id and output.status == "streaming":
+                    self.state.assistant_outputs[key] = replace(
+                        output, status="partial", stop_reason=stop_reason or next_status.value
+                    )
             self._owned_leases.discard(run_id)
         return self._event(run_id, event_type, data)
 
@@ -527,13 +535,24 @@ class MemoryRepository:
         run = self.state.runs.get(run_id)
         if run is None:
             raise ValueError("run not found")
-        normalized = content.strip()
-        if not normalized:
+        outputs = [item for item in self.state.assistant_outputs.values() if item.run_id == run_id]
+        output = max(outputs, key=lambda item: item.step_index) if outputs else None
+        if output is not None and output.content != content:
+            raise ValueError("completed answer differs from published text")
+        normalized = content if output is not None else content.strip()
+        if not normalized.strip():
             raise ValueError("assistant response cannot be empty")
         validate_run_event_transition(run.status, RunStatus.COMPLETED, RunEventType.COMPLETED)
         message = self._add_message(
             run.session_id, run.turn_id, "assistant", normalized, run.provider_id, run.model_id
         )
+        if output is not None:
+            self.state.assistant_outputs[output.model_call_id] = replace(
+                output,
+                status="complete",
+                stop_reason="final_response",
+                promoted_message_id=message.id,
+            )
         first = self._event(run_id, RunEventType.ASSISTANT_COMPLETED, {"message_id": message.id})
         second = await self.transition_run_record(
             run_id,
@@ -543,6 +562,86 @@ class MemoryRepository:
             stop_reason="final_response",
         )
         return message, (first, second)
+
+    async def append_assistant_batch(
+        self, run_id: str, model_call_id: str, batch_index: int, text: str
+    ) -> tuple[AssistantOutput, RunEvent]:
+        validate_assistant_batch(batch_index, text)
+        run = self.state.runs.get(run_id)
+        call = self.state.model_calls.get(model_call_id)
+        if run is None or run.status is not RunStatus.RUNNING:
+            raise ValueError("run is not running")
+        if call is None or call.run_id != run_id or call.status is not ModelCallStatus.STREAMING:
+            raise ValueError("model call is not streaming in this run")
+        existing = self.state.assistant_outputs.get(model_call_id)
+        duplicate = self.state.assistant_batches.get((model_call_id, batch_index))
+        if duplicate is not None:
+            if duplicate.data["text"] != text:
+                raise ValueError("assistant batch conflicts with saved text")
+            assert existing is not None
+            return existing, duplicate
+        if batch_index != (existing.next_batch_index if existing is not None else 0):
+            raise ValueError("assistant batches must be in order")
+        if existing is not None and existing.status != "streaming":
+            raise ValueError("assistant output is not streaming")
+        content = (existing.content if existing else "") + text
+        if len(content.encode("utf-8")) > MAX_ASSISTANT_OUTPUT_BYTES:
+            raise ValueError("assistant output is too large")
+        output = AssistantOutput(
+            existing.id if existing else _id(),
+            run.session_id,
+            run.turn_id,
+            run_id,
+            model_call_id,
+            call.step_index,
+            content,
+            "streaming",
+            batch_index + 1,
+            None,
+            None,
+            existing.created_at if existing else _now(),
+        )
+        event = self._event(
+            run_id,
+            RunEventType.ASSISTANT_DELTA,
+            {
+                "output_id": output.id,
+                "model_call_id": model_call_id,
+                "step_index": call.step_index,
+                "batch_index": batch_index,
+                "text": text,
+            },
+        )
+        self.state.assistant_outputs[model_call_id] = output
+        self.state.assistant_batches[(model_call_id, batch_index)] = event
+        return output, event
+
+    async def list_assistant_outputs(self, session_id: str) -> list[AssistantOutput]:
+        return [
+            item for item in self.state.assistant_outputs.values() if item.session_id == session_id
+        ]
+
+    async def finish_assistant_output(
+        self, run_id: str, model_call_id: str, *, stop_reason: str = "tool_continuation"
+    ) -> AssistantOutput | None:
+        run = self.state.runs.get(run_id)
+        if run is None or run.status is not RunStatus.RUNNING:
+            raise ValueError("run is not running")
+        call = self.state.model_calls.get(model_call_id)
+        if call is None or call.run_id != run_id:
+            raise ValueError("model call belongs to another run")
+        output = self.state.assistant_outputs.get(model_call_id)
+        if output is None:
+            return None
+        if output.run_id != run_id:
+            raise ValueError("model call belongs to another run")
+        if output.status == "complete" and output.stop_reason == stop_reason:
+            return output
+        if output.status != "streaming":
+            raise ValueError("output already finalized")
+        finished = replace(output, status="complete", stop_reason=stop_reason)
+        self.state.assistant_outputs[model_call_id] = finished
+        return finished
 
     async def request_run_cancellation(self, run_id: str) -> tuple[RunSnapshot, RunEvent | None]:
         run = self.state.runs.get(run_id)

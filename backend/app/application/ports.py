@@ -12,6 +12,7 @@ from app.domain.models import (
     Session,
     UserProfile,
 )
+from app.domain.outputs import AssistantOutput
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -75,6 +76,8 @@ class SessionRepository(Protocol):
     async def get_session(self, session_id: str) -> Session | None: ...
 
     async def list_messages(self, session_id: str) -> list[Message]: ...
+
+    async def list_assistant_outputs(self, session_id: str) -> list[AssistantOutput]: ...
 
 
 class WorkspaceDirectoryPicker(Protocol):
@@ -149,6 +152,14 @@ class RunRepository(Protocol):
         run_id: str,
         content: str,
     ) -> tuple[Message, tuple[RunEvent, ...]]: ...
+
+    async def append_assistant_batch(
+        self, run_id: str, model_call_id: str, batch_index: int, text: str
+    ) -> tuple[AssistantOutput, RunEvent]: ...
+
+    async def finish_assistant_output(
+        self, run_id: str, model_call_id: str, *, stop_reason: str = "tool_continuation"
+    ) -> AssistantOutput | None: ...
 
     async def request_run_cancellation(
         self,
