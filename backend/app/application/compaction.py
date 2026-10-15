@@ -70,6 +70,7 @@ def build_summary_request(request: ModelRequest, prefix: Sequence[ContextItem]) 
         max_output_tokens=2048,
         system_instructions=_SUMMARY_INSTRUCTIONS,
         tools=(),
+        native_context_json=None,
     )
 
 

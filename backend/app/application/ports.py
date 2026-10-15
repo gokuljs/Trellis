@@ -8,6 +8,7 @@ from app.domain.context import (
     ContextCheckpointDraft,
     ContextWindow,
     InputTokenCount,
+    NativeCompactionResult,
 )
 from app.domain.models import (
     Message,
@@ -314,3 +315,9 @@ class TokenCountingProvider(Protocol):
     async def count_input(
         self, request: ModelRequest, api_key: str, user_id: str
     ) -> InputTokenCount: ...
+
+
+class NativeCompactingProvider(Protocol):
+    async def compact(
+        self, request: ModelRequest, api_key: str, user_id: str
+    ) -> NativeCompactionResult: ...

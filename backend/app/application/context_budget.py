@@ -38,6 +38,7 @@ def _input_record(request: ModelRequest) -> dict[str, object]:
         "adapter_kind": request.adapter_kind,
         "upstream_model_id": request.upstream_model_id,
         "system_instructions": request.system_instructions,
+        "native_context_json": request.native_context_json,
         "messages": [asdict(message) for message in request.messages],
         "tools": [asdict(tool) for tool in request.tools],
     }
@@ -138,6 +139,7 @@ def _tail_boundary(request: ModelRequest, units: Sequence[tuple[ContextItem, ...
                 messages=tuple(item.message for item in units[index]),
                 system_instructions="",
                 tools=(),
+                native_context_json=None,
             )
         ).tokens
         if turns >= MAX_RECENT_TURNS or tokens + count > MAX_RECENT_TOKENS:
@@ -206,6 +208,13 @@ def preflight_context(
     remaining_run_cost_usd: float | None = None,
     pricing_context_tokens: int = 0,
 ) -> ContextPreflight:
+    if request.native_context_json is not None and (
+        counted_input is None or counted_input.method != "provider"
+    ):
+        raise ApplicationError(
+            "native_context_count_required",
+            "Native context requires a provider token count; use the portable summary instead.",
+        )
     if not isinstance(remaining_run_tokens, int) or isinstance(remaining_run_tokens, bool):
         raise ValueError("remaining run tokens must be integers")
     if remaining_run_tokens <= 0:
@@ -245,7 +254,8 @@ def preflight_context(
     )
     required_tokens = (
         count.tokens
-        if required_request.messages == prepared.messages
+        if prepared.native_context_json is not None
+        or required_request.messages == prepared.messages
         else min(estimate_input_tokens(required_request).tokens, count.tokens)
     )
     if required_tokens >= remaining_run_tokens:

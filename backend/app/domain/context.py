@@ -5,7 +5,7 @@ from typing import Literal, Never
 from uuid import UUID
 
 from app.domain.models import Message
-from app.domain.runtime import ModelMessage, ModelRequest
+from app.domain.runtime import ModelMessage, ModelRequest, ModelStreamEvent
 
 
 def _reject_json_constant(_value: str) -> Never:
@@ -180,3 +180,12 @@ class ContextCheckpoint:
 class ContextWindow:
     checkpoint: ContextCheckpoint | None
     messages: tuple[Message, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class NativeCompactionResult:
+    native_kind: NativeCompactionKind
+    payload_json: str | None
+    usage_events: tuple[ModelStreamEvent, ...]
+    provider_response_id: str | None
+    failure_code: str | None = None

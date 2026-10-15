@@ -9,7 +9,7 @@ import httpx
 
 from app.application.context_budget import input_fingerprint
 from app.application.errors import ProviderError
-from app.domain.context import InputTokenCount
+from app.domain.context import InputTokenCount, NativeCompactionKind, NativeCompactionResult
 from app.domain.models import Message, ProviderName
 from app.domain.runtime import (
     ModelContinuationItem,
@@ -340,6 +340,130 @@ def _openai_completed_calls(calls: dict[str, _OpenAIFunctionCall]) -> list[Model
     return [call for _, call in completed]
 
 
+_MAX_NATIVE_CONTEXT_BYTES = 262144
+
+
+def _native_value(request: ModelRequest) -> object:
+    payload = request.native_context_json
+    if payload is None:
+        return None
+    try:
+        if len(payload.encode("utf-8")) > _MAX_NATIVE_CONTEXT_BYTES:
+            raise ValueError("native context too large")
+        return json.loads(payload, parse_constant=_reject_json_constant)
+    except ValueError, RecursionError:
+        raise ProviderError(
+            "native_context_invalid", "The saved native context cannot be replayed."
+        ) from None
+
+
+def _native_openai_window(request: ModelRequest) -> list[dict[str, Any]]:
+    window = _native_value(request)
+    if window is None:
+        return []
+    if (
+        not isinstance(window, list)
+        or not window
+        or not all(isinstance(item, dict) for item in window)
+        or not any(
+            item.get("type") == "compaction"
+            and isinstance(item.get("encrypted_content"), str)
+            and item["encrypted_content"]
+            for item in window
+        )
+    ):
+        raise _openai_invalid_stream()
+    return window
+
+
+def _usage_integer(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _native_usage(payload: dict[str, Any], *, anthropic: bool) -> tuple[ModelStreamEvent, ...]:
+    usage = _mapping(payload.get("usage"))
+    raw_entries = usage.get("iterations") if anthropic else [usage]
+    if not isinstance(raw_entries, list):
+        return ()
+    events = []
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            continue
+        input_tokens = _usage_integer(entry.get("input_tokens"))
+        output_tokens = _usage_integer(entry.get("output_tokens"))
+        if input_tokens is None or output_tokens is None:
+            continue
+        input_details = _mapping(entry.get("input_tokens_details"))
+        output_details = _mapping(entry.get("output_tokens_details"))
+        cache_creation = _mapping(entry.get("cache_creation"))
+        tier = entry.get("service_tier", usage.get("service_tier", payload.get("service_tier")))
+        try:
+            tier = _served_service_tier(tier)
+        except ProviderError:
+            # Preserve reported paid usage without storing malformed metadata or
+            # guessing a known price for the failed tier.
+            tier = "unknown"
+        events.append(
+            ModelStreamEvent(
+                kind="usage",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_tokens=_usage_integer(
+                    entry.get("cache_read_input_tokens", 0)
+                    if anthropic
+                    else input_details.get("cached_tokens", 0)
+                ),
+                cache_creation_tokens=_usage_integer(
+                    entry.get("cache_creation_input_tokens", 0)
+                    if anthropic
+                    else input_details.get("cache_write_tokens", 0)
+                ),
+                cache_creation_1h_tokens=_usage_integer(
+                    cache_creation.get(
+                        "ephemeral_1h_input_tokens",
+                        0 if entry.get("cache_creation_input_tokens", 0) == 0 else None,
+                    )
+                )
+                if anthropic
+                else 0,
+                reasoning_tokens=_usage_integer(output_details.get("reasoning_tokens", 0))
+                if not anthropic
+                else None,
+                service_tier=tier if isinstance(tier, str) else None,
+            )
+        )
+    return tuple(events)
+
+
+def _native_usage_complete(
+    payload: dict[str, Any], usage: tuple[ModelStreamEvent, ...], *, anthropic: bool
+) -> bool:
+    if not usage:
+        return False
+    entries = (
+        _mapping(payload.get("usage")).get("iterations") if anthropic else [payload.get("usage")]
+    )
+    return isinstance(entries, list) and len(entries) == len(usage)
+
+
+def _native_result(
+    kind: NativeCompactionKind,
+    value: object,
+    usage: tuple[ModelStreamEvent, ...],
+    response_id: str | None,
+) -> NativeCompactionResult:
+    if not usage:
+        return NativeCompactionResult(kind, None, usage, response_id, "native_usage_unknown")
+    try:
+        payload = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        size = len(payload.encode("utf-8"))
+    except ValueError, TypeError, RecursionError:
+        return NativeCompactionResult(kind, None, usage, response_id, "native_context_invalid")
+    if size > _MAX_NATIVE_CONTEXT_BYTES:
+        return NativeCompactionResult(kind, None, usage, response_id, "native_context_too_large")
+    return NativeCompactionResult(kind, payload, usage, response_id)
+
+
 def _input_count(payload: dict[str, Any], request: ModelRequest) -> InputTokenCount:
     count = payload.get("input_tokens")
     if not isinstance(count, int) or isinstance(count, bool) or count < 0:
@@ -401,7 +525,7 @@ async def _context_post(
 
 
 def _openai_body(request: ModelRequest, user_id: str) -> dict[str, Any]:
-    input_items: list[dict[str, object]] = []
+    input_items: list[dict[str, object]] = _native_openai_window(request)
     for message in request.messages:
         if message.role == "tool":
             if not message.tool_call_id:
@@ -502,6 +626,41 @@ class OpenAIProvider:
             max_bytes=16384,
         )
         return _input_count(payload, request)
+
+    async def compact(
+        self, request: ModelRequest, api_key: str, user_id: str
+    ) -> NativeCompactionResult:
+        body = _openai_body(request, user_id)
+        payload = await _context_post(
+            self._client,
+            "https://api.openai.com/v1/responses/compact",
+            headers={"Authorization": f"Bearer {api_key}"},
+            body={key: body[key] for key in ("model", "input", "instructions") if key in body},
+            max_bytes=524288,
+        )
+        usage = _native_usage(payload, anthropic=False)
+        response_id = payload.get("id") if isinstance(payload.get("id"), str) else None
+        if not _native_usage_complete(payload, usage, anthropic=False):
+            return NativeCompactionResult(
+                "openai_window", None, usage, response_id, "native_usage_unknown"
+            )
+        window = payload.get("output")
+        if (
+            payload.get("status", "completed") != "completed"
+            or not isinstance(window, list)
+            or not window
+            or not all(isinstance(item, dict) for item in window)
+            or not any(
+                item.get("type") == "compaction"
+                and isinstance(item.get("encrypted_content"), str)
+                and item["encrypted_content"]
+                for item in window
+            )
+        ):
+            return NativeCompactionResult(
+                "openai_window", None, usage, response_id, "native_context_invalid"
+            )
+        return _native_result("openai_window", window, usage, response_id)
 
     def stream(
         self,

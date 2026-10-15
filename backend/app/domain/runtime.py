@@ -231,6 +231,7 @@ class ModelRequest:
     max_output_tokens: int
     system_instructions: str = ""
     tools: tuple[ModelToolSpec, ...] = ()
+    native_context_json: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
