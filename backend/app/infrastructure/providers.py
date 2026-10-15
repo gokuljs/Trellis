@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
@@ -6,7 +7,9 @@ from typing import Any
 
 import httpx
 
+from app.application.context_budget import input_fingerprint
 from app.application.errors import ProviderError
+from app.domain.context import InputTokenCount
 from app.domain.models import Message, ProviderName
 from app.domain.runtime import (
     ModelContinuationItem,
@@ -337,12 +340,168 @@ def _openai_completed_calls(calls: dict[str, _OpenAIFunctionCall]) -> list[Model
     return [call for _, call in completed]
 
 
+def _input_count(payload: dict[str, Any], request: ModelRequest) -> InputTokenCount:
+    count = payload.get("input_tokens")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        raise ProviderError(
+            "provider_invalid_response", "The provider returned an invalid token count."
+        )
+    return InputTokenCount(count, "provider", input_fingerprint(request))
+
+
+_CONTEXT_REQUEST_TIMEOUT_SECONDS = 30.0
+
+
+async def _context_post(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    max_bytes: int,
+) -> dict[str, Any]:
+    try:
+        async with asyncio.timeout(_CONTEXT_REQUEST_TIMEOUT_SECONDS):
+            async with client.stream(
+                "POST",
+                url,
+                headers=headers,
+                json=body,
+                follow_redirects=False,
+                timeout=httpx.Timeout(_CONTEXT_REQUEST_TIMEOUT_SECONDS, connect=3),
+            ) as response:
+                _raise_for_provider_response(response)
+                parts = []
+                size = 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise ProviderError(
+                            "provider_invalid_response",
+                            "The provider context response exceeded its size limit.",
+                        )
+                    if chunk:
+                        parts.append(chunk)
+        payload = json.loads(b"".join(parts), parse_constant=_reject_json_constant)
+        if not isinstance(payload, dict):
+            raise ValueError("invalid context response")
+        return payload
+    except httpx.TimeoutException, TimeoutError:
+        raise ProviderError(
+            "provider_timeout", "The provider took too long to respond. Try again."
+        ) from None
+    except httpx.RequestError:
+        raise ProviderError(
+            "provider_upstream_failed", "Trellis could not reach the provider. Try again."
+        ) from None
+    except ValueError, RecursionError:
+        raise ProviderError(
+            "provider_invalid_response", "The provider returned an invalid context response."
+        ) from None
+
+
+def _openai_body(request: ModelRequest, user_id: str) -> dict[str, Any]:
+    input_items: list[dict[str, object]] = []
+    for message in request.messages:
+        if message.role == "tool":
+            if not message.tool_call_id:
+                raise _openai_invalid_stream()
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": message.tool_call_id,
+                    "output": message.content,
+                }
+            )
+            continue
+        for continuation in message.continuation_items:
+            if (
+                continuation.provider_id == request.provider_id
+                and continuation.model_id == request.model_id
+            ):
+                input_items.append(_openai_replay_reasoning(continuation))
+        if message.content or (not message.tool_calls and not message.continuation_items):
+            input_items.append({"role": message.role, "content": message.content})
+        for call in message.tool_calls:
+            input_items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call.id,
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments, separators=(",", ":"), allow_nan=False),
+                }
+            )
+
+    body = {
+        "model": request.upstream_model_id,
+        "input": input_items,
+        "store": False,
+        "stream": True,
+        "include": ["reasoning.encrypted_content"],
+        "reasoning": {"effort": "medium"},
+        "max_output_tokens": request.max_output_tokens,
+        "safety_identifier": user_id,
+    }
+    if request.system_instructions:
+        body["instructions"] = request.system_instructions
+    if request.tools:
+        body["tools"] = [
+            {
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema,
+                "strict": _openai_strict_schema(tool.input_schema),
+            }
+            for tool in request.tools
+        ]
+    return body
+
+
+def _anthropic_body(request: ModelRequest) -> dict[str, Any]:
+    body = {
+        "model": request.upstream_model_id,
+        "max_tokens": request.max_output_tokens,
+        "stream": True,
+        "messages": _anthropic_messages(request.messages),
+    }
+    if request.system_instructions:
+        body["system"] = request.system_instructions
+    if request.tools:
+        body["tools"] = [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            }
+            for tool in request.tools
+        ]
+    return body
+
+
 class OpenAIProvider:
     name: ProviderName = "openai"
     model = "gpt-5.5"
 
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
+
+    async def count_input(
+        self, request: ModelRequest, api_key: str, user_id: str
+    ) -> InputTokenCount:
+        body = _openai_body(request, user_id)
+        payload = await _context_post(
+            self._client,
+            "https://api.openai.com/v1/responses/input_tokens",
+            headers={"Authorization": f"Bearer {api_key}"},
+            body={
+                key: body[key]
+                for key in ("model", "input", "instructions", "tools", "reasoning")
+                if key in body
+            },
+            max_bytes=16384,
+        )
+        return _input_count(payload, request)
 
     def stream(
         self,
@@ -400,6 +559,22 @@ class AnthropicProvider:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
 
+    async def count_input(
+        self, request: ModelRequest, api_key: str, user_id: str
+    ) -> InputTokenCount:
+        del user_id
+        body = _anthropic_body(request)
+        payload = await _context_post(
+            self._client,
+            "https://api.anthropic.com/v1/messages/count_tokens",
+            headers={"X-Api-Key": api_key, "anthropic-version": "2023-06-01"},
+            body={
+                key: body[key] for key in ("model", "messages", "system", "tools") if key in body
+            },
+            max_bytes=16384,
+        )
+        return _input_count(payload, request)
+
     def stream(
         self,
         request: ModelRequest,
@@ -452,60 +627,7 @@ async def _stream_openai(
     api_key: str,
     user_id: str,
 ) -> AsyncGenerator[ModelStreamEvent]:
-    input_items: list[dict[str, object]] = []
-    for message in request.messages:
-        if message.role == "tool":
-            if not message.tool_call_id:
-                raise _openai_invalid_stream()
-            input_items.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": message.tool_call_id,
-                    "output": message.content,
-                }
-            )
-            continue
-        for continuation in message.continuation_items:
-            if (
-                continuation.provider_id == request.provider_id
-                and continuation.model_id == request.model_id
-            ):
-                input_items.append(_openai_replay_reasoning(continuation))
-        if message.content or (not message.tool_calls and not message.continuation_items):
-            input_items.append({"role": message.role, "content": message.content})
-        for call in message.tool_calls:
-            input_items.append(
-                {
-                    "type": "function_call",
-                    "call_id": call.id,
-                    "name": call.name,
-                    "arguments": json.dumps(call.arguments, separators=(",", ":"), allow_nan=False),
-                }
-            )
-
-    body = {
-        "model": request.upstream_model_id,
-        "input": input_items,
-        "store": False,
-        "stream": True,
-        "include": ["reasoning.encrypted_content"],
-        "reasoning": {"effort": "medium"},
-        "max_output_tokens": request.max_output_tokens,
-        "safety_identifier": user_id,
-    }
-    if request.system_instructions:
-        body["instructions"] = request.system_instructions
-    if request.tools:
-        body["tools"] = [
-            {
-                "type": "function",
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.input_schema,
-                "strict": _openai_strict_schema(tool.input_schema),
-            }
-            for tool in request.tools
-        ]
+    body = _openai_body(request, user_id)
     response_id: str | None = None
     saw_text = False
     saw_refusal_delta = False
@@ -754,23 +876,7 @@ async def _stream_anthropic(
     request: ModelRequest,
     api_key: str,
 ) -> AsyncGenerator[ModelStreamEvent]:
-    body = {
-        "model": request.upstream_model_id,
-        "max_tokens": request.max_output_tokens,
-        "stream": True,
-        "messages": _anthropic_messages(request.messages),
-    }
-    if request.system_instructions:
-        body["system"] = request.system_instructions
-    if request.tools:
-        body["tools"] = [
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": tool.input_schema,
-            }
-            for tool in request.tools
-        ]
+    body = _anthropic_body(request)
     response_id: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None

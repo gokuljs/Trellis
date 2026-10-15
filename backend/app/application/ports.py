@@ -3,7 +3,12 @@ from pathlib import Path
 from typing import Protocol
 
 from app.application.budgets import BudgetPreset
-from app.domain.context import ContextCheckpoint, ContextCheckpointDraft, ContextWindow
+from app.domain.context import (
+    ContextCheckpoint,
+    ContextCheckpointDraft,
+    ContextWindow,
+    InputTokenCount,
+)
 from app.domain.models import (
     Message,
     ModelDescriptor,
@@ -302,3 +307,9 @@ class ContextCheckpointRepository(Protocol):
     async def list_context_messages(
         self, session_id: str, after_ordinal: int, *, limit: int = 128
     ) -> list[Message]: ...
+
+
+class TokenCountingProvider(Protocol):
+    async def count_input(
+        self, request: ModelRequest, api_key: str, user_id: str
+    ) -> InputTokenCount: ...
