@@ -1,5 +1,6 @@
 import { Menu } from "lucide-react"
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 
 import { ChatThread } from "@/components/chat-thread"
 import { Composer } from "@/components/composer"
@@ -54,6 +55,11 @@ import {
   selectedChatModelId,
   type ModelSelectionOwner,
 } from "@/lib/model-choice"
+import {
+  serverKeys,
+  sessionModelMutationOptions,
+  settingsQueryOptions,
+} from "@/lib/server-queries"
 import "./workspace-bootstrap.css"
 
 type BootstrapState =
@@ -222,10 +228,21 @@ export function AppShell({
     "conservative" | "longer" | null
   >(null)
   const [profile, setProfile] = useState<Profile | null>(null)
-  const [settings, setSettings] = useState<Settings | null>(null)
   const [bootstrap, setBootstrap] = useState<BootstrapState>({
     status: "loading",
   })
+  const queryClient = useQueryClient()
+  const { data: settings = null } = useQuery({
+    ...settingsQueryOptions(),
+    enabled: bootstrap.status === "ready" || bootstrap.status === "onboarding",
+  })
+  const setSettings = useCallback(
+    (next: Settings) => queryClient.setQueryData(serverKeys.settings, next),
+    [queryClient]
+  )
+  const { mutateAsync: selectSessionModel } = useMutation(
+    sessionModelMutationOptions(queryClient)
+  )
   const [sessions, setSessions] = useState<Session[]>([])
   const [activeSession, setActiveSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
@@ -725,16 +742,21 @@ export function AppShell({
     )
     const current = () => bootstrapControllerRef.current === controller
     try {
-      const [restoredProfile, restoredSettings, restoredOnboarding] =
-        await Promise.all([
-          api.getProfile(options),
-          api.getSettings(options),
-          api.getOnboarding(options),
-        ])
+      const [restoredProfile, , restoredOnboarding] = await Promise.all([
+        api.getProfile(options),
+        queryClient.fetchQuery({
+          ...settingsQueryOptions(),
+          staleTime: 0,
+          queryFn: ({ signal }) =>
+            api.getSettings({
+              signal: AbortSignal.any([signal, controller.signal]),
+            }),
+        }),
+        api.getOnboarding(options),
+      ])
       if (!current()) return
 
       setProfile(restoredProfile)
-      setSettings(restoredSettings)
       if (!restoredOnboarding.completed) {
         setBootstrap({ status: "onboarding", progress: restoredOnboarding })
         return
@@ -751,7 +773,7 @@ export function AppShell({
     } finally {
       clearTimeout(timer)
     }
-  }, [])
+  }, [queryClient])
 
   useEffect(() => {
     let mounted = true
@@ -1201,7 +1223,7 @@ export function AppShell({
     modelSaveOwnerRef.current = owner
     setModelSelection({ sessionId, modelId })
     try {
-      const updated = await api.selectSessionModel(sessionId, modelId)
+      const updated = await selectSessionModel({ sessionId, modelId })
       if (!isCurrent()) return null
       setSessions((current) => upsertSession(current, updated))
       setActiveSession(updated)
