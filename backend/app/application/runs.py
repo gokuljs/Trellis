@@ -18,11 +18,10 @@ from app.application.budgets import (
     count_total_tokens,
     estimate_model_cost,
 )
-from app.application.context import build_model_context
-from app.application.context_budget import preflight_context
 from app.application.errors import ApplicationError, ProviderError
 from app.application.model_catalog import profile_for_model
 from app.application.ports import (
+    ContextCheckpointRepository,
     ProfileRepository,
     RunEventPublisher,
     RunLeasePort,
@@ -33,6 +32,7 @@ from app.application.ports import (
     StreamingProviderAdapter,
     WorkspaceBindingPort,
 )
+from app.application.run_context import RunContext, usage_cost
 from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
 from app.application.streaming import TextStreamBatcher
 from app.application.tools import (
@@ -41,7 +41,6 @@ from app.application.tools import (
     ToolRegistry,
 )
 from app.domain.capabilities import DEFAULT_RUNTIME_CAPABILITIES, RuntimeCapabilities
-from app.domain.context import ContextItem
 from app.domain.models import ModelDescriptor
 from app.domain.runtime import (
     ModelCallRecord,
@@ -81,10 +80,15 @@ class _ModelStep:
     provider_response_id: str | None
     finish_reason: str | None
     finish_kind: ModelFinishKind
+    billing_context: dict[str, object]
 
 
-def _usage_measure(model_id: str, usage: dict[str, int | None]) -> tuple[int | None, float | None]:
+def _usage_measure(
+    model_id: str, usage: dict[str, int | None], billing: Mapping[str, object] | None = None
+) -> tuple[int | None, float | None]:
     try:
+        if billing is not None:
+            return usage_cost(model_id, usage, billing)
         tokens = count_total_tokens(
             model_id,
             usage["input_tokens"],
@@ -678,7 +682,14 @@ class RunService:
                 if model.supports_tools and self._tool_registry is not None
                 else ()
             )
-            visible_messages = await self._sessions.list_messages(run.session_id)
+            context_runtime = RunContext(
+                self._runs,
+                self._sessions,
+                cast(ContextCheckpointRepository, self._runs),
+                self._budget_totals,
+                self._publish,
+                self._redactor,
+            )
 
             prior_model_steps = await self._runs.list_model_calls(run.id)
             if prior_model_steps:
@@ -686,8 +697,7 @@ class RunService:
                 if not await self._execute_pending_tools(run, workspace_root):
                     return
 
-            for step_index in range(len(prior_model_steps) + 1, run.max_model_calls + 1):
-                run_messages = await self._runs.list_run_messages(run.id)
+            while True:
                 prior_tool_calls = await self._runs.list_tool_calls(run.id)
                 prior_model_calls = await self._runs.list_model_calls(run.id)
                 prior_tokens, prior_cost = self._budget_totals(run.model_id, prior_model_calls)
@@ -699,66 +709,33 @@ class RunService:
                     tokens=prior_tokens,
                     cost_usd=prior_cost,
                 )
-                context = build_model_context(
-                    visible_messages,
-                    run_messages,
-                    workspace_root=workspace_root,
-                    workspace_guidance=guidance,
-                    run_tool_calls=prior_tool_calls,
-                    tools=offered_tools,
-                    redactor=self._redactor,
-                )
-                request = ModelRequest(
-                    provider_id=run.provider_id,
-                    model_id=run.model_id,
-                    adapter_kind=run.adapter_kind,
-                    upstream_model_id=run.upstream_model_id,
-                    messages=context.messages,
-                    max_output_tokens=min(MAX_OUTPUT_TOKENS, run.max_total_tokens - prior_tokens),
-                    system_instructions=context.system_instructions,
-                    tools=context.tools,
-                )
                 model_profile = profile_for_model(run.model_id)
                 if model_profile is None:
                     raise ApplicationError(
                         "model_not_available", "The selected model metadata is unavailable."
                     )
-                visible_sources = sorted(visible_messages, key=lambda item: (item.ordinal, item.id))
-                if not any(source.id == run.input_message_id for source in visible_sources):
-                    raise ApplicationError(
-                        "context_current_request_missing",
-                        "The current request is missing from the saved context. Try again.",
-                    )
-                exchange_sources = sorted(run_messages, key=lambda item: (item.ordinal, item.id))
-                items = tuple(
-                    ContextItem(
-                        source.id,
-                        source.turn_id,
-                        message,
-                        required=source.id == run.input_message_id,
-                    )
-                    for source, message in zip(
-                        visible_sources, context.messages[: len(visible_sources)], strict=True
-                    )
-                ) + tuple(
-                    ContextItem(source.id, run.turn_id, message, source_kind="run_message")
-                    for source, message in zip(
-                        exchange_sources, context.messages[len(visible_sources) :], strict=True
-                    )
+                plan = await context_runtime.prepare(
+                    run,
+                    model,
+                    model_profile,
+                    provider,
+                    api_key or "",
+                    profile.id,
+                    workspace_root=workspace_root,
+                    guidance=guidance,
+                    tools=offered_tools,
                 )
-                plan = preflight_context(
-                    request,
-                    items=items,
-                    profile=model_profile,
-                    remaining_run_tokens=run.max_total_tokens - prior_tokens,
-                    remaining_run_cost_usd=(
-                        run.max_cost_usd - prior_cost if prior_cost is not None else None
-                    ),
+                prior_model_calls = await self._runs.list_model_calls(run.id)
+                prior_tokens, prior_cost = self._budget_totals(run.model_id, prior_model_calls)
+                step_index = len(prior_model_calls) + 1
+                self._check_budget(
+                    run,
+                    kind="model",
+                    model_calls=len(prior_model_calls),
+                    tool_calls=len(prior_tool_calls),
+                    tokens=prior_tokens,
+                    cost_usd=prior_cost,
                 )
-                if plan.needs_compaction:
-                    raise ApplicationError(
-                        "context_compaction_required", "This conversation requires compaction."
-                    )
                 request = plan.request
                 call = await self._runs.create_model_call(
                     run.id,
@@ -779,6 +756,7 @@ class RunService:
                     profile.id,
                     prior_tokens,
                     prior_cost,
+                    pricing_context_tokens=plan.pricing_context_tokens,
                 )
                 if not step.content.strip() and not step.tool_calls:
                     raise ProviderError(
@@ -786,7 +764,9 @@ class RunService:
                     )
                 safe_calls, preflight_errors = _prepare_tool_calls(step.tool_calls, self._redactor)
                 step = replace(step, tool_calls=safe_calls)
-                _step_tokens, step_cost = _usage_measure(run.model_id, step.usage)
+                _step_tokens, step_cost = _usage_measure(
+                    run.model_id, step.usage, step.billing_context
+                )
                 call = await self._runs.update_model_call(
                     call.id,
                     ModelCallStatus.COMPLETED,
@@ -799,6 +779,7 @@ class RunService:
                     cached_tokens=step.usage["cached_tokens"],
                     cache_creation_tokens=step.usage["cache_creation_tokens"],
                     estimated_cost=step_cost,
+                    clear_estimated_cost=step_cost is None,
                 )
                 await self._append_and_publish(
                     run.id,
@@ -1136,6 +1117,7 @@ class RunService:
                 for item in step.continuation_items
             ],
             "usage": step.usage,
+            "usage_context": step.billing_context,
             "finish_reason": step.finish_reason,
             "finish_kind": step.finish_kind,
             "provider_response_id": step.provider_response_id,
@@ -1152,6 +1134,8 @@ class RunService:
         user_id: str,
         prior_tokens: int,
         prior_cost: float | None,
+        *,
+        pricing_context_tokens: int = 0,
     ) -> _ModelStep:
         output_parts: list[str] = []
         batcher = TextStreamBatcher(secrets=(*self._redactor.streaming_secrets, api_key))
@@ -1178,6 +1162,7 @@ class RunService:
             "cached_tokens": None,
             "cache_creation_tokens": None,
         }
+        billing_context: dict[str, object] = {"pricing_context_tokens": pricing_context_tokens}
         provider_response_id: str | None = None
         finish_reason: str | None = None
         finish_kind: ModelFinishKind | None = None
@@ -1229,6 +1214,12 @@ class RunService:
                     )
                 continuation_items.append(item)
             elif event.kind == "usage":
+                if event.service_tier is not None:
+                    billing_context["service_tier"] = event.service_tier
+                if event.cache_creation_tokens is not None:
+                    billing_context["cache_creation_1h_tokens"] = (
+                        event.cache_creation_1h_tokens if event.cache_creation_tokens else 0
+                    )
                 incoming_usage = {
                     "input_tokens": event.input_tokens,
                     "output_tokens": event.output_tokens,
@@ -1242,7 +1233,7 @@ class RunService:
                 provider_response_id = (
                     self._safe_provider_metadata(event.provider_response_id) or provider_response_id
                 )
-                step_tokens, step_cost = _usage_measure(run.model_id, usage)
+                step_tokens, step_cost = _usage_measure(run.model_id, usage, billing_context)
                 call = await self._runs.update_model_call(
                     call.id,
                     ModelCallStatus.STREAMING,
@@ -1253,6 +1244,8 @@ class RunService:
                     cached_tokens=usage["cached_tokens"],
                     cache_creation_tokens=usage["cache_creation_tokens"],
                     estimated_cost=step_cost,
+                    clear_estimated_cost=step_cost is None,
+                    response_snapshot={"usage_context": billing_context.copy()},
                 )
                 await self._append_and_publish(
                     run.id,
@@ -1327,6 +1320,7 @@ class RunService:
             provider_response_id=provider_response_id,
             finish_reason=finish_reason,
             finish_kind=finish_kind or ("tool" if tool_calls else "final"),
+            billing_context=billing_context,
         )
 
     def _safe_provider_metadata(self, value: str | None) -> str | None:
@@ -1359,7 +1353,11 @@ class RunService:
         cost = 0.0
         missing_price = False
         for call in calls:
-            if call.status is not ModelCallStatus.COMPLETED:
+            if (
+                call.status is not ModelCallStatus.COMPLETED
+                and call.input_tokens is None
+                and call.output_tokens is None
+            ):
                 continue
             call_tokens, call_cost = _usage_measure(
                 model_id,
@@ -1370,6 +1368,7 @@ class RunService:
                     "cached_tokens": call.cached_tokens,
                     "cache_creation_tokens": call.cache_creation_tokens,
                 },
+                cast(Mapping[str, object], (call.response_snapshot or {}).get("usage_context", {})),
             )
             if call_tokens is None:
                 raise ProviderError(

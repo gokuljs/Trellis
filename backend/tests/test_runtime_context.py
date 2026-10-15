@@ -1,8 +1,6 @@
 import asyncio
 from pathlib import Path
 
-import pytest
-
 from app.application.runs import RunService
 from app.domain.runtime import ModelStreamEvent, RunStatus
 from app.infrastructure.secrets import SecretStore
@@ -46,17 +44,10 @@ def test_generation_persists_preflight_provenance_and_reserved_output(tmp_path: 
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("historical", [False, True])
-def test_over_budget_context_never_dispatches_generation(tmp_path: Path, historical: bool) -> None:
+def test_over_budget_current_request_never_dispatches_generation(tmp_path: Path) -> None:
     async def exercise():
         database = MemoryRepository(tmp_path / "db")
         session = await database.create_session()
-        if historical:
-            for index in range(20):
-                await database.add_user_message(session.id, str(index), "history " * 800)
-                await database.add_assistant_message(
-                    session.id, str(index), "Done", "openai", "openai:gpt-5.5"
-                )
         secrets = SecretStore(tmp_path / ".env")
         await secrets.set("openai", "test-key")
         provider = RecordingProvider(
@@ -67,15 +58,11 @@ def test_over_budget_context_never_dispatches_generation(tmp_path: Path, histori
         )
         service = RunService(database, database, database, database, secrets, {"openai": provider})
         try:
-            run = await service.create_run(
-                session.id, "context", "Current" if historical else "x" * 100001
-            )
+            run = await service.create_run(session.id, "context", "x" * 100001)
             await service.wait_for_run(run.id)
             saved = await database.get_run(run.id)
             assert saved is not None and saved.status is RunStatus.FAILED
-            assert saved.error_code == (
-                "context_compaction_required" if historical else "run_budget_exhausted"
-            )
+            assert saved.error_code == "run_budget_exhausted"
             assert provider.request is None
             assert await database.list_model_calls(run.id) == []
         finally:
@@ -86,8 +73,14 @@ def test_over_budget_context_never_dispatches_generation(tmp_path: Path, histori
 
 def test_missing_current_request_stops_before_provider_dispatch(tmp_path: Path) -> None:
     class CappedHistoryRepository(MemoryRepository):
-        async def list_messages(self, session_id: str):
-            return (await super().list_messages(session_id))[:2]
+        async def load_context_window(self, session_id: str, *, limit: int = 128):
+            from app.domain.context import ContextWindow
+
+            window = await super().load_context_window(session_id, limit=limit)
+            return ContextWindow(window.checkpoint, window.messages[:2])
+
+        async def get_turn_messages(self, session_id: str, turn_id: str):
+            return []
 
     async def exercise():
         database = CappedHistoryRepository(tmp_path / "db")
