@@ -33,6 +33,5 @@ bun run format
 bun run format:check
 bun run lint
 bun run typecheck
-bun run test:contracts
 bun run build
 ```

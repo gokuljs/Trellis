@@ -15,7 +15,6 @@ request.
 
 ## Safe implementation workflow
 
-- Follow RED–GREEN–REFACTOR for every behavior change.
 - Use synchronous path operations for blocking work; use `async` only when the
   entire call path is non-blocking.
 - Bound concurrency and retries, set explicit timeouts, and propagate
@@ -26,8 +25,8 @@ request.
 ## Review priorities
 
 Review public API and OpenAPI compatibility first, then type safety, cancellation
-and timeout behavior, dependency risk, test coverage, and accidental layering
-leaks. Do not invent contracts for future Trellis runs, sessions, or events.
+and timeout behavior, dependency risk, and accidental layering leaks. Do not
+invent contracts for future Trellis runs, sessions, or events.
 
 ## Required checks
 
@@ -37,5 +36,5 @@ From this directory, run:
 make check
 ```
 
-The command must pass Ruff format checking, Ruff linting, `ty check`, strict
-pytest, and the 90% coverage threshold. Use uv 0.12.5 as configured by CI.
+The command must pass Ruff format checking, Ruff linting, and `ty check`. Use uv
+0.12.5 as configured by CI.

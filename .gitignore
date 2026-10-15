@@ -4,10 +4,9 @@ node_modules/
 .pnp.*
 vendor/
 
-# Build and coverage output
+# Build output
 dist/
 build/
-coverage/
 .turbo/
 .next/
 .vite/
@@ -30,7 +29,6 @@ pnpm-debug.log*
 # Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
 .venv/
 venv/
 env/

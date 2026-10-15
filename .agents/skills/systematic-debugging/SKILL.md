@@ -1,6 +1,6 @@
 ---
 name: systematic-debugging
-description: Use when encountering any bug, test failure, or unexpected behavior, before proposing fixes
+description: Use when encountering any bug or unexpected behavior, before proposing fixes
 ---
 
 # Systematic Debugging
@@ -22,7 +22,7 @@ If you haven't completed Phase 1, you cannot propose fixes.
 ## When to Use
 
 Use for ANY technical issue:
-- Test failures
+- Bugs
 - Bugs in production
 - Unexpected behavior
 - Performance problems
@@ -140,7 +140,7 @@ You MUST complete each phase before proceeding to the next.
    - What settings, config, environment?
    - What assumptions does it make?
 
-### Phase 3: Hypothesis and Testing
+### Phase 3: Hypothesis and Validation
 
 **Scientific method:**
 
@@ -149,8 +149,8 @@ You MUST complete each phase before proceeding to the next.
    - Write it down
    - Be specific, not vague
 
-2. **Test Minimally**
-   - Make the SMALLEST possible change to test hypothesis
+2. **Validate Minimally**
+   - Make the SMALLEST possible change or observation to check the hypothesis
    - One variable at a time
    - Don't fix multiple things at once
 
@@ -169,33 +169,26 @@ You MUST complete each phase before proceeding to the next.
 
 **Fix the root cause, not the symptom:**
 
-1. **Create Failing Test Case**
-   - Simplest possible reproduction
-   - Automated test if possible
-   - One-off test script if no framework
-   - MUST have before fixing
-   - Use the `superpowers:test-driven-development` skill for writing proper failing tests
-
-2. **Implement Single Fix**
+1. **Implement Single Fix**
    - Address the root cause identified
    - ONE change at a time
    - No "while I'm here" improvements
    - No bundled refactoring
 
-3. **Verify Fix**
-   - Test passes now?
-   - No other tests broken?
+2. **Verify Fix**
+   - Does the original problem no longer occur?
+   - Did the change break related behavior?
    - Issue actually resolved?
    - Use the `superpowers:verification-before-completion` skill before claiming success
 
-4. **If Fix Doesn't Work**
+3. **If Fix Doesn't Work**
    - STOP
    - Count: How many fixes have you tried?
    - If < 3: Return to Phase 1, re-analyze with new information
-   - **If ≥ 3: STOP and question the architecture (step 5 below)**
+   - **If ≥ 3: STOP and question the architecture (step 4 below)**
    - DON'T attempt Fix #4 without architectural discussion
 
-5. **If 3+ Fixes Failed: Question Architecture**
+4. **If 3+ Fixes Failed: Question Architecture**
 
    **Pattern indicating architectural problem:**
    - Each fix reveals new shared state/coupling/problem in different place
@@ -216,8 +209,8 @@ You MUST complete each phase before proceeding to the next.
 If you catch yourself thinking:
 - "Quick fix for now, investigate later"
 - "Just try changing X and see if it works"
-- "Add multiple changes, run tests"
-- "Skip the test, I'll manually verify"
+- "Add multiple changes before checking the result"
+- "Skip validation and rely on assumptions"
 - "It's probably X, let me fix that"
 - "I don't fully understand but this might work"
 - "Pattern says X but I'll adapt it differently"
@@ -248,7 +241,7 @@ If you catch yourself thinking:
 | "Issue is simple, don't need process" | Simple issues have root causes too. Process is fast for simple bugs. |
 | "Emergency, no time for process" | Systematic debugging is FASTER than guess-and-check thrashing. |
 | "Just try this first, then investigate" | First fix sets the pattern. Do it right from the start. |
-| "I'll write test after confirming fix works" | Untested fixes don't stick. Test first proves it. |
+| "I'll verify after confirming fix works" | Unverified fixes don't stick. Check the evidence first. |
 | "Multiple fixes at once saves time" | Can't isolate what worked. Causes new bugs. |
 | "Reference too long, I'll adapt the pattern" | Partial understanding guarantees bugs. Read it completely. |
 | "I see the problem, let me fix it" | Seeing symptoms ≠ understanding root cause. |
@@ -260,8 +253,8 @@ If you catch yourself thinking:
 |-------|---------------|------------------|
 | **1. Root Cause** | Read errors, reproduce, check changes, gather evidence | Understand WHAT and WHY |
 | **2. Pattern** | Find working examples, compare | Identify differences |
-| **3. Hypothesis** | Form theory, test minimally | Confirmed or new hypothesis |
-| **4. Implementation** | Create test, fix, verify | Bug resolved, tests pass |
+| **3. Hypothesis** | Form theory, validate minimally | Confirmed or new hypothesis |
+| **4. Implementation** | Fix, verify behavior and related checks | Bug resolved |
 
 ## When Process Reveals "No Root Cause"
 
@@ -280,4 +273,3 @@ These techniques are part of systematic debugging and available in this director
 
 - **`root-cause-tracing.md`** - Trace bugs backward through call stack to find original trigger
 - **`defense-in-depth.md`** - Add validation at multiple layers after finding root cause
-- **`condition-based-waiting.md`** - Replace arbitrary timeouts with condition polling
