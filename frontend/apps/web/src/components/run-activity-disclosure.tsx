@@ -2,6 +2,8 @@ import { ChevronDown } from "lucide-react"
 import { useEffect, useId, useRef, useState } from "react"
 import { ThinkingOrb } from "thinking-orbs"
 
+import { SavedTurnActivity } from "@/components/saved-turn-activity"
+import { SavedRunActivity } from "@/components/saved-run-activity"
 import { RunActivity } from "@/components/run-activity"
 import { describeActivity } from "@/lib/activity-status"
 import type {
@@ -10,6 +12,8 @@ import type {
 } from "@/lib/runtime-client"
 
 type RunActivityDisclosureProps = {
+  sessionId?: string
+  turnId?: string
   activity: TurnRunActivity
   pending: boolean
   expanded: boolean
@@ -25,6 +29,8 @@ type RunActivityDisclosureProps = {
 }
 
 export function RunActivityDisclosure({
+  sessionId,
+  turnId,
   activity,
   pending,
   expanded,
@@ -37,6 +43,7 @@ export function RunActivityDisclosure({
 }: RunActivityDisclosureProps) {
   const rootRef = useRef<HTMLDivElement>(null)
   const detailsId = useId()
+  const [openAttemptId, setOpenAttemptId] = useState<string | null>(null)
   const [now, setNow] = useState(() => Date.now())
   const status = describeActivity(
     activity.events,
@@ -46,6 +53,7 @@ export function RunActivityDisclosure({
     activity.summary
   )
   const available = Boolean(
+    (sessionId && turnId) ||
     activity.events.length ||
     activity.summary ||
     activity.priorAttempts?.length ||
@@ -93,7 +101,14 @@ export function RunActivityDisclosure({
               paused={status.terminal}
               aria-hidden="true"
             />
-            <span>{status.label}</span>
+            <span>
+              {!pending &&
+              !activity.summary &&
+              !activity.latestEvent &&
+              !activity.events.length
+                ? "View activity"
+                : status.label}
+            </span>
           </span>
           <span className="run-activity-trigger-end">
             {status.duration ? <time>{status.duration}</time> : null}
@@ -122,61 +137,103 @@ export function RunActivityDisclosure({
           aria-label="Activity details"
           tabIndex={0}
         >
-          {activity.priorAttempts?.map((attempt, index) => (
-            <div className="run-activity-attempt" key={attempt.runId}>
-              <div className="run-activity-attempt-label">
-                Attempt {index + 1}
-              </div>
-              {attempt.events?.length ? (
+          {sessionId && turnId && !pending ? (
+            <SavedTurnActivity sessionId={sessionId} turnId={turnId} />
+          ) : (
+            <>
+              {activity.priorAttempts?.map((attempt, index) => (
+                <div className="run-activity-attempt" key={attempt.runId}>
+                  <div className="run-activity-attempt-label">
+                    Attempt {index + 1}
+                  </div>
+                  {sessionId ? (
+                    <>
+                      <button
+                        type="button"
+                        className="run-activity-retry"
+                        aria-expanded={openAttemptId === attempt.runId}
+                        onClick={() =>
+                          setOpenAttemptId(
+                            openAttemptId === attempt.runId
+                              ? null
+                              : attempt.runId
+                          )
+                        }
+                      >
+                        {" "}
+                        {openAttemptId === attempt.runId
+                          ? "Hide attempt activity"
+                          : "View attempt activity"}
+                      </button>
+                      {openAttemptId === attempt.runId ? (
+                        <SavedRunActivity
+                          sessionId={sessionId}
+                          runId={attempt.runId}
+                          runInfo={attempt.runInfo}
+                          label={`Attempt ${index + 1} activity`}
+                        />
+                      ) : null}
+                    </>
+                  ) : attempt.events?.length ? (
+                    <RunActivity
+                      label={`Attempt ${index + 1} activity`}
+                      events={attempt.events}
+                      runInfo={attempt.runInfo}
+                      pending={false}
+                      approvalPendingToolId={null}
+                      approvalError={null}
+                      onApprovalDecision={onApprovalDecision}
+                    />
+                  ) : (
+                    <p className="run-activity-load-state">
+                      {attempt.error ??
+                        (attempt.loading
+                          ? "Loading activity…"
+                          : "Activity unavailable")}
+                    </p>
+                  )}
+                </div>
+              ))}
+              {activity.priorAttempts?.length ? (
+                <div className="run-activity-attempt-label">Latest attempt</div>
+              ) : null}
+              {sessionId &&
+              !pending &&
+              (activity.summary?.run_id || activity.runInfo?.runId) ? (
+                <SavedRunActivity
+                  sessionId={sessionId}
+                  runId={(activity.summary?.run_id ?? activity.runInfo?.runId)!}
+                  runInfo={activity.runInfo}
+                />
+              ) : activity.events.length ? (
                 <RunActivity
-                  label={`Attempt ${index + 1} activity`}
-                  events={attempt.events}
-                  runInfo={attempt.runInfo}
-                  pending={false}
-                  approvalPendingToolId={null}
-                  approvalError={null}
+                  events={activity.events}
+                  runInfo={activity.runInfo}
+                  pending={pending}
+                  approvalPendingToolId={approvalPendingToolId}
+                  approvalError={approvalError}
                   onApprovalDecision={onApprovalDecision}
                 />
               ) : (
                 <p className="run-activity-load-state">
-                  {attempt.error ??
-                    (attempt.loading
+                  {activity.eventsError ??
+                    (activity.eventsLoading
                       ? "Loading activity…"
-                      : "Activity unavailable")}
+                      : "Waiting for activity…")}
                 </p>
               )}
-            </div>
-          ))}
-          {activity.priorAttempts?.length ? (
-            <div className="run-activity-attempt-label">Latest attempt</div>
-          ) : null}
-          {activity.events.length ? (
-            <RunActivity
-              events={activity.events}
-              runInfo={activity.runInfo}
-              pending={pending}
-              approvalPendingToolId={approvalPendingToolId}
-              approvalError={approvalError}
-              onApprovalDecision={onApprovalDecision}
-            />
-          ) : (
-            <p className="run-activity-load-state">
-              {activity.eventsError ??
-                (activity.eventsLoading
-                  ? "Loading activity…"
-                  : "Waiting for activity…")}
-            </p>
+              {activity.eventsError ||
+              activity.priorAttempts?.some((attempt) => attempt.error) ? (
+                <button
+                  type="button"
+                  className="run-activity-retry"
+                  onClick={onRequestEvents}
+                >
+                  Retry loading
+                </button>
+              ) : null}
+            </>
           )}
-          {activity.eventsError ||
-          activity.priorAttempts?.some((attempt) => attempt.error) ? (
-            <button
-              type="button"
-              className="run-activity-retry"
-              onClick={onRequestEvents}
-            >
-              Retry loading
-            </button>
-          ) : null}
         </div>
       ) : null}
     </div>

@@ -1,3 +1,5 @@
+from typing import Literal
+
 from fastapi import APIRouter
 from pydantic import BaseModel
 
@@ -29,6 +31,19 @@ class ModelOption(BaseModel):
     supports_tools: bool
     configured: bool
     key_hint: str | None
+
+    enabled: bool = True
+    selectable: bool = False
+    context_window_tokens: int | None = None
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None = None
+    supports_native_compaction: bool | None = None
+    metadata_status: Literal["ready", "pending"] = "pending"
+    pending_reasons: tuple[str, ...] = ()
+    verification_sources: tuple[str, ...] = ()
+    metadata_verified_at: str | None = None
+    availability: Literal["available", "unavailable", "unknown"] = "unknown"
+    availability_checked_at: str | None = None
 
 
 class SettingsResponse(BaseModel):
@@ -84,6 +99,18 @@ def serialize_settings(settings: AppSettings) -> SettingsResponse:
                 supports_tools=model.supports_tools,
                 configured=model.configured,
                 key_hint=None,
+                enabled=model.enabled,
+                selectable=model.selectable,
+                context_window_tokens=model.context_window_tokens,
+                max_input_tokens=model.max_input_tokens,
+                max_output_tokens=model.max_output_tokens,
+                supports_native_compaction=model.supports_native_compaction,
+                metadata_status=model.metadata_status,
+                pending_reasons=model.pending_reasons,
+                verification_sources=model.verification_sources,
+                metadata_verified_at=model.metadata_verified_at,
+                availability=model.availability,
+                availability_checked_at=model.availability_checked_at,
             )
             for model in settings.models
         ],

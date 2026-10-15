@@ -1,11 +1,15 @@
+import asyncio
 import json
+import re
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 
+from app.application.context_budget import input_fingerprint
 from app.application.errors import ProviderError
+from app.domain.context import InputTokenCount, NativeCompactionKind, NativeCompactionResult
 from app.domain.models import Message, ProviderName
 from app.domain.runtime import (
     ModelContinuationItem,
@@ -336,12 +340,354 @@ def _openai_completed_calls(calls: dict[str, _OpenAIFunctionCall]) -> list[Model
     return [call for _, call in completed]
 
 
+_MAX_NATIVE_CONTEXT_BYTES = 262144
+
+
+def _native_value(request: ModelRequest) -> object:
+    payload = request.native_context_json
+    if payload is None:
+        return None
+    try:
+        if len(payload.encode("utf-8")) > _MAX_NATIVE_CONTEXT_BYTES:
+            raise ValueError("native context too large")
+        return json.loads(payload, parse_constant=_reject_json_constant)
+    except ValueError, RecursionError:
+        raise ProviderError(
+            "native_context_invalid", "The saved native context cannot be replayed."
+        ) from None
+
+
+def _native_openai_window(request: ModelRequest) -> list[dict[str, Any]]:
+    window = _native_value(request)
+    if window is None:
+        return []
+    if (
+        not isinstance(window, list)
+        or not window
+        or not all(isinstance(item, dict) for item in window)
+        or not any(
+            item.get("type") == "compaction"
+            and isinstance(item.get("encrypted_content"), str)
+            and item["encrypted_content"]
+            for item in window
+        )
+    ):
+        raise _openai_invalid_stream()
+    return window
+
+
+def _valid_anthropic_block(block: object) -> bool:
+    return (
+        isinstance(block, dict)
+        and block.get("type") == "compaction"
+        and isinstance(block.get("content"), str)
+        and bool(block["content"].strip())
+        and isinstance(block.get("signature"), str)
+        and bool(block["signature"])
+    )
+
+
+def _native_anthropic_messages(request: ModelRequest) -> list[dict[str, object]]:
+    block = _native_value(request)
+    if block is None:
+        return []
+    if not _valid_anthropic_block(block):
+        raise _anthropic_invalid_stream()
+    return [{"role": "assistant", "content": [block]}]
+
+
+def _anthropic_headers(api_key: str, *, native: bool) -> dict[str, str]:
+    headers = {"X-Api-Key": api_key, "anthropic-version": "2023-06-01"}
+    if native:
+        headers["anthropic-beta"] = "compact-2026-09-04"
+    return headers
+
+
+def _usage_integer(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _native_usage(payload: dict[str, Any], *, anthropic: bool) -> tuple[ModelStreamEvent, ...]:
+    usage = _mapping(payload.get("usage"))
+    raw_entries = usage.get("iterations") if anthropic else [usage]
+    if not isinstance(raw_entries, list):
+        return ()
+    events = []
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            continue
+        input_tokens = _usage_integer(entry.get("input_tokens"))
+        output_tokens = _usage_integer(entry.get("output_tokens"))
+        if input_tokens is None or output_tokens is None:
+            continue
+        input_details = _mapping(entry.get("input_tokens_details"))
+        output_details = _mapping(entry.get("output_tokens_details"))
+        cache_creation = _mapping(entry.get("cache_creation"))
+        tier = entry.get("service_tier", usage.get("service_tier", payload.get("service_tier")))
+        try:
+            tier = _served_service_tier(tier)
+        except ProviderError:
+            # Preserve reported paid usage without storing malformed metadata or
+            # guessing a known price for the failed tier.
+            tier = "unknown"
+        events.append(
+            ModelStreamEvent(
+                kind="usage",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_tokens=_usage_integer(
+                    entry.get("cache_read_input_tokens", 0)
+                    if anthropic
+                    else input_details.get("cached_tokens", 0)
+                ),
+                cache_creation_tokens=_usage_integer(
+                    entry.get("cache_creation_input_tokens", 0)
+                    if anthropic
+                    else input_details.get("cache_write_tokens", 0)
+                ),
+                cache_creation_1h_tokens=_usage_integer(
+                    cache_creation.get(
+                        "ephemeral_1h_input_tokens",
+                        0 if entry.get("cache_creation_input_tokens", 0) == 0 else None,
+                    )
+                )
+                if anthropic
+                else 0,
+                reasoning_tokens=_usage_integer(output_details.get("reasoning_tokens", 0))
+                if not anthropic
+                else None,
+                service_tier=tier if isinstance(tier, str) else None,
+            )
+        )
+    return tuple(events)
+
+
+def _native_usage_complete(
+    payload: dict[str, Any], usage: tuple[ModelStreamEvent, ...], *, anthropic: bool
+) -> bool:
+    if not usage:
+        return False
+    entries = (
+        _mapping(payload.get("usage")).get("iterations") if anthropic else [payload.get("usage")]
+    )
+    return isinstance(entries, list) and len(entries) == len(usage)
+
+
+def _native_result(
+    kind: NativeCompactionKind,
+    value: object,
+    usage: tuple[ModelStreamEvent, ...],
+    response_id: str | None,
+) -> NativeCompactionResult:
+    if not usage:
+        return NativeCompactionResult(kind, None, usage, response_id, "native_usage_unknown")
+    try:
+        payload = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        size = len(payload.encode("utf-8"))
+    except ValueError, TypeError, RecursionError:
+        return NativeCompactionResult(kind, None, usage, response_id, "native_context_invalid")
+    if size > _MAX_NATIVE_CONTEXT_BYTES:
+        return NativeCompactionResult(kind, None, usage, response_id, "native_context_too_large")
+    return NativeCompactionResult(kind, payload, usage, response_id)
+
+
+def _input_count(payload: dict[str, Any], request: ModelRequest) -> InputTokenCount:
+    count = payload.get("input_tokens")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        raise ProviderError(
+            "provider_invalid_response", "The provider returned an invalid token count."
+        )
+    return InputTokenCount(count, "provider", input_fingerprint(request))
+
+
+_CONTEXT_REQUEST_TIMEOUT_SECONDS = 30.0
+
+
+async def _context_post(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    max_bytes: int,
+) -> dict[str, Any]:
+    try:
+        async with asyncio.timeout(_CONTEXT_REQUEST_TIMEOUT_SECONDS):
+            async with client.stream(
+                "POST",
+                url,
+                headers=headers,
+                json=body,
+                follow_redirects=False,
+                timeout=httpx.Timeout(_CONTEXT_REQUEST_TIMEOUT_SECONDS, connect=3),
+            ) as response:
+                _raise_for_provider_response(response)
+                parts = []
+                size = 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise ProviderError(
+                            "provider_invalid_response",
+                            "The provider context response exceeded its size limit.",
+                        )
+                    if chunk:
+                        parts.append(chunk)
+        payload = json.loads(b"".join(parts), parse_constant=_reject_json_constant)
+        if not isinstance(payload, dict):
+            raise ValueError("invalid context response")
+        return payload
+    except httpx.TimeoutException, TimeoutError:
+        raise ProviderError(
+            "provider_timeout", "The provider took too long to respond. Try again."
+        ) from None
+    except httpx.RequestError:
+        raise ProviderError(
+            "provider_upstream_failed", "Trellis could not reach the provider. Try again."
+        ) from None
+    except ValueError, RecursionError:
+        raise ProviderError(
+            "provider_invalid_response", "The provider returned an invalid context response."
+        ) from None
+
+
+def _openai_body(request: ModelRequest, user_id: str) -> dict[str, Any]:
+    input_items: list[dict[str, object]] = _native_openai_window(request)
+    for message in request.messages:
+        if message.role == "tool":
+            if not message.tool_call_id:
+                raise _openai_invalid_stream()
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": message.tool_call_id,
+                    "output": message.content,
+                }
+            )
+            continue
+        for continuation in message.continuation_items:
+            if (
+                continuation.provider_id == request.provider_id
+                and continuation.model_id == request.model_id
+            ):
+                input_items.append(_openai_replay_reasoning(continuation))
+        if message.content or (not message.tool_calls and not message.continuation_items):
+            input_items.append({"role": message.role, "content": message.content})
+        for call in message.tool_calls:
+            input_items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call.id,
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments, separators=(",", ":"), allow_nan=False),
+                }
+            )
+
+    body = {
+        "model": request.upstream_model_id,
+        "input": input_items,
+        "store": False,
+        "stream": True,
+        "include": ["reasoning.encrypted_content"],
+        "reasoning": {"effort": "medium"},
+        "max_output_tokens": request.max_output_tokens,
+        "safety_identifier": user_id,
+    }
+    if request.system_instructions:
+        body["instructions"] = request.system_instructions
+    if request.tools:
+        body["tools"] = [
+            {
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema,
+                "strict": _openai_strict_schema(tool.input_schema),
+            }
+            for tool in request.tools
+        ]
+    return body
+
+
+def _anthropic_body(request: ModelRequest) -> dict[str, Any]:
+    body = {
+        "model": request.upstream_model_id,
+        "max_tokens": request.max_output_tokens,
+        "stream": True,
+        "messages": _native_anthropic_messages(request) + _anthropic_messages(request.messages),
+    }
+    if request.system_instructions:
+        body["system"] = request.system_instructions
+    if request.tools:
+        body["tools"] = [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            }
+            for tool in request.tools
+        ]
+    return body
+
+
 class OpenAIProvider:
     name: ProviderName = "openai"
     model = "gpt-5.5"
 
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
+
+    async def count_input(
+        self, request: ModelRequest, api_key: str, user_id: str
+    ) -> InputTokenCount:
+        body = _openai_body(request, user_id)
+        payload = await _context_post(
+            self._client,
+            "https://api.openai.com/v1/responses/input_tokens",
+            headers={"Authorization": f"Bearer {api_key}"},
+            body={
+                key: body[key]
+                for key in ("model", "input", "instructions", "tools", "reasoning")
+                if key in body
+            },
+            max_bytes=16384,
+        )
+        return _input_count(payload, request)
+
+    async def compact(
+        self, request: ModelRequest, api_key: str, user_id: str
+    ) -> NativeCompactionResult:
+        body = _openai_body(request, user_id)
+        payload = await _context_post(
+            self._client,
+            "https://api.openai.com/v1/responses/compact",
+            headers={"Authorization": f"Bearer {api_key}"},
+            body={key: body[key] for key in ("model", "input", "instructions") if key in body},
+            max_bytes=524288,
+        )
+        usage = _native_usage(payload, anthropic=False)
+        response_id = payload.get("id") if isinstance(payload.get("id"), str) else None
+        if not _native_usage_complete(payload, usage, anthropic=False):
+            return NativeCompactionResult(
+                "openai_window", None, usage, response_id, "native_usage_unknown"
+            )
+        window = payload.get("output")
+        if (
+            payload.get("status", "completed") != "completed"
+            or not isinstance(window, list)
+            or not window
+            or not all(isinstance(item, dict) for item in window)
+            or not any(
+                item.get("type") == "compaction"
+                and isinstance(item.get("encrypted_content"), str)
+                and item["encrypted_content"]
+                for item in window
+            )
+        ):
+            return NativeCompactionResult(
+                "openai_window", None, usage, response_id, "native_context_invalid"
+            )
+        return _native_result("openai_window", window, usage, response_id)
 
     def stream(
         self,
@@ -399,6 +745,61 @@ class AnthropicProvider:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
 
+    async def count_input(
+        self, request: ModelRequest, api_key: str, user_id: str
+    ) -> InputTokenCount:
+        del user_id
+        body = _anthropic_body(request)
+        payload = await _context_post(
+            self._client,
+            "https://api.anthropic.com/v1/messages/count_tokens",
+            headers=_anthropic_headers(api_key, native=request.native_context_json is not None),
+            body={
+                key: body[key] for key in ("model", "messages", "system", "tools") if key in body
+            },
+            max_bytes=16384,
+        )
+        return _input_count(payload, request)
+
+    async def compact(
+        self, request: ModelRequest, api_key: str, user_id: str
+    ) -> NativeCompactionResult:
+        del user_id
+        body = _anthropic_body(request)
+        body.pop("stream")
+        body["compaction"] = {
+            "type": "summarize",
+            "instructions": (
+                "Summarize the conversation for continuation. Preserve constraints, decisions, "
+                "actions, results, failures and remaining work. Do not call tools; "
+                "return only the summary."
+            ),
+        }
+        payload = await _context_post(
+            self._client,
+            "https://api.anthropic.com/v1/messages",
+            headers=_anthropic_headers(api_key, native=True),
+            body=body,
+            max_bytes=524288,
+        )
+        usage = _native_usage(payload, anthropic=True)
+        response_id = payload.get("id") if isinstance(payload.get("id"), str) else None
+        if not _native_usage_complete(payload, usage, anthropic=True):
+            return NativeCompactionResult(
+                "anthropic_block", None, usage, response_id, "native_usage_unknown"
+            )
+        blocks = payload.get("content")
+        if (
+            payload.get("stop_reason") != "compaction"
+            or not isinstance(blocks, list)
+            or len(blocks) != 1
+            or not _valid_anthropic_block(blocks[0])
+        ):
+            return NativeCompactionResult(
+                "anthropic_block", None, usage, response_id, "native_context_incomplete"
+            )
+        return _native_result("anthropic_block", blocks[0], usage, response_id)
+
     def stream(
         self,
         request: ModelRequest,
@@ -451,60 +852,7 @@ async def _stream_openai(
     api_key: str,
     user_id: str,
 ) -> AsyncGenerator[ModelStreamEvent]:
-    input_items: list[dict[str, object]] = []
-    for message in request.messages:
-        if message.role == "tool":
-            if not message.tool_call_id:
-                raise _openai_invalid_stream()
-            input_items.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": message.tool_call_id,
-                    "output": message.content,
-                }
-            )
-            continue
-        for continuation in message.continuation_items:
-            if (
-                continuation.provider_id == request.provider_id
-                and continuation.model_id == request.model_id
-            ):
-                input_items.append(_openai_replay_reasoning(continuation))
-        if message.content or (not message.tool_calls and not message.continuation_items):
-            input_items.append({"role": message.role, "content": message.content})
-        for call in message.tool_calls:
-            input_items.append(
-                {
-                    "type": "function_call",
-                    "call_id": call.id,
-                    "name": call.name,
-                    "arguments": json.dumps(call.arguments, separators=(",", ":"), allow_nan=False),
-                }
-            )
-
-    body = {
-        "model": request.upstream_model_id,
-        "input": input_items,
-        "store": False,
-        "stream": True,
-        "include": ["reasoning.encrypted_content"],
-        "reasoning": {"effort": "medium"},
-        "max_output_tokens": request.max_output_tokens,
-        "safety_identifier": user_id,
-    }
-    if request.system_instructions:
-        body["instructions"] = request.system_instructions
-    if request.tools:
-        body["tools"] = [
-            {
-                "type": "function",
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.input_schema,
-                "strict": _openai_strict_schema(tool.input_schema),
-            }
-            for tool in request.tools
-        ]
+    body = _openai_body(request, user_id)
     response_id: str | None = None
     saw_text = False
     saw_refusal_delta = False
@@ -677,7 +1025,9 @@ async def _stream_openai(
             input_tokens = _optional_integer(usage.get("input_tokens"))
             output_tokens = _optional_integer(usage.get("output_tokens"))
             cached_tokens = _optional_integer(input_details.get("cached_tokens"))
+            cache_creation_tokens = _optional_integer(input_details.get("cache_write_tokens"))
             reasoning_tokens = _optional_integer(output_details.get("reasoning_tokens"))
+            service_tier = _served_service_tier(response.get("service_tier"))
             usage_event = None
             if any(
                 value is not None
@@ -685,7 +1035,9 @@ async def _stream_openai(
                     input_tokens,
                     output_tokens,
                     cached_tokens,
+                    cache_creation_tokens,
                     reasoning_tokens,
+                    service_tier,
                 )
             ):
                 usage_event = ModelStreamEvent(
@@ -694,6 +1046,9 @@ async def _stream_openai(
                     output_tokens=output_tokens,
                     reasoning_tokens=reasoning_tokens,
                     cached_tokens=cached_tokens,
+                    cache_creation_tokens=cache_creation_tokens,
+                    cache_creation_1h_tokens=0,
+                    service_tier=service_tier,
                     provider_response_id=response_id,
                 )
             incomplete_reason = _mapping(response.get("incomplete_details")).get("reason")
@@ -719,6 +1074,13 @@ async def _stream_openai(
                 kind="completed",
                 finish_reason=finish_reason,
                 provider_response_id=response_id,
+                finish_kind=(
+                    "incomplete"
+                    if event_type == "response.incomplete"
+                    else "tool"
+                    if completed_calls
+                    else "final"
+                ),
             )
             break
         elif event_type in {"response.failed", "error"}:
@@ -739,28 +1101,14 @@ async def _stream_anthropic(
     request: ModelRequest,
     api_key: str,
 ) -> AsyncGenerator[ModelStreamEvent]:
-    body = {
-        "model": request.upstream_model_id,
-        "max_tokens": request.max_output_tokens,
-        "stream": True,
-        "messages": _anthropic_messages(request.messages),
-    }
-    if request.system_instructions:
-        body["system"] = request.system_instructions
-    if request.tools:
-        body["tools"] = [
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": tool.input_schema,
-            }
-            for tool in request.tools
-        ]
+    body = _anthropic_body(request)
     response_id: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
     cached_tokens: int | None = None
-    cache_creation_tokens = 0
+    cache_creation_tokens: int | None = 0
+    cache_creation_1h_tokens: int | None = 0
+    service_tier: str | None = None
     finish_reason: str | None = None
     saw_text = False
     completed = False
@@ -771,10 +1119,7 @@ async def _stream_anthropic(
     provider_events = _post_stream(
         client,
         "https://api.anthropic.com/v1/messages",
-        headers={
-            "X-Api-Key": api_key,
-            "anthropic-version": "2023-06-01",
-        },
+        headers=_anthropic_headers(api_key, native=request.native_context_json is not None),
         json=body,
     )
 
@@ -788,6 +1133,8 @@ async def _stream_anthropic(
             input_tokens = _optional_integer(usage.get("input_tokens"))
             cached_tokens = _optional_integer(usage.get("cache_read_input_tokens"))
             cache_creation_tokens = _optional_integer(usage.get("cache_creation_input_tokens", 0))
+            cache_creation_1h_tokens = _anthropic_write_1h(usage, cache_creation_tokens)
+            service_tier = _served_service_tier(usage.get("service_tier"))
         elif event_type == "content_block_start":
             index = payload.get("index")
             block = _mapping(payload.get("content_block"))
@@ -875,8 +1222,16 @@ async def _stream_anthropic(
             finish_reason = stop_reason if isinstance(stop_reason, str) else finish_reason
             usage = _mapping(payload.get("usage"))
             output_tokens = _optional_integer(usage.get("output_tokens"))
+            if "input_tokens" in usage:
+                input_tokens = _optional_integer(usage["input_tokens"])
+            if "cache_read_input_tokens" in usage:
+                cached_tokens = _optional_integer(usage["cache_read_input_tokens"])
             if "cache_creation_input_tokens" in usage:
                 cache_creation_tokens = _optional_integer(usage["cache_creation_input_tokens"])
+            if "cache_creation_input_tokens" in usage or "cache_creation" in usage:
+                cache_creation_1h_tokens = _anthropic_write_1h(usage, cache_creation_tokens)
+            if "service_tier" in usage:
+                service_tier = _served_service_tier(usage["service_tier"])
         elif event_type == "message_stop":
             if block_types.keys() - stopped_blocks or (tool_uses and finish_reason != "tool_use"):
                 raise _anthropic_invalid_stream()
@@ -886,13 +1241,18 @@ async def _stream_anthropic(
                     "Anthropic returned an empty response.",
                 )
             usage_event = None
-            if any(value is not None for value in (input_tokens, output_tokens, cached_tokens)):
+            if any(
+                value is not None
+                for value in (input_tokens, output_tokens, cached_tokens, service_tier)
+            ):
                 usage_event = ModelStreamEvent(
                     kind="usage",
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cached_tokens=cached_tokens,
                     cache_creation_tokens=cache_creation_tokens,
+                    cache_creation_1h_tokens=cache_creation_1h_tokens,
+                    service_tier=service_tier,
                     provider_response_id=response_id,
                 )
             completed = True
@@ -915,6 +1275,13 @@ async def _stream_anthropic(
                 kind="completed",
                 finish_reason=finish_reason,
                 provider_response_id=response_id,
+                finish_kind=(
+                    "tool"
+                    if tool_uses
+                    else "final"
+                    if finish_reason in {"end_turn", "stop_sequence", "refusal"}
+                    else "incomplete"
+                ),
             )
             break
         elif event_type == "error":
@@ -988,6 +1355,21 @@ def _decode_sse_data(data_lines: list[str]) -> dict[str, Any]:
 
 def _mapping(value: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _served_service_tier(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", value) is None:
+        raise ProviderError(
+            "provider_invalid_response", "The provider returned invalid usage metadata."
+        )
+    return value
+
+
+def _anthropic_write_1h(usage: dict[str, Any], total: int | None) -> int | None:
+    details = _mapping(usage.get("cache_creation"))
+    return _optional_integer(details.get("ephemeral_1h_input_tokens", 0 if total == 0 else None))
 
 
 def _optional_integer(value: object) -> int | None:

@@ -1,7 +1,8 @@
 import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from contextlib import aclosing, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,9 +18,11 @@ from app.application.budgets import (
     count_total_tokens,
     estimate_model_cost,
 )
-from app.application.context import build_model_context
+from app.application.context_preview import preview_from_plan
 from app.application.errors import ApplicationError, ProviderError
+from app.application.model_catalog import profile_for_model
 from app.application.ports import (
+    ContextCheckpointRepository,
     ProfileRepository,
     RunEventPublisher,
     RunLeasePort,
@@ -30,7 +33,9 @@ from app.application.ports import (
     StreamingProviderAdapter,
     WorkspaceBindingPort,
 )
+from app.application.run_context import RunContext, billing_tier, usage_cost
 from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
+from app.application.streaming import TextStreamBatcher
 from app.application.tools import (
     MAX_ARGUMENT_BYTES,
     ToolExecutionError,
@@ -42,8 +47,10 @@ from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
     ModelContinuationItem,
+    ModelFinishKind,
     ModelMessage,
     ModelRequest,
+    ModelStreamEvent,
     ModelToolCall,
     RunEvent,
     RunEventType,
@@ -73,10 +80,16 @@ class _ModelStep:
     usage: dict[str, int | None]
     provider_response_id: str | None
     finish_reason: str | None
+    finish_kind: ModelFinishKind
+    billing_context: dict[str, object]
 
 
-def _usage_measure(model_id: str, usage: dict[str, int | None]) -> tuple[int | None, float | None]:
+def _usage_measure(
+    model_id: str, usage: dict[str, int | None], billing: Mapping[str, object] | None = None
+) -> tuple[int | None, float | None]:
     try:
+        if billing is not None:
+            return usage_cost(model_id, usage, billing)
         tokens = count_total_tokens(
             model_id,
             usage["input_tokens"],
@@ -216,7 +229,9 @@ class RunService:
 
         models = await self._settings.list_models()
         selected_model_id = (
-            model_id if model_id is not None else await self._settings.get_selected_model_id()
+            model_id
+            if model_id is not None
+            else session.model_id or await self._settings.get_selected_model_id()
         )
         model = next((item for item in models if item.id == selected_model_id), None)
         if model is None:
@@ -322,11 +337,19 @@ class RunService:
         )
 
     async def list_session_runs(
-        self, session_id: str, offset: int, limit: int
+        self,
+        session_id: str,
+        offset: int,
+        limit: int,
+        *,
+        turn_id: str | None = None,
+        newest_first: bool = False,
     ) -> tuple[list[RunSnapshot], int | None]:
         if await self._sessions.get_session(session_id) is None:
             raise ApplicationError("session_not_found", "Session not found.")
-        runs = await self._runs.list_runs_for_session(session_id, offset, limit + 1)
+        runs = await self._runs.list_runs_for_session(
+            session_id, offset, limit + 1, turn_id=turn_id, newest_first=newest_first
+        )
         visible = [await self._recover_if_expired(run) for run in runs[:limit]]
         return [run for run in visible if run is not None], offset + limit if len(
             runs
@@ -668,7 +691,14 @@ class RunService:
                 if model.supports_tools and self._tool_registry is not None
                 else ()
             )
-            visible_messages = await self._sessions.list_messages(run.session_id)
+            context_runtime = RunContext(
+                self._runs,
+                self._sessions,
+                cast(ContextCheckpointRepository, self._runs),
+                self._budget_totals,
+                self._publish,
+                self._redactor,
+            )
 
             prior_model_steps = await self._runs.list_model_calls(run.id)
             if prior_model_steps:
@@ -676,8 +706,7 @@ class RunService:
                 if not await self._execute_pending_tools(run, workspace_root):
                     return
 
-            for step_index in range(len(prior_model_steps) + 1, run.max_model_calls + 1):
-                run_messages = await self._runs.list_run_messages(run.id)
+            while True:
                 prior_tool_calls = await self._runs.list_tool_calls(run.id)
                 prior_model_calls = await self._runs.list_model_calls(run.id)
                 prior_tokens, prior_cost = self._budget_totals(run.model_id, prior_model_calls)
@@ -689,29 +718,52 @@ class RunService:
                     tokens=prior_tokens,
                     cost_usd=prior_cost,
                 )
-                context = build_model_context(
-                    visible_messages,
-                    run_messages,
+                model_profile = profile_for_model(run.model_id)
+                if model_profile is None:
+                    raise ApplicationError(
+                        "model_not_available", "The selected model metadata is unavailable."
+                    )
+                plan = await context_runtime.prepare(
+                    run,
+                    model,
+                    model_profile,
+                    provider,
+                    api_key or "",
+                    profile.id,
                     workspace_root=workspace_root,
-                    workspace_guidance=guidance,
-                    run_tool_calls=prior_tool_calls,
+                    guidance=guidance,
                     tools=offered_tools,
-                    redactor=self._redactor,
                 )
-                request = ModelRequest(
-                    provider_id=run.provider_id,
-                    model_id=run.model_id,
-                    adapter_kind=run.adapter_kind,
-                    upstream_model_id=run.upstream_model_id,
-                    messages=context.messages,
-                    max_output_tokens=min(MAX_OUTPUT_TOKENS, run.max_total_tokens - prior_tokens),
-                    system_instructions=context.system_instructions,
-                    tools=context.tools,
+                prior_model_calls = await self._runs.list_model_calls(run.id)
+                prior_tokens, prior_cost = self._budget_totals(run.model_id, prior_model_calls)
+                step_index = len(prior_model_calls) + 1
+                self._check_budget(
+                    run,
+                    kind="model",
+                    model_calls=len(prior_model_calls),
+                    tool_calls=len(prior_tool_calls),
+                    tokens=prior_tokens,
+                    cost_usd=prior_cost,
+                )
+                request = plan.request
+                assert model_profile.context_window_tokens is not None
+                await self._append_and_publish(
+                    run.id,
+                    RunEventType.CONTEXT,
+                    preview_from_plan(
+                        plan, context_window_tokens=model_profile.context_window_tokens
+                    ).snapshot(),
                 )
                 call = await self._runs.create_model_call(
-                    run.id, step_index, model, self._request_snapshot(request)
+                    run.id,
+                    step_index,
+                    model,
+                    {**self._request_snapshot(request), "context": plan.snapshot()},
                 )
                 call = await self._runs.update_model_call(call.id, ModelCallStatus.STREAMING)
+                await self._append_and_publish(
+                    run.id, RunEventType.PHASE, {"phase": "answering", "model_call_id": call.id}
+                )
                 step = await self._stream_model_step(
                     run,
                     call,
@@ -721,16 +773,17 @@ class RunService:
                     profile.id,
                     prior_tokens,
                     prior_cost,
+                    pricing_context_tokens=plan.pricing_context_tokens,
                 )
                 if not step.content.strip() and not step.tool_calls:
                     raise ProviderError(
                         "provider_invalid_response", "The provider returned an empty response."
                     )
                 safe_calls, preflight_errors = _prepare_tool_calls(step.tool_calls, self._redactor)
-                step = replace(
-                    step, content=self._redactor.redact_text(step.content), tool_calls=safe_calls
+                step = replace(step, tool_calls=safe_calls)
+                _step_tokens, step_cost = _usage_measure(
+                    run.model_id, step.usage, step.billing_context
                 )
-                _step_tokens, step_cost = _usage_measure(run.model_id, step.usage)
                 call = await self._runs.update_model_call(
                     call.id,
                     ModelCallStatus.COMPLETED,
@@ -743,6 +796,7 @@ class RunService:
                     cached_tokens=step.usage["cached_tokens"],
                     cache_creation_tokens=step.usage["cache_creation_tokens"],
                     estimated_cost=step_cost,
+                    clear_estimated_cost=step_cost is None,
                 )
                 await self._append_and_publish(
                     run.id,
@@ -751,6 +805,7 @@ class RunService:
                         "model_call_id": call.id,
                         "provider_response_id": step.provider_response_id,
                         "finish_reason": step.finish_reason,
+                        "finish_kind": step.finish_kind,
                     },
                 )
                 total_tokens, total_cost = self._budget_totals(
@@ -764,14 +819,24 @@ class RunService:
                     tokens=total_tokens,
                     cost_usd=total_cost,
                 )
+                if step.finish_kind == "incomplete":
+                    raise ProviderError(
+                        "provider_response_incomplete",
+                        "The provider stopped before completing the answer. Try again.",
+                    )
+                if (step.finish_kind == "tool") != bool(step.tool_calls):
+                    raise ProviderError(
+                        "provider_invalid_response",
+                        "The provider returned an inconsistent completion.",
+                    )
                 if not step.tool_calls:
-                    final_content = self._redactor.redact_text(step.content).strip()
-                    if not final_content:
+                    final_content = step.content
+                    if not final_content.strip():
                         raise ProviderError(
                             "provider_invalid_response", "The provider returned an empty response."
                         )
                     await self._append_and_publish(
-                        run.id, RunEventType.ASSISTANT_DELTA, {"text": final_content}
+                        run.id, RunEventType.PHASE, {"phase": "finishing", "model_call_id": call.id}
                     )
                     _message, completion_events = await self._runs.complete_run(
                         run.id, final_content
@@ -823,10 +888,11 @@ class RunService:
                 )
                 assistant_message = ModelMessage(
                     role="assistant",
-                    content=self._redactor.redact_text(step.content),
+                    content=step.content,
                     tool_calls=step.tool_calls,
                     continuation_items=step.continuation_items,
                 )
+                await self._runs.finish_assistant_output(run.id, call.id)
                 _assistant, stored_calls, stored_events = await self._runs.record_assistant_message(
                     run.id, call.id, assistant_message
                 )
@@ -896,6 +962,9 @@ class RunService:
             if stored_call.status is not ToolCallStatus.PENDING:
                 continue
             await self._renew_before_local_tool(run.id)
+            await self._append_and_publish(
+                run.id, RunEventType.PHASE, {"phase": "tool_use", "tool_call_id": stored_call.id}
+            )
             self._check_budget(
                 run,
                 kind="tool",
@@ -1046,6 +1115,11 @@ class RunService:
                 for tool in request.tools
             ],
             "max_output_tokens": request.max_output_tokens,
+            **(
+                {"native_context_json": request.native_context_json}
+                if request.native_context_json is not None
+                else {}
+            ),
         }
         return cast(dict[str, object], self._redactor.redact_record(snapshot))
 
@@ -1065,7 +1139,9 @@ class RunService:
                 for item in step.continuation_items
             ],
             "usage": step.usage,
+            "usage_context": step.billing_context,
             "finish_reason": step.finish_reason,
+            "finish_kind": step.finish_kind,
             "provider_response_id": step.provider_response_id,
         }
         return cast(dict[str, object], self._redactor.redact_record(snapshot))
@@ -1080,8 +1156,23 @@ class RunService:
         user_id: str,
         prior_tokens: int,
         prior_cost: float | None,
+        *,
+        pricing_context_tokens: int = 0,
     ) -> _ModelStep:
         output_parts: list[str] = []
+        batcher = TextStreamBatcher(secrets=(*self._redactor.streaming_secrets, api_key))
+        batch_index = 0
+
+        async def publish_batches(batches: Iterable[str]) -> None:
+            nonlocal batch_index
+            for text in batches:
+                _output, saved_event = await self._runs.append_assistant_batch(
+                    run.id, call.id, batch_index, text
+                )
+                batch_index += 1
+                output_parts.append(text)
+                await self._publish(saved_event)
+
         output_bytes = 0
         continuation_bytes = 0
         tool_calls: list[ModelToolCall] = []
@@ -1093,114 +1184,149 @@ class RunService:
             "cached_tokens": None,
             "cache_creation_tokens": None,
         }
+        billing_context: dict[str, object] = {"pricing_context_tokens": pricing_context_tokens}
         provider_response_id: str | None = None
         finish_reason: str | None = None
+        finish_kind: ModelFinishKind | None = None
         received_completion = False
         timeout_seconds = self._remaining_seconds(run)
         if timeout_seconds <= 0:
             raise ProviderError("provider_timeout", "The run deadline was reached.")
 
+        async def process_event(event: ModelStreamEvent) -> None:
+            nonlocal output_bytes, continuation_bytes, provider_response_id, finish_reason
+            nonlocal finish_kind, received_completion, call
+            if event.kind == "text_delta":
+                if event.text is None:
+                    raise ProviderError(
+                        "provider_invalid_response", "The provider returned invalid text."
+                    )
+                output_bytes += len(event.text.encode("utf-8"))
+                if output_bytes > MAX_MODEL_RESPONSE_BYTES:
+                    raise ProviderError(
+                        "provider_invalid_response", "The provider response is too large."
+                    )
+                await publish_batches(
+                    batcher.push(event.text, now=asyncio.get_running_loop().time())
+                )
+            elif event.kind == "tool_call":
+                if event.tool_call is None:
+                    raise ProviderError(
+                        "provider_invalid_response",
+                        "The provider returned an invalid tool call.",
+                    )
+                if len(tool_calls) >= run.max_tool_calls:
+                    raise ProviderError("tool_call_limit", "The run reached its tool-call limit.")
+                tool_calls.append(event.tool_call)
+            elif event.kind == "continuation_item":
+                if event.continuation_item is None:
+                    raise ProviderError(
+                        "provider_invalid_response",
+                        "The provider returned invalid continuation data.",
+                    )
+                item = event.continuation_item
+                continuation_bytes += len(item.payload_json.encode("utf-8"))
+                if (
+                    continuation_bytes > MAX_CONTINUATION_BYTES
+                    or self._redactor.redact_text(item.payload_json) != item.payload_json
+                ):
+                    raise ProviderError(
+                        "provider_invalid_response",
+                        "The provider returned invalid continuation data.",
+                    )
+                continuation_items.append(item)
+            elif event.kind == "usage":
+                if event.service_tier is not None:
+                    billing_context["service_tier"] = billing_tier(event.service_tier)
+                if event.cache_creation_tokens is not None:
+                    billing_context["cache_creation_1h_tokens"] = (
+                        event.cache_creation_1h_tokens if event.cache_creation_tokens else 0
+                    )
+                incoming_usage = {
+                    "input_tokens": event.input_tokens,
+                    "output_tokens": event.output_tokens,
+                    "reasoning_tokens": event.reasoning_tokens,
+                    "cached_tokens": event.cached_tokens,
+                    "cache_creation_tokens": event.cache_creation_tokens,
+                }
+                usage.update(
+                    {key: value for key, value in incoming_usage.items() if value is not None}
+                )
+                provider_response_id = (
+                    self._safe_provider_metadata(event.provider_response_id) or provider_response_id
+                )
+                step_tokens, step_cost = _usage_measure(run.model_id, usage, billing_context)
+                call = await self._runs.update_model_call(
+                    call.id,
+                    ModelCallStatus.STREAMING,
+                    provider_response_id=provider_response_id,
+                    input_tokens=usage["input_tokens"],
+                    output_tokens=usage["output_tokens"],
+                    reasoning_tokens=usage["reasoning_tokens"],
+                    cached_tokens=usage["cached_tokens"],
+                    cache_creation_tokens=usage["cache_creation_tokens"],
+                    estimated_cost=step_cost,
+                    clear_estimated_cost=step_cost is None,
+                    response_snapshot={"usage_context": billing_context.copy()},
+                )
+                await self._append_and_publish(
+                    run.id,
+                    RunEventType.MODEL_USAGE,
+                    {
+                        **{key: value for key, value in usage.items() if value is not None},
+                        "estimated_cost_usd": step_cost,
+                        "total_estimated_cost_usd": (
+                            prior_cost + step_cost
+                            if step_cost is not None and prior_cost is not None
+                            else None
+                        ),
+                        "total_tokens": (
+                            prior_tokens + step_tokens if step_tokens is not None else None
+                        ),
+                        **(
+                            {"provider_response_id": provider_response_id}
+                            if provider_response_id is not None
+                            else {}
+                        ),
+                    },
+                )
+            elif event.kind == "completed":
+                received_completion = True
+                provider_response_id = (
+                    self._safe_provider_metadata(event.provider_response_id) or provider_response_id
+                )
+                finish_reason = self._safe_provider_metadata(event.finish_reason)
+                finish_kind = event.finish_kind
+
         try:
-            async with asyncio.timeout(timeout_seconds):
-                async for event in provider.stream(request, api_key, user_id):
-                    if event.kind == "text_delta":
-                        if event.text is None:
-                            raise ProviderError(
-                                "provider_invalid_response", "The provider returned invalid text."
-                            )
-                        output_bytes += len(event.text.encode("utf-8"))
-                        if output_bytes > MAX_MODEL_RESPONSE_BYTES:
-                            raise ProviderError(
-                                "provider_invalid_response", "The provider response is too large."
-                            )
-                        output_parts.append(event.text)
-                    elif event.kind == "tool_call":
-                        if event.tool_call is None:
-                            raise ProviderError(
-                                "provider_invalid_response",
-                                "The provider returned an invalid tool call.",
-                            )
-                        if len(tool_calls) >= run.max_tool_calls:
-                            raise ProviderError(
-                                "tool_call_limit", "The run reached its tool-call limit."
-                            )
-                        tool_calls.append(event.tool_call)
-                    elif event.kind == "continuation_item":
-                        if event.continuation_item is None:
-                            raise ProviderError(
-                                "provider_invalid_response",
-                                "The provider returned invalid continuation data.",
-                            )
-                        item = event.continuation_item
-                        continuation_bytes += len(item.payload_json.encode("utf-8"))
-                        if (
-                            continuation_bytes > MAX_CONTINUATION_BYTES
-                            or self._redactor.redact_text(item.payload_json) != item.payload_json
-                        ):
-                            raise ProviderError(
-                                "provider_invalid_response",
-                                "The provider returned invalid continuation data.",
-                            )
-                        continuation_items.append(item)
-                    elif event.kind == "usage":
-                        incoming_usage = {
-                            "input_tokens": event.input_tokens,
-                            "output_tokens": event.output_tokens,
-                            "reasoning_tokens": event.reasoning_tokens,
-                            "cached_tokens": event.cached_tokens,
-                            "cache_creation_tokens": event.cache_creation_tokens,
-                        }
-                        usage.update(
-                            {
-                                key: value
-                                for key, value in incoming_usage.items()
-                                if value is not None
-                            }
-                        )
-                        provider_response_id = (
-                            self._safe_provider_metadata(event.provider_response_id)
-                            or provider_response_id
-                        )
-                        step_tokens, step_cost = _usage_measure(run.model_id, usage)
-                        call = await self._runs.update_model_call(
-                            call.id,
-                            ModelCallStatus.STREAMING,
-                            provider_response_id=provider_response_id,
-                            input_tokens=usage["input_tokens"],
-                            output_tokens=usage["output_tokens"],
-                            reasoning_tokens=usage["reasoning_tokens"],
-                            cached_tokens=usage["cached_tokens"],
-                            cache_creation_tokens=usage["cache_creation_tokens"],
-                            estimated_cost=step_cost,
-                        )
-                        await self._append_and_publish(
-                            run.id,
-                            RunEventType.MODEL_USAGE,
-                            {
-                                **{key: value for key, value in usage.items() if value is not None},
-                                "estimated_cost_usd": step_cost,
-                                "total_estimated_cost_usd": (
-                                    prior_cost + step_cost
-                                    if step_cost is not None and prior_cost is not None
-                                    else None
-                                ),
-                                "total_tokens": (
-                                    prior_tokens + step_tokens if step_tokens is not None else None
-                                ),
-                                **(
-                                    {"provider_response_id": provider_response_id}
-                                    if provider_response_id is not None
-                                    else {}
-                                ),
-                            },
-                        )
-                    elif event.kind == "completed":
-                        received_completion = True
-                        provider_response_id = (
-                            self._safe_provider_metadata(event.provider_response_id)
-                            or provider_response_id
-                        )
-                        finish_reason = self._safe_provider_metadata(event.finish_reason)
+            async with (
+                asyncio.timeout(timeout_seconds),
+                aclosing(provider.stream(request, api_key, user_id)) as stream,
+            ):
+                pending = asyncio.create_task(anext(stream, None))
+                try:
+                    while True:
+                        now = asyncio.get_running_loop().time()
+                        deadline = batcher.next_flush_at
+                        delay = None if deadline is None else max(0.0, deadline - now)
+                        done, _ = await asyncio.wait({pending}, timeout=delay)
+                        if not done:
+                            await publish_batches(batcher.flush())
+                            continue
+                        event = pending.result()
+                        if event is None:
+                            break
+                        # Processing remains ordered; only one provider read is in flight.
+                        await process_event(event)
+                        if received_completion:
+                            break
+                        pending = asyncio.create_task(anext(stream, None))
+                finally:
+                    if not pending.done():
+                        pending.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await pending
+                await publish_batches(batcher.finish())
         except TimeoutError:
             raise ProviderError("provider_timeout", "The run deadline was reached.") from None
 
@@ -1215,6 +1341,8 @@ class RunService:
             usage=usage,
             provider_response_id=provider_response_id,
             finish_reason=finish_reason,
+            finish_kind=finish_kind or ("tool" if tool_calls else "final"),
+            billing_context=billing_context,
         )
 
     def _safe_provider_metadata(self, value: str | None) -> str | None:
@@ -1247,7 +1375,19 @@ class RunService:
         cost = 0.0
         missing_price = False
         for call in calls:
-            if call.status is not ModelCallStatus.COMPLETED:
+            billing = cast(
+                Mapping[str, object], (call.response_snapshot or {}).get("usage_context", {})
+            )
+            if billing.get("usage_complete") is False:
+                raise ProviderError(
+                    "provider_usage_unavailable",
+                    "The provider did not report enough usage to enforce this run's budget.",
+                )
+            if (
+                call.status is not ModelCallStatus.COMPLETED
+                and call.input_tokens is None
+                and call.output_tokens is None
+            ):
                 continue
             call_tokens, call_cost = _usage_measure(
                 model_id,
@@ -1258,6 +1398,7 @@ class RunService:
                     "cached_tokens": call.cached_tokens,
                     "cache_creation_tokens": call.cache_creation_tokens,
                 },
+                billing,
             )
             if call_tokens is None:
                 raise ProviderError(
@@ -1441,7 +1582,14 @@ class RunService:
         for tool in await self._runs.list_tool_calls(run_id):
             if tool.status not in {ToolCallStatus.PENDING, ToolCallStatus.RUNNING}:
                 continue
-            _message, _updated, event = await self._runs.record_tool_result(
-                run_id, tool.id, content, status=status
-            )
+            try:
+                _message, _updated, event = await self._runs.record_tool_result(
+                    run_id, tool.id, content, status=status
+                )
+            except ApplicationError as error:
+                if error.code != "event_storage_limit":
+                    raise
+                # The terminal transition closes remaining tool records without
+                # consuming per-tool events from its finite reserved capacity.
+                break
             await self._publish(event)

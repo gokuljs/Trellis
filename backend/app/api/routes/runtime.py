@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from typing import cast
 from urllib.parse import urlsplit
@@ -35,6 +35,9 @@ _AUTH_TIMEOUT_SECONDS = 5
 _AUTH_RECHECK_SECONDS = 30
 _AUTH_MONITOR_CANCEL_REASON = "runtime authentication ended"
 _CLEANUP_TIMEOUT_SECONDS = 5
+_SEND_TIMEOUT_SECONDS = 5
+_MAX_ACTIVE_SUBSCRIPTIONS = 8
+_SLOW_TRANSPORT_CANCEL_REASON = "runtime transport send timed out"
 _MAX_AUTH_FRAME_BYTES = 20_000
 
 
@@ -201,6 +204,31 @@ def _run_result(run) -> dict[str, object]:
     }
 
 
+async def _send_with_deadline(
+    websocket: WebSocket,
+    payload: object,
+    send_lock: asyncio.Lock | None = None,
+    *,
+    before_send: Callable[[], None] | None = None,
+) -> None:
+    async with asyncio.timeout(_SEND_TIMEOUT_SECONDS):
+        if send_lock is None:
+            if before_send is not None:
+                before_send()
+            await websocket.send_json(payload)
+        else:
+            async with send_lock:
+                if before_send is not None:
+                    before_send()
+                await websocket.send_json(payload)
+
+
+async def _close_transport(websocket: WebSocket, code: int) -> None:
+    with suppress(RuntimeError, WebSocketDisconnect, TimeoutError):
+        async with asyncio.timeout(_CLEANUP_TIMEOUT_SECONDS):
+            await websocket.close(code=code)
+
+
 @router.websocket("/api/runtime")
 async def runtime_websocket(websocket: WebSocket) -> None:
     settings = websocket.app.state.settings
@@ -211,9 +239,17 @@ async def runtime_websocket(websocket: WebSocket) -> None:
         return
     await websocket.accept()
 
+    async def send_initial(payload: object) -> bool:
+        try:
+            await _send_with_deadline(websocket, payload)
+        except TimeoutError:
+            await _close_transport(websocket, 1013)
+            return False
+        return True
+
     async def reject_access(error: RpcFault, rpc_id: str | int | None) -> None:
-        await websocket.send_json(_error_response(rpc_id, error.code, error.message, error.data))
-        await websocket.close(code=_access_close_code(error))
+        if await send_initial(_error_response(rpc_id, error.code, error.message, error.data)):
+            await _close_transport(websocket, _access_close_code(error))
 
     try:
         raw_auth = await asyncio.wait_for(websocket.receive_text(), timeout=_AUTH_TIMEOUT_SECONDS)
@@ -232,15 +268,15 @@ async def runtime_websocket(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         return
     except RpcFault as error:
-        await websocket.send_json(
+        if await send_initial(
             _error_response(
                 None,
                 error.code,
                 error.message,
                 {"code": "auth_required"},
             )
-        )
-        await websocket.close(code=4401)
+        ):
+            await _close_transport(websocket, 4401)
         return
 
     try:
@@ -270,20 +306,44 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             _account_fault(ApplicationError("database_unavailable", "")), request_id
         )
         return
-    await websocket.send_json(
+    if not await send_initial(
         {"jsonrpc": "2.0", "id": request_id, "result": {"userId": str(verified.id)}}
-    )
+    ):
+        return
     service: RunService = account.run_service
     event_hub: RuntimeEventHub = account.event_hub
     send_lock = asyncio.Lock()
     auth_lost = asyncio.Event()
     active_subscriptions: dict[str, tuple[RuntimeEventSubscription, asyncio.Task[None]]] = {}
+    transport_lost = asyncio.Event()
+    transport_cancel_requested = False
+    handler_task = asyncio.current_task()
+
+    async def close_slow_transport() -> None:
+        nonlocal transport_cancel_requested
+        if transport_lost.is_set():
+            return
+        transport_lost.set()
+        await _close_transport(websocket, 1013)
+        if (
+            not teardown_started
+            and handler_task is not None
+            and handler_task is not asyncio.current_task()
+            and not handler_task.cancelling()
+        ):
+            transport_cancel_requested = True
+            handler_task.cancel(_SLOW_TRANSPORT_CANCEL_REASON)
 
     async def send(payload: object) -> None:
-        async with send_lock:
-            if auth_lost.is_set():
-                raise WebSocketDisconnect(code=4401)
-            await websocket.send_json(payload)
+        def check_connected() -> None:
+            if auth_lost.is_set() or transport_lost.is_set():
+                raise WebSocketDisconnect(code=4401 if auth_lost.is_set() else 1013)
+
+        try:
+            await _send_with_deadline(websocket, payload, send_lock, before_send=check_connected)
+        except TimeoutError:
+            await close_slow_transport()
+            raise WebSocketDisconnect(code=1013) from None
 
     async def access_failure() -> RpcFault | None:
         try:
@@ -325,7 +385,6 @@ async def runtime_websocket(websocket: WebSocket) -> None:
         except TimeoutError:
             logger.error("Runtime authentication close timed out")
 
-    handler_task = asyncio.current_task()
     teardown_started = False
 
     async def monitor_auth() -> None:
@@ -369,17 +428,31 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             sequence = event.sequence
             return event.event_type in _TERMINAL_EVENTS
 
+        async def replay_persisted(through_sequence: int | None = None) -> bool:
+            while True:
+                previous_sequence = sequence
+                batch = await service.list_run_events(run_id, sequence)
+                for event in batch:
+                    if await emit_event(event):
+                        return True
+                if len(batch) < 500 and (through_sequence is None or sequence >= through_sequence):
+                    return False
+                if sequence == previous_sequence:
+                    await send(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "run.replay_required",
+                            "params": {"runId": run_id, "afterSequence": sequence},
+                        }
+                    )
+                    return True
+
         try:
             run = await service.get_run(run_id)
             if run is None:
                 return
-            while True:
-                batch = await service.list_run_events(run_id, sequence)
-                for event in batch:
-                    if await emit_event(event):
-                        return
-                if len(batch) < 500:
-                    break
+            if await replay_persisted(run.last_event_sequence):
+                return
 
             if is_terminal_run_status(run.status):
                 return
@@ -389,12 +462,16 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                 except TimeoutError:
                     # Durable events are authoritative. Polling closes the rare gap where
                     # persistence succeeds but in-process fanout is interrupted.
-                    batch = await service.list_run_events(run_id, sequence)
-                    for persisted_event in batch:
-                        if await emit_event(persisted_event):
-                            return
+                    if await replay_persisted():
+                        return
                     current_run = await service.get_run(run_id)
-                    if current_run is None or is_terminal_run_status(current_run.status):
+                    if current_run is None:
+                        return
+                    if is_terminal_run_status(current_run.status):
+                        # Completion may commit after the last page was read. Drain
+                        # through its durable cursor before ending the subscription.
+                        if sequence < current_run.last_event_sequence:
+                            await replay_persisted(current_run.last_event_sequence)
                         return
                     continue
                 if event is None:
@@ -424,7 +501,19 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             if active is not None and active[0] is subscription:
                 del active_subscriptions[run_id]
 
+    def check_subscription_capacity(run_id: str | None = None) -> None:
+        if (
+            run_id not in active_subscriptions
+            and len(active_subscriptions) >= _MAX_ACTIVE_SUBSCRIPTIONS
+        ):
+            raise RpcFault(
+                -32010,
+                "This connection has too many active run subscriptions.",
+                data={"code": "subscription_limit", "status": 429},
+            )
+
     async def subscribe(run_id: str, after_sequence: int) -> None:
+        check_subscription_capacity(run_id)
         existing = active_subscriptions.pop(run_id, None)
         if existing is not None:
             event_hub.unsubscribe(existing[0])
@@ -454,6 +543,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                 not isinstance(model_id, str) or not model_id or len(model_id) > 200
             ):
                 raise RpcFault(-32602, "Invalid params: modelId")
+            check_subscription_capacity()
             run = await service.create_run(
                 session_id,
                 client_request_id,
@@ -589,8 +679,12 @@ async def runtime_websocket(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     except asyncio.CancelledError as error:
+        owned_transport_cancel = transport_cancel_requested and error.args in (
+            (),
+            (_SLOW_TRANSPORT_CANCEL_REASON,),
+        )
         if (
-            error.args != (_AUTH_MONITOR_CANCEL_REASON,)
+            (error.args != (_AUTH_MONITOR_CANCEL_REASON,) and not owned_transport_cancel)
             or handler_task is None
             or handler_task.cancelling() != 1
         ):

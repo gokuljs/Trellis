@@ -22,6 +22,7 @@ export type Session = {
   created_at: string
   updated_at: string
   message_count: number
+  model_id?: ModelId | null
 }
 
 export type Profile = {
@@ -52,6 +53,18 @@ export type ModelStatus = {
   supports_tools: boolean
   configured: boolean
   key_hint: string | null
+  enabled?: boolean
+  selectable?: boolean
+  context_window_tokens?: number | null
+  max_input_tokens?: number | null
+  max_output_tokens?: number | null
+  supports_native_compaction?: boolean | null
+  metadata_status?: "ready" | "pending"
+  pending_reasons?: string[]
+  verification_sources?: string[]
+  metadata_verified_at?: string | null
+  availability?: "available" | "unavailable" | "unknown"
+  availability_checked_at?: string | null
 }
 
 export type Settings = {
@@ -76,6 +89,36 @@ export type Message = {
 export type SessionDetail = {
   session: Session
   messages: Message[]
+  assistant_outputs?: AssistantOutput[]
+}
+
+export type TimelineRow = {
+  kind: "message" | "assistant_output"
+  id: string
+}
+
+export type SessionHistoryPage = SessionDetail & {
+  timeline_order: TimelineRow[]
+  next_before_cursor: string | null
+}
+
+export type SessionPage = {
+  items: Session[]
+  next_before_cursor: string | null
+}
+
+export type AssistantOutput = {
+  id: string
+  turn_id: string
+  run_id: string
+  model_call_id: string
+  step_index: number
+  content: string
+  status: "streaming" | "complete" | "partial"
+  stop_reason: string | null
+  promoted_message_id: string | null
+  created_at: string
+  next_batch_index?: number
 }
 
 export type LatestRun = {
@@ -83,6 +126,7 @@ export type LatestRun = {
   turn_id: string
   status: string
   last_sequence: number
+  input_message?: Message | null
 }
 
 export type RunSummary = {
@@ -100,6 +144,28 @@ export type RunSummary = {
   created_at: string
   started_at: string | null
   finished_at: string | null
+  model_id?: ModelId
+}
+
+export type ContextPreviewRequest = {
+  session_id?: string
+  model_id: ModelId
+  draft: string
+  budget_preset: "conservative" | "longer"
+}
+
+export type ContextPreview = {
+  model_id: ModelId
+  context_window_tokens: number | null
+  input_tokens: number | null
+  count_method: "provider" | "utf8_bytes_estimate_v1"
+  output_reserve_tokens: number | null
+  safety_margin_tokens: number | null
+  usable_input_tokens: number | null
+  compaction_threshold_tokens: number | null
+  percentage: number | null
+  status: "ready" | "compaction_required" | "compacting" | "unavailable"
+  checkpoint_id?: string | null
 }
 
 export type SavedRunEvent = {

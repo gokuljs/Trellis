@@ -1,6 +1,6 @@
-import { Check, Sparkles } from "lucide-react"
 import { useState } from "react"
 
+import { ModelOptions } from "@/components/model-select"
 import { ApiError, api } from "@/lib/api"
 import type {
   ModelStatus,
@@ -9,6 +9,7 @@ import type {
   Settings,
 } from "@/lib/app-types"
 import { notifications } from "@/lib/notifications"
+import { modelProviderId, modelProviders } from "@/lib/model-choice"
 import "./profile-summary.css"
 
 type SettingsPageProps = {
@@ -52,9 +53,13 @@ export function SettingsPage({
   const selectedModelId =
     settings.selected_model_id ?? settings.selected_provider
   const selectedModel = models.find((model) => model.id === selectedModelId)
-  const selectedModelReady =
-    selectedModel &&
-    (selectedModel.configured || !selectedModel.requires_api_key)
+  const providers = settings.providers.length
+    ? settings.providers
+    : modelProviders(models)
+  const selectedProviderId =
+    settings.selected_provider ||
+    modelProviderId(selectedModel ?? { id: selectedModelId }) ||
+    ""
   const setupStatus = onboarding
     ? onboarding.completed
       ? "Complete"
@@ -92,13 +97,26 @@ export function SettingsPage({
       {
         kind: "info",
         title: `${nextModel.name} selected`,
-        description:
-          nextModel.configured || !nextModel.requires_api_key
-            ? `${nextModel.provider_name} will power new messages.`
-            : "Your selection is saved. This model is currently unavailable.",
+        description: `${nextModel.provider_name} will power new chats.`,
       },
       async () => {
         onSettingsChange(await api.selectModel(modelId))
+      }
+    )
+  }
+
+  const selectProvider = (providerId: string) => {
+    const nextProvider = providers.find((item) => item.id === providerId)
+    if (!nextProvider || providerId === selectedProviderId) return
+    void runUpdate(
+      "provider",
+      {
+        kind: "info",
+        title: `${nextProvider.name} selected`,
+        description: "New chats use your selected provider.",
+      },
+      async () => {
+        onSettingsChange(await api.selectProvider(providerId))
       }
     )
   }
@@ -142,16 +160,8 @@ export function SettingsPage({
                   <dd>{setupStatus}</dd>
                 </div>
                 <div>
-                  <dt>Selected model</dt>
-                  <dd>
-                    {selectedModel
-                      ? `${selectedModel.provider_name} · ${selectedModel.name}`
-                      : "Selected model unavailable"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Model availability</dt>
-                  <dd>{selectedModelReady ? "Ready to use" : "Unavailable"}</dd>
+                  <dt>Default model</dt>
+                  <dd>{selectedModel?.name ?? selectedModelId}</dd>
                 </div>
               </dl>
             </section>
@@ -224,54 +234,68 @@ export function SettingsPage({
         >
           <div className="settings-section-copy">
             <div className="settings-section-label">MODEL</div>
-            <h2 id="provider-heading">Choose your model</h2>
-            <p>Choose which available model powers new turns.</p>
+            <h2 id="provider-heading">Default model</h2>
+            <p>
+              New chats use this model. Existing chats keep their own choice.
+            </p>
           </div>
 
-          <div
-            className="provider-options"
-            role="radiogroup"
-            aria-label="Available models"
-          >
-            {!selectedModelReady ? (
-              <p className="settings-field-help">
-                {selectedModel
-                  ? "This model is unavailable right now. Choose a model marked Ready to use."
-                  : models.length
-                    ? "Choose an available model to use for new turns."
-                    : "No models are available right now. Try again later."}
-              </p>
-            ) : null}
-            {models.map((item) => {
-              const isSelected = item.id === selectedModelId
-              return (
-                <button
-                  className={`provider-option ${isSelected ? "is-selected" : ""}`}
-                  key={item.id}
-                  type="button"
-                  role="radio"
-                  aria-checked={isSelected}
+          <div className="settings-form-grid">
+            <label className="settings-field">
+              <span className="settings-field-label">
+                Provider for new chats
+              </span>
+              <span className="settings-input-wrap">
+                <select
+                  aria-label="Default provider for new chats"
+                  value={selectedProviderId}
                   disabled={saving !== null}
-                  onClick={() => selectModel(item.id)}
+                  aria-busy={saving === "provider"}
+                  onChange={(event) => selectProvider(event.target.value)}
                 >
-                  <span className="provider-icon">
-                    <Sparkles size={16} strokeWidth={1.7} aria-hidden="true" />
-                  </span>
-                  <span className="provider-details">
-                    <span className="provider-name">{item.provider_name}</span>
-                    <span className="provider-description">
-                      {item.configured || !item.requires_api_key
-                        ? "Ready to use"
-                        : "Unavailable"}
-                    </span>
-                  </span>
-                  <span className="provider-model">{item.name}</span>
-                  <span className="provider-check" aria-hidden="true">
-                    {isSelected ? <Check size={14} strokeWidth={2} /> : null}
-                  </span>
-                </button>
-              )
-            })}
+                  {!providers.some(
+                    (provider) => provider.id === selectedProviderId
+                  ) ? (
+                    <option value={selectedProviderId} disabled>
+                      {selectedProviderId || "Choose a provider"}
+                    </option>
+                  ) : null}
+                  {providers.map((provider) => (
+                    <option key={provider.id} value={provider.id}>
+                      {provider.name}
+                    </option>
+                  ))}
+                </select>
+              </span>
+              {saving === "provider" ? (
+                <span className="settings-field-help" role="status">
+                  Saving default provider…
+                </span>
+              ) : null}
+            </label>
+            <label className="settings-field">
+              <span className="settings-field-label">Model for new chats</span>
+              <span className="settings-input-wrap">
+                <select
+                  aria-label="Default model for new chats"
+                  value={selectedModelId}
+                  disabled={saving !== null}
+                  aria-busy={saving === "model"}
+                  onChange={(event) => selectModel(event.target.value)}
+                >
+                  <ModelOptions
+                    models={models}
+                    selectedModelId={selectedModelId}
+                    providerId={selectedProviderId || null}
+                  />
+                </select>
+              </span>
+              {saving === "model" ? (
+                <span className="settings-field-help" role="status">
+                  Saving default model…
+                </span>
+              ) : null}
+            </label>
           </div>
         </section>
 
