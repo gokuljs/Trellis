@@ -842,6 +842,21 @@ class MemoryRepository:
             finished_at=now if is_terminal_run_status(next_status) else None,
         )
         if is_terminal_run_status(next_status):
+            for key, call in tuple(self.state.model_calls.items()):
+                if call.run_id == run_id and call.status in {
+                    ModelCallStatus.PENDING,
+                    ModelCallStatus.STREAMING,
+                }:
+                    self.state.model_calls[key] = replace(
+                        call,
+                        status=(
+                            ModelCallStatus.FAILED
+                            if next_status is RunStatus.FAILED
+                            else ModelCallStatus.CANCELLED
+                        ),
+                        finished_at=now,
+                        error_code=call.error_code or "run_terminated",
+                    )
             for key, output in tuple(self.state.assistant_outputs.items()):
                 if output.run_id == run_id and output.status == "streaming":
                     self.state.assistant_outputs[key] = replace(

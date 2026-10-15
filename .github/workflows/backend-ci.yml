@@ -77,6 +77,10 @@ jobs:
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/history_pages.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610150009_unknown_usage_cost.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/unknown_usage_cost.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/terminal_model_call_backfill.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610150010_terminal_model_calls.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/terminal_model_calls.sql
+          python3 supabase/tests/terminal_model_call_lock_order.py
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/chat_turn_security.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/schema_contract.sql
 
