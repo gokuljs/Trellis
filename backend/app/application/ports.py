@@ -198,6 +198,7 @@ class RunRepository(Protocol):
         cached_tokens: int | None = None,
         cache_creation_tokens: int | None = None,
         estimated_cost: float | None = None,
+        clear_estimated_cost: bool = False,
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> ModelCallRecord: ...

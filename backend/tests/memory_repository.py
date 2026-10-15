@@ -1034,6 +1034,7 @@ class MemoryRepository:
         cached_tokens: int | None = None,
         cache_creation_tokens: int | None = None,
         estimated_cost: float | None = None,
+        clear_estimated_cost: bool = False,
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> ModelCallRecord:
@@ -1062,7 +1063,11 @@ class MemoryRepository:
                 if cache_creation_tokens is not None
                 else record.cache_creation_tokens
             ),
-            estimated_cost=estimated_cost if estimated_cost is not None else record.estimated_cost,
+            estimated_cost=None
+            if clear_estimated_cost
+            else estimated_cost
+            if estimated_cost is not None
+            else record.estimated_cost,
             error_code=error_code or record.error_code,
             error_message=error_message or record.error_message,
             finished_at=None if next_status is ModelCallStatus.STREAMING else _now(),

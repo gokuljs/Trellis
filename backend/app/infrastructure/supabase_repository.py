@@ -1232,6 +1232,7 @@ class SupabaseRepository:
         cached_tokens: int | None = None,
         cache_creation_tokens: int | None = None,
         estimated_cost: float | None = None,
+        clear_estimated_cost: bool = False,
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> ModelCallRecord:
@@ -1252,6 +1253,7 @@ class SupabaseRepository:
                 "cached_read_tokens": cached_tokens,
                 "cache_creation_tokens": cache_creation_tokens,
                 "estimated_cost": estimated_cost,
+                "clear_estimated_cost": clear_estimated_cost,
                 "error_code": error_code,
                 "error_message": error_message,
             },
