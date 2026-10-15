@@ -376,6 +376,33 @@ def _native_openai_window(request: ModelRequest) -> list[dict[str, Any]]:
     return window
 
 
+def _valid_anthropic_block(block: object) -> bool:
+    return (
+        isinstance(block, dict)
+        and block.get("type") == "compaction"
+        and isinstance(block.get("content"), str)
+        and bool(block["content"].strip())
+        and isinstance(block.get("signature"), str)
+        and bool(block["signature"])
+    )
+
+
+def _native_anthropic_messages(request: ModelRequest) -> list[dict[str, object]]:
+    block = _native_value(request)
+    if block is None:
+        return []
+    if not _valid_anthropic_block(block):
+        raise _anthropic_invalid_stream()
+    return [{"role": "assistant", "content": [block]}]
+
+
+def _anthropic_headers(api_key: str, *, native: bool) -> dict[str, str]:
+    headers = {"X-Api-Key": api_key, "anthropic-version": "2023-06-01"}
+    if native:
+        headers["anthropic-beta"] = "compact-2026-09-04"
+    return headers
+
+
 def _usage_integer(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
@@ -587,7 +614,7 @@ def _anthropic_body(request: ModelRequest) -> dict[str, Any]:
         "model": request.upstream_model_id,
         "max_tokens": request.max_output_tokens,
         "stream": True,
-        "messages": _anthropic_messages(request.messages),
+        "messages": _native_anthropic_messages(request) + _anthropic_messages(request.messages),
     }
     if request.system_instructions:
         body["system"] = request.system_instructions
@@ -726,13 +753,52 @@ class AnthropicProvider:
         payload = await _context_post(
             self._client,
             "https://api.anthropic.com/v1/messages/count_tokens",
-            headers={"X-Api-Key": api_key, "anthropic-version": "2023-06-01"},
+            headers=_anthropic_headers(api_key, native=request.native_context_json is not None),
             body={
                 key: body[key] for key in ("model", "messages", "system", "tools") if key in body
             },
             max_bytes=16384,
         )
         return _input_count(payload, request)
+
+    async def compact(
+        self, request: ModelRequest, api_key: str, user_id: str
+    ) -> NativeCompactionResult:
+        del user_id
+        body = _anthropic_body(request)
+        body.pop("stream")
+        body["compaction"] = {
+            "type": "summarize",
+            "instructions": (
+                "Summarize the conversation for continuation. Preserve constraints, decisions, "
+                "actions, results, failures and remaining work. Do not call tools; "
+                "return only the summary."
+            ),
+        }
+        payload = await _context_post(
+            self._client,
+            "https://api.anthropic.com/v1/messages",
+            headers=_anthropic_headers(api_key, native=True),
+            body=body,
+            max_bytes=524288,
+        )
+        usage = _native_usage(payload, anthropic=True)
+        response_id = payload.get("id") if isinstance(payload.get("id"), str) else None
+        if not _native_usage_complete(payload, usage, anthropic=True):
+            return NativeCompactionResult(
+                "anthropic_block", None, usage, response_id, "native_usage_unknown"
+            )
+        blocks = payload.get("content")
+        if (
+            payload.get("stop_reason") != "compaction"
+            or not isinstance(blocks, list)
+            or len(blocks) != 1
+            or not _valid_anthropic_block(blocks[0])
+        ):
+            return NativeCompactionResult(
+                "anthropic_block", None, usage, response_id, "native_context_incomplete"
+            )
+        return _native_result("anthropic_block", blocks[0], usage, response_id)
 
     def stream(
         self,
@@ -1053,10 +1119,7 @@ async def _stream_anthropic(
     provider_events = _post_stream(
         client,
         "https://api.anthropic.com/v1/messages",
-        headers={
-            "X-Api-Key": api_key,
-            "anthropic-version": "2023-06-01",
-        },
+        headers=_anthropic_headers(api_key, native=request.native_context_json is not None),
         json=body,
     )
 
