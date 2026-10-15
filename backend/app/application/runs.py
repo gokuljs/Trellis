@@ -18,6 +18,7 @@ from app.application.budgets import (
     count_total_tokens,
     estimate_model_cost,
 )
+from app.application.context_preview import preview_from_plan
 from app.application.errors import ApplicationError, ProviderError
 from app.application.model_catalog import profile_for_model
 from app.application.ports import (
@@ -745,6 +746,14 @@ class RunService:
                     cost_usd=prior_cost,
                 )
                 request = plan.request
+                assert model_profile.context_window_tokens is not None
+                await self._append_and_publish(
+                    run.id,
+                    RunEventType.CONTEXT,
+                    preview_from_plan(
+                        plan, context_window_tokens=model_profile.context_window_tokens
+                    ).snapshot(),
+                )
                 call = await self._runs.create_model_call(
                     run.id,
                     step_index,

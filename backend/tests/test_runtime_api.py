@@ -203,11 +203,11 @@ def test_session_run_history_pages_summaries_and_events(tmp_path: Path) -> None:
     summary = first_page.json()["items"][0]
     assert summary["status"] == "completed"
     assert summary["created_at"] and summary["finished_at"]
-    assert summary["last_sequence"] == 9
+    assert summary["last_sequence"] == 10
     assert summary["max_model_calls"] > 0
     assert [item["sequence"] for item in events_page.json()["items"]] == [1, 2]
     assert events_page.json()["next_after_sequence"] == 2
-    assert [item["sequence"] for item in remaining_events.json()["items"]] == list(range(3, 10))
+    assert [item["sequence"] for item in remaining_events.json()["items"]] == list(range(3, 11))
     assert remaining_events.json()["next_after_sequence"] is None
     assert all(item["created_at"] for item in remaining_events.json()["items"])
 
@@ -465,6 +465,7 @@ def test_jsonrpc_websocket_streams_a_durable_run(tmp_path: Path) -> None:
     assert [item["eventType"] for item in notifications] == [
         RunEventType.QUEUED.value,
         RunEventType.STARTED.value,
+        RunEventType.CONTEXT.value,
         RunEventType.PHASE.value,
         RunEventType.MODEL_USAGE.value,
         RunEventType.ASSISTANT_DELTA.value,
@@ -473,7 +474,7 @@ def test_jsonrpc_websocket_streams_a_durable_run(tmp_path: Path) -> None:
         RunEventType.ASSISTANT_COMPLETED.value,
         RunEventType.COMPLETED.value,
     ]
-    assert [item["sequence"] for item in notifications] == list(range(1, 10))
+    assert [item["sequence"] for item in notifications] == list(range(1, 11))
     assert [message["content"] for message in detail["messages"]] == [
         "Stream this",
         "Streaming works",
@@ -671,7 +672,7 @@ def test_jsonrpc_resume_replays_persisted_events_after_disconnect(tmp_path: Path
     acknowledgement = next(item for item in resumed if item.get("id") == 2)
     events = [item["params"] for item in resumed if item.get("method") == "run.event"]
     assert acknowledgement["result"]["runId"] == run_id
-    assert [event["sequence"] for event in events] == list(range(5, 10))
+    assert [event["sequence"] for event in events] == list(range(5, 11))
 
 
 def test_jsonrpc_replays_when_a_live_event_sequence_has_a_gap(tmp_path: Path) -> None:
@@ -740,8 +741,8 @@ def test_jsonrpc_replays_when_a_live_event_sequence_has_a_gap(tmp_path: Path) ->
             )
 
     events = [item["params"] for item in replayed if item.get("method") == "run.event"]
-    assert cursor == 3
-    assert [item["sequence"] for item in events] == list(range(4, 10))
+    assert cursor == 4
+    assert [item["sequence"] for item in events] == list(range(5, 11))
 
 
 def test_jsonrpc_reports_parse_empty_batch_and_valid_batch_responses(tmp_path: Path) -> None:
@@ -1047,7 +1048,7 @@ def test_session_latest_run_lookup_tracks_active_and_terminal_runs(tmp_path: Pat
                 "run_id": run_id,
                 "turn_id": "turn-lookup",
                 "status": "running",
-                "last_sequence": 3,
+                "last_sequence": 4,
             }
             websocket.send_json(
                 {

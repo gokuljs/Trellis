@@ -35,6 +35,7 @@ class RunEventType(StrEnum):
     INTERRUPTED = "run.interrupted"
     RESUMED = "run.resumed"
     PHASE = "run.phase"
+    CONTEXT = "run.context"
 
 
 class ModelCallStatus(StrEnum):

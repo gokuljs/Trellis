@@ -1,6 +1,8 @@
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from app.application.runs import RunService
 from app.domain.runtime import ModelStreamEvent, RunStatus
 from app.infrastructure.secrets import SecretStore
@@ -104,6 +106,89 @@ def test_missing_current_request_stops_before_provider_dispatch(tmp_path: Path) 
             saved = await database.get_run(run.id)
             assert saved is not None and saved.error_code == "context_current_request_missing"
             assert provider.request is None
+        finally:
+            await service.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_context_event_is_durable_before_generation_and_uses_the_locked_model(
+    tmp_path: Path,
+    historical: bool,
+) -> None:
+    class ContextAwareProvider(RecordingProvider):
+        def __init__(self, database):
+            super().__init__(())
+            self.database = database
+            self.run_id = None
+            self.before_generation = []
+
+        def stream(self, request, api_key, user_id):
+            async def generate():
+                self.before_generation = await self.database.list_run_events(self.run_id)
+                yield ModelStreamEvent("text_delta", text="Answer")
+                yield ModelStreamEvent("usage", input_tokens=12, output_tokens=5)
+                yield ModelStreamEvent("completed", finish_kind="final")
+
+            return generate()
+
+    class DurablePublisher:
+        def __init__(self, database):
+            self.database = database
+            self.events = []
+
+        async def publish(self, event):
+            assert (await self.database.list_run_events(event.run_id))[event.sequence - 1] == event
+            self.events.append(event)
+
+    async def exercise():
+        database = MemoryRepository(tmp_path / "db")
+        session = await database.create_session()
+        if historical:
+            for index in range(65):
+                await database.add_user_message(session.id, str(index), "Old")
+                await database.add_assistant_message(
+                    session.id, str(index), "Done", "openai", "openai:gpt-5.5"
+                )
+        secrets = SecretStore(tmp_path / ".env")
+        await secrets.set("openai", "test-key")
+        provider = ContextAwareProvider(database)
+        publisher = DurablePublisher(database)
+        service = RunService(
+            database, database, database, database, secrets, {"openai": provider}, publisher
+        )
+        try:
+            run = await service.create_run(session.id, "current", "Current request")
+            provider.run_id = run.id
+            await database.set_selected_model("anthropic:claude-sonnet-5")
+            await service.wait_for_run(run.id)
+            saved = await database.get_run(run.id)
+            assert saved is not None and saved.status is RunStatus.COMPLETED
+            contexts = [
+                event for event in publisher.events if event.event_type.value == "run.context"
+            ]
+            assert len(contexts) == 1
+            context = contexts[0]
+            assert context in provider.before_generation
+            assert context.data["model_id"] == run.model_id == "openai:gpt-5.5"
+            assert context.data["status"] == "ready"
+            input_tokens = context.data["input_tokens"]
+            assert isinstance(input_tokens, int) and input_tokens > 0
+            assert context.data["count_method"] == "utf8_bytes_estimate_v1"
+            assert context.data["output_reserve_tokens"] == 4096
+            checkpoint = await database.load_context_checkpoint(session.id)
+            assert (checkpoint is not None) == historical
+            assert context.data["checkpoint_id"] == (checkpoint.id if checkpoint else None)
+            delta = next(
+                event for event in publisher.events if event.event_type.value == "assistant.delta"
+            )
+            assert context.sequence < delta.sequence
+            call = (await database.list_model_calls(run.id))[-1]
+            plan = call.request_snapshot["context"]
+            assert isinstance(plan, dict)
+            assert context.data["input_tokens"] == plan["input_tokens"]
+            assert context.data["usable_input_tokens"] == plan["usable_input_tokens"]
         finally:
             await service.close()
 

@@ -329,6 +329,7 @@ def test_run_service_streams_and_persists_a_provider_neutral_run(tmp_path: Path)
     assert [event.event_type for event in events] == [
         RunEventType.QUEUED,
         RunEventType.STARTED,
+        RunEventType.CONTEXT,
         RunEventType.PHASE,
         RunEventType.MODEL_USAGE,
         RunEventType.ASSISTANT_DELTA,
