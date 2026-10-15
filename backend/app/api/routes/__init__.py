@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 
+from app.api.routes.context_preview import router as context_preview_router
 from app.api.routes.health import router as health_router
 from app.api.routes.history import router as history_router
 from app.api.routes.onboarding import router as onboarding_router
@@ -11,6 +12,7 @@ from app.api.routes.workspaces import router as workspaces_router
 
 router = APIRouter()
 router.include_router(health_router)
+router.include_router(context_preview_router)
 router.include_router(profile_router)
 router.include_router(onboarding_router)
 router.include_router(settings_router)
