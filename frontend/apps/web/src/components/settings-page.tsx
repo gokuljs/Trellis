@@ -9,6 +9,7 @@ import type {
   Settings,
 } from "@/lib/app-types"
 import { notifications } from "@/lib/notifications"
+import { isModelSelectable, modelAvailabilityLabel } from "@/lib/model-choice"
 import "./profile-summary.css"
 
 type SettingsPageProps = {
@@ -52,9 +53,7 @@ export function SettingsPage({
   const selectedModelId =
     settings.selected_model_id ?? settings.selected_provider
   const selectedModel = models.find((model) => model.id === selectedModelId)
-  const selectedModelReady =
-    selectedModel &&
-    (selectedModel.configured || !selectedModel.requires_api_key)
+  const selectedModelReady = isModelSelectable(selectedModel)
   const setupStatus = onboarding
     ? onboarding.completed
       ? "Complete"
@@ -86,16 +85,13 @@ export function SettingsPage({
 
   const selectModel = (modelId: string) => {
     const nextModel = models.find((item) => item.id === modelId)
-    if (!nextModel) return
+    if (!nextModel || !isModelSelectable(nextModel)) return
     void runUpdate(
       "model",
       {
         kind: "info",
         title: `${nextModel.name} selected`,
-        description:
-          nextModel.configured || !nextModel.requires_api_key
-            ? `${nextModel.provider_name} will power new messages.`
-            : "Your selection is saved. This model is currently unavailable.",
+        description: `${nextModel.provider_name} will power new chats.`,
       },
       async () => {
         onSettingsChange(await api.selectModel(modelId))
@@ -142,7 +138,7 @@ export function SettingsPage({
                   <dd>{setupStatus}</dd>
                 </div>
                 <div>
-                  <dt>Selected model</dt>
+                  <dt>Default model</dt>
                   <dd>
                     {selectedModel
                       ? `${selectedModel.provider_name} · ${selectedModel.name}`
@@ -224,21 +220,23 @@ export function SettingsPage({
         >
           <div className="settings-section-copy">
             <div className="settings-section-label">MODEL</div>
-            <h2 id="provider-heading">Choose your model</h2>
-            <p>Choose which available model powers new turns.</p>
+            <h2 id="provider-heading">Default model</h2>
+            <p>
+              New chats use this model. Existing chats keep their own choice.
+            </p>
           </div>
 
           <div
             className="provider-options"
             role="radiogroup"
-            aria-label="Available models"
+            aria-label="Default model for new chats"
           >
             {!selectedModelReady ? (
               <p className="settings-field-help">
                 {selectedModel
                   ? "This model is unavailable right now. Choose a model marked Ready to use."
                   : models.length
-                    ? "Choose an available model to use for new turns."
+                    ? "Choose an available model to use for new chats."
                     : "No models are available right now. Try again later."}
               </p>
             ) : null}
@@ -251,7 +249,7 @@ export function SettingsPage({
                   type="button"
                   role="radio"
                   aria-checked={isSelected}
-                  disabled={saving !== null}
+                  disabled={saving !== null || !isModelSelectable(item)}
                   onClick={() => selectModel(item.id)}
                 >
                   <span className="provider-icon">
@@ -260,9 +258,7 @@ export function SettingsPage({
                   <span className="provider-details">
                     <span className="provider-name">{item.provider_name}</span>
                     <span className="provider-description">
-                      {item.configured || !item.requires_api_key
-                        ? "Ready to use"
-                        : "Unavailable"}
+                      {modelAvailabilityLabel(item)}
                     </span>
                   </span>
                   <span className="provider-model">{item.name}</span>

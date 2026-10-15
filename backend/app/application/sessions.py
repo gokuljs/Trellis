@@ -4,7 +4,7 @@ from pathlib import Path
 from app.application.errors import ApplicationError
 from app.application.ports import SessionRepository, WorkspaceBindingPort
 from app.domain.capabilities import RuntimeCapabilities
-from app.domain.models import Session, SessionDetail, SessionWorkspaceBusy
+from app.domain.models import Session, SessionDetail, SessionModelBusy, SessionWorkspaceBusy
 
 
 def _resolved_workspace(raw_path: str) -> str:
@@ -44,6 +44,23 @@ class SessionService:
 
     async def list_sessions(self) -> list[Session]:
         return await self._repository.list_sessions()
+
+    async def select_model(self, session_id: str, model_id: str) -> Session:
+        try:
+            session = await self._repository.set_session_model(session_id, model_id)
+        except SessionModelBusy:
+            raise ApplicationError(
+                "session_model_busy", "Wait for this run to finish before changing its model."
+            ) from None
+        except ValueError as error:
+            if str(error) != "model_not_available":
+                raise
+            raise ApplicationError(
+                "model_not_available", "The selected model is unavailable."
+            ) from None
+        if session is None:
+            raise ApplicationError("session_not_found", "Session not found.")
+        return session
 
     async def create(self, workspace_path: str | None = None) -> Session:
         if workspace_path is not None:

@@ -9,6 +9,8 @@ import { ArrowUp } from "lucide-react"
 import { BEND, MetalFx, useMetalBend } from "metal-fx"
 
 import { useTheme } from "@/components/theme-provider"
+import { ModelSelect } from "@/components/model-select"
+import type { ModelStatus } from "@/lib/app-types"
 
 type BudgetPreset = "conservative" | "longer"
 
@@ -20,6 +22,11 @@ type ComposerProps = {
   disabled?: boolean
   budgetPreset: BudgetPreset
   onBudgetChange: (preset: BudgetPreset) => void
+  models: ModelStatus[]
+  selectedModelId: string
+  modelSaving: boolean
+  modelReady: boolean
+  onModelChange: (modelId: string) => void
 }
 
 function usePrefersReducedMotion() {
@@ -49,10 +56,15 @@ export function Composer({
   disabled = false,
   budgetPreset,
   onBudgetChange,
+  models,
+  selectedModelId,
+  modelSaving,
+  modelReady,
+  onModelChange,
 }: ComposerProps) {
   const { resolvedTheme } = useTheme()
   const prefersReducedMotion = usePrefersReducedMotion()
-  const isSendable = Boolean(value.trim()) && !disabled
+  const isSendable = Boolean(value.trim()) && !disabled && modelReady
   const sendRef = useRef<HTMLDivElement>(null)
   const getBendConfig = useCallback(
     () => ({
@@ -67,7 +79,7 @@ export function Composer({
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault()
-      if (!disabled) onSubmit()
+      if (isSendable) onSubmit()
     }
   }
 
@@ -85,6 +97,13 @@ export function Composer({
         />
         <div className="composer-toolbar">
           <div className="composer-tools">
+            <ModelSelect
+              models={models}
+              selectedModelId={selectedModelId}
+              disabled={disabled}
+              saving={modelSaving}
+              onChange={onModelChange}
+            />
             <select
               className="composer-select"
               aria-label="Run budget"

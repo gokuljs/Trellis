@@ -220,6 +220,10 @@ class SupabaseRepository:
         if response.status_code == 409:
             if error_code == "PT409" and error_message == "session_workspace_busy":
                 raise SessionWorkspaceBusy
+            if error_code == "PT409" and error_message == "session_model_busy":
+                raise ApplicationError(
+                    "session_model_busy", "Wait for this run to finish before changing its model."
+                )
             if error_code == "PT409" and error_message == "session_run_busy":
                 raise ApplicationError(
                     "session_run_busy", "This chat has an active run. Try again after it finishes."
@@ -479,6 +483,7 @@ class SupabaseRepository:
             created_at=_text(row, "created_at"),
             updated_at=_text(row, "updated_at"),
             message_count=message_count,
+            model_id=_nullable_text(row, "model_id"),
         )
 
     async def list_sessions(self) -> list[Session]:
@@ -532,6 +537,15 @@ class SupabaseRepository:
             )
         )
         return self._session(rows[0]) if rows else None
+
+    async def set_session_model(self, session_id: str, model_id: str) -> Session | None:
+        result = await self._rpc(
+            "set_session_model", {"session_id": session_id, "model_id": model_id}
+        )
+        if result is None:
+            return None
+        self._owned(_object(result))
+        return await self.get_session(session_id)
 
     def _message(self, row: dict[str, object]) -> Message:
         self._owned(row)

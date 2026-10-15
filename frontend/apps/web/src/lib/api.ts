@@ -313,6 +313,11 @@ export function createApiClient({
       }),
     getSession: (sessionId: string) =>
       request<SessionDetail>(`/api/sessions/${sessionId}`),
+    selectSessionModel: (sessionId: string, modelId: string) =>
+      request<Session>(`/api/sessions/${encodeURIComponent(sessionId)}/model`, {
+        method: "PUT",
+        body: JSON.stringify({ model_id: modelId }),
+      }),
     getLatestRun: (sessionId: string) =>
       request<LatestRun | null>(`/api/sessions/${sessionId}/runs/latest`),
     listRunSummaries: (sessionId: string, offset: number) =>

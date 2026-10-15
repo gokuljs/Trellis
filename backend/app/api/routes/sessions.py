@@ -16,6 +16,11 @@ class SessionResponse(BaseModel):
     message_count: int
     workspace_path: str | None
     workspace_ready: bool
+    model_id: str | None = None
+
+
+class SessionModelRequest(BaseModel):
+    model_id: str = Field(min_length=1, max_length=200)
 
 
 class SessionWorkspaceRequest(BaseModel):
@@ -118,6 +123,7 @@ async def serialize_session(session: Session, service: SessionServiceDep) -> Ses
         message_count=session.message_count,
         workspace_path=session.workspace_path if service.workspace_enabled else None,
         workspace_ready=await service.workspace_ready(session),
+        model_id=session.model_id,
     )
 
 
@@ -168,6 +174,15 @@ async def get_session(session_id: str, service: SessionServiceDep) -> SessionDet
             AssistantOutputResponse.model_validate(output, from_attributes=True)
             for output in detail.assistant_outputs
         ],
+    )
+
+
+@router.put("/{session_id}/model")
+async def select_session_model(
+    session_id: str, payload: SessionModelRequest, service: SessionServiceDep
+) -> SessionResponse:
+    return await serialize_session(
+        await service.select_model(session_id, payload.model_id), service
     )
 
 

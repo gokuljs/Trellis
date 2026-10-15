@@ -3,6 +3,11 @@ import { useEffect, useRef, useState, type ReactNode } from "react"
 
 import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 import { ApiError } from "@/lib/api"
+import {
+  isModelSelectable,
+  modelAvailabilityLabel,
+  nextSelectableModelIndex,
+} from "@/lib/model-choice"
 import type {
   ModelId,
   ModelStatus,
@@ -81,9 +86,8 @@ export function OnboardingFlow({
   const modelRefs = useRef<Array<HTMLButtonElement | null>>([])
 
   const selectedModel = modelOptions.find((item) => item.id === modelId)
-  const selectedModelReady =
-    selectedModel &&
-    (selectedModel.configured || !selectedModel.requires_api_key)
+  const selectedModelReady = isModelSelectable(selectedModel)
+  const firstReadyIndex = modelOptions.findIndex(isModelSelectable)
   const busy = submitting || checkingModels
 
   useEffect(() => {
@@ -135,6 +139,8 @@ export function OnboardingFlow({
   }
 
   const selectModel = (nextModel: ModelId) => {
+    if (!isModelSelectable(modelOptions.find((item) => item.id === nextModel)))
+      return
     setModelId(nextModel)
     setError(null)
   }
@@ -325,32 +331,19 @@ export function OnboardingFlow({
                           role="radio"
                           aria-checked={item.id === modelId}
                           tabIndex={
-                            item.id === modelId ||
-                            (!selectedModel && index === 0)
+                            (item.id === modelId && selectedModelReady) ||
+                            (!selectedModelReady && index === firstReadyIndex)
                               ? 0
                               : -1
                           }
-                          disabled={busy}
+                          disabled={busy || !isModelSelectable(item)}
                           onClick={() => selectModel(item.id)}
                           onKeyDown={(event) => {
-                            let nextIndex: number | null = null
-                            if (
-                              event.key === "ArrowDown" ||
-                              event.key === "ArrowRight"
-                            ) {
-                              nextIndex = (index + 1) % modelOptions.length
-                            } else if (
-                              event.key === "ArrowUp" ||
-                              event.key === "ArrowLeft"
-                            ) {
-                              nextIndex =
-                                (index - 1 + modelOptions.length) %
-                                modelOptions.length
-                            } else if (event.key === "Home") {
-                              nextIndex = 0
-                            } else if (event.key === "End") {
-                              nextIndex = modelOptions.length - 1
-                            }
+                            const nextIndex = nextSelectableModelIndex(
+                              modelOptions,
+                              index,
+                              event.key
+                            )
 
                             if (nextIndex === null) return
                             event.preventDefault()
@@ -362,11 +355,7 @@ export function OnboardingFlow({
                         >
                           <span>{item.provider_name}</span>
                           <span>{item.name}</span>
-                          <span>
-                            {item.configured || !item.requires_api_key
-                              ? "Ready to use"
-                              : "Unavailable"}
-                          </span>
+                          <span>{modelAvailabilityLabel(item)}</span>
                         </button>
                       ))}
                     </div>

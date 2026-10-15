@@ -86,6 +86,20 @@ test("new chats never submit a legacy folder argument", async () => {
   expect(sent.init.headers.get("Authorization")).toBe("Bearer test-token")
 })
 
+test("chat model selection saves only the requested chat preference", async () => {
+  const client = fixture()
+  let sent
+  client.transport.fetch = async (url, init) => {
+    sent = { url, init }
+    return Response.json({ id: "chat-a", model_id: "model-b" })
+  }
+  const session = await client.api.selectSessionModel("chat-a", "model-b")
+  expect(session.model_id).toBe("model-b")
+  expect(sent.url).toBe("/api/sessions/chat-a/model")
+  expect(sent.init.method).toBe("PUT")
+  expect(JSON.parse(sent.init.body)).toEqual({ model_id: "model-b" })
+})
+
 test("an account change during token retrieval cannot send as the new account", async () => {
   const client = fixture()
   const token = deferred()

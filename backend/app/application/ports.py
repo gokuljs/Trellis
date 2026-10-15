@@ -67,6 +67,8 @@ class OnboardingRepository(Protocol):
 
 
 class SessionRepository(Protocol):
+    async def set_session_model(self, session_id: str, model_id: ModelId) -> Session | None: ...
+
     async def create_session(self, workspace_path: str | None = None) -> Session: ...
 
     async def set_session_workspace(

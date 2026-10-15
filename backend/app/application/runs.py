@@ -221,7 +221,9 @@ class RunService:
 
         models = await self._settings.list_models()
         selected_model_id = (
-            model_id if model_id is not None else await self._settings.get_selected_model_id()
+            model_id
+            if model_id is not None
+            else session.model_id or await self._settings.get_selected_model_id()
         )
         model = next((item for item in models if item.id == selected_model_id), None)
         if model is None:

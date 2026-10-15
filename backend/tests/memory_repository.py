@@ -203,10 +203,47 @@ class MemoryRepository:
 
     async def create_session(self, workspace_path: str | None = None) -> Session:
         now = _now()
-        session = Session(_id(), self.state.user_id, "New session", now, now, 0, workspace_path)
+        session = Session(
+            _id(),
+            self.state.user_id,
+            "New session",
+            now,
+            now,
+            0,
+            workspace_path,
+            await self.get_selected_model_id(),
+        )
         self.state.sessions[session.id] = session
         self.state.messages[session.id] = []
         return session
+
+    async def set_session_model(self, session_id: str, model_id: str) -> Session | None:
+        from app.application.model_catalog import profile_for_model
+        from app.domain.models import SessionModelBusy
+
+        session = self.state.sessions.get(session_id)
+        if session is None:
+            return None
+        if session_id in self.state.turn_claims or any(
+            run.session_id == session_id and not is_terminal_run_status(run.status)
+            for run in self.state.runs.values()
+        ):
+            raise SessionModelBusy
+        profile = profile_for_model(model_id)
+        if profile is None or not any(
+            model.id == model_id
+            and model.enabled
+            and model.supports_streaming
+            and model.supports_tools
+            and getattr(model, "availability", "unknown") != "unavailable"
+            and (model.provider_id, model.adapter_kind, model.upstream_model_id)
+            == (profile.provider_id, profile.provider_id, profile.upstream_model_id)
+            for model in await self.list_models()
+        ):
+            raise ValueError("model_not_available")
+        updated = replace(session, model_id=model_id, updated_at=_now())
+        self.state.sessions[session_id] = updated
+        return updated
 
     async def set_session_workspace(
         self, session_id: str, workspace_path: str | None

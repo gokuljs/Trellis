@@ -47,6 +47,7 @@ ERROR_STATUS = {
     "workspace_picker_unavailable": 503,
     "workspace_picker_timeout": 504,
     "session_workspace_busy": 409,
+    "session_model_busy": 409,
     "session_run_busy": 409,
     "session_turn_busy": 409,
     "provider_not_configured": 409,

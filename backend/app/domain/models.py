@@ -36,10 +36,15 @@ class Session:
     updated_at: str
     message_count: int
     workspace_path: str | None = None
+    model_id: ModelId | None = None
 
 
 class SessionWorkspaceBusy(Exception):
     """A session's workspace cannot change while a run can still use it."""
+
+
+class SessionModelBusy(Exception):
+    """The selected model is locked while a chat has an active run."""
 
 
 @dataclass(frozen=True, slots=True)

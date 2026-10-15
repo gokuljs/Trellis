@@ -22,6 +22,7 @@ export type Session = {
   created_at: string
   updated_at: string
   message_count: number
+  model_id?: ModelId | null
 }
 
 export type Profile = {
@@ -52,6 +53,18 @@ export type ModelStatus = {
   supports_tools: boolean
   configured: boolean
   key_hint: string | null
+  enabled?: boolean
+  selectable?: boolean
+  context_window_tokens?: number | null
+  max_input_tokens?: number | null
+  max_output_tokens?: number | null
+  supports_native_compaction?: boolean | null
+  metadata_status?: "ready" | "pending"
+  pending_reasons?: string[]
+  verification_sources?: string[]
+  metadata_verified_at?: string | null
+  availability?: "available" | "unavailable" | "unknown"
+  availability_checked_at?: string | null
 }
 
 export type Settings = {

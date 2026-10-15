@@ -47,6 +47,13 @@ import {
   turnFailureAction,
   type TerminalRunOutcome,
 } from "@/lib/run-recovery"
+import {
+  ensureSessionModel,
+  isModelSelectable,
+  ownsModelSelection,
+  selectedChatModelId,
+  type ModelSelectionOwner,
+} from "@/lib/model-choice"
 import "./workspace-bootstrap.css"
 
 type BootstrapState =
@@ -206,6 +213,11 @@ export function AppShell({
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [composerValue, setComposerValue] = useState("")
+  const [draftModelId, setDraftModelId] = useState<string | null>(null)
+  const [modelSelection, setModelSelection] = useState<{
+    sessionId: string
+    modelId: string
+  } | null>(null)
   const [runBudgetChoice, setRunBudgetChoice] = useState<
     "conservative" | "longer" | null
   >(null)
@@ -242,6 +254,8 @@ export function AppShell({
   const activeSessionIdRef = useRef<string | null>(null)
   const sessionLoadSequenceRef = useRef(0)
   const submissionLockRef = useRef(false)
+  const modelRequestSequenceRef = useRef(0)
+  const modelSaveOwnerRef = useRef<ModelSelectionOwner | null>(null)
   const activeRunRef = useRef<{ runId: string; lastSequence: number } | null>(
     null
   )
@@ -794,6 +808,10 @@ export function AppShell({
   const startNewSession = useCallback(() => {
     runGenerationRef.current += 1
     submissionLockRef.current = false
+    modelRequestSequenceRef.current += 1
+    modelSaveOwnerRef.current = null
+    setModelSelection(null)
+    setDraftModelId(null)
     sessionLoadSequenceRef.current += 1
     activeSessionIdRef.current = null
     setComposerValue("")
@@ -834,6 +852,9 @@ export function AppShell({
   const selectSession = async (sessionId: string) => {
     if (pending) return
     runGenerationRef.current += 1
+    modelRequestSequenceRef.current += 1
+    modelSaveOwnerRef.current = null
+    setModelSelection(null)
     const loadSequence = sessionLoadSequenceRef.current + 1
     sessionLoadSequenceRef.current = loadSequence
     activeSessionIdRef.current = sessionId
@@ -1161,19 +1182,93 @@ export function AppShell({
     }
   }
 
+  const saveSessionModel = async (
+    sessionId: string,
+    modelId: string,
+    generation: number
+  ): Promise<Session | null> => {
+    const owner = {
+      sessionId,
+      generation,
+      requestSequence: ++modelRequestSequenceRef.current,
+    }
+    const isCurrent = () =>
+      ownsModelSelection(owner, {
+        sessionId: activeSessionIdRef.current,
+        generation: runGenerationRef.current,
+        requestSequence: modelRequestSequenceRef.current,
+      })
+    modelSaveOwnerRef.current = owner
+    setModelSelection({ sessionId, modelId })
+    try {
+      const updated = await api.selectSessionModel(sessionId, modelId)
+      if (!isCurrent()) return null
+      setSessions((current) => upsertSession(current, updated))
+      setActiveSession(updated)
+      return updated
+    } catch (saveError) {
+      if (!isCurrent()) return null
+      throw saveError
+    } finally {
+      if (isCurrent()) {
+        modelSaveOwnerRef.current = null
+        setModelSelection(null)
+      }
+    }
+  }
+
+  const changeChatModel = async (modelId: string) => {
+    if (
+      pending ||
+      sessionLoading ||
+      submissionLockRef.current ||
+      modelSaveOwnerRef.current
+    )
+      return
+    if (
+      !isModelSelectable(
+        settings?.models?.find((model) => model.id === modelId)
+      )
+    )
+      return
+    setError(null)
+    if (!activeSession) {
+      setDraftModelId(modelId)
+      return
+    }
+    if (activeSession.model_id === modelId) return
+    const owner = {
+      sessionId: activeSession.id,
+      generation: runGenerationRef.current,
+    }
+    try {
+      await saveSessionModel(activeSession.id, modelId, owner.generation)
+    } catch (saveError) {
+      if (
+        ownsRun(owner, {
+          sessionId: activeSessionIdRef.current,
+          generation: runGenerationRef.current,
+        })
+      )
+        setError(visibleError(saveError))
+    }
+  }
+
   const submitComposer = async () => {
     const content = composerValue.trim()
-    if (!content || pending || sessionLoading || submissionLockRef.current)
+    if (
+      !content ||
+      pending ||
+      sessionLoading ||
+      submissionLockRef.current ||
+      modelSaveOwnerRef.current
+    )
       return
     const model = settings?.models?.find((item) => item.id === selectedModelId)
-    const provider = settings?.providers.find(
-      (item) => item.id === model?.provider_id
-    )
-    const configured = provider?.configured ?? model?.configured ?? false
-    if (!model || (model.requires_api_key && !configured)) {
+    if (!model || !isModelSelectable(model)) {
       setError(
         model
-          ? "The selected model is unavailable. Choose a ready-to-use model in Settings and try again."
+          ? "The selected model is unavailable. Choose a ready-to-use model for this chat and try again."
           : "Open Settings before starting a session."
       )
       return
@@ -1200,9 +1295,18 @@ export function AppShell({
         session = createdSession
         sessionLoadSequenceRef.current += 1
         activeSessionIdRef.current = createdSession.id
+        owner = { ...owner, sessionId: createdSession.id }
         setActiveSession(createdSession)
         setSessions((current) => upsertSession(current, createdSession))
         setActiveView("session")
+        const prepared = await ensureSessionModel(
+          createdSession,
+          model.id,
+          (sessionId, modelId) =>
+            saveSessionModel(sessionId, modelId, owner.generation)
+        )
+        if (!isCurrent() || !prepared) return
+        session = prepared
       }
       const completion = completeTurn(
         {
@@ -1232,11 +1336,29 @@ export function AppShell({
   }
 
   const retryFailedTurn = async () => {
-    if (!failedTurn || pending || submissionLockRef.current) return
+    if (
+      !failedTurn ||
+      pending ||
+      sessionLoading ||
+      submissionLockRef.current ||
+      modelSaveOwnerRef.current
+    )
+      return
+    if (
+      !isModelSelectable(
+        settings?.models?.find((model) => model.id === selectedModelId)
+      )
+    ) {
+      setError("Choose a ready-to-use model for this chat before retrying.")
+      return
+    }
     submissionLockRef.current = true
     setPending(true)
     let preservePending = false
-    const completion = completeTurn(failedTurn, false)
+    const completion = completeTurn(
+      { ...failedTurn, modelId: selectedModelId },
+      false
+    )
     const owner = {
       sessionId: failedTurn.sessionId,
       generation: runGenerationRef.current,
@@ -1294,11 +1416,10 @@ export function AppShell({
     })
   }
 
-  const configuredModels = (settings?.models ?? []).filter(
-    (model) => model.configured || !model.requires_api_key
-  )
   const selectedModelId =
-    settings?.selected_model_id ?? configuredModels[0]?.id ?? ""
+    (modelSelection?.sessionId === activeSession?.id
+      ? modelSelection?.modelId
+      : null) ?? selectedChatModelId(activeSession, settings, draftModelId)
   const selectedBudgetPreset =
     runBudgetChoice ?? settings?.default_budget_preset ?? "conservative"
 
@@ -1430,7 +1551,7 @@ export function AppShell({
               onRetryActivityHistory={() =>
                 void selectSession(activeSession.id)
               }
-              canRetry={failedTurn !== null && !pending}
+              canRetry={failedTurn !== null && !pending && !modelSelection}
               canReconnect={reconnectAvailable}
               canCancel={pending && activeRunId !== null}
               cancellationPending={cancellingRun}
@@ -1469,9 +1590,16 @@ export function AppShell({
               }
               onChange={setComposerValue}
               onSubmit={() => void submitComposer()}
-              disabled={pending || sessionLoading}
+              disabled={pending || sessionLoading || modelSelection !== null}
               budgetPreset={selectedBudgetPreset}
               onBudgetChange={setRunBudgetChoice}
+              models={settings?.models ?? []}
+              selectedModelId={selectedModelId}
+              modelSaving={modelSelection !== null}
+              modelReady={isModelSelectable(
+                settings?.models?.find((model) => model.id === selectedModelId)
+              )}
+              onModelChange={(modelId) => void changeChatModel(modelId)}
             />
           </>
         ) : null}
