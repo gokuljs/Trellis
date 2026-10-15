@@ -1,12 +1,9 @@
-.PHONY: dev test-dev-launcher format format-check setup-hooks
+.PHONY: dev format format-check setup-hooks
 
 UV ?= uvx --from uv==0.12.5 uv
 
 dev:
 	@./scripts/dev-all.sh
-
-test-dev-launcher:
-	@./tests/test_dev_launcher.sh
 
 format:
 	cd frontend && bun run format
