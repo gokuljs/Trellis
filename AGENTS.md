@@ -10,16 +10,27 @@ to the requested area and preserve the existing frontend toolchain. Backend
 work lives under `backend/`; read its nested `AGENTS.md` before editing files
 there.
 
-## Frontend design workflow
+## Pstack workflow
 
-- Use the project-local `impeccable` skill as the default workflow for frontend
-  design, layout, and spacing work. It takes precedence over generic global
-  design guidance for this repository.
-- Use the project-local `web-design-guidelines` skill for requested UI,
-  accessibility, and UX audits.
+- Use the project-local [pstack skill](.agents/skills/pstack/SKILL.md) for
+  nontrivial engineering work and explicit pstack requests. It is the only
+  repository-local skill entrypoint.
+- Read the official workflow and only the relevant playbooks and principle
+  files from `.agents/pstack/upstream/`. Follow the mappings in the pstack
+  skill for Codex tools and user authorization.
+- Preserve the pinned upstream snapshot. Keep Trellis guidance in the pstack
+  adapter, its references, and this file.
+- Preserve the user's scope. A pstack playbook does not authorize creating a
+  pull request, sending messages, deploying, or merging unless requested.
+
+## Frontend guidance
+
+- Read [frontend/AGENTS.md](frontend/AGENTS.md) before frontend changes.
 - Preserve Trellis's existing visual system unless a redesign is requested.
-  Use Impeccable's layout workflow to improve spacing and rhythm; do not reduce
-  padding indiscriminately or make the interface cramped.
+  Use pstack's relevant design and prototype workflows when they help answer
+  the request. Do not add spacing changes without a design reason.
+- Keep the existing frontend toolchain and use the relevant checks for changed
+  packages and user-facing behavior.
 
 ## SVG icon ownership and reuse
 
@@ -48,14 +59,19 @@ there.
 
 ## Development and review rules
 
+- Follow pstack's focused `tdd` workflow when a behavior change has a clear,
+  inexpensive test path. Otherwise choose the closest practical verification.
+- For defects, use the pstack bug-fix workflow and trace the cause before
+  changing code.
 - Keep async work bounded, timeout-aware, and cancellation-safe. Never hide
   blocking work in an async path operation.
 - Prefer the existing dependency policy and justify every new runtime package.
-- Prioritize public contract compatibility, error handling, data boundaries,
-  cancellation, and dependency/security risk during review.
-- Do not claim completion without fresh evidence from the required checks.
+- Review public contracts, error handling, data boundaries, cancellation,
+  coverage, and dependency risk when those areas are in scope.
+- Prove the requested result with fresh evidence before claiming completion.
 
 ## Required backend verification
 
 From `backend/`, run `make check` with uv 0.12.5 (or the CI-equivalent pinned
-uv invocation). The aggregate check runs Ruff formatting, Ruff linting, and ty.
+uv invocation). The aggregate check runs Ruff formatting, Ruff linting, ty,
+strict pytest, and the 90% coverage floor.
