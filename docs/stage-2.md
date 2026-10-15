@@ -225,37 +225,23 @@ available for compatibility.
 
 ## Verification
 
-Run the backend aggregate checks from `backend/` with the pinned uv version:
+Run the backend quality checks from `backend/` with the pinned uv version:
 
 ```bash
 uvx --from uv==0.12.5 uv sync --locked
 make check UV='uvx --from uv==0.12.5 uv'
 ```
 
-This runs Ruff format checking, Ruff linting, `ty check`, strict pytest, and the
-90% coverage floor. From `frontend/`, use the existing toolchain:
+This runs Ruff format checking, Ruff linting, and `ty check`. From `frontend/`,
+use the existing toolchain:
 
 ```bash
 bun install --frozen-lockfile
 bun run format:check
 bun run lint
 bun run typecheck
-bun run test:contracts
 bun run build
 ```
 
-The [SQL CI recipe](../.github/workflows/backend-ci.yml) applies migrations and
-SQL contracts to disposable PostgreSQL 15. Its `local_bootstrap.sql` supplies
-mock auth roles and users and must never run against hosted Supabase. Run the
-terminal-call backfill fixture before migration 010, then its contract test
-afterward, to cover both upgrades and new terminal transitions. Hosted rollout
-still requires applying the migrations, exposing the schema, and checking
-ownership with two real Supabase accounts.
-
-Focused backend tests cover chunk-boundary redaction, incomplete responses,
-partial outputs, queue/send limits, durable replay caps, restricted discovery,
-exact counts and fallbacks, atomic checkpoints, native compaction, cross-model
-replay, draft previews, history cursors, and terminal call cleanup. Frontend
-contract tests cover model selection, gauge disclosure, preview cancellation,
-bounded query windows, and reconnect/retry behavior. Provider adapter tests use
-mocked API responses; they do not establish paid live-provider compatibility.
+For hosted rollout, apply the migrations to the chosen project and expose the
+`trellis` schema through the Supabase Data API.

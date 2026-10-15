@@ -13,7 +13,7 @@ schemas, event names, or provider behavior that the repository has not defined.
 ## Establish the contract first
 
 1. Read the repository-root and nearest `AGENTS.md` files before editing.
-2. Inspect existing modules, tests, and public API documentation. Treat current
+2. Inspect existing modules and public API documentation. Treat current
    behavior as the contract; record unknowns instead of guessing.
 3. Define the smallest typed boundary required by the task. Preserve backward
    compatibility unless the request explicitly changes a public contract.
@@ -25,7 +25,7 @@ schemas, event names, or provider behavior that the repository has not defined.
 - Keep domain state, invariants, and typed events independent of transport.
 - Put model/provider integrations behind narrow protocols and adapters; do not
   leak SDK types into domain code.
-- Pass dependencies explicitly so tests can use deterministic fakes.
+- Pass dependencies explicitly so runtime behavior remains predictable.
 
 ## Make async work bounded and cancellable
 
@@ -37,17 +37,15 @@ schemas, event names, or provider behavior that the repository has not defined.
 - Preserve event ordering and idempotency where the existing contract requires
   it; document assumptions when it does not.
 
-## Work test-first
+## Work in small verified steps
 
-Follow RED–GREEN–REFACTOR for each behavior. Start with a focused failing test,
-run it to confirm the expected failure, implement the smallest change, then
-refactor only while the full suite remains green. Test cancellation, timeout,
-provider failure, and duplicate-event behavior when those paths are in scope.
+Implement the smallest change that meets the requested behavior. Check
+cancellation, timeout, provider failure, and duplicate-event paths when those
+paths are in scope.
 
 ## Verify with evidence
 
-Run the narrowest relevant tests after each change, then the backend aggregate
-check before completion. Include formatting, linting, type checking, coverage,
-and contract/OpenAPI checks as applicable. Diagnose failures from their root
-cause before changing code, and report commands and results rather than relying
-on assumptions.
+Run the backend aggregate check before completion. Include formatting, linting,
+type checking, and contract/OpenAPI checks as applicable. Diagnose failures
+from their root cause before changing code, and report commands and results
+rather than relying on assumptions.

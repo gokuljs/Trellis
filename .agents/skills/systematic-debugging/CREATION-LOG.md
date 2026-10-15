@@ -52,39 +52,12 @@ Framework designed to resist rationalization under pressure:
 - "NEVER fix symptom" appears 4 times in different contexts
 - Each phase has explicit "don't skip" guidance
 
-## Testing Approach
-
-Created 4 validation tests following skills/meta/testing-skills-with-subagents:
-
-### Test 1: Academic Context (No Pressure)
-- Simple bug, no time pressure
-- **Result:** Perfect compliance, complete investigation
-
-### Test 2: Time Pressure + Obvious Quick Fix
-- User "in a hurry", symptom fix looks easy
-- **Result:** Resisted shortcut, followed full process, found real root cause
-
-### Test 3: Complex System + Uncertainty
-- Multi-layer failure, unclear if can find root cause
-- **Result:** Systematic investigation, traced through all layers, found source
-
-### Test 4: Failed First Fix
-- Hypothesis doesn't work, temptation to add more fixes
-- **Result:** Stopped, re-analyzed, formed new hypothesis (no shotgun)
-
-**All tests passed.** No rationalizations found.
-
 ## Iterations
 
 ### Initial Version
 - Complete 4-phase framework
 - Anti-patterns section
 - Flowchart for "fix failed" decision
-
-### Enhancement 1: TDD Reference
-- Added link to skills/testing/test-driven-development
-- Note explaining TDD's "simplest code" ≠ debugging's "root cause"
-- Prevents confusion between methodologies
 
 ## Final Outcome
 
@@ -93,8 +66,6 @@ Bulletproof skill that:
 - ✅ Resists time pressure rationalization
 - ✅ Provides concrete steps for each phase
 - ✅ Shows anti-patterns explicitly
-- ✅ Tested under multiple pressure scenarios
-- ✅ Clarifies relationship to TDD
 - ✅ Ready for use
 
 ## Key Insight

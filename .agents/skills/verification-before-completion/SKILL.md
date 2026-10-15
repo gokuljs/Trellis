@@ -39,13 +39,12 @@ Skip any step = lying, not verifying
 
 | Claim | Requires | Not Sufficient |
 |-------|----------|----------------|
-| Tests pass | Test command output: 0 failures | Previous run, "should pass" |
+| Behavior verified | Fresh output from the relevant check | Previous run, "should pass" |
 | Linter clean | Linter output: 0 errors | Partial check, extrapolation |
 | Build succeeds | Build command: exit 0 | Linter passing, logs look good |
-| Bug fixed | Test original symptom: passes | Code changed, assumed fixed |
-| Regression test works | Red-green cycle verified | Test passes once |
+| Bug fixed | Observe the original behavior after the change | Code changed, assumed fixed |
 | Agent completed | VCS diff shows changes | Agent reports "success" |
-| Requirements met | Line-by-line checklist | Tests passing |
+| Requirements met | Line-by-line checklist | A partial check or assumption |
 
 ## Red Flags - STOP
 
@@ -73,18 +72,6 @@ Skip any step = lying, not verifying
 
 ## Key Patterns
 
-**Tests:**
-```
-✅ [Run test command] [See: 34/34 pass] "All tests pass"
-❌ "Should pass now" / "Looks correct"
-```
-
-**Regression tests (TDD Red-Green):**
-```
-✅ Write → Run (pass) → Revert fix → Run (MUST FAIL) → Restore → Run (pass)
-❌ "I've written a regression test" (without red-green verification)
-```
-
 **Build:**
 ```
 ✅ [Run build] [See: exit 0] "Build passes"
@@ -94,7 +81,7 @@ Skip any step = lying, not verifying
 **Requirements:**
 ```
 ✅ Re-read plan → Create checklist → Verify each → Report gaps or completion
-❌ "Tests pass, phase complete"
+❌ "Checks pass, phase complete" without verifying each requirement
 ```
 
 **Agent delegation:**

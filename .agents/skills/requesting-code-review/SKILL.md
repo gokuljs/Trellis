@@ -62,7 +62,7 @@ HEAD_SHA=$(git rev-parse HEAD)
   HEAD_SHA: 3df7661
 
 [Subagent returns]:
-  Strengths: Clean architecture, real tests
+  Strengths: Clean architecture, clear behavior checks
   Issues:
     Important: Missing progress indicators
     Minor: Magic number (100) for reporting interval
@@ -89,7 +89,7 @@ You: [Fix progress indicators]
 
 **If reviewer wrong:**
 - Push back with technical reasoning
-- Show code/tests that prove it works
+- Show implementation details or fresh check output that support the conclusion
 - Request clarification
 
 See template at: [code-reviewer.md](code-reviewer.md)

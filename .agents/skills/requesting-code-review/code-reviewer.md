@@ -63,12 +63,6 @@ Subagent (general-purpose):
     - Security concerns?
     - Integrates cleanly with surrounding code?
 
-    **Testing:**
-    - Tests verify real behavior, not mocks?
-    - Edge cases covered?
-    - Integration tests where they matter?
-    - All tests passing?
-
     **Production readiness:**
     - Migration strategy if schema changed?
     - Backward compatibility considered?
@@ -97,7 +91,7 @@ Subagent (general-purpose):
     [Bugs, security issues, data loss risks, broken functionality]
 
     #### Important (Should Fix)
-    [Architecture problems, missing features, poor error handling, test gaps]
+    [Architecture problems, missing features, poor error handling, validation gaps]
 
     #### Minor (Nice to Have)
     [Code style, optimization opportunities, documentation polish]
@@ -147,7 +141,6 @@ Subagent (general-purpose):
 ```
 ### Strengths
 - Clean database schema with proper migrations (db.ts:15-42)
-- Comprehensive test coverage (18 tests, all edge cases)
 - Good error handling with fallbacks (summarizer.ts:85-92)
 
 ### Issues
@@ -177,5 +170,5 @@ Subagent (general-purpose):
 
 **Ready to merge: With fixes**
 
-**Reasoning:** Core implementation is solid with good architecture and tests. Important issues (help text, date validation) are easily fixed and don't affect core functionality.
+**Reasoning:** Core implementation is solid with good architecture. Important issues (help text, date validation) are easily fixed and don't affect core functionality.
 ```

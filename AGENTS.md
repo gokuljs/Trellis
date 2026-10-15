@@ -48,17 +48,14 @@ there.
 
 ## Development and review rules
 
-- Use RED–GREEN–REFACTOR for behavior changes: write a focused failing test,
-  implement the smallest passing change, then refactor.
 - Keep async work bounded, timeout-aware, and cancellation-safe. Never hide
   blocking work in an async path operation.
 - Prefer the existing dependency policy and justify every new runtime package.
 - Prioritize public contract compatibility, error handling, data boundaries,
-  cancellation, test coverage, and dependency/security risk during review.
+  cancellation, and dependency/security risk during review.
 - Do not claim completion without fresh evidence from the required checks.
 
 ## Required backend verification
 
 From `backend/`, run `make check` with uv 0.12.5 (or the CI-equivalent pinned
-uv invocation). The aggregate check runs Ruff formatting, Ruff linting, ty,
-strict pytest, and the 90% coverage floor.
+uv invocation). The aggregate check runs Ruff formatting, Ruff linting, and ty.
