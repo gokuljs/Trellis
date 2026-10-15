@@ -28,6 +28,7 @@ from app.domain.event_limits import (
     EventStorageLimit,
     check_event_storage,
 )
+from app.domain.history import HistoryPage, PageCursor, SessionPage, TimelineKind, TimelineRow
 from app.domain.models import (
     Message,
     MessageRole,
@@ -458,6 +459,68 @@ class MemoryRepository:
         self.state.sessions[session_id] = updated
         return updated
 
+    async def get_message(self, session_id: str, message_id: str) -> Message | None:
+        return next(
+            (
+                message
+                for message in self.state.messages.get(session_id, [])
+                if message.id == message_id
+            ),
+            None,
+        )
+
+    async def read_session_page(self, before: PageCursor | None, *, limit: int = 40) -> SessionPage:
+        if not 1 <= limit <= 100:
+            raise ValueError("invalid page limit")
+        rows = sorted(
+            self.state.sessions.values(), key=lambda item: (item.updated_at, item.id), reverse=True
+        )
+        if before:
+            rows = [
+                row for row in rows if (row.updated_at, row.id) < (before.created_at, before.id)
+            ]
+        page = rows[:limit]
+        cursor = (
+            PageCursor(page[-1].updated_at, "session", page[-1].id).encode()
+            if len(rows) > limit
+            else None
+        )
+        return SessionPage(tuple(page), cursor)
+
+    async def read_history_page(
+        self, session_id: str, before: PageCursor | None, *, limit: int = 40
+    ) -> HistoryPage:
+        if not 1 <= limit <= 100:
+            raise ValueError("invalid page limit")
+        messages = self.state.messages.get(session_id, [])
+        outputs = [
+            item for item in self.state.assistant_outputs.values() if item.session_id == session_id
+        ]
+        rows: list[tuple[str, TimelineKind, str]] = [
+            (message.created_at, "message", message.id) for message in messages
+        ]
+        rows += [
+            (output.created_at, "assistant_output", output.id)
+            for output in outputs
+            if output.promoted_message_id is None
+        ]
+        rows.sort(reverse=True)
+        if before:
+            rows = [row for row in rows if row < (before.created_at, before.kind, before.id)]
+        page = rows[:limit]
+        cursor = PageCursor(*page[-1]).encode() if len(rows) > limit else None
+        identities = {row[2] for row in page}
+        return HistoryPage(
+            tuple(message for message in messages if message.id in identities),
+            tuple(
+                output
+                for output in outputs
+                if output.id in identities or output.promoted_message_id in identities
+            ),
+            tuple(TimelineRow(kind, identity) for _, kind, identity in reversed(page)),
+            cursor,
+        )
+
     async def list_sessions(self) -> list[Session]:
         return sorted(
             self.state.sessions.values(), key=lambda session: session.updated_at, reverse=True
@@ -706,11 +769,22 @@ class MemoryRepository:
         )
 
     async def list_runs_for_session(
-        self, session_id: str, offset: int, limit: int
+        self,
+        session_id: str,
+        offset: int,
+        limit: int,
+        *,
+        turn_id: str | None = None,
+        newest_first: bool = False,
     ) -> list[RunSnapshot]:
         if offset < 0 or not 1 <= limit <= 101:
             raise ValueError("run offset and limit are outside the supported range")
-        return [run for run in self.state.runs.values() if run.session_id == session_id][
+        rows = [
+            run
+            for run in self.state.runs.values()
+            if run.session_id == session_id and (turn_id is None or run.turn_id == turn_id)
+        ]
+        return sorted(rows, key=lambda run: (run.created_at, run.id), reverse=newest_first)[
             offset : offset + limit
         ]
 

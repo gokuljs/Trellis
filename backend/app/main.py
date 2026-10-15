@@ -43,6 +43,7 @@ ERROR_STATUS = {
     "database_unavailable": 503,
     "database_not_configured": 503,
     "invalid_workspace": 422,
+    "invalid_history_cursor": 400,
     "capability_disabled": 403,
     "workspace_picker_unavailable": 503,
     "workspace_picker_timeout": 504,

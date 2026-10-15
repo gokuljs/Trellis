@@ -10,6 +10,7 @@ from app.domain.context import (
     InputTokenCount,
     NativeCompactionResult,
 )
+from app.domain.history import HistoryPage, PageCursor, SessionPage
 from app.domain.models import (
     Message,
     ModelDescriptor,
@@ -74,6 +75,16 @@ class OnboardingRepository(Protocol):
 
 
 class SessionRepository(Protocol):
+    async def read_session_page(
+        self, before: PageCursor | None, *, limit: int = 40
+    ) -> SessionPage: ...
+
+    async def read_history_page(
+        self, session_id: str, before: PageCursor | None, *, limit: int = 40
+    ) -> HistoryPage: ...
+
+    async def get_message(self, session_id: str, message_id: str) -> Message | None: ...
+
     async def set_session_model(self, session_id: str, model_id: ModelId) -> Session | None: ...
 
     async def create_session(self, workspace_path: str | None = None) -> Session: ...
@@ -126,7 +137,13 @@ class RunRepository(Protocol):
     async def get_latest_run_for_session(self, session_id: str) -> RunSnapshot | None: ...
 
     async def list_runs_for_session(
-        self, session_id: str, offset: int, limit: int
+        self,
+        session_id: str,
+        offset: int,
+        limit: int,
+        *,
+        turn_id: str | None = None,
+        newest_first: bool = False,
     ) -> list[RunSnapshot]: ...
 
     async def append_run_event(

@@ -336,11 +336,19 @@ class RunService:
         )
 
     async def list_session_runs(
-        self, session_id: str, offset: int, limit: int
+        self,
+        session_id: str,
+        offset: int,
+        limit: int,
+        *,
+        turn_id: str | None = None,
+        newest_first: bool = False,
     ) -> tuple[list[RunSnapshot], int | None]:
         if await self._sessions.get_session(session_id) is None:
             raise ApplicationError("session_not_found", "Session not found.")
-        runs = await self._runs.list_runs_for_session(session_id, offset, limit + 1)
+        runs = await self._runs.list_runs_for_session(
+            session_id, offset, limit + 1, turn_id=turn_id, newest_first=newest_first
+        )
         visible = [await self._recover_if_expired(run) for run in runs[:limit]]
         return [run for run in visible if run is not None], offset + limit if len(
             runs

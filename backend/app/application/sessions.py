@@ -4,7 +4,14 @@ from pathlib import Path
 from app.application.errors import ApplicationError
 from app.application.ports import SessionRepository, WorkspaceBindingPort
 from app.domain.capabilities import RuntimeCapabilities
-from app.domain.models import Session, SessionDetail, SessionModelBusy, SessionWorkspaceBusy
+from app.domain.history import HistoryPage, PageCursor, SessionPage
+from app.domain.models import (
+    Message,
+    Session,
+    SessionDetail,
+    SessionModelBusy,
+    SessionWorkspaceBusy,
+)
 
 
 def _resolved_workspace(raw_path: str) -> str:
@@ -41,6 +48,35 @@ class SessionService:
     def _require_workspace(self) -> None:
         if not self.workspace_enabled:
             raise ApplicationError("capability_disabled", "Local workspace access is disabled.")
+
+    @staticmethod
+    def _page_cursor(value: str | None, *, session_list: bool = False) -> PageCursor | None:
+        if value is None:
+            return None
+        try:
+            return PageCursor.decode(value, session_list=session_list)
+        except ValueError:
+            raise ApplicationError(
+                "invalid_history_cursor", "The history page cursor is invalid."
+            ) from None
+
+    async def read_session_page(self, cursor: str | None, limit: int) -> SessionPage:
+        return await self._repository.read_session_page(
+            self._page_cursor(cursor, session_list=True), limit=limit
+        )
+
+    async def read_history_page(
+        self, session_id: str, cursor: str | None, limit: int
+    ) -> tuple[Session, HistoryPage]:
+        session = await self._repository.get_session(session_id)
+        if session is None:
+            raise ApplicationError("session_not_found", "Session not found.")
+        return session, await self._repository.read_history_page(
+            session_id, self._page_cursor(cursor), limit=limit
+        )
+
+    async def get_message(self, session_id: str, message_id: str) -> Message | None:
+        return await self._repository.get_message(session_id, message_id)
 
     async def list_sessions(self) -> list[Session]:
         return await self._repository.list_sessions()

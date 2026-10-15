@@ -29,6 +29,7 @@ from app.domain.context import (
     ContextWindow,
 )
 from app.domain.event_limits import EVENT_STORAGE_LIMIT_MESSAGE
+from app.domain.history import HistoryPage, PageCursor, SessionPage, TimelineRow
 from app.domain.models import (
     Message,
     ModelDescriptor,
@@ -636,6 +637,81 @@ class SupabaseRepository:
             model_id=_nullable_text(row, "model_id"),
         )
 
+    async def get_message(self, session_id: str, message_id: str) -> Message | None:
+        rows = await self._messages(
+            {"chat_id": f"eq.{session_id}", "id": f"eq.{message_id}", "limit": "1"}
+        )
+        if rows and (rows[0].session_id != session_id or rows[0].id != message_id):
+            raise RuntimeError("Supabase returned another message")
+        return rows[0] if rows else None
+
+    @staticmethod
+    def _page_payload(before: PageCursor | None, limit: int) -> dict[str, object]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("invalid page limit")
+        return {
+            "p_limit": limit,
+            "p_before_time": before.created_at if before else None,
+            "p_before_id": before.id if before else None,
+        }
+
+    @staticmethod
+    def _history_cursor(row: dict[str, object]) -> str | None:
+        cursor = row.get("next_before")
+        if cursor is None:
+            return None
+        raw = _object(cursor)
+        encoded = PageCursor(
+            _text(raw, "created_at"), _text(raw, "kind"), _text(raw, "id")
+        ).encode()
+        # Reject malformed cursor metadata rather than returning a poisoned page.
+        PageCursor.decode(encoded, session_list=raw["kind"] == "session")
+        return encoded
+
+    async def read_session_page(self, before: PageCursor | None, *, limit: int = 40) -> SessionPage:
+        row = _object(
+            await self._request(
+                "POST", "rpc/read_chat_summaries_page", payload=self._page_payload(before, limit)
+            )
+        )
+        items = tuple(self._session(item) for item in _array(row.get("items")))
+        if len(items) > limit:
+            raise RuntimeError("Supabase returned an oversized session page")
+        return SessionPage(items, self._history_cursor(row))
+
+    async def read_history_page(
+        self, session_id: str, before: PageCursor | None, *, limit: int = 40
+    ) -> HistoryPage:
+        payload = {
+            **self._page_payload(before, limit),
+            "p_chat_id": session_id,
+            "p_before_kind": before.kind if before else None,
+        }
+        row = _object(await self._request("POST", "rpc/read_chat_history", payload=payload))
+        messages = tuple(self._message(item) for item in _array(row.get("messages")))
+        outputs = tuple(
+            self._assistant_output(item) for item in _array(row.get("assistant_outputs"))
+        )
+        order = []
+        for item in _array(row.get("timeline_order")):
+            kind = _text(item, "kind")
+            if kind not in {"message", "assistant_output"}:
+                raise RuntimeError("Supabase returned an invalid timeline kind")
+            order.append(TimelineRow(kind, _text(item, "id")))
+        expected = {("message", item.id) for item in messages} | {
+            ("assistant_output", item.id) for item in outputs if item.promoted_message_id is None
+        }
+        if (
+            len(order) > limit
+            or len(messages) > limit
+            or len(outputs) > limit
+            or len(order) != len(expected)
+            or {(item.kind, item.id) for item in order} != expected
+            or any(item.session_id != session_id for item in (*messages, *outputs))
+        ):
+            raise RuntimeError("Supabase returned an invalid history page")
+        return HistoryPage(messages, outputs, tuple(order), self._history_cursor(row))
+
     async def list_sessions(self) -> list[Session]:
         sessions: list[Session] = []
         offset = 0
@@ -887,14 +963,21 @@ class SupabaseRepository:
         return rows[0] if rows else None
 
     async def list_runs_for_session(
-        self, session_id: str, offset: int, limit: int
+        self,
+        session_id: str,
+        offset: int,
+        limit: int,
+        *,
+        turn_id: str | None = None,
+        newest_first: bool = False,
     ) -> list[RunSnapshot]:
         if offset < 0 or not 1 <= limit <= 101:
             raise ValueError("run offset and limit are outside the supported range")
         return await self._runs(
             {
                 "chat_id": f"eq.{session_id}",
-                "order": "created_at.asc,id.asc",
+                "order": "created_at.desc,id.desc" if newest_first else "created_at.asc,id.asc",
+                **({"turn_id": f"eq.{turn_id}"} if turn_id is not None else {}),
                 "offset": str(offset),
                 "limit": str(limit),
             }

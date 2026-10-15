@@ -1040,7 +1040,10 @@ def test_session_latest_run_lookup_tracks_active_and_terminal_runs(tmp_path: Pat
             )
             active = client.get(latest_url)
             assert active.status_code == 200
-            assert active.json() == {
+            assert active.json()["input_message"]["content"] == "Keep working"
+            assert {
+                key: value for key, value in active.json().items() if key != "input_message"
+            } == {
                 "run_id": run_id,
                 "turn_id": "turn-lookup",
                 "status": "running",
@@ -1118,7 +1121,8 @@ def test_waiting_approval_is_discoverable_and_replayed_after_socket_refresh(tmp_
             tool_call_id = waiting[-1]["params"]["data"]["tool_call_id"]
 
         discovered = client.get(f"/api/sessions/{session_id}/runs/latest").json()
-        assert discovered == {
+        assert discovered["input_message"]["content"] == "Read the note"
+        assert {key: value for key, value in discovered.items() if key != "input_message"} == {
             "run_id": run_id,
             "turn_id": "waiting-turn",
             "status": "waiting_for_approval",

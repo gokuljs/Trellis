@@ -73,6 +73,8 @@ jobs:
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/context_checkpoints.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610150007_event_limits.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/event_limits.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610150008_history_pages.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/history_pages.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610150009_unknown_usage_cost.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/unknown_usage_cost.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/chat_turn_security.sql
