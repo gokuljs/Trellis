@@ -1,4 +1,5 @@
 import json
+import re
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -679,6 +680,7 @@ async def _stream_openai(
             cached_tokens = _optional_integer(input_details.get("cached_tokens"))
             cache_creation_tokens = _optional_integer(input_details.get("cache_write_tokens"))
             reasoning_tokens = _optional_integer(output_details.get("reasoning_tokens"))
+            service_tier = _served_service_tier(response.get("service_tier"))
             usage_event = None
             if any(
                 value is not None
@@ -688,6 +690,7 @@ async def _stream_openai(
                     cached_tokens,
                     cache_creation_tokens,
                     reasoning_tokens,
+                    service_tier,
                 )
             ):
                 usage_event = ModelStreamEvent(
@@ -697,6 +700,8 @@ async def _stream_openai(
                     reasoning_tokens=reasoning_tokens,
                     cached_tokens=cached_tokens,
                     cache_creation_tokens=cache_creation_tokens,
+                    cache_creation_1h_tokens=0,
+                    service_tier=service_tier,
                     provider_response_id=response_id,
                 )
             incomplete_reason = _mapping(response.get("incomplete_details")).get("reason")
@@ -770,7 +775,9 @@ async def _stream_anthropic(
     input_tokens: int | None = None
     output_tokens: int | None = None
     cached_tokens: int | None = None
-    cache_creation_tokens = 0
+    cache_creation_tokens: int | None = 0
+    cache_creation_1h_tokens: int | None = 0
+    service_tier: str | None = None
     finish_reason: str | None = None
     saw_text = False
     completed = False
@@ -798,6 +805,8 @@ async def _stream_anthropic(
             input_tokens = _optional_integer(usage.get("input_tokens"))
             cached_tokens = _optional_integer(usage.get("cache_read_input_tokens"))
             cache_creation_tokens = _optional_integer(usage.get("cache_creation_input_tokens", 0))
+            cache_creation_1h_tokens = _anthropic_write_1h(usage, cache_creation_tokens)
+            service_tier = _served_service_tier(usage.get("service_tier"))
         elif event_type == "content_block_start":
             index = payload.get("index")
             block = _mapping(payload.get("content_block"))
@@ -885,8 +894,16 @@ async def _stream_anthropic(
             finish_reason = stop_reason if isinstance(stop_reason, str) else finish_reason
             usage = _mapping(payload.get("usage"))
             output_tokens = _optional_integer(usage.get("output_tokens"))
+            if "input_tokens" in usage:
+                input_tokens = _optional_integer(usage["input_tokens"])
+            if "cache_read_input_tokens" in usage:
+                cached_tokens = _optional_integer(usage["cache_read_input_tokens"])
             if "cache_creation_input_tokens" in usage:
                 cache_creation_tokens = _optional_integer(usage["cache_creation_input_tokens"])
+            if "cache_creation_input_tokens" in usage or "cache_creation" in usage:
+                cache_creation_1h_tokens = _anthropic_write_1h(usage, cache_creation_tokens)
+            if "service_tier" in usage:
+                service_tier = _served_service_tier(usage["service_tier"])
         elif event_type == "message_stop":
             if block_types.keys() - stopped_blocks or (tool_uses and finish_reason != "tool_use"):
                 raise _anthropic_invalid_stream()
@@ -896,13 +913,18 @@ async def _stream_anthropic(
                     "Anthropic returned an empty response.",
                 )
             usage_event = None
-            if any(value is not None for value in (input_tokens, output_tokens, cached_tokens)):
+            if any(
+                value is not None
+                for value in (input_tokens, output_tokens, cached_tokens, service_tier)
+            ):
                 usage_event = ModelStreamEvent(
                     kind="usage",
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cached_tokens=cached_tokens,
                     cache_creation_tokens=cache_creation_tokens,
+                    cache_creation_1h_tokens=cache_creation_1h_tokens,
+                    service_tier=service_tier,
                     provider_response_id=response_id,
                 )
             completed = True
@@ -1005,6 +1027,21 @@ def _decode_sse_data(data_lines: list[str]) -> dict[str, Any]:
 
 def _mapping(value: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _served_service_tier(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", value) is None:
+        raise ProviderError(
+            "provider_invalid_response", "The provider returned invalid usage metadata."
+        )
+    return value
+
+
+def _anthropic_write_1h(usage: dict[str, Any], total: int | None) -> int | None:
+    details = _mapping(usage.get("cache_creation"))
+    return _optional_integer(details.get("ephemeral_1h_input_tokens", 0 if total == 0 else None))
 
 
 def _optional_integer(value: object) -> int | None:

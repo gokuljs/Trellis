@@ -247,6 +247,8 @@ class ModelStreamEvent:
     finish_reason: str | None = None
     provider_response_id: str | None = None
     finish_kind: ModelFinishKind | None = None
+    service_tier: str | None = None
+    cache_creation_1h_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if self.finish_kind is not None:
@@ -267,6 +269,7 @@ class ModelStreamEvent:
                 self.reasoning_tokens,
                 self.cached_tokens,
                 self.cache_creation_tokens,
+                self.cache_creation_1h_tokens,
             ):
                 if token_count is not None and token_count < 0:
                     raise ValueError("token counts cannot be negative")

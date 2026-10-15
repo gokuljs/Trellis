@@ -249,6 +249,7 @@ def test_openai_stream_normalizes_deltas_usage_and_model_snapshot() -> None:
             reasoning_tokens=1,
             cached_tokens=2,
             provider_response_id="resp_123",
+            cache_creation_1h_tokens=0,
         ),
         ModelStreamEvent(
             kind="completed",
@@ -535,7 +536,11 @@ def test_openai_stream_assembles_multiple_function_calls_after_response_completi
             ),
         ),
         ModelStreamEvent(
-            kind="usage", input_tokens=12, output_tokens=8, provider_response_id="resp_tools"
+            kind="usage",
+            input_tokens=12,
+            output_tokens=8,
+            provider_response_id="resp_tools",
+            cache_creation_1h_tokens=0,
         ),
         ModelStreamEvent(
             kind="completed",
@@ -1199,6 +1204,7 @@ def test_anthropic_stream_replays_tool_exchange_and_assembles_mixed_blocks() -> 
             output_tokens=19,
             cache_creation_tokens=0,
             provider_response_id="msg_tools",
+            cache_creation_1h_tokens=0,
         ),
         ModelStreamEvent(
             kind="completed",
