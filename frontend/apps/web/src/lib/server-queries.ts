@@ -3,6 +3,7 @@ import {
   queryOptions,
   type QueryClient,
   type InfiniteData,
+  type MutationFilters,
 } from "@tanstack/react-query"
 
 import { ApiError, api } from "@/lib/api"
@@ -78,6 +79,7 @@ export function sessionModelMutationOptions(
 ) {
   return {
     mutationKey: ["session-model"],
+    scope: { id: "session-model-preference" },
     mutationFn: ({
       sessionId,
       modelId,
@@ -94,7 +96,20 @@ export function sessionModelMutationOptions(
     onSettled: () => {
       void client.invalidateQueries({ queryKey: serverKeys.sessionPages })
     },
-    onSuccess: (session: Session) => {
+    onSuccess: async (session: Session) => {
+      // Navigation can start another read after onMutate cancelled the old ones.
+      // Let those snapshots settle before publishing the saved preference.
+      await Promise.allSettled(
+        [
+          serverKeys.history(session.id),
+          serverKeys.session(session.id),
+          serverKeys.sessionPages,
+          serverKeys.sessions,
+        ].map(
+          (queryKey) =>
+            client.getQueryCache().find({ queryKey, exact: true })?.promise
+        )
+      )
       client.setQueryData<InfiniteData<SessionHistoryPage>>(
         serverKeys.history(session.id),
         (data) =>
@@ -119,6 +134,18 @@ export function sessionModelMutationOptions(
         queryKey: ["context-preview", session.id],
       })
     },
+  }
+}
+
+export function sessionModelMutationFilters(
+  sessionId: string | null
+): MutationFilters {
+  return {
+    mutationKey: ["session-model"],
+    predicate: (mutation) =>
+      sessionId !== null &&
+      (mutation.state.variables as { sessionId: string } | undefined)
+        ?.sessionId === sessionId,
   }
 }
 

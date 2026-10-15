@@ -2,6 +2,7 @@ import { Menu } from "lucide-react"
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import {
   useInfiniteQuery,
+  useIsMutating,
   useMutation,
   useQuery,
   useQueryClient,
@@ -67,6 +68,7 @@ import {
   runSummariesQueryOptions,
   serverKeys,
   sessionModelMutationOptions,
+  sessionModelMutationFilters,
   settingsQueryOptions,
 } from "@/lib/server-queries"
 import {
@@ -162,6 +164,9 @@ export function AppShell({
     sessionModelMutationOptions(queryClient)
   )
   const [activeSession, setActiveSession] = useState<Session | null>(null)
+  const sessionModelSaving =
+    useIsMutating(sessionModelMutationFilters(activeSession?.id ?? null)) > 0
+  const modelSaving = modelSelection !== null || sessionModelSaving
   const [messages, setMessages] = useState<Message[]>([])
   const [timelineOrder, setTimelineOrder] = useState<TimelineRow[]>([])
   const [historyError, setHistoryError] = useState<string | null>(null)
@@ -1139,7 +1144,8 @@ export function AppShell({
       pending ||
       sessionLoading ||
       submissionLockRef.current ||
-      modelSaveOwnerRef.current
+      modelSaveOwnerRef.current ||
+      sessionModelSaving
     )
       return
     if (
@@ -1153,7 +1159,7 @@ export function AppShell({
       setDraftModelId(modelId)
       return
     }
-    if (activeSession.model_id === modelId) return
+    if (selectedModelId === modelId) return
     const owner = {
       sessionId: activeSession.id,
       generation: runGenerationRef.current,
@@ -1178,7 +1184,8 @@ export function AppShell({
       pending ||
       sessionLoading ||
       submissionLockRef.current ||
-      modelSaveOwnerRef.current
+      modelSaveOwnerRef.current ||
+      sessionModelSaving
     )
       return
     const model = settings?.models?.find((item) => item.id === selectedModelId)
@@ -1258,7 +1265,8 @@ export function AppShell({
       pending ||
       sessionLoading ||
       submissionLockRef.current ||
-      modelSaveOwnerRef.current
+      modelSaveOwnerRef.current ||
+      sessionModelSaving
     )
       return
     if (
@@ -1331,7 +1339,13 @@ export function AppShell({
   const selectedModelId =
     (modelSelection?.sessionId === activeSession?.id
       ? modelSelection?.modelId
-      : null) ?? selectedChatModelId(activeSession, settings, draftModelId)
+      : null) ??
+    selectedChatModelId(
+      activeSession,
+      settings,
+      draftModelId,
+      history.data?.pages[0]?.session ?? null
+    )
   const selectedBudgetPreset =
     runBudgetChoice ?? settings?.default_budget_preset ?? "conservative"
   const activeActivity = activeRunTurnId ? runActivities[activeRunTurnId] : null
@@ -1361,7 +1375,7 @@ export function AppShell({
       activeView !== "Settings" &&
       !pending &&
       !sessionLoading &&
-      modelSelection === null &&
+      !modelSaving &&
       Boolean(selectedModelId)
   )
 
@@ -1521,7 +1535,7 @@ export function AppShell({
               onRetryActivityHistory={() =>
                 void selectSession(activeSession.id)
               }
-              canRetry={failedTurn !== null && !pending && !modelSelection}
+              canRetry={failedTurn !== null && !pending && !modelSaving}
               canReconnect={reconnectAvailable}
               canCancel={pending && activeRunId !== null}
               cancellationPending={cancellingRun}
@@ -1559,12 +1573,12 @@ export function AppShell({
               }
               onChange={setComposerValue}
               onSubmit={() => void submitComposer()}
-              disabled={pending || sessionLoading || modelSelection !== null}
+              disabled={pending || sessionLoading || modelSaving}
               budgetPreset={selectedBudgetPreset}
               onBudgetChange={setRunBudgetChoice}
               models={settings?.models ?? []}
               selectedModelId={selectedModelId}
-              modelSaving={modelSelection !== null}
+              modelSaving={modelSaving}
               modelReady={isModelSelectable(
                 settings?.models?.find((model) => model.id === selectedModelId)
               )}
@@ -1580,9 +1594,7 @@ export function AppShell({
                   loading={
                     pending
                       ? !liveContext && !compacting
-                      : contextPreview.loading ||
-                        sessionLoading ||
-                        modelSelection !== null
+                      : contextPreview.loading || sessionLoading || modelSaving
                   }
                   error={pending ? null : contextPreview.error}
                   compacting={compacting}

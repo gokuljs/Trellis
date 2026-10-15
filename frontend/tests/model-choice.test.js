@@ -39,6 +39,30 @@ test("legacy chats use the default and an absent default uses the first selectab
   ).toBe("ready")
 })
 
+test("a model save acknowledged after returning to a chat overrides its stale local preference", async () => {
+  const { selectedChatModelId } = await helpers()
+  const session = { id: "chat-a", model_id: "old" }
+  const settings = { selected_model_id: "default" }
+  expect(
+    selectedChatModelId(session, settings, null, {
+      id: "chat-a",
+      model_id: "saved",
+    })
+  ).toBe("saved")
+  expect(
+    selectedChatModelId(session, settings, null, {
+      id: "chat-b",
+      model_id: "other",
+    })
+  ).toBe("old")
+  expect(
+    selectedChatModelId(null, settings, "draft", {
+      id: "chat-a",
+      model_id: "saved",
+    })
+  ).toBe("draft")
+})
+
 test("pending metadata, unavailable providers and disabled models cannot be selected", async () => {
   const { isModelSelectable, modelAvailabilityLabel } = await helpers()
   const pending = model("pending", { metadata_status: "pending" })

@@ -189,3 +189,160 @@ test("a failed model save resumes a cancelled in-flight chat list read", async (
   unsubscribe()
   disposeSessionQueryClient(client)
 })
+
+test("model saves across chat navigation preserve selection order and the latest pending choice", async () => {
+  const { MutationObserver } = await import("@tanstack/react-query")
+  const {
+    sessionModelMutationOptions,
+    sessionModelMutationFilters,
+    serverKeys,
+  } = await helpers()
+  const client = createSessionQueryClient()
+  const nextAccount = createSessionQueryClient()
+  const pending = ["first", "other", "latest"].map((modelId) => {
+    let release
+    return {
+      modelId,
+      wait: new Promise((resolve) => (release = resolve)),
+      release: () => release(),
+    }
+  })
+  const started = []
+  const saved = new Map()
+  const service = {
+    selectSessionModel: async (sessionId, modelId) => {
+      started.push({ sessionId, modelId })
+      await pending.find((request) => request.modelId === modelId).wait
+      saved.set(sessionId, modelId)
+      return { id: sessionId, model_id: modelId }
+    },
+  }
+  for (const sessionId of ["chat-a", "chat-b"])
+    client.setQueryData(serverKeys.history(sessionId), {
+      pages: [{ session: { id: sessionId, model_id: "old" }, messages: [] }],
+      pageParams: [null],
+    })
+  const observers = pending.map(
+    () =>
+      new MutationObserver(client, sessionModelMutationOptions(client, service))
+  )
+  const unsubscribe = observers.map((observer) => observer.subscribe(() => {}))
+  const writes = observers.map((observer, index) =>
+    observer.mutate({
+      sessionId: index === 1 ? "chat-b" : "chat-a",
+      modelId: pending[index].modelId,
+    })
+  )
+  const nextTurn = () => new Promise((resolve) => setTimeout(resolve, 0))
+  try {
+    await nextTurn()
+    expect(started).toEqual([{ sessionId: "chat-a", modelId: "first" }])
+    expect(observers[2].getCurrentResult()).toMatchObject({
+      isPending: true,
+      isPaused: true,
+      variables: { sessionId: "chat-a", modelId: "latest" },
+    })
+    const savesForChatA = sessionModelMutationFilters("chat-a")
+    expect(client.isMutating(savesForChatA)).toBe(2)
+    expect(client.isMutating(sessionModelMutationFilters(null))).toBe(0)
+    expect(client.isMutating(sessionModelMutationFilters("chat-c"))).toBe(0)
+    expect(nextAccount.isMutating(savesForChatA)).toBe(0)
+    pending[0].release()
+    await writes[0]
+    await nextTurn()
+    expect(started).toEqual([
+      { sessionId: "chat-a", modelId: "first" },
+      { sessionId: "chat-b", modelId: "other" },
+    ])
+    expect(observers[2].getCurrentResult().isPending).toBe(true)
+    expect(client.isMutating(savesForChatA)).toBe(1)
+    pending[1].release()
+    await writes[1]
+    await nextTurn()
+    expect(started).toEqual([
+      { sessionId: "chat-a", modelId: "first" },
+      { sessionId: "chat-b", modelId: "other" },
+      { sessionId: "chat-a", modelId: "latest" },
+    ])
+    pending[2].release()
+    await writes[2]
+    expect(saved.get("chat-a")).toBe("latest")
+    expect(saved.get("chat-b")).toBe("other")
+    expect(
+      client.getQueryData(serverKeys.history("chat-a")).pages[0].session
+        .model_id
+    ).toBe("latest")
+    expect(observers[2].getCurrentResult().isPending).toBe(false)
+    expect(client.isMutating(savesForChatA)).toBe(0)
+  } finally {
+    for (const request of pending) request.release()
+    await Promise.allSettled(writes)
+    for (const dispose of unsubscribe) dispose()
+    disposeSessionQueryClient(client)
+    disposeSessionQueryClient(nextAccount)
+  }
+})
+
+test("a history read begun during a model save cannot overwrite its acknowledged preference", async () => {
+  const { MutationObserver } = await import("@tanstack/react-query")
+  const {
+    sessionHistoryQueryOptions,
+    sessionModelMutationOptions,
+    sessionModelMutationFilters,
+    serverKeys,
+  } = await helpers()
+  const { selectedChatModelId } =
+    await import("../apps/web/src/lib/model-choice.ts")
+  const client = createSessionQueryClient()
+  const staleSession = { id: "chat-a", model_id: "old" }
+  let releaseSave
+  let releaseRead
+  const saving = new Promise((resolve) => (releaseSave = resolve))
+  const reading = new Promise((resolve) => (releaseRead = resolve))
+  const observer = new MutationObserver(
+    client,
+    sessionModelMutationOptions(client, {
+      selectSessionModel: async () => {
+        await saving
+        return { ...staleSession, model_id: "saved" }
+      },
+    })
+  )
+  const unsubscribe = observer.subscribe(() => {})
+  const nextTurn = () => new Promise((resolve) => setTimeout(resolve, 0))
+  const write = observer.mutate({ sessionId: "chat-a", modelId: "saved" })
+  await nextTurn()
+  const history = client.fetchInfiniteQuery(
+    sessionHistoryQueryOptions("chat-a", {
+      getSessionHistory: async () => {
+        await reading
+        return {
+          session: staleSession,
+          messages: [],
+          assistant_outputs: [],
+          timeline_order: [],
+          next_before_cursor: null,
+        }
+      },
+    })
+  )
+  try {
+    releaseSave()
+    await nextTurn()
+    expect(client.isMutating(sessionModelMutationFilters("chat-a"))).toBe(1)
+    releaseRead()
+    await Promise.all([write, history])
+    const cached = client.getQueryData(serverKeys.history("chat-a"))
+    expect(cached.pages[0].session.model_id).toBe("saved")
+    expect(
+      selectedChatModelId(staleSession, null, null, cached.pages[0].session)
+    ).toBe("saved")
+    expect(client.isMutating(sessionModelMutationFilters("chat-a"))).toBe(0)
+  } finally {
+    releaseSave()
+    releaseRead()
+    await Promise.allSettled([write, history])
+    unsubscribe()
+    disposeSessionQueryClient(client)
+  }
+})

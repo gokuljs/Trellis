@@ -19,12 +19,15 @@ export function modelAvailabilityLabel(model: ModelStatus): string {
 }
 
 export function selectedChatModelId(
-  session: Pick<Session, "model_id"> | null,
+  session: (Pick<Session, "model_id"> & Partial<Pick<Session, "id">>) | null,
   settings: Pick<Settings, "selected_model_id" | "models"> | null,
-  draftModelId: string | null = null
+  draftModelId: string | null = null,
+  cachedSession: Pick<Session, "id" | "model_id"> | null = null
 ): string {
+  const remembered =
+    cachedSession && cachedSession.id === session?.id ? cachedSession : session
   return (
-    session?.model_id ??
+    remembered?.model_id ??
     (!session ? draftModelId : null) ??
     settings?.selected_model_id ??
     settings?.models?.find(isModelSelectable)?.id ??
