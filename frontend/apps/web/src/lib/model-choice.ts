@@ -5,6 +5,27 @@ export function isModelSelectable(model: ModelStatus | undefined): boolean {
   return Boolean(model)
 }
 
+export function modelProviderId(
+  model: Pick<ModelStatus, "id"> & Partial<Pick<ModelStatus, "provider_id">>
+): string | null {
+  return model.provider_id || /^(openai|anthropic):/.exec(model.id)?.[1] || null
+}
+
+export function modelProviders(models: ModelStatus[]) {
+  const providers = new Map<string, { id: string; name: string }>()
+  for (const model of models) {
+    const id = modelProviderId(model)
+    if (id && !providers.has(id))
+      providers.set(id, {
+        id,
+        name:
+          model.provider_name ||
+          (id === "openai" ? "OpenAI" : id === "anthropic" ? "Anthropic" : id),
+      })
+  }
+  return [...providers.values()]
+}
+
 export function selectedChatModelId(
   session: (Pick<Session, "model_id"> & Partial<Pick<Session, "id">>) | null,
   settings: Pick<Settings, "selected_model_id" | "models"> | null,

@@ -65,7 +65,9 @@ test("the native chat selector leaves API-key and unchecked availability errors 
   expect(markup).toContain(
     'value="openai:ready" selected="">GPT ready</option>'
   )
-  expect(markup).toContain('value="anthropic:sonnet">Claude Sonnet</option>')
+  expect(markup).not.toContain(
+    'value="anthropic:sonnet">Claude Sonnet</option>'
+  )
   expect(markup).toContain('value="openai:unchecked">GPT unchecked</option>')
 })
 
