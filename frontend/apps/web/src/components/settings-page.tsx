@@ -9,6 +9,7 @@ import type {
   Settings,
 } from "@/lib/app-types"
 import { notifications } from "@/lib/notifications"
+import { modelProviderId, modelProviders } from "@/lib/model-choice"
 import "./profile-summary.css"
 
 type SettingsPageProps = {
@@ -52,6 +53,13 @@ export function SettingsPage({
   const selectedModelId =
     settings.selected_model_id ?? settings.selected_provider
   const selectedModel = models.find((model) => model.id === selectedModelId)
+  const providers = settings.providers.length
+    ? settings.providers
+    : modelProviders(models)
+  const selectedProviderId =
+    settings.selected_provider ||
+    modelProviderId(selectedModel ?? { id: selectedModelId }) ||
+    ""
   const setupStatus = onboarding
     ? onboarding.completed
       ? "Complete"
@@ -93,6 +101,22 @@ export function SettingsPage({
       },
       async () => {
         onSettingsChange(await api.selectModel(modelId))
+      }
+    )
+  }
+
+  const selectProvider = (providerId: string) => {
+    const nextProvider = providers.find((item) => item.id === providerId)
+    if (!nextProvider || providerId === selectedProviderId) return
+    void runUpdate(
+      "provider",
+      {
+        kind: "info",
+        title: `${nextProvider.name} selected`,
+        description: "New chats use your selected provider.",
+      },
+      async () => {
+        onSettingsChange(await api.selectProvider(providerId))
       }
     )
   }
@@ -216,28 +240,63 @@ export function SettingsPage({
             </p>
           </div>
 
-          <label className="settings-field">
-            <span className="settings-field-label">Model for new chats</span>
-            <span className="settings-input-wrap">
-              <select
-                aria-label="Default model for new chats"
-                value={selectedModelId}
-                disabled={saving !== null}
-                aria-busy={saving === "model"}
-                onChange={(event) => selectModel(event.target.value)}
-              >
-                <ModelOptions
-                  models={models}
-                  selectedModelId={selectedModelId}
-                />
-              </select>
-            </span>
-            {saving === "model" ? (
-              <span className="settings-field-help" role="status">
-                Saving default model…
+          <div className="settings-form-grid">
+            <label className="settings-field">
+              <span className="settings-field-label">
+                Provider for new chats
               </span>
-            ) : null}
-          </label>
+              <span className="settings-input-wrap">
+                <select
+                  aria-label="Default provider for new chats"
+                  value={selectedProviderId}
+                  disabled={saving !== null}
+                  aria-busy={saving === "provider"}
+                  onChange={(event) => selectProvider(event.target.value)}
+                >
+                  {!providers.some(
+                    (provider) => provider.id === selectedProviderId
+                  ) ? (
+                    <option value={selectedProviderId} disabled>
+                      {selectedProviderId || "Choose a provider"}
+                    </option>
+                  ) : null}
+                  {providers.map((provider) => (
+                    <option key={provider.id} value={provider.id}>
+                      {provider.name}
+                    </option>
+                  ))}
+                </select>
+              </span>
+              {saving === "provider" ? (
+                <span className="settings-field-help" role="status">
+                  Saving default provider…
+                </span>
+              ) : null}
+            </label>
+            <label className="settings-field">
+              <span className="settings-field-label">Model for new chats</span>
+              <span className="settings-input-wrap">
+                <select
+                  aria-label="Default model for new chats"
+                  value={selectedModelId}
+                  disabled={saving !== null}
+                  aria-busy={saving === "model"}
+                  onChange={(event) => selectModel(event.target.value)}
+                >
+                  <ModelOptions
+                    models={models}
+                    selectedModelId={selectedModelId}
+                    providerId={selectedProviderId || null}
+                  />
+                </select>
+              </span>
+              {saving === "model" ? (
+                <span className="settings-field-help" role="status">
+                  Saving default model…
+                </span>
+              ) : null}
+            </label>
+          </div>
         </section>
 
         <section

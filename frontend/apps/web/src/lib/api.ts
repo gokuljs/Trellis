@@ -311,6 +311,11 @@ export function createApiClient({
         },
         { timeoutMs: requestTimeoutMs, ...options }
       ),
+    selectProvider: (providerId: string) =>
+      request<Settings>("/api/settings/provider", {
+        method: "PUT",
+        body: JSON.stringify({ provider: providerId }),
+      }),
     selectModel: (modelId: string) =>
       request<Settings>("/api/settings/model", {
         method: "PUT",

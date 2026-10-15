@@ -1834,8 +1834,11 @@ html.theme-ripple-fallback::before {
 
   .composer-tools {
     display: flex;
-    height: var(--space-8);
+    max-width: 100%;
+    min-height: var(--space-8);
+    flex-wrap: wrap;
     align-items: center;
+    justify-content: flex-end;
     gap: var(--space-3);
   }
 
@@ -1907,7 +1910,7 @@ html.theme-ripple-fallback::before {
     }
 
     .composer-tools {
-      height: 40px;
+      min-height: 40px;
     }
 
     .send-button-metal {
