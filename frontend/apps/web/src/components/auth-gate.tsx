@@ -4,6 +4,7 @@ import { GitHubIcon } from "@trellis/ui/icons/github-icon"
 import { GoogleIcon } from "@trellis/ui/icons/google-icon"
 import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 import { useAuth } from "@/lib/use-auth"
+import { SessionQueryProvider } from "@/components/session-query-provider"
 import "./auth-screen.css"
 
 function subscribeToPath(listener: () => void) {
@@ -71,7 +72,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
         className="authenticated-workspace"
         key={`${auth.user.id}:${auth.sessionEpoch}`}
       >
-        {children}
+        <SessionQueryProvider>{children}</SessionQueryProvider>
       </div>
     )
   }
