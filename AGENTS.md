@@ -10,6 +10,25 @@ to the requested area and preserve the existing frontend toolchain. Backend
 work lives under `backend/`; read its nested `AGENTS.md` before editing files
 there.
 
+## Agent workflow and skill discovery
+
+- Use the project-local [pstack adapter](.agents/skills/pstack/SKILL.md) for
+  pstack or poteto-mode requests and multi-step engineering work. It adapts
+  Lauren Tan's pinned upstream workflow to Codex and routes to existing skills.
+- Read only the skills relevant to the task. Pstack coordinates the workflow;
+  the domain-specific skills below own frontend and backend guidance.
+- Read [frontend/AGENTS.md](frontend/AGENTS.md) before frontend changes. It also
+  routes to skills in `frontend/.agents/skills/` for chats started at the root.
+- Keep imported pstack files in `.agents/pstack/upstream/` unchanged. They are
+  supporting references outside native skill discovery. Apply the local
+  adapter when interpreting Cursor tool names, model choices, and playbooks.
+- Treat upstream autonomy, PR, shipping, and automation instructions within
+  the user's authorized scope. They do not grant permission for external
+  messages, ticket updates, PR creation, merges, deployments, or background jobs.
+- Add shared skills under `.agents/skills/` and frontend-only skills under
+  `frontend/.agents/skills/`. Use unique names and record their trigger and path
+  in the applicable instructions. See [the extension guide](docs/agent-workflows.md).
+
 ## Frontend design workflow
 
 - Use the project-local `impeccable` skill as the default workflow for frontend
