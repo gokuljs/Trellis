@@ -67,7 +67,7 @@ test("pending metadata, unavailable providers and disabled models cannot be sele
   const { isModelSelectable, modelAvailabilityLabel } = await helpers()
   const pending = model("pending", { metadata_status: "pending" })
   expect(isModelSelectable(pending)).toBe(false)
-  expect(modelAvailabilityLabel(pending)).toBe("Pending")
+  expect(modelAvailabilityLabel(pending)).toBe("Metadata pending review")
   expect(isModelSelectable(model("blocked", { selectable: false }))).toBe(false)
   expect(isModelSelectable(model("disabled", { enabled: false }))).toBe(false)
   expect(
@@ -90,6 +90,32 @@ test("pending metadata, unavailable providers and disabled models cannot be sele
     )
   ).toBe(true)
 })
+
+test.each([
+  [{ selectable: true }, "Ready to use"],
+  [{ configured: false, selectable: true }, "API key missing"],
+  [
+    { configured: false, enabled: false, availability: "unknown" },
+    "API key missing",
+  ],
+  [{ metadata_status: "pending" }, "Metadata pending review"],
+  [{ availability: "unavailable" }, "Not available from provider"],
+  [{ enabled: false, availability: "unknown" }, "Availability not checked"],
+  [
+    { enabled: false, pending_reasons: ["availability_unverified"] },
+    "Availability not checked",
+  ],
+  [{ enabled: false, availability: "available" }, "Disabled"],
+  [{ selectable: false, supports_streaming: false }, "Streaming not supported"],
+  [{ selectable: false, supports_tools: false }, "Tools not supported"],
+  [{ selectable: false }, "Unavailable"],
+])(
+  "model availability explains known DTO flags without guessing (%j)",
+  async (flags, expected) => {
+    const { modelAvailabilityLabel } = await helpers()
+    expect(modelAvailabilityLabel(model("example", flags))).toBe(expected)
+  }
+)
 
 test("keyboard model selection skips unavailable choices and respects Home and End", async () => {
   const { nextSelectableModelIndex } = await helpers()

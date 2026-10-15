@@ -27,8 +27,50 @@ test("the composer model selector exposes names and disables pending choices", a
   expect(markup).toContain('aria-label="Chat model"')
   expect(markup).toContain('value="ready" selected=""')
   expect(markup).toContain('value="pending" disabled=""')
-  expect(markup).toContain("Pending model · Pending")
+  expect(markup).toContain("Pending model · Metadata pending review")
   expect(markup).toContain('value="unavailable" disabled=""')
+})
+
+test("the native chat selector groups models under each provider once and explains disabled options", async () => {
+  const markup = await renderChoice({
+    models: [
+      {
+        id: "openai:ready",
+        name: "GPT ready",
+        provider_id: "openai",
+        provider_name: "OpenAI",
+        selectable: true,
+      },
+      {
+        id: "anthropic:sonnet",
+        name: "Claude Sonnet",
+        provider_id: "anthropic",
+        provider_name: "Anthropic",
+        requires_api_key: true,
+        configured: false,
+      },
+      {
+        id: "openai:unchecked",
+        name: "GPT unchecked",
+        provider_id: "openai",
+        provider_name: "OpenAI",
+        enabled: false,
+        availability: "unknown",
+      },
+    ],
+    selectedModelId: "openai:ready",
+  })
+  expect(markup.match(/<optgroup label="OpenAI"/g)).toHaveLength(1)
+  expect(markup.match(/<optgroup label="Anthropic"/g)).toHaveLength(1)
+  expect(markup).toContain(
+    'value="openai:ready" selected="">GPT ready</option>'
+  )
+  expect(markup).toContain(
+    'value="anthropic:sonnet" disabled="">Claude Sonnet · API key missing</option>'
+  )
+  expect(markup).toContain(
+    'value="openai:unchecked" disabled="">GPT unchecked · Availability not checked</option>'
+  )
 })
 
 test("an unknown saved choice remains visible until a ready model is chosen", async () => {

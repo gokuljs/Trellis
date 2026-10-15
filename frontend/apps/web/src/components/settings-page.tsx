@@ -1,6 +1,6 @@
-import { Check, Sparkles } from "lucide-react"
 import { useState } from "react"
 
+import { ModelOptions } from "@/components/model-select"
 import { ApiError, api } from "@/lib/api"
 import type {
   ModelStatus,
@@ -53,7 +53,6 @@ export function SettingsPage({
   const selectedModelId =
     settings.selected_model_id ?? settings.selected_provider
   const selectedModel = models.find((model) => model.id === selectedModelId)
-  const selectedModelReady = isModelSelectable(selectedModel)
   const setupStatus = onboarding
     ? onboarding.completed
       ? "Complete"
@@ -147,7 +146,11 @@ export function SettingsPage({
                 </div>
                 <div>
                   <dt>Model availability</dt>
-                  <dd>{selectedModelReady ? "Ready to use" : "Unavailable"}</dd>
+                  <dd>
+                    {selectedModel
+                      ? modelAvailabilityLabel(selectedModel)
+                      : "Unavailable"}
+                  </dd>
                 </div>
               </dl>
             </section>
@@ -226,49 +229,32 @@ export function SettingsPage({
             </p>
           </div>
 
-          <div
-            className="provider-options"
-            role="radiogroup"
-            aria-label="Default model for new chats"
-          >
-            {!selectedModelReady ? (
-              <p className="settings-field-help">
-                {selectedModel
-                  ? "This model is unavailable right now. Choose a model marked Ready to use."
+          <label className="settings-field">
+            <span className="settings-field-label">Model for new chats</span>
+            <span className="settings-input-wrap">
+              <select
+                aria-label="Default model for new chats"
+                value={selectedModelId}
+                disabled={saving !== null}
+                aria-busy={saving === "model"}
+                onChange={(event) => selectModel(event.target.value)}
+              >
+                <ModelOptions
+                  models={models}
+                  selectedModelId={selectedModelId}
+                />
+              </select>
+            </span>
+            <span className="settings-field-help" role="status">
+              {saving === "model"
+                ? "Saving default model…"
+                : selectedModel
+                  ? modelAvailabilityLabel(selectedModel)
                   : models.length
-                    ? "Choose an available model to use for new chats."
-                    : "No models are available right now. Try again later."}
-              </p>
-            ) : null}
-            {models.map((item) => {
-              const isSelected = item.id === selectedModelId
-              return (
-                <button
-                  className={`provider-option ${isSelected ? "is-selected" : ""}`}
-                  key={item.id}
-                  type="button"
-                  role="radio"
-                  aria-checked={isSelected}
-                  disabled={saving !== null || !isModelSelectable(item)}
-                  onClick={() => selectModel(item.id)}
-                >
-                  <span className="provider-icon">
-                    <Sparkles size={16} strokeWidth={1.7} aria-hidden="true" />
-                  </span>
-                  <span className="provider-details">
-                    <span className="provider-name">{item.provider_name}</span>
-                    <span className="provider-description">
-                      {modelAvailabilityLabel(item)}
-                    </span>
-                  </span>
-                  <span className="provider-model">{item.name}</span>
-                  <span className="provider-check" aria-hidden="true">
-                    {isSelected ? <Check size={14} strokeWidth={2} /> : null}
-                  </span>
-                </button>
-              )
-            })}
-          </div>
+                    ? "Choose a model for new chats."
+                    : "No models found."}
+            </span>
+          </label>
         </section>
 
         <section

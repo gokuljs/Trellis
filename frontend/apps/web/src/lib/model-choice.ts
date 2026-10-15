@@ -14,8 +14,23 @@ export function isModelSelectable(model: ModelStatus | undefined): boolean {
 }
 
 export function modelAvailabilityLabel(model: ModelStatus): string {
-  if (model.metadata_status === "pending") return "Pending"
-  return isModelSelectable(model) ? "Ready to use" : "Unavailable"
+  if (isModelSelectable(model)) return "Ready to use"
+  if (model.requires_api_key && !model.configured) return "API key missing"
+  if (model.metadata_status === "pending") return "Metadata pending review"
+  if (
+    model.availability === "unavailable" ||
+    model.pending_reasons?.includes("provider_unavailable")
+  )
+    return "Not available from provider"
+  if (model.supports_streaming === false) return "Streaming not supported"
+  if (model.supports_tools === false) return "Tools not supported"
+  if (
+    model.availability === "unknown" ||
+    model.pending_reasons?.includes("availability_unverified")
+  )
+    return "Availability not checked"
+  if (model.enabled === false) return "Disabled"
+  return "Unavailable"
 }
 
 export function selectedChatModelId(
