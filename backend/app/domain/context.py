@@ -70,6 +70,11 @@ class ContextPreflight:
             "safety_margin_tokens": self.safety_margin_tokens,
             "usable_input_tokens": self.usable_input_tokens,
             "checkpoint_id": self.checkpoint_id,
+            "checkpoint_replay": (
+                "native" if self.request.native_context_json is not None else "portable"
+            )
+            if self.checkpoint_id is not None
+            else None,
             "fits": self.fits,
             "needs_compaction": self.needs_compaction,
             "estimated_call_cost_usd": self.estimated_call_cost_usd,

@@ -60,6 +60,7 @@ def test_preflight_reserves_output_and_safety_space_and_records_used_sources() -
     assert snapshot["sources"] == [{"source_id": "m1", "source_kind": "message", "turn_id": "t1"}]
     assert snapshot["count_method"] == "utf8_bytes_estimate_v1"
     assert snapshot["checkpoint_id"] is None
+    assert snapshot["checkpoint_replay"] is None
     assert len(str(snapshot["input_hash"])) == 64
     tokens = snapshot["input_tokens"]
     assert isinstance(tokens, int) and tokens > 5
