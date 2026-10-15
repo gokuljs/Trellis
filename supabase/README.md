@@ -42,18 +42,6 @@ finish every import that has started with the previous backend. The migration
 checks for unfinished imports and aborts without changing data if any remain.
 It does not delete local SQLite source files.
 
-## Local SQL checks
-
-The test fixture `tests/local_bootstrap.sql` supplies only a mock `auth.users`,
-`auth.uid()` and the `anon`/`authenticated` roles for a fresh local PostgreSQL
-database. **Never apply that fixture to a hosted Supabase project.** CI applies
-the five historical migrations and runs the supported runtime SQL contracts,
-then tests the import-retirement preflight and migration. The SQL tests use
-fixed local-only UUIDs and must run on a disposable database.
-
-Hosted verification still requires applying the migrations to the chosen
-project, exposing `trellis`, and testing with two actual Supabase accounts.
-
 Migration `202610150003_model_catalog.sql` stores exact reviewed profiles in the
 private schema and adds trusted metadata, verification timestamps, and cached
 availability to model rows. Authenticated users can read pending model choices,
