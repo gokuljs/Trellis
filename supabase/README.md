@@ -57,3 +57,18 @@ availability to model rows. Authenticated users can read pending model choices,
 but cannot write catalog tables. A trigger prevents enabling arbitrary upstream
 IDs or replacing reviewed limits/prices. Missing profiles remain disabled. The
 existing model-selection RPCs continue using the enabled-model invariant.
+
+Migration `202610150004_catalog_sync.sql` creates the restricted login
+`trellis_catalog_sync` without a password. Provision its credential separately
+with the database administrator's interactive `\password trellis_catalog_sync`
+command or the operator's secret-management workflow. The migration rejects an
+existing privileged role or role memberships. The login has no table reads,
+table writes, account RPC access, or trusted-profile mutation grant. It can only
+execute `trellis_private.sync_model_catalog(text,jsonb)`, which accepts a bounded
+provider availability snapshot and uses reviewed private profiles to determine
+readiness. Do not expose the private schema through the Supabase Data API.
+
+The operator connects directly through PostgreSQL with this login. Keep its URL
+and provider keys outside the app's public configuration and browser environment.
+The worker's deployment supervisor starts and restarts it; the backend app does
+not start discovery workers during HTTP requests or application startup.

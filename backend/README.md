@@ -83,3 +83,41 @@ Legacy calls without an Anthropic write TTL retain the conservative one-hour
 price. GPT-5.5 callers retain the highest session pricing context after compaction.
 Token estimates exclude provider tools, regional premiums, taxes and negotiated
 rates.
+
+The operator runs model discovery outside the request-serving app:
+
+```bash
+uv run python -m app.infrastructure.catalog_sync
+```
+
+Run it under the deployment's process supervisor. It refreshes immediately,
+then waits ten minutes after each completed cycle. `--once` performs one refresh
+for a scheduled external job. Provide `TRELLIS_OPENAI_API_KEY`,
+`TRELLIS_ANTHROPIC_API_KEY`, and `TRELLIS_CATALOG_DATABASE_URL` as process secrets.
+The database URL must use the `trellis_catalog_sync` login and a direct PostgreSQL
+host; it is never passed as a command-line argument. TLS defaults to `verify-full`
+and accepts explicit `sslmode=require` or `verify-ca`. Install `psql` on the
+operator host. No new Python runtime package is required. Never use a Supabase
+service key or the app's user token for this process.
+
+Provider list APIs supply availability, not trusted limits or prices. A complete
+successful snapshot enables only its intersection with exact reviewed chat
+profiles. Unknown discoveries appear disabled and pending verification. A failed,
+oversized, malformed, paginated-incomplete, or timed-out provider response leaves
+that provider's previous cache unchanged. A later successful cycle recovers
+availability automatically. Verified absent models stay visible and disabled;
+absent unknown discoveries are removed unless historical account/run rows refer
+to them. Availability timestamps show the last successful refresh, so a preserved
+cache can be stale during an outage. Operator logs contain provider names and
+safe outcome codes only.
+
+Each provider refresh has a 30-second total deadline, at most 20 pages, 2000
+unique IDs, and 2 MiB per response. PostgreSQL writes have a 20-second process
+deadline, a 15-second statement timeout, and a 3-second lock timeout. Cancellation
+terminates and joins the child process. Database updates are atomic and snapshots
+are serialized. A failed database write preserves the previous cache.
+
+A complete empty availability snapshot disables generation choices while keeping
+account and conversation reads available. Existing account defaults are retained;
+a new account stores a verified, unavailable default until a provider recovers.
+Pending metadata never becomes the account default.
