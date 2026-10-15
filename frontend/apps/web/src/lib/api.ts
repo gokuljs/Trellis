@@ -7,6 +7,8 @@ import type {
   Session,
   SessionDetail,
   Settings,
+  ContextPreview,
+  ContextPreviewRequest,
 } from "@/lib/app-types"
 import {
   AuthAccessError,
@@ -261,6 +263,18 @@ export function createApiClient({
         "/api/settings",
         {},
         { timeoutMs: requestTimeoutMs, ...options }
+      ),
+    previewContext: (
+      input: ContextPreviewRequest,
+      options: RequestOptions = {}
+    ) =>
+      request<ContextPreview>(
+        "/api/context-preview",
+        {
+          method: "POST",
+          body: JSON.stringify(input),
+        },
+        options
       ),
     getOnboarding: (options: RequestOptions = {}) =>
       request<OnboardingState>(

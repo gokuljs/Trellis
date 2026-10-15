@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 
 import { ChatThread } from "@/components/chat-thread"
 import { Composer } from "@/components/composer"
+import { ContextGauge } from "@/components/context-gauge"
 import {
   OnboardingFlow,
   type OnboardingValues,
@@ -60,6 +61,12 @@ import {
   sessionModelMutationOptions,
   settingsQueryOptions,
 } from "@/lib/server-queries"
+import {
+  activeRunContext,
+  newRunContextState,
+  reduceRunContext,
+} from "@/lib/context-gauge"
+import { useContextPreview } from "@/lib/use-context-preview"
 import "./workspace-bootstrap.css"
 
 type BootstrapState =
@@ -112,6 +119,7 @@ const maxRestoredReconnectAttempts = 4
 function runInfoFromSummary(summary: RunSummary): RuntimeRunInfo {
   return {
     runId: summary.run_id,
+    modelId: summary.model_id,
     budgetPreset: summary.budget_preset,
     limits: {
       maxModelCalls: summary.max_model_calls,
@@ -249,6 +257,8 @@ export function AppShell({
   const [assistantOutputState, setAssistantOutputState] = useState(
     newAssistantOutputState
   )
+  const [runContextState, setRunContextState] = useState(newRunContextState)
+  const [contextGeneration, setContextGeneration] = useState(0)
   const [sessionLoading, setSessionLoading] = useState(false)
   const [pending, setPending] = useState(false)
   const [streamingText, setStreamingText] = useState<string | null>(null)
@@ -298,6 +308,7 @@ export function AppShell({
 
   const recordRunEvent = useCallback(
     (turnId: string, event: RuntimeRunEvent) => {
+      setRunContextState((current) => reduceRunContext(current, event))
       setAssistantOutputState((current) =>
         reduceAssistantOutputEvent(current, event, turnId)
       )
@@ -460,6 +471,7 @@ export function AppShell({
       ownerGeneration?: number
     ) => {
       const generation = ownerGeneration ?? ++runGenerationRef.current
+      setContextGeneration(generation)
       const isStale = () =>
         isCancelled() || runGenerationRef.current !== generation
       setReconnectAvailable(false)
@@ -829,6 +841,7 @@ export function AppShell({
 
   const startNewSession = useCallback(() => {
     runGenerationRef.current += 1
+    setContextGeneration(runGenerationRef.current)
     submissionLockRef.current = false
     modelRequestSequenceRef.current += 1
     modelSaveOwnerRef.current = null
@@ -840,6 +853,7 @@ export function AppShell({
     setActiveSession(null)
     setMessages([])
     setAssistantOutputState(newAssistantOutputState())
+    setRunContextState(newRunContextState())
     setPending(false)
     setStreamingText(null)
     setActiveRunId(null)
@@ -874,6 +888,7 @@ export function AppShell({
   const selectSession = async (sessionId: string) => {
     if (pending) return
     runGenerationRef.current += 1
+    setContextGeneration(runGenerationRef.current)
     modelRequestSequenceRef.current += 1
     modelSaveOwnerRef.current = null
     setModelSelection(null)
@@ -887,6 +902,7 @@ export function AppShell({
     )
     setMessages([])
     setAssistantOutputState(newAssistantOutputState())
+    setRunContextState(newRunContextState())
     setStreamingText(null)
     setActiveRunId(null)
     setRunActivities({})
@@ -958,12 +974,14 @@ export function AppShell({
       sessionId: turn.sessionId,
       generation: ++runGenerationRef.current,
     }
+    setContextGeneration(owner.generation)
     const isCurrent = () =>
       ownsRun(owner, {
         sessionId: activeSessionIdRef.current,
         generation: runGenerationRef.current,
       })
     setError(null)
+    setRunContextState(newRunContextState())
     setStreamingText(null)
     setActiveRunId(null)
     setRunActivities((current) => ({
@@ -1444,6 +1462,36 @@ export function AppShell({
       : null) ?? selectedChatModelId(activeSession, settings, draftModelId)
   const selectedBudgetPreset =
     runBudgetChoice ?? settings?.default_budget_preset ?? "conservative"
+  const activeActivity = activeRunTurnId ? runActivities[activeRunTurnId] : null
+  const lockedModelId = pending
+    ? (activeActivity?.runInfo?.modelId ??
+      (runContextState.runId === activeRunId
+        ? runContextState.preview?.model_id
+        : null) ??
+      selectedModelId)
+    : selectedModelId
+  const liveContext = pending
+    ? activeRunContext(runContextState, activeRunId, lockedModelId)
+    : null
+  const compacting =
+    pending &&
+    runContextState.runId === activeRunId &&
+    runContextState.compacting
+  const contextPreview = useContextPreview(
+    {
+      ...(activeSession ? { session_id: activeSession.id } : {}),
+      model_id: selectedModelId,
+      draft: composerValue,
+      budget_preset: selectedBudgetPreset,
+    },
+    contextGeneration,
+    bootstrap.status === "ready" &&
+      activeView !== "Settings" &&
+      !pending &&
+      !sessionLoading &&
+      modelSelection === null &&
+      Boolean(selectedModelId)
+  )
 
   const renderedAccountControl =
     typeof accountControl === "function"
@@ -1622,6 +1670,25 @@ export function AppShell({
                 settings?.models?.find((model) => model.id === selectedModelId)
               )}
               onModelChange={(modelId) => void changeChatModel(modelId)}
+              contextGauge={
+                <ContextGauge
+                  preview={pending ? liveContext : contextPreview.preview}
+                  modelName={
+                    settings?.models?.find(
+                      (model) => model.id === lockedModelId
+                    )?.name ?? lockedModelId
+                  }
+                  loading={
+                    pending
+                      ? !liveContext && !compacting
+                      : contextPreview.loading ||
+                        sessionLoading ||
+                        modelSelection !== null
+                  }
+                  error={pending ? null : contextPreview.error}
+                  compacting={compacting}
+                />
+              }
             />
           </>
         ) : null}

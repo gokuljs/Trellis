@@ -20,7 +20,7 @@ export function ModelSelect({
   return (
     <>
       <select
-        className="composer-select"
+        className="composer-select composer-model-select"
         aria-label="Chat model"
         disabled={disabled || saving}
         aria-busy={saving}

@@ -128,6 +128,28 @@ export type RunSummary = {
   created_at: string
   started_at: string | null
   finished_at: string | null
+  model_id?: ModelId
+}
+
+export type ContextPreviewRequest = {
+  session_id?: string
+  model_id: ModelId
+  draft: string
+  budget_preset: "conservative" | "longer"
+}
+
+export type ContextPreview = {
+  model_id: ModelId
+  context_window_tokens: number | null
+  input_tokens: number | null
+  count_method: "provider" | "utf8_bytes_estimate_v1"
+  output_reserve_tokens: number | null
+  safety_margin_tokens: number | null
+  usable_input_tokens: number | null
+  compaction_threshold_tokens: number | null
+  percentage: number | null
+  status: "ready" | "compaction_required" | "compacting" | "unavailable"
+  checkpoint_id?: string | null
 }
 
 export type SavedRunEvent = {

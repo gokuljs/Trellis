@@ -4,6 +4,7 @@ import {
   useRef,
   useState,
   type KeyboardEvent,
+  type ReactNode,
 } from "react"
 import { ArrowUp } from "lucide-react"
 import { BEND, MetalFx, useMetalBend } from "metal-fx"
@@ -27,6 +28,7 @@ type ComposerProps = {
   modelSaving: boolean
   modelReady: boolean
   onModelChange: (modelId: string) => void
+  contextGauge?: ReactNode
 }
 
 function usePrefersReducedMotion() {
@@ -61,6 +63,7 @@ export function Composer({
   modelSaving,
   modelReady,
   onModelChange,
+  contextGauge,
 }: ComposerProps) {
   const { resolvedTheme } = useTheme()
   const prefersReducedMotion = usePrefersReducedMotion()
@@ -116,6 +119,7 @@ export function Composer({
               <option value="conservative">Standard</option>
               <option value="longer">Extended</option>
             </select>
+            {contextGauge}
             <MetalFx
               ref={sendRef}
               className="send-button-metal"

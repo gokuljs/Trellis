@@ -100,6 +100,27 @@ test("chat model selection saves only the requested chat preference", async () =
   expect(JSON.parse(sent.init.body)).toEqual({ model_id: "model-b" })
 })
 
+test("context preview posts the complete draft with its selected chat model and forwards cancellation", async () => {
+  const client = fixture()
+  const controller = new AbortController()
+  const input = {
+    session_id: "chat-a",
+    model_id: "model-b",
+    draft: "  Exact draft 🌳  ",
+    budget_preset: "longer",
+  }
+  let sent
+  client.transport.fetch = async (url, init) => {
+    sent = { url, init }
+    return Response.json({ model_id: "model-b" })
+  }
+  await client.api.previewContext(input, { signal: controller.signal })
+  expect(sent.url).toBe("/api/context-preview")
+  expect(sent.init.method).toBe("POST")
+  expect(JSON.parse(sent.init.body)).toEqual(input)
+  expect(sent.init.signal).toBeInstanceOf(AbortSignal)
+})
+
 test("an account change during token retrieval cannot send as the new account", async () => {
   const client = fixture()
   const token = deferred()

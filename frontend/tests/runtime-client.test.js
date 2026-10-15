@@ -589,3 +589,18 @@ test("resume publishes the saved cursor without starting a second run", async ()
   await flush()
   expect(outcome.value).toEqual({ runId: "run-a" })
 })
+
+test("the run acknowledgement exposes its locked model to context displays", async () => {
+  const infos = []
+  const outcome = observe(
+    streamRun(input, { onRunInfo: (info) => infos.push(info) })
+  )
+  const socket = await authenticateSocket()
+  const request = socket.sent.find((message) => message.method === "run.start")
+  socket.reply(request.id, { runId: "run-a", modelId: "locked-model" })
+  await flush()
+  runEvent(socket, 1, "run.completed")
+  await flush()
+  expect(infos[0].modelId).toBe("locked-model")
+  expect(outcome.value).toEqual({ runId: "run-a" })
+})

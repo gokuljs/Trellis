@@ -23,7 +23,7 @@ async function renderChoice(overrides = {}) {
 
 test("the composer model selector exposes names and disables pending choices", async () => {
   const markup = await renderChoice()
-  expect(markup).toContain('class="composer-select"')
+  expect(markup).toContain('class="composer-select composer-model-select"')
   expect(markup).toContain('aria-label="Chat model"')
   expect(markup).toContain('value="ready" selected=""')
   expect(markup).toContain('value="pending" disabled=""')
