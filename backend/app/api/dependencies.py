@@ -4,6 +4,7 @@ from fastapi import Depends, Request
 
 from app.api.auth import VerifiedUser
 from app.application.chat import ChatService
+from app.application.context_preview import ContextPreviewService
 from app.application.onboarding import OnboardingService
 from app.application.profile import ProfileService
 from app.application.runs import RunService
@@ -29,6 +30,10 @@ async def get_account_context(request: Request, verified: CurrentUserDep) -> Acc
 
 
 AccountDep = Annotated[AccountContext, Depends(get_account_context)]
+
+
+def get_context_preview_service(account: AccountDep) -> ContextPreviewService:
+    return account.context_preview_service
 
 
 def get_chat_service(account: AccountDep) -> ChatService:
@@ -66,3 +71,5 @@ SettingsServiceDep = Annotated[SettingsService, Depends(get_settings_service)]
 OnboardingServiceDep = Annotated[OnboardingService, Depends(get_onboarding_service)]
 RunServiceDep = Annotated[RunService, Depends(get_run_service)]
 WorkspacePickerDep = Annotated[WorkspacePickerService, Depends(get_workspace_picker)]
+
+ContextPreviewServiceDep = Annotated[ContextPreviewService, Depends(get_context_preview_service)]

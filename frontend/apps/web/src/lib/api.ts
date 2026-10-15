@@ -6,7 +6,11 @@ import type {
   OnboardingState,
   Session,
   SessionDetail,
+  SessionHistoryPage,
+  SessionPage,
   Settings,
+  ContextPreview,
+  ContextPreviewRequest,
 } from "@/lib/app-types"
 import {
   AuthAccessError,
@@ -262,6 +266,18 @@ export function createApiClient({
         {},
         { timeoutMs: requestTimeoutMs, ...options }
       ),
+    previewContext: (
+      input: ContextPreviewRequest,
+      options: RequestOptions = {}
+    ) =>
+      request<ContextPreview>(
+        "/api/context-preview",
+        {
+          method: "POST",
+          body: JSON.stringify(input),
+        },
+        options
+      ),
     getOnboarding: (options: RequestOptions = {}) =>
       request<OnboardingState>(
         "/api/onboarding",
@@ -295,6 +311,11 @@ export function createApiClient({
         },
         { timeoutMs: requestTimeoutMs, ...options }
       ),
+    selectProvider: (providerId: string) =>
+      request<Settings>("/api/settings/provider", {
+        method: "PUT",
+        body: JSON.stringify({ provider: providerId }),
+      }),
     selectModel: (modelId: string) =>
       request<Settings>("/api/settings/model", {
         method: "PUT",
@@ -307,21 +328,59 @@ export function createApiClient({
       }),
     listSessions: (options: RequestOptions = {}) =>
       request<Session[]>("/api/sessions", {}, options),
+    listSessionPages: (
+      beforeCursor: string | null,
+      options: RequestOptions = {}
+    ) =>
+      request<SessionPage>(
+        `/api/session-pages?limit=40${beforeCursor === null ? "" : `&before_cursor=${encodeURIComponent(beforeCursor)}`}`,
+        {},
+        options
+      ),
+    getSessionHistory: (
+      sessionId: string,
+      beforeCursor: string | null,
+      options: RequestOptions = {}
+    ) =>
+      request<SessionHistoryPage>(
+        `/api/sessions/${encodeURIComponent(sessionId)}/history?limit=40${beforeCursor === null ? "" : `&before_cursor=${encodeURIComponent(beforeCursor)}`}`,
+        {},
+        options
+      ),
     createSession: () =>
       request<Session>("/api/sessions", {
         method: "POST",
       }),
     getSession: (sessionId: string) =>
       request<SessionDetail>(`/api/sessions/${sessionId}`),
+    selectSessionModel: (sessionId: string, modelId: string) =>
+      request<Session>(`/api/sessions/${encodeURIComponent(sessionId)}/model`, {
+        method: "PUT",
+        body: JSON.stringify({ model_id: modelId }),
+      }),
     getLatestRun: (sessionId: string) =>
       request<LatestRun | null>(`/api/sessions/${sessionId}/runs/latest`),
-    listRunSummaries: (sessionId: string, offset: number) =>
+    listRunSummaries: (
+      sessionId: string,
+      offset: number,
+      options: RequestOptions = {},
+      filters: { turnId?: string; newestFirst?: boolean } = {}
+    ) =>
       request<{ items: RunSummary[]; next_offset: number | null }>(
-        `/api/sessions/${sessionId}/runs?offset=${offset}&limit=100`
+        `/api/sessions/${encodeURIComponent(sessionId)}/runs?offset=${offset}&limit=100${filters.newestFirst ? "&newest_first=true" : ""}${filters.turnId ? `&turn_id=${encodeURIComponent(filters.turnId)}` : ""}`,
+        {},
+        options
       ),
-    listRunEvents: (sessionId: string, runId: string, afterSequence: number) =>
+    listRunEvents: (
+      sessionId: string,
+      runId: string,
+      afterSequence: number,
+      options: RequestOptions = {}
+    ) =>
       request<{ items: SavedRunEvent[]; next_after_sequence: number | null }>(
-        `/api/sessions/${sessionId}/runs/${encodeURIComponent(runId)}/events?after_sequence=${afterSequence}&limit=500`
+        `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/events?after_sequence=${afterSequence}&limit=100`,
+        {},
+        options
       ),
   }
 }

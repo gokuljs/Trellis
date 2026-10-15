@@ -8,8 +8,11 @@ Supabase repository.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, replace
+from collections.abc import Awaitable, Callable
+from copy import deepcopy
+from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 from pathlib import Path
 from typing import ClassVar, cast
 from uuid import UUID, uuid4
@@ -17,7 +20,15 @@ from uuid import UUID, uuid4
 import httpx
 
 from app.application.budgets import BudgetPreset, limits_for_preset
+from app.application.errors import ApplicationError
 from app.core.config import Settings
+from app.domain.context import ContextCheckpoint, ContextCheckpointDraft, ContextWindow
+from app.domain.event_limits import (
+    EVENT_STORAGE_LIMIT_MESSAGE,
+    EventStorageLimit,
+    check_event_storage,
+)
+from app.domain.history import HistoryPage, PageCursor, SessionPage, TimelineKind, TimelineRow
 from app.domain.models import (
     Message,
     MessageRole,
@@ -30,6 +41,7 @@ from app.domain.models import (
     SessionWorkspaceBusy,
     UserProfile,
 )
+from app.domain.outputs import MAX_ASSISTANT_OUTPUT_BYTES, AssistantOutput, validate_assistant_batch
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -100,16 +112,199 @@ class MemoryState:
     turn_claims: dict[str, str] = field(default_factory=dict)
     runs: dict[str, RunSnapshot] = field(default_factory=dict)
     events: dict[str, list[RunEvent]] = field(default_factory=dict)
+    event_storage_bytes: dict[str, int] = field(default_factory=dict)
     model_calls: dict[str, ModelCallRecord] = field(default_factory=dict)
     run_messages: dict[str, list[RunMessageRecord]] = field(default_factory=dict)
     tool_calls: dict[str, ToolCallRecord] = field(default_factory=dict)
     waiting_tool_call_id: dict[str, str] = field(default_factory=dict)
+    assistant_outputs: dict[str, AssistantOutput] = field(default_factory=dict)
+    assistant_batches: dict[tuple[str, int], RunEvent] = field(default_factory=dict)
+    context_checkpoints: dict[str, ContextCheckpoint] = field(default_factory=dict)
+    latest_context_checkpoint: dict[str, str] = field(default_factory=dict)
+
+
+def _atomic_event_write[**P, T](operation: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
+    """Match RPC rollback when a multi-record event write exhausts storage."""
+
+    @wraps(operation)
+    async def execute(*args: P.args, **kwargs: P.kwargs) -> T:
+        repository = cast(MemoryRepository, args[0])
+        before = deepcopy(repository.state)
+        leases = set(repository._owned_leases)
+        try:
+            return await operation(*args, **kwargs)
+        except ApplicationError as error:
+            if error.code == "event_storage_limit":
+                for item in fields(before):
+                    setattr(repository.state, item.name, getattr(before, item.name))
+                repository._owned_leases = leases
+            raise
+
+    return execute
 
 
 class MemoryRepository:
     """An in-memory implementation of account ports used only by tests."""
 
     _states: ClassVar[dict[Path, MemoryState]] = {}
+
+    async def load_context_window(self, session_id: str, *, limit: int = 128) -> ContextWindow:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 128:
+            raise ValueError("context page limit is invalid")
+        checkpoint_id = self.state.latest_context_checkpoint.get(session_id)
+        checkpoint = self.state.context_checkpoints.get(checkpoint_id) if checkpoint_id else None
+        boundary = checkpoint.covered_message_ordinal if checkpoint else 0
+        return ContextWindow(
+            checkpoint,
+            tuple(
+                message
+                for message in self.state.messages.get(session_id, [])
+                if message.ordinal > boundary
+            )[:limit],
+        )
+
+    async def load_context_checkpoint(self, session_id: str) -> ContextCheckpoint | None:
+        checkpoint_id = self.state.latest_context_checkpoint.get(session_id)
+        return self.state.context_checkpoints.get(checkpoint_id) if checkpoint_id else None
+
+    async def save_context_checkpoint(
+        self, run_id: str, expected_revision: int, draft: ContextCheckpointDraft
+    ) -> ContextCheckpoint:
+        if not self.owns_run_lease(run_id):
+            raise ApplicationError("run_not_owned", "This run is active on another computer.")
+        run = self.state.runs[run_id]
+        if run.status is not RunStatus.RUNNING:
+            raise ValueError("checkpoint run is not running")
+        call = self.state.model_calls.get(draft.model_call_id)
+        if (
+            call is None
+            or call.run_id != run_id
+            or call.status is not ModelCallStatus.COMPLETED
+            or call.request_snapshot.get("purpose") not in {"summary", "native_compaction"}
+        ):
+            raise ValueError("checkpoint requires a completed compaction call")
+        existing = self.state.context_checkpoints.get(draft.id)
+        if existing is not None:
+            if (
+                replace(existing.draft, pricing_context_tokens=draft.pricing_context_tokens)
+                == draft
+                and existing.draft.pricing_context_tokens >= draft.pricing_context_tokens
+                and existing.run_id == run_id
+                and existing.revision == expected_revision + 1
+            ):
+                return existing
+            raise ValueError("checkpoint id conflicts with saved content")
+        previous = await self.load_context_checkpoint(run.session_id)
+        revision = previous.revision if previous else 0
+        if expected_revision != revision:
+            raise ApplicationError(
+                "context_checkpoint_conflict", "Context changed while compaction was being saved."
+            )
+        checkpoint_sources = [
+            source for source in draft.sources if source.source_kind == "checkpoint"
+        ]
+        if (previous is None and checkpoint_sources) or (
+            previous is not None
+            and [source.source_id for source in checkpoint_sources] != [previous.id]
+        ):
+            raise ValueError("checkpoint prefix must include its current parent")
+        messages = self.state.messages[run.session_id]
+        chosen: list[Message] = []
+        chosen_run: list[RunMessageRecord] = []
+        before_run = (
+            previous.covered_run_message_ordinal if previous and previous.run_id == run_id else 0
+        )
+        for source in draft.sources:
+            if source.source_kind == "message":
+                message = next(
+                    (
+                        item
+                        for item in messages
+                        if item.id == source.source_id and item.turn_id == source.turn_id
+                    ),
+                    None,
+                )
+                if message is None:
+                    raise ValueError("checkpoint source does not belong to chat")
+                if message.id == run.input_message_id:
+                    raise ValueError("checkpoint cannot cover the current request")
+                chosen.append(message)
+            elif source.source_kind == "run_message":
+                message = next(
+                    (
+                        item
+                        for item in self.state.run_messages[run_id]
+                        if item.id == source.source_id
+                    ),
+                    None,
+                )
+                if message is None or source.turn_id != run.turn_id:
+                    raise ValueError("checkpoint source does not belong to run")
+                if message.ordinal <= before_run:
+                    raise ValueError("checkpoint cannot rehydrate archived run messages")
+                chosen_run.append(message)
+        before = previous.covered_message_ordinal if previous else 0
+        covered = max((message.ordinal for message in chosen), default=before)
+        expected_ids = {message.id for message in messages if before < message.ordinal <= covered}
+        if expected_ids != {message.id for message in chosen} or any(
+            message.ordinal <= before for message in chosen
+        ):
+            raise ValueError("checkpoint must cover a contiguous unarchived prefix")
+        if chosen and any(
+            message.turn_id == chosen[-1].turn_id and message.ordinal > covered
+            for message in messages
+        ):
+            raise ValueError("checkpoint cannot split a conversation turn")
+        covered_run = max((message.ordinal for message in chosen_run), default=before_run)
+        if {
+            message.id
+            for message in self.state.run_messages[run_id]
+            if before_run < message.ordinal <= covered_run
+        } != {message.id for message in chosen_run}:
+            raise ValueError("checkpoint must cover a contiguous run prefix")
+        for tool in self.state.tool_calls.values():
+            if (
+                tool.run_id == run_id
+                and any(message.id == tool.assistant_message_id for message in chosen_run)
+                and not any(message.tool_call_id == tool.id for message in chosen_run)
+            ):
+                raise ValueError("checkpoint cannot split a tool exchange")
+        saved_draft = replace(
+            draft,
+            pricing_context_tokens=max(
+                draft.pricing_context_tokens,
+                previous.draft.pricing_context_tokens if previous else 0,
+            ),
+        )
+        saved = ContextCheckpoint(
+            run.session_id,
+            run_id,
+            revision + 1,
+            previous.id if previous else None,
+            run.provider_id,
+            run.model_id,
+            run.adapter_kind,
+            covered,
+            covered_run,
+            _now(),
+            saved_draft,
+        )
+        self.state.context_checkpoints[draft.id] = saved
+        self.state.latest_context_checkpoint[run.session_id] = draft.id
+        return saved
+
+    async def list_context_messages(
+        self, session_id: str, after_ordinal: int, *, limit: int = 128
+    ) -> list[Message]:
+        if after_ordinal < 0 or not 1 <= limit <= 128:
+            raise ValueError("context cursor or page limit is invalid")
+        checkpoint = await self.load_context_checkpoint(session_id)
+        boundary = max(after_ordinal, checkpoint.covered_message_ordinal if checkpoint else 0)
+        return [
+            message
+            for message in self.state.messages.get(session_id, [])
+            if message.ordinal > boundary
+        ][:limit]
 
     def __init__(self, path: Path, *, owner_id: UUID | None = None) -> None:
         self.path = path.resolve()
@@ -179,6 +374,9 @@ class MemoryRepository:
     async def list_models(self) -> list[ModelDescriptor]:
         return list(self.state.models)
 
+    async def list_catalog_models(self) -> list[ModelDescriptor]:
+        return list(self.state.models)
+
     async def set_selected_model(self, model_id: ModelId) -> bool:
         model = next((item for item in self.state.models if item.id == model_id), None)
         if model is None:
@@ -197,10 +395,46 @@ class MemoryRepository:
 
     async def create_session(self, workspace_path: str | None = None) -> Session:
         now = _now()
-        session = Session(_id(), self.state.user_id, "New session", now, now, 0, workspace_path)
+        session = Session(
+            _id(),
+            self.state.user_id,
+            "New session",
+            now,
+            now,
+            0,
+            workspace_path,
+            await self.get_selected_model_id(),
+        )
         self.state.sessions[session.id] = session
         self.state.messages[session.id] = []
         return session
+
+    async def set_session_model(self, session_id: str, model_id: str) -> Session | None:
+        from app.application.model_catalog import profile_for_model
+        from app.domain.models import SessionModelBusy
+
+        session = self.state.sessions.get(session_id)
+        if session is None:
+            return None
+        if session_id in self.state.turn_claims or any(
+            run.session_id == session_id and not is_terminal_run_status(run.status)
+            for run in self.state.runs.values()
+        ):
+            raise SessionModelBusy
+        profile = profile_for_model(model_id)
+        if profile is None or not any(
+            model.id == model_id
+            and model.enabled
+            and model.supports_streaming
+            and model.supports_tools
+            and (model.provider_id, model.adapter_kind, model.upstream_model_id)
+            == (profile.provider_id, profile.provider_id, profile.upstream_model_id)
+            for model in await self.list_models()
+        ):
+            raise ValueError("model_not_available")
+        updated = replace(session, model_id=model_id, updated_at=_now())
+        self.state.sessions[session_id] = updated
+        return updated
 
     async def set_session_workspace(
         self, session_id: str, workspace_path: str | None
@@ -223,6 +457,68 @@ class MemoryRepository:
         updated = replace(session, workspace_path=workspace_path, updated_at=_now())
         self.state.sessions[session_id] = updated
         return updated
+
+    async def get_message(self, session_id: str, message_id: str) -> Message | None:
+        return next(
+            (
+                message
+                for message in self.state.messages.get(session_id, [])
+                if message.id == message_id
+            ),
+            None,
+        )
+
+    async def read_session_page(self, before: PageCursor | None, *, limit: int = 40) -> SessionPage:
+        if not 1 <= limit <= 100:
+            raise ValueError("invalid page limit")
+        rows = sorted(
+            self.state.sessions.values(), key=lambda item: (item.updated_at, item.id), reverse=True
+        )
+        if before:
+            rows = [
+                row for row in rows if (row.updated_at, row.id) < (before.created_at, before.id)
+            ]
+        page = rows[:limit]
+        cursor = (
+            PageCursor(page[-1].updated_at, "session", page[-1].id).encode()
+            if len(rows) > limit
+            else None
+        )
+        return SessionPage(tuple(page), cursor)
+
+    async def read_history_page(
+        self, session_id: str, before: PageCursor | None, *, limit: int = 40
+    ) -> HistoryPage:
+        if not 1 <= limit <= 100:
+            raise ValueError("invalid page limit")
+        messages = self.state.messages.get(session_id, [])
+        outputs = [
+            item for item in self.state.assistant_outputs.values() if item.session_id == session_id
+        ]
+        rows: list[tuple[str, TimelineKind, str]] = [
+            (message.created_at, "message", message.id) for message in messages
+        ]
+        rows += [
+            (output.created_at, "assistant_output", output.id)
+            for output in outputs
+            if output.promoted_message_id is None
+        ]
+        rows.sort(reverse=True)
+        if before:
+            rows = [row for row in rows if row < (before.created_at, before.kind, before.id)]
+        page = rows[:limit]
+        cursor = PageCursor(*page[-1]).encode() if len(rows) > limit else None
+        identities = {row[2] for row in page}
+        return HistoryPage(
+            tuple(message for message in messages if message.id in identities),
+            tuple(
+                output
+                for output in outputs
+                if output.id in identities or output.promoted_message_id in identities
+            ),
+            tuple(TimelineRow(kind, identity) for _, kind, identity in reversed(page)),
+            cursor,
+        )
 
     async def list_sessions(self) -> list[Session]:
         return sorted(
@@ -313,12 +609,25 @@ class MemoryRepository:
         event_version: int = 1,
     ) -> RunEvent:
         run = self.state.runs[run_id]
+        try:
+            size = check_event_storage(
+                event_type,
+                data,
+                event_count=len(self.state.events[run_id]),
+                data_bytes=self.state.event_storage_bytes.get(run_id, 0),
+            )
+        except EventStorageLimit:
+            raise ApplicationError("event_storage_limit", EVENT_STORAGE_LIMIT_MESSAGE) from None
         sequence = run.last_event_sequence + 1
         event = RunEvent(run_id, sequence, event_type, event_version, data, _now())
         self.state.events[run_id].append(event)
+        self.state.event_storage_bytes[run_id] = (
+            self.state.event_storage_bytes.get(run_id, 0) + size
+        )
         self.state.runs[run_id] = replace(run, last_event_sequence=sequence)
         return event
 
+    @_atomic_event_write
     async def create_run(
         self,
         session_id: str,
@@ -459,11 +768,22 @@ class MemoryRepository:
         )
 
     async def list_runs_for_session(
-        self, session_id: str, offset: int, limit: int
+        self,
+        session_id: str,
+        offset: int,
+        limit: int,
+        *,
+        turn_id: str | None = None,
+        newest_first: bool = False,
     ) -> list[RunSnapshot]:
         if offset < 0 or not 1 <= limit <= 101:
             raise ValueError("run offset and limit are outside the supported range")
-        return [run for run in self.state.runs.values() if run.session_id == session_id][
+        rows = [
+            run
+            for run in self.state.runs.values()
+            if run.session_id == session_id and (turn_id is None or run.turn_id == turn_id)
+        ]
+        return sorted(rows, key=lambda run: (run.created_at, run.id), reverse=newest_first)[
             offset : offset + limit
         ]
 
@@ -494,6 +814,7 @@ class MemoryRepository:
             event for event in self.state.events.get(run_id, []) if event.sequence > after_sequence
         ][:limit]
 
+    @_atomic_event_write
     async def transition_run_record(
         self,
         run_id: str,
@@ -520,21 +841,76 @@ class MemoryRepository:
             finished_at=now if is_terminal_run_status(next_status) else None,
         )
         if is_terminal_run_status(next_status):
+            for key, call in tuple(self.state.model_calls.items()):
+                if call.run_id == run_id and call.status in {
+                    ModelCallStatus.PENDING,
+                    ModelCallStatus.STREAMING,
+                }:
+                    self.state.model_calls[key] = replace(
+                        call,
+                        status=(
+                            ModelCallStatus.FAILED
+                            if next_status is RunStatus.FAILED
+                            else ModelCallStatus.CANCELLED
+                        ),
+                        finished_at=now,
+                        error_code=call.error_code or "run_terminated",
+                    )
+            for key, output in tuple(self.state.assistant_outputs.items()):
+                if output.run_id == run_id and output.status == "streaming":
+                    self.state.assistant_outputs[key] = replace(
+                        output, status="partial", stop_reason=stop_reason or next_status.value
+                    )
             self._owned_leases.discard(run_id)
+            for key, tool in tuple(self.state.tool_calls.items()):
+                if tool.run_id == run_id and tool.status in {
+                    ToolCallStatus.PENDING,
+                    ToolCallStatus.RUNNING,
+                }:
+                    self.state.tool_calls[key] = replace(
+                        tool,
+                        status=(
+                            ToolCallStatus.FAILED
+                            if next_status is RunStatus.FAILED
+                            else ToolCallStatus.CANCELLED
+                        ),
+                        finished_at=now,
+                    )
         return self._event(run_id, event_type, data)
 
+    @_atomic_event_write
     async def complete_run(self, run_id: str, content: str) -> tuple[Message, tuple[RunEvent, ...]]:
         run = self.state.runs.get(run_id)
         if run is None:
             raise ValueError("run not found")
-        normalized = content.strip()
-        if not normalized:
+        outputs = [item for item in self.state.assistant_outputs.values() if item.run_id == run_id]
+        output = max(outputs, key=lambda item: item.step_index) if outputs else None
+        if output is not None and output.content != content:
+            raise ValueError("completed answer differs from published text")
+        normalized = content if output is not None else content.strip()
+        if not normalized.strip():
             raise ValueError("assistant response cannot be empty")
         validate_run_event_transition(run.status, RunStatus.COMPLETED, RunEventType.COMPLETED)
         message = self._add_message(
             run.session_id, run.turn_id, "assistant", normalized, run.provider_id, run.model_id
         )
-        first = self._event(run_id, RunEventType.ASSISTANT_COMPLETED, {"message_id": message.id})
+        if output is not None:
+            self.state.assistant_outputs[output.model_call_id] = replace(
+                output,
+                status="complete",
+                stop_reason="final_response",
+                promoted_message_id=message.id,
+            )
+        completion_data: dict[str, object] = {"message_id": message.id}
+        if output is not None:
+            completion_data.update(
+                output_id=output.id,
+                model_call_id=output.model_call_id,
+                status="complete",
+                stop_reason="final_response",
+                promoted_message_id=message.id,
+            )
+        first = self._event(run_id, RunEventType.ASSISTANT_COMPLETED, completion_data)
         second = await self.transition_run_record(
             run_id,
             RunStatus.COMPLETED,
@@ -544,6 +920,87 @@ class MemoryRepository:
         )
         return message, (first, second)
 
+    async def append_assistant_batch(
+        self, run_id: str, model_call_id: str, batch_index: int, text: str
+    ) -> tuple[AssistantOutput, RunEvent]:
+        validate_assistant_batch(batch_index, text)
+        run = self.state.runs.get(run_id)
+        call = self.state.model_calls.get(model_call_id)
+        if run is None or run.status is not RunStatus.RUNNING:
+            raise ValueError("run is not running")
+        if call is None or call.run_id != run_id or call.status is not ModelCallStatus.STREAMING:
+            raise ValueError("model call is not streaming in this run")
+        existing = self.state.assistant_outputs.get(model_call_id)
+        duplicate = self.state.assistant_batches.get((model_call_id, batch_index))
+        if duplicate is not None:
+            if duplicate.data["text"] != text:
+                raise ValueError("assistant batch conflicts with saved text")
+            assert existing is not None
+            return existing, duplicate
+        if batch_index != (existing.next_batch_index if existing is not None else 0):
+            raise ValueError("assistant batches must be in order")
+        if existing is not None and existing.status != "streaming":
+            raise ValueError("assistant output is not streaming")
+        content = (existing.content if existing else "") + text
+        if len(content.encode("utf-8")) > MAX_ASSISTANT_OUTPUT_BYTES:
+            raise ValueError("assistant output is too large")
+        output = AssistantOutput(
+            existing.id if existing else _id(),
+            run.session_id,
+            run.turn_id,
+            run_id,
+            model_call_id,
+            call.step_index,
+            content,
+            "streaming",
+            batch_index + 1,
+            None,
+            None,
+            existing.created_at if existing else _now(),
+        )
+        event = self._event(
+            run_id,
+            RunEventType.ASSISTANT_DELTA,
+            {
+                "output_id": output.id,
+                "model_call_id": model_call_id,
+                "step_index": call.step_index,
+                "batch_index": batch_index,
+                "text": text,
+            },
+        )
+        self.state.assistant_outputs[model_call_id] = output
+        self.state.assistant_batches[(model_call_id, batch_index)] = event
+        return output, event
+
+    async def list_assistant_outputs(self, session_id: str) -> list[AssistantOutput]:
+        return [
+            item for item in self.state.assistant_outputs.values() if item.session_id == session_id
+        ]
+
+    async def finish_assistant_output(
+        self, run_id: str, model_call_id: str, *, stop_reason: str = "tool_continuation"
+    ) -> AssistantOutput | None:
+        run = self.state.runs.get(run_id)
+        if run is None or run.status is not RunStatus.RUNNING:
+            raise ValueError("run is not running")
+        call = self.state.model_calls.get(model_call_id)
+        if call is None or call.run_id != run_id:
+            raise ValueError("model call belongs to another run")
+        output = self.state.assistant_outputs.get(model_call_id)
+        if output is None:
+            return None
+        if output.run_id != run_id:
+            raise ValueError("model call belongs to another run")
+        if output.status == "complete" and output.stop_reason == stop_reason:
+            return output
+        if output.status != "streaming":
+            raise ValueError("output already finalized")
+        finished = replace(output, status="complete", stop_reason=stop_reason)
+        self.state.assistant_outputs[model_call_id] = finished
+        return finished
+
+    @_atomic_event_write
     async def request_run_cancellation(self, run_id: str) -> tuple[RunSnapshot, RunEvent | None]:
         run = self.state.runs.get(run_id)
         if run is None:
@@ -591,6 +1048,7 @@ class MemoryRepository:
         self.state.runs[run_id] = renewed
         return renewed
 
+    @_atomic_event_write
     async def recover_expired_run(self, run_id: str) -> RunSnapshot:
         run = self.state.runs.get(run_id)
         if run is None:
@@ -664,6 +1122,7 @@ class MemoryRepository:
         cached_tokens: int | None = None,
         cache_creation_tokens: int | None = None,
         estimated_cost: float | None = None,
+        clear_estimated_cost: bool = False,
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> ModelCallRecord:
@@ -692,7 +1151,11 @@ class MemoryRepository:
                 if cache_creation_tokens is not None
                 else record.cache_creation_tokens
             ),
-            estimated_cost=estimated_cost if estimated_cost is not None else record.estimated_cost,
+            estimated_cost=None
+            if clear_estimated_cost
+            else estimated_cost
+            if estimated_cost is not None
+            else record.estimated_cost,
             error_code=error_code or record.error_code,
             error_message=error_message or record.error_message,
             finished_at=None if next_status is ModelCallStatus.STREAMING else _now(),
@@ -706,6 +1169,7 @@ class MemoryRepository:
             key=lambda call: call.step_index,
         )
 
+    @_atomic_event_write
     async def record_assistant_message(
         self,
         run_id: str,
@@ -782,6 +1246,15 @@ class MemoryRepository:
                     "message_id": assistant.id,
                     "model_call_id": model_call_id,
                     "content": message.content,
+                    **(
+                        {
+                            "output_id": self.state.assistant_outputs[model_call_id].id,
+                            "status": "complete",
+                            "stop_reason": "tool_continuation",
+                        }
+                        if model_call_id in self.state.assistant_outputs
+                        else {}
+                    ),
                 },
             )
         ]
@@ -801,6 +1274,7 @@ class MemoryRepository:
         )
         return assistant, calls, tuple(events)
 
+    @_atomic_event_write
     async def record_tool_result(
         self,
         run_id: str,
@@ -867,6 +1341,7 @@ class MemoryRepository:
     async def list_tool_calls(self, run_id: str) -> list[ToolCallRecord]:
         return [call for call in self.state.tool_calls.values() if call.run_id == run_id]
 
+    @_atomic_event_write
     async def request_tool_approval(
         self,
         run_id: str,
@@ -903,6 +1378,7 @@ class MemoryRepository:
         )
         return self.state.runs[run_id], event
 
+    @_atomic_event_write
     async def record_tool_approval_decision(
         self,
         run_id: str,
@@ -935,6 +1411,7 @@ class MemoryRepository:
         )
         return updated, event
 
+    @_atomic_event_write
     async def resume_approved_run(self, run_id: str) -> tuple[RunSnapshot, RunEvent]:
         run = self.state.runs.get(run_id)
         if run is None:

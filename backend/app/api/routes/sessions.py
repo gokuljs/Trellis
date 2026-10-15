@@ -16,6 +16,11 @@ class SessionResponse(BaseModel):
     message_count: int
     workspace_path: str | None
     workspace_ready: bool
+    model_id: str | None = None
+
+
+class SessionModelRequest(BaseModel):
+    model_id: str = Field(min_length=1, max_length=200)
 
 
 class SessionWorkspaceRequest(BaseModel):
@@ -32,12 +37,28 @@ class MessageResponse(BaseModel):
     created_at: str
 
 
+class AssistantOutputResponse(BaseModel):
+    id: str
+    turn_id: str
+    run_id: str
+    model_call_id: str
+    step_index: int
+    next_batch_index: int
+    content: str
+    status: str
+    stop_reason: str | None
+    promoted_message_id: str | None
+    created_at: str
+
+
 class SessionDetailResponse(BaseModel):
     session: SessionResponse
     messages: list[MessageResponse]
+    assistant_outputs: list[AssistantOutputResponse] = Field(default_factory=list)
 
 
 class LatestRunResponse(BaseModel):
+    input_message: MessageResponse | None = None
     run_id: str
     turn_id: str
     status: str
@@ -103,6 +124,7 @@ async def serialize_session(session: Session, service: SessionServiceDep) -> Ses
         message_count=session.message_count,
         workspace_path=session.workspace_path if service.workspace_enabled else None,
         workspace_ready=await service.workspace_ready(session),
+        model_id=session.model_id,
     )
 
 
@@ -149,16 +171,33 @@ async def get_session(session_id: str, service: SessionServiceDep) -> SessionDet
     return SessionDetailResponse(
         session=await serialize_session(detail.session, service),
         messages=[serialize_message(message) for message in detail.messages],
+        assistant_outputs=[
+            AssistantOutputResponse.model_validate(output, from_attributes=True)
+            for output in detail.assistant_outputs
+        ],
+    )
+
+
+@router.put("/{session_id}/model")
+async def select_session_model(
+    session_id: str, payload: SessionModelRequest, service: SessionServiceDep
+) -> SessionResponse:
+    return await serialize_session(
+        await service.select_model(session_id, payload.model_id), service
     )
 
 
 @router.get("/{session_id}/runs/latest")
-async def get_latest_run(session_id: str, service: RunServiceDep) -> LatestRunResponse | None:
+async def get_latest_run(
+    session_id: str, service: RunServiceDep, sessions: SessionServiceDep
+) -> LatestRunResponse | None:
     run = await service.get_latest_run_for_session(session_id)
+    input_message = await sessions.get_message(session_id, run.input_message_id) if run else None
     return (
         None
         if run is None
         else LatestRunResponse(
+            input_message=serialize_message(input_message) if input_message else None,
             run_id=run.id,
             turn_id=run.turn_id,
             status=run.status.value,
@@ -173,8 +212,12 @@ async def list_session_runs(
     service: RunServiceDep,
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=100)] = 100,
+    turn_id: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
+    newest_first: bool = False,
 ) -> RunSummariesResponse:
-    runs, next_offset = await service.list_session_runs(session_id, offset, limit)
+    runs, next_offset = await service.list_session_runs(
+        session_id, offset, limit, turn_id=turn_id, newest_first=newest_first
+    )
     return RunSummariesResponse(
         items=[
             RunSummaryResponse(

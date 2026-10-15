@@ -3,6 +3,14 @@ from pathlib import Path
 from typing import Protocol
 
 from app.application.budgets import BudgetPreset
+from app.domain.context import (
+    ContextCheckpoint,
+    ContextCheckpointDraft,
+    ContextWindow,
+    InputTokenCount,
+    NativeCompactionResult,
+)
+from app.domain.history import HistoryPage, PageCursor, SessionPage
 from app.domain.models import (
     Message,
     ModelDescriptor,
@@ -12,6 +20,7 @@ from app.domain.models import (
     Session,
     UserProfile,
 )
+from app.domain.outputs import AssistantOutput
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -44,6 +53,8 @@ class SettingsRepository(Protocol):
 
     async def list_models(self) -> list[ModelDescriptor]: ...
 
+    async def list_catalog_models(self) -> list[ModelDescriptor]: ...
+
     async def set_selected_model(self, model_id: ModelId) -> bool: ...
 
     async def get_default_budget_preset(self) -> BudgetPreset: ...
@@ -64,6 +75,18 @@ class OnboardingRepository(Protocol):
 
 
 class SessionRepository(Protocol):
+    async def read_session_page(
+        self, before: PageCursor | None, *, limit: int = 40
+    ) -> SessionPage: ...
+
+    async def read_history_page(
+        self, session_id: str, before: PageCursor | None, *, limit: int = 40
+    ) -> HistoryPage: ...
+
+    async def get_message(self, session_id: str, message_id: str) -> Message | None: ...
+
+    async def set_session_model(self, session_id: str, model_id: ModelId) -> Session | None: ...
+
     async def create_session(self, workspace_path: str | None = None) -> Session: ...
 
     async def set_session_workspace(
@@ -75,6 +98,8 @@ class SessionRepository(Protocol):
     async def get_session(self, session_id: str) -> Session | None: ...
 
     async def list_messages(self, session_id: str) -> list[Message]: ...
+
+    async def list_assistant_outputs(self, session_id: str) -> list[AssistantOutput]: ...
 
 
 class WorkspaceDirectoryPicker(Protocol):
@@ -112,7 +137,13 @@ class RunRepository(Protocol):
     async def get_latest_run_for_session(self, session_id: str) -> RunSnapshot | None: ...
 
     async def list_runs_for_session(
-        self, session_id: str, offset: int, limit: int
+        self,
+        session_id: str,
+        offset: int,
+        limit: int,
+        *,
+        turn_id: str | None = None,
+        newest_first: bool = False,
     ) -> list[RunSnapshot]: ...
 
     async def append_run_event(
@@ -150,6 +181,14 @@ class RunRepository(Protocol):
         content: str,
     ) -> tuple[Message, tuple[RunEvent, ...]]: ...
 
+    async def append_assistant_batch(
+        self, run_id: str, model_call_id: str, batch_index: int, text: str
+    ) -> tuple[AssistantOutput, RunEvent]: ...
+
+    async def finish_assistant_output(
+        self, run_id: str, model_call_id: str, *, stop_reason: str = "tool_continuation"
+    ) -> AssistantOutput | None: ...
+
     async def request_run_cancellation(
         self,
         run_id: str,
@@ -177,6 +216,7 @@ class RunRepository(Protocol):
         cached_tokens: int | None = None,
         cache_creation_tokens: int | None = None,
         estimated_cost: float | None = None,
+        clear_estimated_cost: bool = False,
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> ModelCallRecord: ...
@@ -272,3 +312,29 @@ class StreamingProviderAdapter(ProviderAdapter, Protocol):
 
 class RunEventPublisher(Protocol):
     async def publish(self, event: RunEvent) -> None: ...
+
+
+class ContextCheckpointRepository(Protocol):
+    async def load_context_window(self, session_id: str, *, limit: int = 128) -> ContextWindow: ...
+
+    async def load_context_checkpoint(self, session_id: str) -> ContextCheckpoint | None: ...
+
+    async def save_context_checkpoint(
+        self, run_id: str, expected_revision: int, draft: ContextCheckpointDraft
+    ) -> ContextCheckpoint: ...
+
+    async def list_context_messages(
+        self, session_id: str, after_ordinal: int, *, limit: int = 128
+    ) -> list[Message]: ...
+
+
+class TokenCountingProvider(Protocol):
+    async def count_input(
+        self, request: ModelRequest, api_key: str, user_id: str
+    ) -> InputTokenCount: ...
+
+
+class NativeCompactingProvider(Protocol):
+    async def compact(
+        self, request: ModelRequest, api_key: str, user_id: str
+    ) -> NativeCompactionResult: ...

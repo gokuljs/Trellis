@@ -17,10 +17,12 @@ except ImportError:  # pragma: no cover - Windows has no compatible process lock
     fcntl = None  # type: ignore[assignment]
 
 from app.application.chat import ChatService
+from app.application.context_preview import ContextPreviewService
 from app.application.errors import ApplicationError
 from app.application.onboarding import OnboardingService
 from app.application.ports import (
     ChatRepository,
+    ContextCheckpointRepository,
     OnboardingRepository,
     ProviderAdapter,
     RunLeasePort,
@@ -47,7 +49,12 @@ from app.infrastructure.workspace_bindings import LocalWorkspaceBindings
 
 
 class AccountRepository(
-    ChatRepository, OnboardingRepository, RunRepository, RunLeasePort, Protocol
+    ChatRepository,
+    ContextCheckpointRepository,
+    OnboardingRepository,
+    RunRepository,
+    RunLeasePort,
+    Protocol,
 ):
     async def ensure_account(self) -> None: ...
 
@@ -65,6 +72,7 @@ class AccountContext:
     session_service: SessionService
     settings_service: SettingsService
     onboarding_service: OnboardingService
+    context_preview_service: ContextPreviewService
     chat_service: ChatService
     run_service: RunService
     event_hub: RuntimeEventHub
@@ -278,6 +286,20 @@ class AccountRegistry:
                             onboarding_service=OnboardingService(database, database, secret_store),
                             chat_service=ChatService(
                                 database, secret_store, self._providers, redactor=self._redactor
+                            ),
+                            context_preview_service=ContextPreviewService(
+                                database,
+                                database,
+                                database,
+                                secret_store,
+                                available_adapters=frozenset(self._runtime_providers),
+                                tool_registry=tools,
+                                capabilities=self._capabilities,
+                                redactor=self._redactor,
+                                workspace_guidance_reader=read_workspace_guidance
+                                if self._capabilities.allows("local_read")
+                                else None,
+                                workspace_bindings=workspace_bindings,
                             ),
                             run_service=run_service,
                             event_hub=event_hub,

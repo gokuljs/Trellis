@@ -4,7 +4,14 @@ from pathlib import Path
 from app.application.errors import ApplicationError
 from app.application.ports import SessionRepository, WorkspaceBindingPort
 from app.domain.capabilities import RuntimeCapabilities
-from app.domain.models import Session, SessionDetail, SessionWorkspaceBusy
+from app.domain.history import HistoryPage, PageCursor, SessionPage
+from app.domain.models import (
+    Message,
+    Session,
+    SessionDetail,
+    SessionModelBusy,
+    SessionWorkspaceBusy,
+)
 
 
 def _resolved_workspace(raw_path: str) -> str:
@@ -42,8 +49,54 @@ class SessionService:
         if not self.workspace_enabled:
             raise ApplicationError("capability_disabled", "Local workspace access is disabled.")
 
+    @staticmethod
+    def _page_cursor(value: str | None, *, session_list: bool = False) -> PageCursor | None:
+        if value is None:
+            return None
+        try:
+            return PageCursor.decode(value, session_list=session_list)
+        except ValueError:
+            raise ApplicationError(
+                "invalid_history_cursor", "The history page cursor is invalid."
+            ) from None
+
+    async def read_session_page(self, cursor: str | None, limit: int) -> SessionPage:
+        return await self._repository.read_session_page(
+            self._page_cursor(cursor, session_list=True), limit=limit
+        )
+
+    async def read_history_page(
+        self, session_id: str, cursor: str | None, limit: int
+    ) -> tuple[Session, HistoryPage]:
+        session = await self._repository.get_session(session_id)
+        if session is None:
+            raise ApplicationError("session_not_found", "Session not found.")
+        return session, await self._repository.read_history_page(
+            session_id, self._page_cursor(cursor), limit=limit
+        )
+
+    async def get_message(self, session_id: str, message_id: str) -> Message | None:
+        return await self._repository.get_message(session_id, message_id)
+
     async def list_sessions(self) -> list[Session]:
         return await self._repository.list_sessions()
+
+    async def select_model(self, session_id: str, model_id: str) -> Session:
+        try:
+            session = await self._repository.set_session_model(session_id, model_id)
+        except SessionModelBusy:
+            raise ApplicationError(
+                "session_model_busy", "Wait for this run to finish before changing its model."
+            ) from None
+        except ValueError as error:
+            if str(error) != "model_not_available":
+                raise
+            raise ApplicationError(
+                "model_not_available", "The selected model is unavailable."
+            ) from None
+        if session is None:
+            raise ApplicationError("session_not_found", "Session not found.")
+        return session
 
     async def create(self, workspace_path: str | None = None) -> Session:
         if workspace_path is not None:
@@ -88,6 +141,7 @@ class SessionService:
         return SessionDetail(
             session=session,
             messages=await self._repository.list_messages(session_id),
+            assistant_outputs=await self._repository.list_assistant_outputs(session_id),
         )
 
     async def workspace_ready(self, session: Session) -> bool:

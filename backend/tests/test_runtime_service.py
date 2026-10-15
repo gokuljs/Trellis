@@ -15,6 +15,7 @@ from app.domain.capabilities import RuntimeCapabilities
 from app.domain.models import ModelDescriptor, ProviderName, Session
 from app.domain.runtime import (
     ModelContinuationItem,
+    ModelFinishKind,
     ModelRequest,
     ModelStreamEvent,
     ModelToolCall,
@@ -328,9 +329,12 @@ def test_run_service_streams_and_persists_a_provider_neutral_run(tmp_path: Path)
     assert [event.event_type for event in events] == [
         RunEventType.QUEUED,
         RunEventType.STARTED,
+        RunEventType.CONTEXT,
+        RunEventType.PHASE,
         RunEventType.MODEL_USAGE,
-        RunEventType.MODEL_COMPLETED,
         RunEventType.ASSISTANT_DELTA,
+        RunEventType.MODEL_COMPLETED,
+        RunEventType.PHASE,
         RunEventType.ASSISTANT_COMPLETED,
         RunEventType.COMPLETED,
     ]
@@ -345,8 +349,9 @@ def test_run_service_streams_and_persists_a_provider_neutral_run(tmp_path: Path)
     assert (model_calls[0].input_tokens, model_calls[0].output_tokens) == (5, 1)
     assert model_calls[0].cached_tokens == 2
     assert model_calls[0].estimated_cost == pytest.approx(0.000046)
-    assert events[2].data["estimated_cost_usd"] == pytest.approx(0.000046)
-    assert events[2].data["total_tokens"] == 6
+    usage_event = next(event for event in events if event.event_type is RunEventType.MODEL_USAGE)
+    assert usage_event.data["estimated_cost_usd"] == pytest.approx(0.000046)
+    assert usage_event.data["total_tokens"] == 6
     assert model_calls[0].provider_response_id == "response-1"
     assert "agent-foundation-v2" in model_calls[0].request_snapshot["system_instructions"]
     assert "No workspace is attached" in model_calls[0].request_snapshot["system_instructions"]
@@ -374,8 +379,10 @@ def test_run_service_streams_and_persists_a_provider_neutral_run(tmp_path: Path)
     assert b"sk-runtime-secret" not in repr(database.state).encode()
 
 
+@pytest.mark.parametrize("finish_kind", [None, "tool"])
 def test_run_service_persists_read_tool_exchange_before_a_second_model_call(
     tmp_path: Path,
+    finish_kind: ModelFinishKind | None,
 ) -> None:
     settings = make_settings(tmp_path)
     database = Database(_repository_key(settings))
@@ -396,7 +403,7 @@ def test_run_service_persists_read_tool_exchange_before_a_second_model_call(
                     kind="tool_call",
                     tool_call=ModelToolCall("provider-call-1", "read_file", {"path": "README.md"}),
                 ),
-                ModelStreamEvent(kind="completed", finish_reason="tool_use"),
+                ModelStreamEvent(kind="completed", finish_kind=finish_kind),
             ),
             (
                 ModelStreamEvent(kind="text_delta", text="The README says hello."),
@@ -468,7 +475,13 @@ def test_run_service_persists_read_tool_exchange_before_a_second_model_call(
     )
     assert [
         event.data["text"] for event in events if event.event_type is RunEventType.ASSISTANT_DELTA
-    ] == ["The README says hello."]
+    ] == ["Checking the file.", "The README says hello."]
+    assert [event.data["phase"] for event in events if event.event_type.value == "run.phase"] == [
+        "answering",
+        "tool_use",
+        "answering",
+        "finishing",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -527,7 +540,7 @@ def test_budget_blocks_tool_execution_after_exhausted_or_missing_usage(
     assert tool_calls == []
 
 
-def test_estimated_cost_limit_stops_before_publishing_a_final_answer(tmp_path: Path) -> None:
+def test_input_cost_floor_stops_before_dispatching_a_model_call(tmp_path: Path) -> None:
     class TinyCostDatabase(Database):
         async def create_run(
             self,
@@ -580,8 +593,8 @@ def test_estimated_cost_limit_stops_before_publishing_a_final_answer(tmp_path: P
         return result
 
     run, calls, visible = asyncio.run(run())
-    assert run is not None and run.error_code == "cost_limit"
-    assert calls[0].estimated_cost == pytest.approx(0.000046)
+    assert run is not None and run.error_code == "budget_cost_limit"
+    assert calls == []
     assert [message.content for message in visible] == ["Answer"]
 
 
@@ -1900,6 +1913,136 @@ def test_provider_failure_keeps_no_partial_assistant_message(tmp_path: Path) -> 
     assert model_calls[0].status.value == "failed"
     assert model_calls[0].error_message == "Safe provider failure"
     assert "sk-runtime-secret" not in str(events)
+
+
+@pytest.mark.parametrize(
+    ("finish_kind", "has_tool", "expected_error"),
+    [
+        ("tool", False, "provider_invalid_response"),
+        ("final", True, "provider_invalid_response"),
+        ("incomplete", True, "provider_response_incomplete"),
+    ],
+)
+def test_run_service_rejects_inconsistent_finish_without_executing_tools(
+    tmp_path: Path, finish_kind: ModelFinishKind, has_tool: bool, expected_error: str
+) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(_repository_key(settings))
+    secret_store = SecretStore(_secrets_path(settings))
+    provider = RecordingProvider(
+        (
+            ModelStreamEvent(kind="text_delta", text="Checking the workspace."),
+            *(
+                (
+                    ModelStreamEvent(
+                        kind="tool_call", tool_call=ModelToolCall("call-1", "list_files", {})
+                    ),
+                )
+                if has_tool
+                else ()
+            ),
+            ModelStreamEvent(kind="completed", finish_kind=finish_kind),
+        )
+    )
+
+    async def run():
+        session = await database.create_session(str(tmp_path))
+        await secret_store.set("openai", "test-key")
+        service = RunService(
+            database,
+            database,
+            database,
+            database,
+            secret_store,
+            {"openai": provider},
+            tool_registry=ToolRegistry(LocalReadToolExecutor(), capabilities=LOCAL_CAPABILITIES),
+            capabilities=LOCAL_CAPABILITIES,
+            workspace_bindings=_selected_workspace(session),
+        )
+        created = await service.create_run(session.id, "inconsistent-finish", "List files")
+        await service.wait_for_run(created.id)
+        await service.close()
+        return (
+            await database.get_run(created.id),
+            await database.list_tool_calls(created.id),
+            await database.list_messages(session.id),
+        )
+
+    run, tool_calls, messages = asyncio.run(run())
+    assert run is not None and run.status is RunStatus.FAILED
+    assert run.error_code == expected_error
+    assert tool_calls == []
+    assert [message.role for message in messages] == ["user"]
+
+
+@pytest.mark.parametrize(
+    ("finish_kind", "hang_after_completion", "expected_status"),
+    [("incomplete", False, RunStatus.FAILED), ("final", True, RunStatus.COMPLETED)],
+)
+def test_first_model_completion_closes_stream_without_consuming_late_events(
+    tmp_path: Path,
+    finish_kind: ModelFinishKind,
+    hang_after_completion: bool,
+    expected_status: RunStatus,
+) -> None:
+    class TerminalProbeProvider(RecordingProvider):
+        closed = False
+        consumed_after_completion = False
+        active_stream: AsyncGenerator[ModelStreamEvent] | None = None
+
+        def stream(
+            self, request: ModelRequest, api_key: str, user_id: str
+        ) -> AsyncGenerator[ModelStreamEvent]:
+            async def generate() -> AsyncGenerator[ModelStreamEvent]:
+                try:
+                    yield ModelStreamEvent(kind="text_delta", text="Partial answer")
+                    yield ModelStreamEvent(kind="usage", input_tokens=1, output_tokens=1)
+                    yield ModelStreamEvent(kind="completed", finish_kind=finish_kind)
+                    self.consumed_after_completion = True
+                    if hang_after_completion:
+                        await asyncio.Event().wait()
+                    yield ModelStreamEvent(kind="completed")
+                finally:
+                    self.closed = True
+
+            self.active_stream = generate()
+            return self.active_stream
+
+    settings = make_settings(tmp_path)
+    database = Database(_repository_key(settings))
+    secret_store = SecretStore(_secrets_path(settings))
+    provider = TerminalProbeProvider(())
+
+    async def run():
+        session = await database.create_session()
+        await secret_store.set("openai", "test-key")
+        service = RunService(
+            database, database, database, database, secret_store, {"openai": provider}
+        )
+        created = await service.create_run(session.id, "first-completion", "Answer")
+        finished_promptly = True
+        try:
+            await asyncio.wait_for(service.wait_for_run(created.id), timeout=0.25)
+        except TimeoutError:
+            finished_promptly = False
+        closed_before_cleanup = provider.closed
+        await service.close()
+        return (
+            await database.get_run(created.id),
+            await database.list_model_calls(created.id),
+            finished_promptly,
+            closed_before_cleanup,
+        )
+
+    run, calls, finished_promptly, closed_before_cleanup = asyncio.run(run())
+    assert finished_promptly
+    assert run is not None and run.status is expected_status
+    assert closed_before_cleanup
+    assert not provider.consumed_after_completion
+    assert calls[0].response_snapshot is not None
+    assert calls[0].response_snapshot["finish_kind"] == finish_kind
+    if finish_kind == "incomplete":
+        assert run.error_code == "provider_response_incomplete"
 
 
 def test_run_service_requires_selected_streaming_adapter_before_persisting(

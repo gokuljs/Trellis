@@ -98,3 +98,26 @@
     min-height: 44px;
   }
 }
+
+.run-activity-attempt-picker {
+  display: grid;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+  color: var(--shell-text-muted);
+  font-size: 11px;
+}
+.run-activity-attempt-picker select {
+  width: 100%;
+  min-width: 0;
+  min-height: 34px;
+  border: 1px solid var(--shell-line);
+  border-radius: 6px;
+  padding: var(--space-2);
+  color: var(--shell-text-strong);
+  background: var(--shell-card);
+  font: inherit;
+}
+.run-activity-attempt-picker select:focus-visible {
+  outline: 2px solid var(--shell-focus);
+  outline-offset: 2px;
+}

@@ -203,11 +203,11 @@ def test_session_run_history_pages_summaries_and_events(tmp_path: Path) -> None:
     summary = first_page.json()["items"][0]
     assert summary["status"] == "completed"
     assert summary["created_at"] and summary["finished_at"]
-    assert summary["last_sequence"] == 7
+    assert summary["last_sequence"] == 10
     assert summary["max_model_calls"] > 0
     assert [item["sequence"] for item in events_page.json()["items"]] == [1, 2]
     assert events_page.json()["next_after_sequence"] == 2
-    assert [item["sequence"] for item in remaining_events.json()["items"]] == [3, 4, 5, 6, 7]
+    assert [item["sequence"] for item in remaining_events.json()["items"]] == list(range(3, 11))
     assert remaining_events.json()["next_after_sequence"] is None
     assert all(item["created_at"] for item in remaining_events.json()["items"])
 
@@ -465,13 +465,16 @@ def test_jsonrpc_websocket_streams_a_durable_run(tmp_path: Path) -> None:
     assert [item["eventType"] for item in notifications] == [
         RunEventType.QUEUED.value,
         RunEventType.STARTED.value,
+        RunEventType.CONTEXT.value,
+        RunEventType.PHASE.value,
         RunEventType.MODEL_USAGE.value,
-        RunEventType.MODEL_COMPLETED.value,
         RunEventType.ASSISTANT_DELTA.value,
+        RunEventType.MODEL_COMPLETED.value,
+        RunEventType.PHASE.value,
         RunEventType.ASSISTANT_COMPLETED.value,
         RunEventType.COMPLETED.value,
     ]
-    assert [item["sequence"] for item in notifications] == list(range(1, 8))
+    assert [item["sequence"] for item in notifications] == list(range(1, 11))
     assert [message["content"] for message in detail["messages"]] == [
         "Stream this",
         "Streaming works",
@@ -669,7 +672,7 @@ def test_jsonrpc_resume_replays_persisted_events_after_disconnect(tmp_path: Path
     acknowledgement = next(item for item in resumed if item.get("id") == 2)
     events = [item["params"] for item in resumed if item.get("method") == "run.event"]
     assert acknowledgement["result"]["runId"] == run_id
-    assert [event["sequence"] for event in events] == list(range(5, 8))
+    assert [event["sequence"] for event in events] == list(range(5, 11))
 
 
 def test_jsonrpc_replays_when_a_live_event_sequence_has_a_gap(tmp_path: Path) -> None:
@@ -738,8 +741,8 @@ def test_jsonrpc_replays_when_a_live_event_sequence_has_a_gap(tmp_path: Path) ->
             )
 
     events = [item["params"] for item in replayed if item.get("method") == "run.event"]
-    assert cursor == 2
-    assert [item["sequence"] for item in events] == list(range(3, 8))
+    assert cursor == 4
+    assert [item["sequence"] for item in events] == list(range(5, 11))
 
 
 def test_jsonrpc_reports_parse_empty_batch_and_valid_batch_responses(tmp_path: Path) -> None:
@@ -766,7 +769,7 @@ def test_jsonrpc_reports_parse_empty_batch_and_valid_batch_responses(tmp_path: P
     assert [response["error"]["code"] for response in batch_responses] == [-32601, -32601]
 
 
-def test_custom_model_uses_registered_adapter_without_provider_specific_runtime_code(
+def test_custom_model_without_verified_context_limits_stops_before_dispatch(
     tmp_path: Path,
 ) -> None:
     settings = Settings(environment="test", data_dir=tmp_path)
@@ -808,25 +811,27 @@ def test_custom_model_uses_registered_adapter_without_provider_specific_runtime_
                     },
                 }
             )
-            receive_until(
+            events = receive_until(
                 websocket,
                 lambda item: (
                     item.get("method") == "run.event"
-                    and item["params"]["eventType"] == RunEventType.COMPLETED.value
+                    and item["params"]["eventType"] == RunEventType.FAILED.value
                 ),
             )
         messages = client.get(f"/api/sessions/{session_id}").json()["messages"]
 
-    assert provider.request is not None
-    assert provider.request.provider_id == "self-hosted"
-    assert provider.request.model_id == "weights:v4"
-    assert provider.request.adapter_kind == "openai-compatible"
-    assert provider.request.upstream_model_id == "weights/model-v4"
-    assert messages[-1]["provider"] == "self-hosted"
-    assert messages[-1]["model"] == "weights:v4"
+    assert provider.request is None
+    assert [message["content"] for message in messages] == ["Use my local model"]
+    terminal = next(
+        item["params"]["data"]
+        for item in events
+        if item.get("method") == "run.event"
+        and item["params"]["eventType"] == RunEventType.FAILED.value
+    )
+    assert terminal["code"] == "model_not_available"
 
 
-def test_unpriced_custom_model_stops_before_a_tool_continuation(tmp_path: Path) -> None:
+def test_unpriced_custom_model_stops_before_generation_or_tool_execution(tmp_path: Path) -> None:
     class ToolingProvider(StreamingProvider):
         def stream(
             self, request: ModelRequest, api_key: str, user_id: str
@@ -897,17 +902,14 @@ def test_unpriced_custom_model_stops_before_a_tool_continuation(tmp_path: Path) 
         calls = asyncio.run(database.list_model_calls(run_id))
         tools = asyncio.run(database.list_tool_calls(run_id))
 
-    assert run is not None and run.error_code == "pricing_unavailable"
-    assert len(calls) == 1 and calls[0].estimated_cost is None
+    assert run is not None and run.error_code == "model_not_available"
+    assert calls == []
     assert tools == []
-    assert (
-        next(
-            item["params"]["data"]["estimated_cost_usd"]
-            for item in events
-            if item.get("method") == "run.event"
-            and item["params"]["eventType"] == RunEventType.MODEL_USAGE.value
-        )
-        is None
+    assert provider.request is None
+    assert not any(
+        item.get("method") == "run.event"
+        and item["params"]["eventType"] == RunEventType.MODEL_USAGE.value
+        for item in events
     )
 
 
@@ -1039,11 +1041,14 @@ def test_session_latest_run_lookup_tracks_active_and_terminal_runs(tmp_path: Pat
             )
             active = client.get(latest_url)
             assert active.status_code == 200
-            assert active.json() == {
+            assert active.json()["input_message"]["content"] == "Keep working"
+            assert {
+                key: value for key, value in active.json().items() if key != "input_message"
+            } == {
                 "run_id": run_id,
                 "turn_id": "turn-lookup",
                 "status": "running",
-                "last_sequence": 2,
+                "last_sequence": 4,
             }
             websocket.send_json(
                 {
@@ -1117,7 +1122,8 @@ def test_waiting_approval_is_discoverable_and_replayed_after_socket_refresh(tmp_
             tool_call_id = waiting[-1]["params"]["data"]["tool_call_id"]
 
         discovered = client.get(f"/api/sessions/{session_id}/runs/latest").json()
-        assert discovered == {
+        assert discovered["input_message"]["content"] == "Read the note"
+        assert {key: value for key, value in discovered.items() if key != "input_message"} == {
             "run_id": run_id,
             "turn_id": "waiting-turn",
             "status": "waiting_for_approval",

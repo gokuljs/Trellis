@@ -2,6 +2,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
+from app.application.model_catalog import (
+    ModelProfile,
+    UsageTokens,
+    estimate_profile_cost,
+    profile_for_model,
+    total_usage_tokens,
+)
+
 BudgetPreset = Literal["conservative", "longer"]
 
 
@@ -31,28 +39,6 @@ class ModelPrice:
     as_of: str
 
 
-_PRICES: dict[str, ModelPrice] = {
-    "openai:gpt-5.5": ModelPrice(
-        5.0,
-        0.5,
-        30.0,
-        0.0,
-        True,
-        "https://developers.openai.com/api/docs/models/gpt-5.5",
-        "2026-10-07",
-    ),
-    "anthropic:claude-sonnet-5": ModelPrice(
-        2.0,
-        0.2,
-        10.0,
-        4.0,
-        False,
-        "https://platform.claude.com/docs/en/models/sonnet-5/overview",
-        "2026-10-07",
-    ),
-}
-
-
 class BudgetExceeded(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -69,11 +55,68 @@ def limits_for_preset(preset: BudgetPreset) -> RunLimits:
     return _PRESETS[preset]
 
 
+def _profile(model_id: str) -> ModelProfile:
+    profile = profile_for_model(model_id)
+    if profile is None or not profile.metadata_ready:
+        raise PricingUnavailable(model_id)
+    return profile
+
+
 def price_for_model(model_id: str) -> ModelPrice:
-    try:
-        return _PRICES[model_id]
-    except KeyError:
-        raise PricingUnavailable(model_id) from None
+    """Compatibility view of standard short-context rates, never a pricing lookup."""
+    profile = _profile(model_id)
+    tier = next(item for item in profile.price_tiers if item.service_tier == "standard")
+    rates = tier.rates
+    return ModelPrice(
+        rates.input_per_million,
+        rates.cached_input_per_million,
+        rates.output_per_million,
+        rates.cache_creation_1h_per_million or rates.cache_creation_per_million or 0,
+        profile.cache_tokens_included_in_input,
+        profile.sources[0],
+        profile.as_of,
+    )
+
+
+def _usage(
+    profile: ModelProfile,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cached_tokens: int | None,
+    cache_creation_tokens: int | None,
+    cache_creation_1h_tokens: int | None,
+    reasoning_tokens: int | None,
+) -> UsageTokens:
+    if (
+        profile.cache_tokens_included_in_input
+        and input_tokens is not None
+        and cached_tokens is not None
+        and cached_tokens > input_tokens
+    ):
+        raise ValueError("cached tokens exceed input tokens")
+    cached_tokens = cached_tokens or 0
+    if cache_creation_tokens is None and all(
+        tier.rates.cache_creation_per_million is None for tier in profile.price_tiers
+    ):
+        cache_creation_tokens = 0
+    # Legacy callers do not identify a cache-write TTL. Retain the conservative
+    # one-hour estimate; adapters with actual TTL counts can pass an explicit 0.
+    one_hour = (
+        cache_creation_tokens
+        if cache_creation_1h_tokens is None
+        and any(
+            tier.rates.cache_creation_1h_per_million is not None for tier in profile.price_tiers
+        )
+        else cache_creation_1h_tokens or 0
+    )
+    return UsageTokens(
+        input_tokens,
+        output_tokens,
+        cached_tokens,
+        cache_creation_tokens,
+        one_hour,
+        reasoning_tokens,
+    )
 
 
 def estimate_model_cost(
@@ -82,21 +125,27 @@ def estimate_model_cost(
     output_tokens: int | None,
     cached_tokens: int | None,
     cache_creation_tokens: int | None = 0,
+    *,
+    cache_creation_1h_tokens: int | None = None,
+    reasoning_tokens: int | None = None,
+    service_tier: str = "standard",
+    pricing_context_tokens: int | None = None,
 ) -> float | None:
-    price = price_for_model(model_id)
-    counts = _checked_counts(
-        price, input_tokens, output_tokens, cached_tokens, cache_creation_tokens
+    profile = _profile(model_id)
+    return estimate_profile_cost(
+        profile,
+        _usage(
+            profile,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+            cache_creation_tokens,
+            cache_creation_1h_tokens,
+            reasoning_tokens,
+        ),
+        service_tier=service_tier,
+        pricing_context_tokens=pricing_context_tokens,
     )
-    if counts is None:
-        return None
-    input_count, output_count, cached, created = counts
-    ordinary = input_count - cached if price.cached_input_included_in_input else input_count
-    return (
-        ordinary * price.input_per_million
-        + cached * price.cached_input_per_million
-        + created * price.cache_creation_per_million
-        + output_count * price.output_per_million
-    ) / 1_000_000
 
 
 def count_total_tokens(
@@ -106,41 +155,13 @@ def count_total_tokens(
     cached_tokens: int | None,
     cache_creation_tokens: int | None = 0,
 ) -> int | None:
-    price = price_for_model(model_id)
-    counts = _checked_counts(
-        price, input_tokens, output_tokens, cached_tokens, cache_creation_tokens
+    profile = _profile(model_id)
+    return total_usage_tokens(
+        profile,
+        _usage(
+            profile, input_tokens, output_tokens, cached_tokens, cache_creation_tokens, None, None
+        ),
     )
-    if counts is None:
-        return None
-    input_count, output_count, cached, created = counts
-    return (
-        input_count
-        + output_count
-        + created
-        + (0 if price.cached_input_included_in_input else cached)
-    )
-
-
-def _checked_counts(
-    price: ModelPrice,
-    input_tokens: int | None,
-    output_tokens: int | None,
-    cached_tokens: int | None,
-    cache_creation_tokens: int | None,
-) -> tuple[int, int, int, int] | None:
-    if (
-        input_tokens is None
-        or output_tokens is None
-        or (price.cache_creation_per_million > 0 and cache_creation_tokens is None)
-    ):
-        return None
-    cached = cached_tokens or 0
-    created = cache_creation_tokens or 0
-    if min(input_tokens, output_tokens, cached, created) < 0:
-        raise ValueError("token counts cannot be negative")
-    if price.cached_input_included_in_input and cached > input_tokens:
-        raise ValueError("cached tokens exceed input tokens")
-    return input_tokens, output_tokens, cached, created
 
 
 def check_step_budget(

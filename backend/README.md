@@ -4,6 +4,9 @@ FastAPI service for Trellis web chat. Authenticated account data is stored in
 Supabase. Provider keys come from backend secrets managed by the operator.
 Users sign in, choose an available model, and chat.
 
+See [Stage 2](../docs/stage-2.md) for setup, migrations, streaming and replay
+limits, context compaction, frontend behavior, and verification.
+
 From this directory:
 
 ```bash
@@ -63,3 +66,71 @@ Temporary authentication or data failures return status `503` and close code
 `1013`, so the web app can offer a retry without clearing a valid session.
 Recheck errors use a JSON-RPC error with `id: null` before closing the socket.
 Authentication and account checks have a five-second deadline.
+
+Model choices include verified context/output limits, native-compaction support,
+metadata readiness, verification sources and dates, and the latest cached
+provider availability. Settings includes pending choices with `selectable=false`
+and a reason; runtime model lookup returns only enabled, verified choices.
+Unknown IDs never inherit another model's limits or prices. Reviewed models can
+be selected and requested without discovery or an availability check. Missing
+credentials and provider failures are reported when a request is made.
+
+`app/application/model_catalog.py` owns reviewed first-party token prices and
+limits as of 2026-10-15. The matching database documents live in migration
+`202610150003_model_catalog.sql`; changes to a profile must update both together.
+Input budgets reserve up to 4096 output tokens, keep a 2% safety margin (at least
+2048 tokens), and compact at 80% of usable input space. A provider's separate
+input cap can reduce that space. Pricing distinguishes cache reads, five-minute
+and one-hour writes, long-context thresholds, and the actual served tier.
+Unpublished tier prices or missing required usage produce an unavailable cost.
+Legacy calls without an Anthropic write TTL retain the conservative one-hour
+price. GPT-5.5 callers retain the highest session pricing context after compaction.
+Token estimates exclude provider tools, regional premiums, taxes and negotiated
+rates.
+
+The operator runs model discovery outside the request-serving app:
+
+```bash
+uv run python -m app.infrastructure.catalog_sync
+```
+
+Run it under the deployment's process supervisor. It refreshes immediately,
+then waits ten minutes after each completed cycle. `--once` performs one refresh
+for a scheduled external job. Provide `TRELLIS_OPENAI_API_KEY`,
+`TRELLIS_ANTHROPIC_API_KEY`, and `TRELLIS_CATALOG_DATABASE_URL` as process secrets.
+The database URL must use the `trellis_catalog_sync` login and a direct PostgreSQL
+host; it is never passed as a command-line argument. TLS defaults to `verify-full`
+and accepts explicit `sslmode=require` or `verify-ca`. Install `psql` on the
+operator host. No new Python runtime package is required. Never use a Supabase
+service key or the app's user token for this process.
+
+Provider list APIs supply availability, not trusted limits or prices. Reviewed
+chat profiles remain enabled independently of the availability snapshot. Unknown
+discoveries require metadata verification before runtime calls. A failed,
+oversized, malformed, paginated-incomplete, or timed-out provider response leaves
+that provider's previous cache unchanged. A later successful cycle recovers
+availability automatically. Verified absent models remain requestable;
+absent unknown discoveries are removed unless historical account/run rows refer
+to them. Availability timestamps show the last successful refresh, so a preserved
+cache can be stale during an outage. Operator logs contain provider names and
+safe outcome codes only.
+
+Each provider refresh has a 30-second total deadline, at most 20 pages, 2000
+unique IDs, and 2 MiB per response. PostgreSQL writes have a 20-second process
+deadline, a 15-second statement timeout, and a 3-second lock timeout. Cancellation
+terminates and joins the child process. Database updates are atomic and snapshots
+are serialized. A failed database write preserves the previous cache.
+
+A complete empty availability snapshot does not disable reviewed generation
+choices. Existing account defaults are retained; new accounts store a reviewed
+default. Provider request errors are returned through the normal run flow.
+Pending metadata never becomes the account default.
+
+Durable replay keeps each run's events until its chat is deleted. Each run may
+store at most 8192 events and 16 MiB of UTF-8 JSON event data; one payload may be
+at most 256 KiB. Ordinary events stop 16 events and 64 KiB before the hard caps.
+Cancellation, final-answer completion, failure and interruption can use that
+finite reserve. A storage-limit failure stops generation, preserves saved text
+as partial, and leaves earlier event sequences available for reconnect. If tool
+cleanup events cannot fit, the terminal transition closes remaining tool records
+without adding one event per tool. No old events are evicted to make room.

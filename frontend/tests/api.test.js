@@ -86,6 +86,41 @@ test("new chats never submit a legacy folder argument", async () => {
   expect(sent.init.headers.get("Authorization")).toBe("Bearer test-token")
 })
 
+test("chat model selection saves only the requested chat preference", async () => {
+  const client = fixture()
+  let sent
+  client.transport.fetch = async (url, init) => {
+    sent = { url, init }
+    return Response.json({ id: "chat-a", model_id: "model-b" })
+  }
+  const session = await client.api.selectSessionModel("chat-a", "model-b")
+  expect(session.model_id).toBe("model-b")
+  expect(sent.url).toBe("/api/sessions/chat-a/model")
+  expect(sent.init.method).toBe("PUT")
+  expect(JSON.parse(sent.init.body)).toEqual({ model_id: "model-b" })
+})
+
+test("context preview posts the complete draft with its selected chat model and forwards cancellation", async () => {
+  const client = fixture()
+  const controller = new AbortController()
+  const input = {
+    session_id: "chat-a",
+    model_id: "model-b",
+    draft: "  Exact draft 🌳  ",
+    budget_preset: "longer",
+  }
+  let sent
+  client.transport.fetch = async (url, init) => {
+    sent = { url, init }
+    return Response.json({ model_id: "model-b" })
+  }
+  await client.api.previewContext(input, { signal: controller.signal })
+  expect(sent.url).toBe("/api/context-preview")
+  expect(sent.init.method).toBe("POST")
+  expect(JSON.parse(sent.init.body)).toEqual(input)
+  expect(sent.init.signal).toBeInstanceOf(AbortSignal)
+})
+
 test("an account change during token retrieval cannot send as the new account", async () => {
   const client = fixture()
   const token = deferred()
@@ -396,4 +431,45 @@ test("caller cancellation prevents a late token from sending a request", async (
   await Promise.resolve()
   expect(requests).toBe(0)
   expect(client.state.status).toBe("signed-in")
+})
+
+test("history and chat list use bounded cursor routes and forward cancellation", async () => {
+  const client = fixture()
+  const requests = []
+  client.transport.fetch = async (url, init) => {
+    requests.push({ url: String(url), signal: init.signal })
+    return Response.json({ items: [], next_before_cursor: null })
+  }
+  const controller = new AbortController()
+  await client.api.getSessionHistory("chat/a", "opaque+/=", {
+    signal: controller.signal,
+  })
+  await client.api.listSessionPages("list+/=", { signal: controller.signal })
+  expect(requests[0].url).toEndWith(
+    "/api/sessions/chat%2Fa/history?limit=40&before_cursor=opaque%2B%2F%3D"
+  )
+  expect(requests[1].url).toEndWith(
+    "/api/session-pages?limit=40&before_cursor=list%2B%2F%3D"
+  )
+  expect(
+    requests.every((request) => request.signal instanceof AbortSignal)
+  ).toBe(true)
+})
+
+test("saved attempt queries request newest-first summaries for only the opened turn", async () => {
+  const client = fixture()
+  let sent
+  client.transport.fetch = async (url) => {
+    sent = String(url)
+    return Response.json({ items: [], next_offset: null })
+  }
+  await client.api.listRunSummaries(
+    "chat",
+    100,
+    {},
+    { turnId: "turn/a", newestFirst: true }
+  )
+  expect(sent).toEndWith(
+    "/api/sessions/chat/runs?offset=100&limit=100&newest_first=true&turn_id=turn%2Fa"
+  )
 })

@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
+ModelFinishKind = Literal["final", "tool", "incomplete"]
+
 
 class RunStatus(StrEnum):
     QUEUED = "queued"
@@ -32,6 +34,8 @@ class RunEventType(StrEnum):
     CANCELLED = "run.cancelled"
     INTERRUPTED = "run.interrupted"
     RESUMED = "run.resumed"
+    PHASE = "run.phase"
+    CONTEXT = "run.context"
 
 
 class ModelCallStatus(StrEnum):
@@ -228,6 +232,7 @@ class ModelRequest:
     max_output_tokens: int
     system_instructions: str = ""
     tools: tuple[ModelToolSpec, ...] = ()
+    native_context_json: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,8 +248,16 @@ class ModelStreamEvent:
     cache_creation_tokens: int | None = None
     finish_reason: str | None = None
     provider_response_id: str | None = None
+    finish_kind: ModelFinishKind | None = None
+    service_tier: str | None = None
+    cache_creation_1h_tokens: int | None = None
 
     def __post_init__(self) -> None:
+        if self.finish_kind is not None:
+            if self.kind != "completed":
+                raise ValueError("finish kind requires a completed event")
+            if self.finish_kind not in {"final", "tool", "incomplete"}:
+                raise ValueError("invalid model finish kind")
         if self.kind == "text_delta" and self.text is None:
             raise ValueError("text_delta events require text")
         if self.kind == "tool_call" and self.tool_call is None:
@@ -258,6 +271,7 @@ class ModelStreamEvent:
                 self.reasoning_tokens,
                 self.cached_tokens,
                 self.cache_creation_tokens,
+                self.cache_creation_1h_tokens,
             ):
                 if token_count is not None and token_count < 0:
                     raise ValueError("token counts cannot be negative")

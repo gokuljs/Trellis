@@ -4,11 +4,14 @@ import {
   useRef,
   useState,
   type KeyboardEvent,
+  type ReactNode,
 } from "react"
 import { ArrowUp } from "lucide-react"
 import { BEND, MetalFx, useMetalBend } from "metal-fx"
 
 import { useTheme } from "@/components/theme-provider"
+import { ModelSelect } from "@/components/model-select"
+import type { ModelStatus } from "@/lib/app-types"
 
 type BudgetPreset = "conservative" | "longer"
 
@@ -20,6 +23,11 @@ type ComposerProps = {
   disabled?: boolean
   budgetPreset: BudgetPreset
   onBudgetChange: (preset: BudgetPreset) => void
+  models: ModelStatus[]
+  selectedModelId: string
+  modelSaving: boolean
+  onModelChange: (modelId: string) => void
+  contextGauge?: ReactNode
 }
 
 function usePrefersReducedMotion() {
@@ -49,10 +57,18 @@ export function Composer({
   disabled = false,
   budgetPreset,
   onBudgetChange,
+  models,
+  selectedModelId,
+  modelSaving,
+  onModelChange,
+  contextGauge,
 }: ComposerProps) {
   const { resolvedTheme } = useTheme()
   const prefersReducedMotion = usePrefersReducedMotion()
-  const isSendable = Boolean(value.trim()) && !disabled
+  const isSendable =
+    Boolean(value.trim()) &&
+    !disabled &&
+    models.some((model) => model.id === selectedModelId)
   const sendRef = useRef<HTMLDivElement>(null)
   const getBendConfig = useCallback(
     () => ({
@@ -67,7 +83,7 @@ export function Composer({
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault()
-      if (!disabled) onSubmit()
+      if (isSendable) onSubmit()
     }
   }
 
@@ -85,6 +101,13 @@ export function Composer({
         />
         <div className="composer-toolbar">
           <div className="composer-tools">
+            <ModelSelect
+              models={models}
+              selectedModelId={selectedModelId}
+              disabled={disabled}
+              saving={modelSaving}
+              onChange={onModelChange}
+            />
             <select
               className="composer-select"
               aria-label="Run budget"
@@ -97,6 +120,7 @@ export function Composer({
               <option value="conservative">Standard</option>
               <option value="longer">Extended</option>
             </select>
+            {contextGauge}
             <MetalFx
               ref={sendRef}
               className="send-button-metal"

@@ -9,16 +9,27 @@ import json
 import secrets
 from collections.abc import Mapping
 from contextlib import suppress
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
-from typing import cast
+from itertools import pairwise
+from typing import Literal, cast
 from uuid import UUID
 
 import httpx
 
 from app.application.budgets import BudgetPreset, limits_for_preset
 from app.application.errors import ApplicationError
+from app.application.model_catalog import profile_for_model
 from app.core.config import Settings
 from app.core.supabase import project_base_url
+from app.domain.context import (
+    CheckpointSource,
+    ContextCheckpoint,
+    ContextCheckpointDraft,
+    ContextWindow,
+)
+from app.domain.event_limits import EVENT_STORAGE_LIMIT_MESSAGE
+from app.domain.history import HistoryPage, PageCursor, SessionPage, TimelineRow
 from app.domain.models import (
     Message,
     ModelDescriptor,
@@ -30,6 +41,7 @@ from app.domain.models import (
     SessionWorkspaceBusy,
     UserProfile,
 )
+from app.domain.outputs import AssistantOutput, validate_assistant_batch
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -148,6 +160,146 @@ def _nullable_number(row: Mapping[str, object], key: str) -> float | None:
 
 
 class SupabaseRepository:
+    async def load_context_window(self, session_id: str, *, limit: int = 128) -> ContextWindow:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 128:
+            raise ValueError("context page limit is invalid")
+        row = _object(
+            await self._request(
+                "POST",
+                "rpc/read_context_window",
+                payload={"p_session_id": session_id, "p_limit": limit},
+            )
+        )
+        checkpoint_row = row.get("checkpoint")
+        checkpoint = (
+            self._checkpoint(_object(checkpoint_row)) if checkpoint_row is not None else None
+        )
+        messages = tuple(self._message(message) for message in _array(row.get("messages")))
+        if (checkpoint is not None and checkpoint.session_id != session_id) or any(
+            message.session_id != session_id for message in messages
+        ):
+            raise RuntimeError("Supabase returned another chat's context")
+        boundary = checkpoint.covered_message_ordinal if checkpoint else 0
+        if (
+            len(messages) > limit
+            or any(message.ordinal <= boundary for message in messages)
+            or any(a.ordinal >= b.ordinal for a, b in pairwise(messages))
+        ):
+            raise RuntimeError("Supabase returned an invalid context window")
+        return ContextWindow(checkpoint, messages)
+
+    async def load_context_checkpoint(self, session_id: str) -> ContextCheckpoint | None:
+        rows = await self._read(
+            "context_checkpoints",
+            select="*",
+            filters={
+                "user_id": f"eq.{self._user_id}",
+                "chat_id": f"eq.{session_id}",
+                "order": "revision.desc",
+                "limit": "1",
+            },
+        )
+        if not rows:
+            return None
+        checkpoint = self._checkpoint(rows[0])
+        if checkpoint.session_id != session_id:
+            raise RuntimeError("Supabase returned another chat's checkpoint")
+        return checkpoint
+
+    async def save_context_checkpoint(
+        self, run_id: str, expected_revision: int, draft: ContextCheckpointDraft
+    ) -> ContextCheckpoint:
+        if (
+            not isinstance(expected_revision, int)
+            or isinstance(expected_revision, bool)
+            or expected_revision < 0
+        ):
+            raise ValueError("checkpoint revision must be a non-negative integer")
+        from dataclasses import asdict, replace
+
+        try:
+            result = await self._rpc(
+                "save_context_checkpoint",
+                {**asdict(draft), "run_id": run_id, "expected_revision": expected_revision},
+                capability=self._run_capability(run_id),
+            )
+        except ValueError as error:
+            if str(error) == "checkpoint revision conflict":
+                raise ApplicationError(
+                    "context_checkpoint_conflict",
+                    "Context changed while compaction was being saved.",
+                ) from None
+            raise
+        saved = self._checkpoint(_object(result))
+        if (
+            saved.run_id != run_id
+            or replace(saved.draft, pricing_context_tokens=draft.pricing_context_tokens) != draft
+            or saved.draft.pricing_context_tokens < draft.pricing_context_tokens
+        ):
+            raise RuntimeError("Supabase returned another checkpoint result")
+        return saved
+
+    async def list_context_messages(
+        self, session_id: str, after_ordinal: int, *, limit: int = 128
+    ) -> list[Message]:
+        if after_ordinal < 0 or not 1 <= limit <= 128:
+            raise ValueError("context cursor or page limit is invalid")
+        checkpoint = await self.load_context_checkpoint(session_id)
+        boundary = max(after_ordinal, checkpoint.covered_message_ordinal if checkpoint else 0)
+        messages = await self._messages(
+            {"chat_id": f"eq.{session_id}", "ordinal": f"gt.{boundary}", "limit": str(limit)}
+        )
+        if any(message.session_id != session_id for message in messages):
+            raise RuntimeError("Supabase returned another chat's context")
+        return messages
+
+    def _checkpoint(self, row: dict[str, object]) -> ContextCheckpoint:
+        self._owned(row)
+        sources = _array(row.get("sources"))
+        native_kind = _nullable_text(row, "native_kind")
+        if native_kind not in {None, "openai_window", "anthropic_block"}:
+            raise RuntimeError("Supabase returned invalid native checkpoint metadata")
+        refs: list[CheckpointSource] = []
+        for source in sources:
+            kind = _text(source, "source_kind")
+            if kind not in {"message", "run_message", "checkpoint"}:
+                raise RuntimeError("Supabase returned an invalid checkpoint source")
+            refs.append(
+                CheckpointSource(
+                    _text(source, "source_id"),
+                    kind,
+                    _text(source, "turn_id"),
+                )
+            )
+        draft = ContextCheckpointDraft(
+            _text(row, "id"),
+            _text(row, "model_call_id"),
+            tuple(refs),
+            _text(row, "summary"),
+            _text(row, "source_hash"),
+            _text(row, "input_hash"),
+            _text(row, "instruction_hash"),
+            _text(row, "workspace_hash"),
+            _integer(row, "input_tokens_before"),
+            _integer(row, "input_tokens_after"),
+            native_kind,
+            _nullable_text(row, "native_payload_json"),
+            _integer(row, "pricing_context_tokens"),
+        )
+        return ContextCheckpoint(
+            _text(row, "chat_id"),
+            _text(row, "run_id"),
+            _integer(row, "revision"),
+            _nullable_text(row, "parent_id"),
+            _text(row, "provider_id"),
+            _text(row, "model_id"),
+            _text(row, "adapter_kind"),
+            _integer(row, "covered_message_ordinal"),
+            _integer(row, "covered_run_message_ordinal"),
+            _text(row, "created_at"),
+            draft,
+        )
+
     def __init__(
         self,
         settings: Settings,
@@ -217,6 +369,10 @@ class SupabaseRepository:
         if response.status_code == 409:
             if error_code == "PT409" and error_message == "session_workspace_busy":
                 raise SessionWorkspaceBusy
+            if error_code == "PT409" and error_message == "session_model_busy":
+                raise ApplicationError(
+                    "session_model_busy", "Wait for this run to finish before changing its model."
+                )
             if error_code == "PT409" and error_message == "session_run_busy":
                 raise ApplicationError(
                     "session_run_busy", "This chat has an active run. Try again after it finishes."
@@ -228,6 +384,8 @@ class SupabaseRepository:
                 )
             raise ValueError("The cloud record conflicts with the current state")
         if response.status_code == 400 and error_code == "22023":
+            if error_message == "event_storage_limit":
+                raise ApplicationError("event_storage_limit", EVENT_STORAGE_LIMIT_MESSAGE)
             if isinstance(error_message, str) and len(error_message) <= 200:
                 raise ValueError(error_message)
             raise ValueError("The cloud operation is invalid")
@@ -373,29 +531,77 @@ class SupabaseRepository:
         return _text(await self._settings_row(), "selected_model_id")
 
     async def list_models(self) -> list[ModelDescriptor]:
+        return [model for model in await self._models(ready_only=True) if model.enabled]
+
+    async def list_catalog_models(self) -> list[ModelDescriptor]:
+        return await self._models(ready_only=False)
+
+    async def _models(self, *, ready_only: bool) -> list[ModelDescriptor]:
+        filters = {"order": "catalog_order.asc,id.asc"}
+        if ready_only:
+            filters.update({"enabled": "eq.true", "metadata_status": "eq.ready"})
         rows = await self._read(
             "models",
             select=(
                 "id,provider_id,provider_name,adapter_kind,upstream_model_id,name,"
-                "requires_api_key,supports_streaming,supports_tools,enabled"
+                "requires_api_key,supports_streaming,supports_tools,enabled,"
+                "trusted_metadata,metadata_status,metadata_verified_at,availability,"
+                "availability_checked_at"
             ),
-            filters={"enabled": "eq.true", "order": "catalog_order.asc"},
+            filters=filters,
         )
-        return [
-            ModelDescriptor(
-                id=_text(row, "id"),
-                provider_id=_text(row, "provider_id"),
-                provider_name=_text(row, "provider_name"),
-                adapter_kind=_text(row, "adapter_kind"),
-                upstream_model_id=_text(row, "upstream_model_id"),
-                name=_text(row, "name"),
-                requires_api_key=row.get("requires_api_key") is True,
-                supports_streaming=row.get("supports_streaming") is True,
-                supports_tools=row.get("supports_tools") is True,
-                enabled=row.get("enabled") is True,
+        models: list[ModelDescriptor] = []
+        for row in rows:
+            profile = profile_for_model(_text(row, "id"))
+            identity_matches = (
+                profile is not None
+                and profile.provider_id == row.get("provider_id")
+                and profile.upstream_model_id == row.get("upstream_model_id")
+                and row.get("adapter_kind") == profile.provider_id
             )
-            for row in rows
-        ]
+            # Old fixtures have no metadata columns. Production migrations store
+            # the exact reviewed profile; a changed document cannot redefine it.
+            ready = bool(identity_matches and profile is not None and profile.metadata_ready)
+            if "metadata_status" in row:
+                ready = bool(
+                    ready
+                    and profile is not None
+                    and row.get("metadata_status") == "ready"
+                    and row.get("trusted_metadata") == json.loads(json.dumps(asdict(profile)))
+                    and row.get("metadata_verified_at")
+                )
+            availability = row.get("availability", "unknown")
+            if availability not in {"available", "unavailable", "unknown"}:
+                raise RuntimeError("Supabase returned invalid model availability")
+            models.append(
+                ModelDescriptor(
+                    id=_text(row, "id"),
+                    provider_id=_text(row, "provider_id"),
+                    provider_name=_text(row, "provider_name"),
+                    adapter_kind=_text(row, "adapter_kind"),
+                    upstream_model_id=_text(row, "upstream_model_id"),
+                    name=_text(row, "name"),
+                    requires_api_key=row.get("requires_api_key") is True,
+                    supports_streaming=row.get("supports_streaming") is True,
+                    supports_tools=row.get("supports_tools") is True,
+                    enabled=row.get("enabled") is True and ready,
+                    context_window_tokens=profile.context_window_tokens
+                    if ready and profile
+                    else None,
+                    max_input_tokens=profile.max_input_tokens if ready and profile else None,
+                    max_output_tokens=profile.max_output_tokens if ready and profile else None,
+                    supports_native_compaction=profile.supports_native_compaction
+                    if ready and profile
+                    else None,
+                    metadata_status="ready" if ready else "pending",
+                    pending_reasons=() if ready else ("metadata_unverified",),
+                    verification_sources=profile.sources if ready and profile else (),
+                    metadata_verified_at=_nullable_text(row, "metadata_verified_at"),
+                    availability=cast(Literal["available", "unavailable", "unknown"], availability),
+                    availability_checked_at=_nullable_text(row, "availability_checked_at"),
+                )
+            )
+        return models
 
     async def set_selected_model(self, model_id: ModelId) -> bool:
         return await self._rpc("set_selected_model", {"model_id": model_id}) is True
@@ -428,7 +634,83 @@ class SupabaseRepository:
             created_at=_text(row, "created_at"),
             updated_at=_text(row, "updated_at"),
             message_count=message_count,
+            model_id=_nullable_text(row, "model_id"),
         )
+
+    async def get_message(self, session_id: str, message_id: str) -> Message | None:
+        rows = await self._messages(
+            {"chat_id": f"eq.{session_id}", "id": f"eq.{message_id}", "limit": "1"}
+        )
+        if rows and (rows[0].session_id != session_id or rows[0].id != message_id):
+            raise RuntimeError("Supabase returned another message")
+        return rows[0] if rows else None
+
+    @staticmethod
+    def _page_payload(before: PageCursor | None, limit: int) -> dict[str, object]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("invalid page limit")
+        return {
+            "p_limit": limit,
+            "p_before_time": before.created_at if before else None,
+            "p_before_id": before.id if before else None,
+        }
+
+    @staticmethod
+    def _history_cursor(row: dict[str, object]) -> str | None:
+        cursor = row.get("next_before")
+        if cursor is None:
+            return None
+        raw = _object(cursor)
+        encoded = PageCursor(
+            _text(raw, "created_at"), _text(raw, "kind"), _text(raw, "id")
+        ).encode()
+        # Reject malformed cursor metadata rather than returning a poisoned page.
+        PageCursor.decode(encoded, session_list=raw["kind"] == "session")
+        return encoded
+
+    async def read_session_page(self, before: PageCursor | None, *, limit: int = 40) -> SessionPage:
+        row = _object(
+            await self._request(
+                "POST", "rpc/read_chat_summaries_page", payload=self._page_payload(before, limit)
+            )
+        )
+        items = tuple(self._session(item) for item in _array(row.get("items")))
+        if len(items) > limit:
+            raise RuntimeError("Supabase returned an oversized session page")
+        return SessionPage(items, self._history_cursor(row))
+
+    async def read_history_page(
+        self, session_id: str, before: PageCursor | None, *, limit: int = 40
+    ) -> HistoryPage:
+        payload = {
+            **self._page_payload(before, limit),
+            "p_chat_id": session_id,
+            "p_before_kind": before.kind if before else None,
+        }
+        row = _object(await self._request("POST", "rpc/read_chat_history", payload=payload))
+        messages = tuple(self._message(item) for item in _array(row.get("messages")))
+        outputs = tuple(
+            self._assistant_output(item) for item in _array(row.get("assistant_outputs"))
+        )
+        order = []
+        for item in _array(row.get("timeline_order")):
+            kind = _text(item, "kind")
+            if kind not in {"message", "assistant_output"}:
+                raise RuntimeError("Supabase returned an invalid timeline kind")
+            order.append(TimelineRow(kind, _text(item, "id")))
+        expected = {("message", item.id) for item in messages} | {
+            ("assistant_output", item.id) for item in outputs if item.promoted_message_id is None
+        }
+        if (
+            len(order) > limit
+            or len(messages) > limit
+            or len(outputs) > limit
+            or len(order) != len(expected)
+            or {(item.kind, item.id) for item in order} != expected
+            or any(item.session_id != session_id for item in (*messages, *outputs))
+        ):
+            raise RuntimeError("Supabase returned an invalid history page")
+        return HistoryPage(messages, outputs, tuple(order), self._history_cursor(row))
 
     async def list_sessions(self) -> list[Session]:
         sessions: list[Session] = []
@@ -481,6 +763,15 @@ class SupabaseRepository:
             )
         )
         return self._session(rows[0]) if rows else None
+
+    async def set_session_model(self, session_id: str, model_id: str) -> Session | None:
+        result = await self._rpc(
+            "set_session_model", {"session_id": session_id, "model_id": model_id}
+        )
+        if result is None:
+            return None
+        self._owned(_object(result))
+        return await self.get_session(session_id)
 
     def _message(self, row: dict[str, object]) -> Message:
         self._owned(row)
@@ -672,14 +963,21 @@ class SupabaseRepository:
         return rows[0] if rows else None
 
     async def list_runs_for_session(
-        self, session_id: str, offset: int, limit: int
+        self,
+        session_id: str,
+        offset: int,
+        limit: int,
+        *,
+        turn_id: str | None = None,
+        newest_first: bool = False,
     ) -> list[RunSnapshot]:
         if offset < 0 or not 1 <= limit <= 101:
             raise ValueError("run offset and limit are outside the supported range")
         return await self._runs(
             {
                 "chat_id": f"eq.{session_id}",
-                "order": "created_at.asc,id.asc",
+                "order": "created_at.desc,id.desc" if newest_first else "created_at.asc,id.asc",
+                **({"turn_id": f"eq.{turn_id}"} if turn_id is not None else {}),
                 "offset": str(offset),
                 "limit": str(limit),
             }
@@ -968,7 +1266,7 @@ class SupabaseRepository:
         result = _object(
             await self._rpc(
                 "complete_run",
-                {"run_id": run_id, "content": content.strip()},
+                {"run_id": run_id, "content": content},
                 capability=self._run_capability(run_id),
             )
         )
@@ -1017,6 +1315,7 @@ class SupabaseRepository:
         cached_tokens: int | None = None,
         cache_creation_tokens: int | None = None,
         estimated_cost: float | None = None,
+        clear_estimated_cost: bool = False,
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> ModelCallRecord:
@@ -1037,6 +1336,7 @@ class SupabaseRepository:
                 "cached_read_tokens": cached_tokens,
                 "cache_creation_tokens": cache_creation_tokens,
                 "estimated_cost": estimated_cost,
+                "clear_estimated_cost": clear_estimated_cost,
                 "error_code": error_code,
                 "error_message": error_message,
             },
@@ -1176,6 +1476,71 @@ class SupabaseRepository:
             )
         )
         return self._run(_object(result.get("run"))), self._event(_object(result.get("event")))
+
+    def _assistant_output(self, row: dict[str, object]) -> AssistantOutput:
+        self._owned(row)
+        status = _text(row, "status")
+        if status not in {"streaming", "complete", "partial"}:
+            raise RuntimeError("Supabase returned an invalid assistant output status")
+        return AssistantOutput(
+            id=_text(row, "id"),
+            session_id=_text(row, "chat_id"),
+            turn_id=_text(row, "turn_id"),
+            run_id=_text(row, "run_id"),
+            model_call_id=_text(row, "model_call_id"),
+            step_index=_integer(row, "step_index"),
+            content=_text(row, "content"),
+            status=status,
+            next_batch_index=_integer(row, "next_batch_index"),
+            stop_reason=_nullable_text(row, "stop_reason"),
+            promoted_message_id=_nullable_text(row, "promoted_message_id"),
+            created_at=_text(row, "created_at"),
+        )
+
+    async def append_assistant_batch(
+        self, run_id: str, model_call_id: str, batch_index: int, text: str
+    ) -> tuple[AssistantOutput, RunEvent]:
+        validate_assistant_batch(batch_index, text)
+        result = _object(
+            await self._rpc(
+                "append_assistant_batch",
+                {
+                    "run_id": run_id,
+                    "model_call_id": model_call_id,
+                    "batch_index": batch_index,
+                    "text": text,
+                },
+                capability=self._run_capability(run_id),
+            )
+        )
+        return self._assistant_output(_object(result.get("output"))), self._event(
+            _object(result.get("event"))
+        )
+
+    async def finish_assistant_output(
+        self, run_id: str, model_call_id: str, *, stop_reason: str = "tool_continuation"
+    ) -> AssistantOutput | None:
+        result = await self._rpc(
+            "finish_assistant_output",
+            {"run_id": run_id, "model_call_id": model_call_id, "stop_reason": stop_reason},
+            capability=self._run_capability(run_id),
+        )
+        return None if result is None else self._assistant_output(_object(result))
+
+    async def list_assistant_outputs(self, session_id: str) -> list[AssistantOutput]:
+        rows = await self._read(
+            "run_assistant_outputs",
+            select="id,user_id,chat_id,turn_id,run_id,model_call_id,step_index,content,status,next_batch_index,stop_reason,promoted_message_id,created_at",
+            filters={
+                "user_id": f"eq.{self._user_id}",
+                "chat_id": f"eq.{session_id}",
+                "order": "created_at.asc,id.asc",
+            },
+        )
+        outputs = [self._assistant_output(row) for row in rows]
+        if any(item.session_id != session_id for item in outputs):
+            raise RuntimeError("Supabase returned assistant output from another chat")
+        return outputs
 
     async def request_run_cancellation(self, run_id: str) -> tuple[RunSnapshot, RunEvent | None]:
         result = _object(

@@ -1,7 +1,8 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from app.domain.capabilities import RuntimeCapability
+from app.domain.outputs import AssistantOutput
 
 # Provider and model identifiers are owned by Trellis' catalog and are deliberately
 # open-ended so adding a provider does not require changing the domain types.
@@ -35,10 +36,15 @@ class Session:
     updated_at: str
     message_count: int
     workspace_path: str | None = None
+    model_id: ModelId | None = None
 
 
 class SessionWorkspaceBusy(Exception):
     """A session's workspace cannot change while a run can still use it."""
+
+
+class SessionModelBusy(Exception):
+    """The selected model is locked while a chat has an active run."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +88,16 @@ class ModelDescriptor:
     supports_streaming: bool
     supports_tools: bool
     enabled: bool
+    context_window_tokens: int | None = None
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None = None
+    supports_native_compaction: bool | None = None
+    metadata_status: Literal["ready", "pending"] | None = None
+    pending_reasons: tuple[str, ...] = ()
+    verification_sources: tuple[str, ...] = ()
+    metadata_verified_at: str | None = None
+    availability: Literal["available", "unavailable", "unknown"] = "unknown"
+    availability_checked_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +114,19 @@ class ModelStatus:
     configured: bool
     key_hint: str | None
 
+    enabled: bool = True
+    selectable: bool = False
+    context_window_tokens: int | None = None
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None = None
+    supports_native_compaction: bool | None = None
+    metadata_status: Literal["ready", "pending"] = "pending"
+    pending_reasons: tuple[str, ...] = ()
+    verification_sources: tuple[str, ...] = ()
+    metadata_verified_at: str | None = None
+    availability: Literal["available", "unavailable", "unknown"] = "unknown"
+    availability_checked_at: str | None = None
+
 
 @dataclass(frozen=True, slots=True)
 class AppSettings:
@@ -113,3 +142,4 @@ class AppSettings:
 class SessionDetail:
     session: Session
     messages: list[Message]
+    assistant_outputs: list[AssistantOutput] = field(default_factory=list)
