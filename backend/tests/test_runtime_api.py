@@ -768,7 +768,7 @@ def test_jsonrpc_reports_parse_empty_batch_and_valid_batch_responses(tmp_path: P
     assert [response["error"]["code"] for response in batch_responses] == [-32601, -32601]
 
 
-def test_custom_model_uses_registered_adapter_without_provider_specific_runtime_code(
+def test_custom_model_without_verified_context_limits_stops_before_dispatch(
     tmp_path: Path,
 ) -> None:
     settings = Settings(environment="test", data_dir=tmp_path)
@@ -810,25 +810,27 @@ def test_custom_model_uses_registered_adapter_without_provider_specific_runtime_
                     },
                 }
             )
-            receive_until(
+            events = receive_until(
                 websocket,
                 lambda item: (
                     item.get("method") == "run.event"
-                    and item["params"]["eventType"] == RunEventType.COMPLETED.value
+                    and item["params"]["eventType"] == RunEventType.FAILED.value
                 ),
             )
         messages = client.get(f"/api/sessions/{session_id}").json()["messages"]
 
-    assert provider.request is not None
-    assert provider.request.provider_id == "self-hosted"
-    assert provider.request.model_id == "weights:v4"
-    assert provider.request.adapter_kind == "openai-compatible"
-    assert provider.request.upstream_model_id == "weights/model-v4"
-    assert messages[-1]["provider"] == "self-hosted"
-    assert messages[-1]["model"] == "weights:v4"
+    assert provider.request is None
+    assert [message["content"] for message in messages] == ["Use my local model"]
+    terminal = next(
+        item["params"]["data"]
+        for item in events
+        if item.get("method") == "run.event"
+        and item["params"]["eventType"] == RunEventType.FAILED.value
+    )
+    assert terminal["code"] == "model_not_available"
 
 
-def test_unpriced_custom_model_stops_before_a_tool_continuation(tmp_path: Path) -> None:
+def test_unpriced_custom_model_stops_before_generation_or_tool_execution(tmp_path: Path) -> None:
     class ToolingProvider(StreamingProvider):
         def stream(
             self, request: ModelRequest, api_key: str, user_id: str
@@ -899,17 +901,14 @@ def test_unpriced_custom_model_stops_before_a_tool_continuation(tmp_path: Path) 
         calls = asyncio.run(database.list_model_calls(run_id))
         tools = asyncio.run(database.list_tool_calls(run_id))
 
-    assert run is not None and run.error_code == "pricing_unavailable"
-    assert len(calls) == 1 and calls[0].estimated_cost is None
+    assert run is not None and run.error_code == "model_not_available"
+    assert calls == []
     assert tools == []
-    assert (
-        next(
-            item["params"]["data"]["estimated_cost_usd"]
-            for item in events
-            if item.get("method") == "run.event"
-            and item["params"]["eventType"] == RunEventType.MODEL_USAGE.value
-        )
-        is None
+    assert provider.request is None
+    assert not any(
+        item.get("method") == "run.event"
+        and item["params"]["eventType"] == RunEventType.MODEL_USAGE.value
+        for item in events
     )
 
 

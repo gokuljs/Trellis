@@ -19,7 +19,9 @@ from app.application.budgets import (
     estimate_model_cost,
 )
 from app.application.context import build_model_context
+from app.application.context_budget import preflight_context
 from app.application.errors import ApplicationError, ProviderError
+from app.application.model_catalog import profile_for_model
 from app.application.ports import (
     ProfileRepository,
     RunEventPublisher,
@@ -39,6 +41,7 @@ from app.application.tools import (
     ToolRegistry,
 )
 from app.domain.capabilities import DEFAULT_RUNTIME_CAPABILITIES, RuntimeCapabilities
+from app.domain.context import ContextItem
 from app.domain.models import ModelDescriptor
 from app.domain.runtime import (
     ModelCallRecord,
@@ -715,8 +718,53 @@ class RunService:
                     system_instructions=context.system_instructions,
                     tools=context.tools,
                 )
+                model_profile = profile_for_model(run.model_id)
+                if model_profile is None:
+                    raise ApplicationError(
+                        "model_not_available", "The selected model metadata is unavailable."
+                    )
+                visible_sources = sorted(visible_messages, key=lambda item: (item.ordinal, item.id))
+                if not any(source.id == run.input_message_id for source in visible_sources):
+                    raise ApplicationError(
+                        "context_current_request_missing",
+                        "The current request is missing from the saved context. Try again.",
+                    )
+                exchange_sources = sorted(run_messages, key=lambda item: (item.ordinal, item.id))
+                items = tuple(
+                    ContextItem(
+                        source.id,
+                        source.turn_id,
+                        message,
+                        required=source.id == run.input_message_id,
+                    )
+                    for source, message in zip(
+                        visible_sources, context.messages[: len(visible_sources)], strict=True
+                    )
+                ) + tuple(
+                    ContextItem(source.id, run.turn_id, message, source_kind="run_message")
+                    for source, message in zip(
+                        exchange_sources, context.messages[len(visible_sources) :], strict=True
+                    )
+                )
+                plan = preflight_context(
+                    request,
+                    items=items,
+                    profile=model_profile,
+                    remaining_run_tokens=run.max_total_tokens - prior_tokens,
+                    remaining_run_cost_usd=(
+                        run.max_cost_usd - prior_cost if prior_cost is not None else None
+                    ),
+                )
+                if plan.needs_compaction:
+                    raise ApplicationError(
+                        "context_compaction_required", "This conversation requires compaction."
+                    )
+                request = plan.request
                 call = await self._runs.create_model_call(
-                    run.id, step_index, model, self._request_snapshot(request)
+                    run.id,
+                    step_index,
+                    model,
+                    {**self._request_snapshot(request), "context": plan.snapshot()},
                 )
                 call = await self._runs.update_model_call(call.id, ModelCallStatus.STREAMING)
                 await self._append_and_publish(

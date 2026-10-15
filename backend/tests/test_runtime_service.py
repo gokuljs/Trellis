@@ -539,7 +539,7 @@ def test_budget_blocks_tool_execution_after_exhausted_or_missing_usage(
     assert tool_calls == []
 
 
-def test_estimated_cost_limit_stops_before_publishing_a_final_answer(tmp_path: Path) -> None:
+def test_input_cost_floor_stops_before_dispatching_a_model_call(tmp_path: Path) -> None:
     class TinyCostDatabase(Database):
         async def create_run(
             self,
@@ -592,8 +592,8 @@ def test_estimated_cost_limit_stops_before_publishing_a_final_answer(tmp_path: P
         return result
 
     run, calls, visible = asyncio.run(run())
-    assert run is not None and run.error_code == "cost_limit"
-    assert calls[0].estimated_cost == pytest.approx(0.000046)
+    assert run is not None and run.error_code == "budget_cost_limit"
+    assert calls == []
     assert [message.content for message in visible] == ["Answer"]
 
 
