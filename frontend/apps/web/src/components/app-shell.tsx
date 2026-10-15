@@ -1,6 +1,11 @@
 import { Menu } from "lucide-react"
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query"
 
 import { ChatThread } from "@/components/chat-thread"
 import { Composer } from "@/components/composer"
@@ -15,20 +20,17 @@ import { WelcomePanel } from "@/components/welcome-panel"
 import { WorkspaceTopbar } from "@/components/workspace-topbar"
 import { ApiError, api } from "@/lib/api"
 import {
-  mergeSavedAssistantOutputs,
   newAssistantOutputState,
   reduceAssistantOutputEvent,
 } from "@/lib/assistant-outputs"
 import {
   RuntimeError,
   cancelRun,
-  mergeRunEvents,
   resumeRun,
   respondToToolApproval,
   streamRun,
   type RuntimeRunEvent,
   type RuntimeRunInfo,
-  type RunAttemptActivity,
   type ToolApprovalDecision,
   type TurnRunActivity,
 } from "@/lib/runtime-client"
@@ -39,7 +41,8 @@ import type {
   Profile,
   Session,
   RunSummary,
-  SavedRunEvent,
+  SessionHistoryPage,
+  TimelineRow,
   Settings,
   WorkspaceView,
 } from "@/lib/app-types"
@@ -57,6 +60,11 @@ import {
   type ModelSelectionOwner,
 } from "@/lib/model-choice"
 import {
+  cacheSession,
+  resetHistoryToLatest,
+  sessionHistoryQueryOptions,
+  sessionPagesQueryOptions,
+  runSummariesQueryOptions,
   serverKeys,
   sessionModelMutationOptions,
   settingsQueryOptions,
@@ -66,6 +74,16 @@ import {
   newRunContextState,
   reduceRunContext,
 } from "@/lib/context-gauge"
+import {
+  flattenHistoryPages,
+  hydrateOutputWindow,
+  retryInputForRun,
+} from "@/lib/history-window"
+import {
+  activitiesFromSummaries,
+  startNextAttempt,
+  retainWindowActivities,
+} from "@/lib/activity-history"
 import { useContextPreview } from "@/lib/use-context-preview"
 import "./workspace-bootstrap.css"
 
@@ -89,12 +107,6 @@ function visibleError(error: unknown) {
     : "Trellis could not reach the service."
 }
 
-function upsertSession(sessions: Session[], next: Session) {
-  const index = sessions.findIndex((session) => session.id === next.id)
-  if (index === -1) return [...sessions, next]
-  return sessions.map((session) => (session.id === next.id ? next : session))
-}
-
 function retryFromTranscript(
   sessionId: string,
   messages: Message[]
@@ -115,108 +127,6 @@ const activeRunStatuses = new Set([
   "cancelling",
 ])
 const maxRestoredReconnectAttempts = 4
-
-function runInfoFromSummary(summary: RunSummary): RuntimeRunInfo {
-  return {
-    runId: summary.run_id,
-    modelId: summary.model_id,
-    budgetPreset: summary.budget_preset,
-    limits: {
-      maxModelCalls: summary.max_model_calls,
-      maxToolCalls: summary.max_tool_calls,
-      maxTotalTokens: summary.max_total_tokens,
-      maxCostUsd: summary.max_cost_usd,
-      deadlineAt: summary.deadline_at,
-    },
-  }
-}
-
-function activitiesFromSummaries(
-  summaries: RunSummary[]
-): Record<string, TurnRunActivity> {
-  const byTurn = new Map<string, RunSummary[]>()
-  for (const summary of summaries) {
-    const attempts = byTurn.get(summary.turn_id) ?? []
-    attempts.push(summary)
-    byTurn.set(summary.turn_id, attempts)
-  }
-  return Object.fromEntries(
-    [...byTurn].map(([turnId, attempts]) => {
-      const latest = attempts.at(-1)!
-      return [
-        turnId,
-        {
-          events: [],
-          runInfo: runInfoFromSummary(latest),
-          summary: latest,
-          priorAttempts: attempts
-            .slice(0, -1)
-            .map((summary): RunAttemptActivity => ({
-              runId: summary.run_id,
-              summary,
-              runInfo: runInfoFromSummary(summary),
-              events: null,
-            })),
-        },
-      ]
-    })
-  )
-}
-
-async function loadSessionRunSummaries(
-  sessionId: string
-): Promise<RunSummary[]> {
-  const runs: RunSummary[] = []
-  let offset = 0
-  while (true) {
-    const page = await api.listRunSummaries(sessionId, offset)
-    runs.push(...page.items)
-    if (page.next_offset === null) return runs
-    if (page.next_offset <= offset) throw new Error("Invalid run history page")
-    offset = page.next_offset
-  }
-}
-
-function savedRunEvent(event: SavedRunEvent): RuntimeRunEvent {
-  return {
-    runId: event.run_id,
-    sequence: event.sequence,
-    eventType: event.event_type,
-    eventVersion: event.event_version,
-    data: event.data,
-    createdAt: event.created_at,
-  }
-}
-
-async function loadRunEventHistory(
-  sessionId: string,
-  runId: string
-): Promise<RuntimeRunEvent[]> {
-  const events: RuntimeRunEvent[] = []
-  let afterSequence = 0
-  while (true) {
-    const page = await api.listRunEvents(sessionId, runId, afterSequence)
-    events.push(...page.items.map(savedRunEvent))
-    if (page.next_after_sequence === null) return events
-    if (page.next_after_sequence <= afterSequence)
-      throw new Error("Invalid run event page")
-    afterSequence = page.next_after_sequence
-  }
-}
-
-function startNextAttempt(previous?: TurnRunActivity): TurnRunActivity {
-  const priorAttempts = [...(previous?.priorAttempts ?? [])]
-  const runId = previous?.runInfo?.runId ?? previous?.summary?.run_id
-  if (runId && !priorAttempts.some((attempt) => attempt.runId === runId)) {
-    priorAttempts.push({
-      runId,
-      summary: previous?.summary ?? null,
-      runInfo: previous?.runInfo ?? null,
-      events: previous?.events.length ? previous.events : null,
-    })
-  }
-  return { events: [], runInfo: null, priorAttempts }
-}
 
 export function AppShell({
   accountControl,
@@ -251,9 +161,25 @@ export function AppShell({
   const { mutateAsync: selectSessionModel } = useMutation(
     sessionModelMutationOptions(queryClient)
   )
-  const [sessions, setSessions] = useState<Session[]>([])
   const [activeSession, setActiveSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
+  const [timelineOrder, setTimelineOrder] = useState<TimelineRow[]>([])
+  const [historyError, setHistoryError] = useState<string | null>(null)
+  const sessionPages = useInfiniteQuery({
+    ...sessionPagesQueryOptions(),
+    enabled: bootstrap.status === "ready",
+  })
+  const sessions = [
+    ...new Map(
+      sessionPages.data?.pages
+        .flatMap((page) => page.items)
+        .map((session) => [session.id, session]) ?? []
+    ).values(),
+  ]
+  const history = useInfiniteQuery({
+    ...sessionHistoryQueryOptions(activeSession?.id ?? ""),
+    enabled: false,
+  })
   const [assistantOutputState, setAssistantOutputState] = useState(
     newAssistantOutputState
   )
@@ -289,8 +215,46 @@ export function AppShell({
   const runGenerationRef = useRef(0)
   const cancelRequestRef = useRef(false)
   const approvalRequestRef = useRef<string | null>(null)
-  const fetchingRunIdsRef = useRef(new Set<string>())
   const bootstrapControllerRef = useRef<AbortController | null>(null)
+
+  const applyHistory = useCallback(
+    (detail: SessionHistoryPage, keepTurnId?: string) => {
+      cacheSession(queryClient, detail.session)
+      setActiveSession(detail.session)
+      setMessages(detail.messages)
+      setTimelineOrder(detail.timeline_order)
+      setHistoryError(null)
+      setAssistantOutputState((current) =>
+        hydrateOutputWindow(
+          current,
+          detail.assistant_outputs ?? [],
+          activeRunRef.current?.runId
+        )
+      )
+      const turns = new Set(
+        [...detail.messages, ...(detail.assistant_outputs ?? [])].map(
+          (row) => row.turn_id
+        )
+      )
+      setRunActivities((current) =>
+        retainWindowActivities(
+          current,
+          turns,
+          activeRunRef.current?.runId,
+          keepTurnId
+        )
+      )
+    },
+    [queryClient]
+  )
+
+  const loadLatestHistory = useCallback(
+    async (sessionId: string) =>
+      flattenHistoryPages(
+        (await resetHistoryToLatest(queryClient, sessionId)).pages
+      ),
+    [queryClient]
+  )
 
   const recordRunInfo = useCallback(
     (turnId: string, runInfo: RuntimeRunInfo) =>
@@ -361,108 +325,6 @@ export function AppShell({
     []
   )
 
-  const loadTurnEvents = (turnId: string) => {
-    const sessionId = activeSessionIdRef.current
-    const activity = runActivities[turnId]
-    if (!sessionId || !activity) return
-    const needed = [
-      ...(activity.priorAttempts ?? [])
-        .filter((attempt) => attempt.events === null)
-        .map((attempt) => attempt.runId),
-      ...(activity.summary && activity.events.length === 0
-        ? [activity.summary.run_id]
-        : []),
-    ]
-    void (async () => {
-      for (const runId of needed) {
-        if (fetchingRunIdsRef.current.has(runId)) continue
-        fetchingRunIdsRef.current.add(runId)
-        setRunActivities((current) => {
-          const turn = current[turnId]
-          if (!turn) return current
-          return {
-            ...current,
-            [turnId]: {
-              ...turn,
-              eventsLoading:
-                turn.summary?.run_id === runId || turn.eventsLoading,
-              eventsError:
-                turn.summary?.run_id === runId ? null : turn.eventsError,
-              priorAttempts: turn.priorAttempts?.map((attempt) =>
-                attempt.runId === runId
-                  ? { ...attempt, loading: true, error: null }
-                  : attempt
-              ),
-            },
-          }
-        })
-        try {
-          const events = await loadRunEventHistory(sessionId, runId)
-          if (activeSessionIdRef.current !== sessionId) return
-          setRunActivities((current) => {
-            const turn = current[turnId]
-            if (!turn) return current
-            const merged = mergeRunEvents(runId, events, turn.events)
-            const mostRecent = merged.at(-1)
-            const latestEvent =
-              turn.latestEvent?.runId === runId &&
-              turn.latestEvent.sequence > (mostRecent?.sequence ?? 0)
-                ? turn.latestEvent
-                : mostRecent
-            return {
-              ...current,
-              [turnId]: {
-                ...turn,
-                ...(turn.summary?.run_id === runId
-                  ? {
-                      events: merged,
-                      latestEvent,
-                      eventsLoading: false,
-                      eventsError: null,
-                    }
-                  : {}),
-                priorAttempts: turn.priorAttempts?.map((attempt) =>
-                  attempt.runId === runId
-                    ? { ...attempt, events, loading: false, error: null }
-                    : attempt
-                ),
-              },
-            }
-          })
-        } catch {
-          if (activeSessionIdRef.current !== sessionId) return
-          setRunActivities((current) => {
-            const turn = current[turnId]
-            if (!turn) return current
-            return {
-              ...current,
-              [turnId]: {
-                ...turn,
-                eventsLoading:
-                  turn.summary?.run_id === runId ? false : turn.eventsLoading,
-                eventsError:
-                  turn.summary?.run_id === runId
-                    ? "Could not load activity."
-                    : turn.eventsError,
-                priorAttempts: turn.priorAttempts?.map((attempt) =>
-                  attempt.runId === runId
-                    ? {
-                        ...attempt,
-                        loading: false,
-                        error: "Could not load this attempt.",
-                      }
-                    : attempt
-                ),
-              },
-            }
-          })
-        } finally {
-          fetchingRunIdsRef.current.delete(runId)
-        }
-      }
-    })()
-  }
-
   const restoreSessionRun = useCallback(
     async (
       sessionId: string,
@@ -493,8 +355,7 @@ export function AppShell({
         setError(message)
         setReconnectAvailable(true)
       }
-      let restoredTranscript = transcript
-      let turn = retryFromTranscript(sessionId, restoredTranscript)
+      let turn = retryFromTranscript(sessionId, transcript)
       let latest: LatestRun | null
       try {
         latest = await api.getLatestRun(sessionId)
@@ -506,37 +367,11 @@ export function AppShell({
         return
       }
       if (isStale()) return
-      if (
-        latest &&
-        !restoredTranscript.some(
-          (message) => message.turn_id === latest.turn_id
-        )
-      ) {
-        try {
-          const detail = await api.getSession(sessionId)
-          if (isStale()) return
-          restoredTranscript = detail.messages
-          turn = retryFromTranscript(sessionId, restoredTranscript)
-          setSessions((current) => upsertSession(current, detail.session))
-          setActiveSession(detail.session)
-          setMessages(detail.messages)
-          setAssistantOutputState((current) =>
-            mergeSavedAssistantOutputs(current, detail.assistant_outputs ?? [])
-          )
-        } catch {
-          if (isStale()) return
+      if (latest && (!turn || turn.turnId === latest.turn_id)) {
+        turn = retryInputForRun(sessionId, transcript, latest)
+        if (!turn && activeRunStatuses.has(latest.status)) {
           waitForDiscovery(
-            "Trellis could not load the active run's messages. Reconnect when the service returns."
-          )
-          return
-        }
-        if (
-          !restoredTranscript.some(
-            (message) => message.turn_id === latest.turn_id
-          )
-        ) {
-          waitForDiscovery(
-            "Trellis could not load the active run's messages. Reconnect to try again."
+            "Trellis could not load the active run's input. Reconnect to try again."
           )
           return
         }
@@ -675,14 +510,9 @@ export function AppShell({
             }
           }
           if (isStale()) return
-          const detail = await api.getSession(sessionId)
+          const detail = await loadLatestHistory(sessionId)
           if (isStale()) return
-          setSessions((current) => upsertSession(current, detail.session))
-          setActiveSession(detail.session)
-          setMessages(detail.messages)
-          setAssistantOutputState((current) =>
-            mergeSavedAssistantOutputs(current, detail.assistant_outputs ?? [])
-          )
+          applyHistory(detail)
           setFailedTurn(null)
           setError(null)
           setReconnectAvailable(false)
@@ -697,21 +527,10 @@ export function AppShell({
               activeRunStatuses.has(currentRun.status)
             setReconnectAvailable(keepActive)
             if (!keepActive && turn) setFailedTurn(turn)
-            const detail = await api.getSession(sessionId)
+            const detail = await loadLatestHistory(sessionId)
             if (isStale()) return
-            setSessions((current) => upsertSession(current, detail.session))
-            setActiveSession(detail.session)
-            setMessages(detail.messages)
-            setAssistantOutputState((current) =>
-              mergeSavedAssistantOutputs(
-                current,
-                detail.assistant_outputs ?? []
-              )
-            )
-            if (
-              !keepActive &&
-              !retryFromTranscript(sessionId, detail.messages)
-            ) {
+            applyHistory(detail)
+            if (!keepActive && currentRun?.status === "completed") {
               setFailedTurn(null)
               setError(null)
             }
@@ -733,7 +552,7 @@ export function AppShell({
         }
       })()
     },
-    [recordRunEvent, recordRunInfo]
+    [applyHistory, loadLatestHistory, recordRunEvent, recordRunInfo]
   )
 
   const restoreWorkspace = useCallback(async () => {
@@ -773,9 +592,15 @@ export function AppShell({
         setBootstrap({ status: "onboarding", progress: restoredOnboarding })
         return
       }
-      const restoredSessions = await api.listSessions(options)
+      await queryClient.fetchInfiniteQuery({
+        ...sessionPagesQueryOptions(),
+        staleTime: 0,
+        queryFn: ({ pageParam, signal }) =>
+          api.listSessionPages(pageParam, {
+            signal: AbortSignal.any([signal, controller.signal]),
+          }),
+      })
       if (!current()) return
-      setSessions(restoredSessions)
       setBootstrap({ status: "ready", progress: restoredOnboarding })
     } catch (restoreError) {
       if (current()) {
@@ -852,13 +677,14 @@ export function AppShell({
     setComposerValue("")
     setActiveSession(null)
     setMessages([])
+    setTimelineOrder([])
+    setHistoryError(null)
     setAssistantOutputState(newAssistantOutputState())
     setRunContextState(newRunContextState())
     setPending(false)
     setStreamingText(null)
     setActiveRunId(null)
     setRunActivities({})
-    fetchingRunIdsRef.current.clear()
     setActiveRunTurnId(null)
     setApprovalPendingToolId(null)
     setApprovalError(null)
@@ -901,12 +727,13 @@ export function AppShell({
       sessions.find((session) => session.id === sessionId) ?? null
     )
     setMessages([])
+    setTimelineOrder([])
+    setHistoryError(null)
     setAssistantOutputState(newAssistantOutputState())
     setRunContextState(newRunContextState())
     setStreamingText(null)
     setActiveRunId(null)
     setRunActivities({})
-    fetchingRunIdsRef.current.clear()
     setActiveRunTurnId(null)
     setApprovalPendingToolId(null)
     setApprovalError(null)
@@ -921,14 +748,20 @@ export function AppShell({
     setFailedTurn(null)
     try {
       const [detail, history] = await Promise.all([
-        api.getSession(sessionId),
-        loadSessionRunSummaries(sessionId).then(
-          (summaries) => ({ summaries, error: null }),
-          () => ({
-            summaries: [] as RunSummary[],
-            error: "Saved activity could not be loaded.",
+        loadLatestHistory(sessionId),
+        queryClient
+          .fetchInfiniteQuery({
+            ...runSummariesQueryOptions(sessionId),
+            staleTime: 0,
           })
-        ),
+          .then((data) => data.pages.flatMap((page) => page.items))
+          .then(
+            (summaries) => ({ summaries, error: null }),
+            () => ({
+              summaries: [] as RunSummary[],
+              error: "Saved activity could not be loaded.",
+            })
+          ),
       ])
       if (
         sessionLoadSequenceRef.current !== loadSequence ||
@@ -937,10 +770,7 @@ export function AppShell({
         return
       }
       setActiveSession(detail.session)
-      setMessages(detail.messages)
-      setAssistantOutputState((current) =>
-        mergeSavedAssistantOutputs(current, detail.assistant_outputs ?? [])
-      )
+      applyHistory(detail)
       setRunActivities(activitiesFromSummaries(history.summaries))
       setActivityHistoryError(history.error)
       await restoreSessionRun(
@@ -958,6 +788,60 @@ export function AppShell({
       if (sessionLoadSequenceRef.current === loadSequence) {
         setSessionLoading(false)
       }
+    }
+  }
+
+  const loadOlderHistory = async () => {
+    if (pending || history.isFetching || !activeSession) return
+    const owner = {
+      sessionId: activeSession.id,
+      generation: runGenerationRef.current,
+    }
+    try {
+      const result = await history.fetchNextPage()
+      if (
+        !ownsRun(owner, {
+          sessionId: activeSessionIdRef.current,
+          generation: runGenerationRef.current,
+        })
+      )
+        return
+      if (result.error) throw result.error
+      if (result.data) applyHistory(flattenHistoryPages(result.data.pages))
+    } catch (pageError) {
+      if (
+        ownsRun(owner, {
+          sessionId: activeSessionIdRef.current,
+          generation: runGenerationRef.current,
+        })
+      )
+        setHistoryError(visibleError(pageError))
+    }
+  }
+
+  const jumpToLatest = async () => {
+    if (pending || history.isFetching || !activeSession) return
+    const owner = {
+      sessionId: activeSession.id,
+      generation: runGenerationRef.current,
+    }
+    try {
+      const detail = await loadLatestHistory(activeSession.id)
+      if (
+        ownsRun(owner, {
+          sessionId: activeSessionIdRef.current,
+          generation: runGenerationRef.current,
+        })
+      )
+        applyHistory(detail)
+    } catch (pageError) {
+      if (
+        ownsRun(owner, {
+          sessionId: activeSessionIdRef.current,
+          generation: runGenerationRef.current,
+        })
+      )
+        setHistoryError(visibleError(pageError))
     }
   }
 
@@ -1015,6 +899,10 @@ export function AppShell({
       terminal: null,
     }
     try {
+      const newest = await loadLatestHistory(turn.sessionId)
+      if (!isCurrent()) return true
+      applyHistory(newest, turn.turnId)
+      if (optimistic) setMessages(recoveryTranscript(newest.messages, turn))
       await streamRun(
         {
           sessionId: turn.sessionId,
@@ -1053,15 +941,12 @@ export function AppShell({
       lifecycle.terminal = "completed"
       setActiveRunId(null)
       activeRunRef.current = null
-      const detail = await api.getSession(turn.sessionId)
+      const detail = await loadLatestHistory(turn.sessionId)
       if (!isCurrent()) return true
-      setSessions((current) => upsertSession(current, detail.session))
+      cacheSession(queryClient, detail.session)
       if (activeSessionIdRef.current === turn.sessionId) {
         setActiveSession(detail.session)
-        setMessages(detail.messages)
-        setAssistantOutputState((current) =>
-          mergeSavedAssistantOutputs(current, detail.assistant_outputs ?? [])
-        )
+        applyHistory(detail)
         setFailedTurn(null)
         setComposerValue("")
       }
@@ -1088,15 +973,10 @@ export function AppShell({
         setReconnectAvailable(false)
         let transcript = recoveryTranscript(messages, turn)
         try {
-          const detail = await api.getSession(turn.sessionId)
+          const detail = await loadLatestHistory(turn.sessionId)
           if (!isCurrent()) return true
           transcript = detail.messages
-          setSessions((current) => upsertSession(current, detail.session))
-          setActiveSession(detail.session)
-          setMessages(detail.messages)
-          setAssistantOutputState((current) =>
-            mergeSavedAssistantOutputs(current, detail.assistant_outputs ?? [])
-          )
+          applyHistory(detail)
         } catch {
           if (!isCurrent()) return true
           // Discovery still has the accepted turn when its transcript is unavailable.
@@ -1127,15 +1007,12 @@ export function AppShell({
         }
       }
       try {
-        const detail = await api.getSession(turn.sessionId)
+        const detail = await loadLatestHistory(turn.sessionId)
         if (!isCurrent()) return true
-        setSessions((current) => upsertSession(current, detail.session))
+        cacheSession(queryClient, detail.session)
         if (activeSessionIdRef.current === turn.sessionId) {
           setActiveSession(detail.session)
-          setMessages(detail.messages)
-          setAssistantOutputState((current) =>
-            mergeSavedAssistantOutputs(current, detail.assistant_outputs ?? [])
-          )
+          applyHistory(detail)
         }
       } catch {
         if (!isCurrent()) return true
@@ -1243,7 +1120,7 @@ export function AppShell({
     try {
       const updated = await selectSessionModel({ sessionId, modelId })
       if (!isCurrent()) return null
-      setSessions((current) => upsertSession(current, updated))
+      cacheSession(queryClient, updated)
       setActiveSession(updated)
       return updated
     } catch (saveError) {
@@ -1337,7 +1214,7 @@ export function AppShell({
         activeSessionIdRef.current = createdSession.id
         owner = { ...owner, sessionId: createdSession.id }
         setActiveSession(createdSession)
-        setSessions((current) => upsertSession(current, createdSession))
+        cacheSession(queryClient, createdSession)
         setActiveView("session")
         const prepared = await ensureSessionModel(
           createdSession,
@@ -1425,18 +1302,13 @@ export function AppShell({
     setError("Reconnecting to Trellis…")
     let generation = runGenerationRef.current
     const recovery = (async () => {
-      const detail = await api.getSession(sessionId)
+      const detail = await loadLatestHistory(sessionId)
       if (
         activeSessionIdRef.current !== sessionId ||
         runGenerationRef.current !== generation
       )
         return
-      setSessions((current) => upsertSession(current, detail.session))
-      setActiveSession(detail.session)
-      setMessages(detail.messages)
-      setAssistantOutputState((current) =>
-        mergeSavedAssistantOutputs(current, detail.assistant_outputs ?? [])
-      )
+      applyHistory(detail)
       const following = restoreSessionRun(
         sessionId,
         detail.messages,
@@ -1585,6 +1457,23 @@ export function AppShell({
           onSelectSession={(sessionId) => void selectSession(sessionId)}
           sidebarCollapsed={sidebarCollapsed}
           onToggleSidebar={toggleSidebar}
+          hasOlderSessions={Boolean(sessionPages.hasNextPage)}
+          browsingSessions={Boolean(
+            sessionPages.data &&
+            (sessionPages.data.pages.length > 1 ||
+              sessionPages.data.pageParams[0] !== null)
+          )}
+          sessionsLoading={sessionPages.isFetching}
+          sessionsError={
+            sessionPages.error ? "Could not load older chats. Try again." : null
+          }
+          onOlderSessions={() => void sessionPages.fetchNextPage()}
+          onRecentSessions={() =>
+            void queryClient.resetQueries({
+              queryKey: serverKeys.sessionPages,
+              exact: true,
+            })
+          }
         />
       </div>
 
@@ -1614,6 +1503,17 @@ export function AppShell({
               session={activeSession}
               messages={messages}
               assistantOutputs={assistantOutputState.outputs}
+              timelineOrder={timelineOrder}
+              hasOlderHistory={Boolean(history.hasNextPage)}
+              browsingHistory={Boolean(
+                history.data &&
+                (history.data.pages.length > 1 ||
+                  history.data.pageParams[0] !== null)
+              )}
+              historyLoading={history.isFetching}
+              historyError={historyError}
+              onLoadOlderHistory={() => void loadOlderHistory()}
+              onJumpToLatest={() => void jumpToLatest()}
               pending={pending}
               streamingText={streamingText}
               error={error}
@@ -1626,7 +1526,6 @@ export function AppShell({
               canCancel={pending && activeRunId !== null}
               cancellationPending={cancellingRun}
               runActivities={runActivities}
-              onRequestActivityEvents={loadTurnEvents}
               activeRunTurnId={activeRunTurnId}
               approvalPendingToolId={approvalPendingToolId}
               approvalError={approvalError}

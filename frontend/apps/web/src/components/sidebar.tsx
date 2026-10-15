@@ -1,5 +1,6 @@
 import { MoreHorizontal, PanelLeft } from "lucide-react"
 
+import { HistoryPagination } from "@/components/history-pagination"
 import { NAVIGATION_ITEMS } from "@/lib/app-data"
 import type { Session, WorkspaceView } from "@/lib/app-types"
 import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
@@ -12,6 +13,12 @@ type SidebarProps = {
   onSelectSession: (sessionId: string) => void
   sidebarCollapsed: boolean
   onToggleSidebar: () => void
+  hasOlderSessions?: boolean
+  browsingSessions?: boolean
+  sessionsLoading?: boolean
+  sessionsError?: string | null
+  onOlderSessions?: () => void
+  onRecentSessions?: () => void
 }
 
 type PrimaryNavigationProps = Pick<SidebarProps, "activeView" | "onNavigate">
@@ -116,6 +123,12 @@ export function Sidebar({
   onSelectSession,
   sidebarCollapsed,
   onToggleSidebar,
+  hasOlderSessions = false,
+  browsingSessions = false,
+  sessionsLoading = false,
+  sessionsError = null,
+  onOlderSessions = () => undefined,
+  onRecentSessions = () => undefined,
 }: SidebarProps) {
   return (
     <aside className="app-sidebar">
@@ -142,6 +155,17 @@ export function Sidebar({
           sessions={sessions}
           activeSessionId={activeSessionId}
           onSelectSession={onSelectSession}
+        />
+        <HistoryPagination
+          label="Chat list history"
+          olderLabel="Load older chats"
+          latestLabel="Recent chats"
+          hasOlder={hasOlderSessions}
+          browsing={browsingSessions}
+          loading={sessionsLoading}
+          error={sessionsError}
+          onOlder={onOlderSessions}
+          onLatest={onRecentSessions}
         />
       </div>
     </aside>

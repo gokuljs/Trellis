@@ -1,0 +1,33 @@
+.history-pagination {
+  display: grid;
+  gap: 6px;
+  padding-block: 12px;
+  color: var(--shell-text-muted);
+  font-size: 11px;
+}
+.history-pagination-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+}
+.history-pagination button {
+  min-height: 32px;
+  padding: 6px 0;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.history-pagination button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+.history-pagination p {
+  margin: 0;
+}
+.history-pagination button:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 3px;
+}

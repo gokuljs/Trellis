@@ -1,4 +1,4 @@
-import type { AssistantOutput, Message } from "@/lib/app-types"
+import type { AssistantOutput, Message, TimelineRow } from "@/lib/app-types"
 import type { RuntimeRunEvent } from "@/lib/runtime-client"
 
 type LiveText = { content: string; lastBatchIndex: number }
@@ -204,7 +204,8 @@ export type ThreadMessage = Message & {
 export function threadMessages(
   messages: Message[],
   outputs: AssistantOutput[],
-  runOrderByTurn: Record<string, string[]> = {}
+  runOrderByTurn: Record<string, string[]> = {},
+  timelineOrder?: TimelineRow[]
 ): ThreadMessage[] {
   const orderedOutputs = [
     ...new Map(outputs.map((output) => [output.id, output])).values(),
@@ -283,6 +284,20 @@ export function threadMessages(
   }
   for (const [turnId, turn] of byTurn) {
     if (!attachedTurns.has(turnId)) entries.push(...turn.map(outputMessage))
+  }
+  if (timelineOrder) {
+    const ranks = new Map(
+      timelineOrder.map((row, index) => [`${row.kind}:${row.id}`, index])
+    )
+    entries.sort((left, right) => {
+      const key = (entry: ThreadMessage) =>
+        entry.output
+          ? `assistant_output:${entry.output.id}`
+          : `message:${entry.id}`
+      return (
+        (ranks.get(key(left)) ?? Infinity) - (ranks.get(key(right)) ?? Infinity)
+      )
+    })
   }
   return entries
 }

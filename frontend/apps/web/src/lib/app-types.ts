@@ -92,6 +92,21 @@ export type SessionDetail = {
   assistant_outputs?: AssistantOutput[]
 }
 
+export type TimelineRow = {
+  kind: "message" | "assistant_output"
+  id: string
+}
+
+export type SessionHistoryPage = SessionDetail & {
+  timeline_order: TimelineRow[]
+  next_before_cursor: string | null
+}
+
+export type SessionPage = {
+  items: Session[]
+  next_before_cursor: string | null
+}
+
 export type AssistantOutput = {
   id: string
   turn_id: string
@@ -111,6 +126,7 @@ export type LatestRun = {
   turn_id: string
   status: string
   last_sequence: number
+  input_message?: Message | null
 }
 
 export type RunSummary = {

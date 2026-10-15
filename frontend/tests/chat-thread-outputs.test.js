@@ -81,3 +81,51 @@ test("promoted final text is rendered once alongside a provider error", async ()
   expect(markup.match(/Saved final text/g)).toHaveLength(1)
   expect(markup).toContain("Provider unavailable")
 })
+
+test("bounded history exposes older and latest controls and blocks paging during a run", async () => {
+  const markup = await renderThread({
+    hasOlderHistory: true,
+    browsingHistory: true,
+    historyLoading: false,
+    pending: true,
+  })
+  expect(markup).toContain("Load older messages")
+  expect(markup).toContain("Jump to latest")
+  expect(markup).toContain('aria-label="Chat history"')
+  expect(markup).toContain('disabled=""')
+})
+
+test("an older user turn can open saved attempts even when no assistant text was published", async () => {
+  const markup = await renderThread()
+  expect(markup).toContain("View activity")
+  expect(markup).toContain('aria-expanded="false"')
+})
+
+test("a failed history reset keeps an explicit retry action without older page metadata", async () => {
+  const markup = await renderThread({ historyError: "History is unavailable" })
+  expect(markup).toContain("History is unavailable")
+  expect(markup).toContain("Try again")
+})
+
+test("an active retry still shows its phase when the original user row is outside the history window", async () => {
+  const markup = await renderThread({
+    messages: [],
+    pending: true,
+    activeRunTurnId: "old-turn",
+    runActivities: {
+      "old-turn": {
+        runInfo: { runId: "run" },
+        events: [
+          {
+            runId: "run",
+            sequence: 1,
+            eventType: "run.phase",
+            eventVersion: 1,
+            data: { phase: "answering" },
+          },
+        ],
+      },
+    },
+  })
+  expect(markup).toContain("Answering")
+})

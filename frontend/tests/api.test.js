@@ -432,3 +432,44 @@ test("caller cancellation prevents a late token from sending a request", async (
   expect(requests).toBe(0)
   expect(client.state.status).toBe("signed-in")
 })
+
+test("history and chat list use bounded cursor routes and forward cancellation", async () => {
+  const client = fixture()
+  const requests = []
+  client.transport.fetch = async (url, init) => {
+    requests.push({ url: String(url), signal: init.signal })
+    return Response.json({ items: [], next_before_cursor: null })
+  }
+  const controller = new AbortController()
+  await client.api.getSessionHistory("chat/a", "opaque+/=", {
+    signal: controller.signal,
+  })
+  await client.api.listSessionPages("list+/=", { signal: controller.signal })
+  expect(requests[0].url).toEndWith(
+    "/api/sessions/chat%2Fa/history?limit=40&before_cursor=opaque%2B%2F%3D"
+  )
+  expect(requests[1].url).toEndWith(
+    "/api/session-pages?limit=40&before_cursor=list%2B%2F%3D"
+  )
+  expect(
+    requests.every((request) => request.signal instanceof AbortSignal)
+  ).toBe(true)
+})
+
+test("saved attempt queries request newest-first summaries for only the opened turn", async () => {
+  const client = fixture()
+  let sent
+  client.transport.fetch = async (url) => {
+    sent = String(url)
+    return Response.json({ items: [], next_offset: null })
+  }
+  await client.api.listRunSummaries(
+    "chat",
+    100,
+    {},
+    { turnId: "turn/a", newestFirst: true }
+  )
+  expect(sent).toEndWith(
+    "/api/sessions/chat/runs?offset=100&limit=100&newest_first=true&turn_id=turn%2Fa"
+  )
+})

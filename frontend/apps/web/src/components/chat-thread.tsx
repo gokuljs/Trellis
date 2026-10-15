@@ -5,8 +5,14 @@ import remarkGfm from "remark-gfm"
 import { ThinkingOrb } from "thinking-orbs"
 
 import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
+import { HistoryPagination } from "@/components/history-pagination"
 import { RunActivityDisclosure } from "@/components/run-activity-disclosure"
-import type { AssistantOutput, Message, Session } from "@/lib/app-types"
+import type {
+  AssistantOutput,
+  Message,
+  Session,
+  TimelineRow,
+} from "@/lib/app-types"
 import { outputStatusLabel, threadMessages } from "@/lib/assistant-outputs"
 import type {
   ToolApprovalDecision,
@@ -17,6 +23,13 @@ type ChatThreadProps = {
   session: Session
   messages: Message[]
   assistantOutputs?: AssistantOutput[]
+  timelineOrder?: TimelineRow[]
+  hasOlderHistory?: boolean
+  browsingHistory?: boolean
+  historyLoading?: boolean
+  historyError?: string | null
+  onLoadOlderHistory?: () => void
+  onJumpToLatest?: () => void
   pending: boolean
   streamingText: string | null
   error: string | null
@@ -91,6 +104,13 @@ export function ChatThread({
   session,
   messages,
   assistantOutputs = [],
+  timelineOrder,
+  hasOlderHistory = false,
+  browsingHistory = false,
+  historyLoading = false,
+  historyError = null,
+  onLoadOlderHistory = () => undefined,
+  onJumpToLatest = () => undefined,
   pending,
   streamingText,
   error,
@@ -125,7 +145,8 @@ export function ChatThread({
   const displayMessages = threadMessages(
     messages,
     assistantOutputs,
-    runOrderByTurn
+    runOrderByTurn,
+    timelineOrder
   )
   const firstAssistantByTurn = new Map<string, string>()
   for (const message of displayMessages) {
@@ -149,15 +170,14 @@ export function ChatThread({
   )
   const waitingForApproval =
     latestApprovalState?.eventType === "tool.approval_requested"
-  const activityForTurn = (turnId: string, assistantReply = false) => {
-    const activity =
-      runActivities[turnId] ??
-      (assistantReply ? { events: [], runInfo: null } : null)
+  const activityForTurn = (turnId: string) => {
+    const activity = runActivities[turnId] ?? { events: [], runInfo: null }
     const active = activeRunTurnId === turnId
-    if (!activity) return null
     return (
       <RunActivityDisclosure
         key={`activity-${turnId}`}
+        sessionId={session.id}
+        turnId={turnId}
         activity={activity}
         pending={pending && active}
         expanded={openActivityTurnId === turnId}
@@ -182,11 +202,23 @@ export function ChatThread({
         <span>{session.message_count} saved messages</span>
       </header>
 
+      <HistoryPagination
+        label="Chat history"
+        olderLabel="Load older messages"
+        latestLabel="Jump to latest"
+        hasOlder={hasOlderHistory}
+        browsing={browsingHistory}
+        loading={historyLoading}
+        disabled={pending}
+        error={historyError}
+        onOlder={onLoadOlderHistory}
+        onLatest={onJumpToLatest}
+      />
       <div className="thread-messages">
         {displayMessages.flatMap((message) => [
           message.role === "assistant" &&
           firstAssistantByTurn.get(message.turn_id) === message.id
-            ? activityForTurn(message.turn_id, true)
+            ? activityForTurn(message.turn_id)
             : null,
           <article
             key={message.id}
@@ -227,6 +259,12 @@ export function ChatThread({
             ? activityForTurn(message.turn_id)
             : null,
         ])}
+
+        {pending &&
+        activeRunTurnId &&
+        !displayMessages.some((message) => message.turn_id === activeRunTurnId)
+          ? activityForTurn(activeRunTurnId)
+          : null}
 
         {pending && streamingText !== null ? (
           <article

@@ -106,3 +106,86 @@ test("an unsuccessful model mutation preserves the saved preference and is never
   expect(client.getQueryData(serverKeys.session("chat-a"))).toBe(detail)
   disposeSessionQueryClient(client)
 })
+
+test("model preference mutation updates paged chat metadata without changing bounded transcript rows", async () => {
+  const { sessionModelMutationOptions, serverKeys } = await helpers()
+  const client = createSessionQueryClient()
+  const old = { id: "chat-a", model_id: "old" }
+  const history = {
+    pages: [
+      {
+        session: old,
+        messages: [{ id: "answer" }],
+        assistant_outputs: [{ id: "partial" }],
+        timeline_order: [{ kind: "assistant_output", id: "partial" }],
+        next_before_cursor: "older",
+      },
+    ],
+    pageParams: [null],
+  }
+  client.setQueryData(serverKeys.history("chat-a"), history)
+  client.setQueryData(serverKeys.sessionPages, {
+    pages: [{ items: [old], next_before_cursor: null }],
+    pageParams: [null],
+  })
+  const mutation = client.getMutationCache().build(
+    client,
+    sessionModelMutationOptions(client, {
+      selectSessionModel: async () => ({ ...old, model_id: "new" }),
+    })
+  )
+  await mutation.execute({ sessionId: "chat-a", modelId: "new" })
+  expect(client.getQueryData(serverKeys.history("chat-a")).pages[0]).toEqual({
+    ...history.pages[0],
+    session: { ...old, model_id: "new" },
+  })
+  expect(
+    client.getQueryData(serverKeys.sessionPages).pages[0].items[0].model_id
+  ).toBe("new")
+  disposeSessionQueryClient(client)
+})
+
+test("a failed model save resumes a cancelled in-flight chat list read", async () => {
+  const { InfiniteQueryObserver } = await import("@tanstack/react-query")
+  const { sessionPagesQueryOptions, sessionModelMutationOptions, serverKeys } =
+    await helpers()
+  const client = createSessionQueryClient()
+  let calls = 0
+  let firstSignal
+  const observer = new InfiniteQueryObserver(
+    client,
+    sessionPagesQueryOptions({
+      listSessionPages: async (_cursor, { signal }) => {
+        calls += 1
+        if (calls === 1) {
+          firstSignal = signal
+          return new Promise(() => {})
+        }
+        return {
+          items: [{ id: "chat-a", model_id: "old" }],
+          next_before_cursor: null,
+        }
+      },
+    })
+  )
+  const unsubscribe = observer.subscribe(() => {})
+  await Promise.resolve()
+  const mutation = client.getMutationCache().build(
+    client,
+    sessionModelMutationOptions(client, {
+      selectSessionModel: async () => {
+        throw new Error("Save unavailable")
+      },
+    })
+  )
+  await expect(
+    mutation.execute({ sessionId: "chat-a", modelId: "new" })
+  ).rejects.toThrow("Save unavailable")
+  expect(firstSignal.aborted).toBe(true)
+  expect(calls).toBe(2)
+  expect(
+    client.getQueryData(serverKeys.sessionPages).pages[0].items[0].model_id
+  ).toBe("old")
+  unsubscribe()
+  disposeSessionQueryClient(client)
+})
