@@ -1,150 +1,71 @@
-# Agent workflows in Trellis
+# Pstack in Trellis
 
-Trellis combines Lauren Tan's pstack engineering workflow with its existing
-domain skills. Pstack selects a way to investigate, plan, implement, and verify
-work. Frontend and backend skills supply the project-specific decisions.
+Trellis uses Lauren Tan's official pstack as its single repository-local agent
+skill. Pstack selects how to investigate, plan, implement, and verify work. The
+root and nested `AGENTS.md` files retain Trellis-specific frontend, backend,
+icon, architecture, and verification constraints.
 
-## What is installed
+## Source and entrypoint
 
-- The native entrypoint is [`.agents/skills/pstack/SKILL.md`](../.agents/skills/pstack/SKILL.md).
-- The original source is [`.agents/pstack/upstream/`](../.agents/pstack/upstream/).
-  It is pinned to `cursor/plugins` commit
-  `850d7f2e9f5e55dff7eb00a0a479337fe79eb22f`, pstack `0.15.25`.
-- [The provenance manifest](../.agents/pstack/upstream.json) and
-  [snapshot maintenance guide](../.agents/pstack/README.md) track the source
-  and explain how to verify or update it.
-- Existing skills, installation locks, app dependencies, and build commands
-  retain their current ownership. This integration adds no runtime packages.
+- Use the discoverable [`pstack` skill](../.agents/skills/pstack/SKILL.md), or
+  ask Codex to use `$pstack` or `poteto-mode` for a substantial task.
+- The [official source snapshot](../.agents/pstack/upstream/) is pinned to
+  `cursor/plugins` commit `850d7f2e9f5e55dff7eb00a0a479337fe79eb22f`, version
+  `0.15.25`. Its license and update procedure are kept alongside it.
+- The upstream tree contains skills and playbooks for pstack to load when
+  needed. Only the native adapter is registered for repository discovery.
+- The adapter maps Cursor-specific tools and model roles to supported Codex
+  capabilities. It preserves the user's authorization and current model
+  settings. The original plugin and automation manifests do not activate tools.
 
-The canonical source is [Lauren's Cursor plugin](https://github.com/cursor/plugins/tree/main/pstack),
-not a community port. Its original tool and model assumptions need adaptation
-for Codex. Keep those adaptations in the native entrypoint rather than editing
-the imported files. The complete upstream tree includes tools and automations
-for reference; they are not enabled by this integration.
+## Use pstack
 
-## Use it
-
-Start a new Codex chat in this worktree or reopen it to refresh skill discovery.
-Codex discovers native skills under `.agents/skills/`; if a running chat has a
-stale catalog, ask it to read the adapter's path explicitly.
-
-Example requests:
+Start a new chat in this worktree or reopen it so Codex discovers the repository
+skill. Example requests:
 
 ```text
 Use $pstack to investigate how chat streaming works. Keep this read-only.
-Use $pstack to fix this bug with a reproducer and focused verification.
-Use $pstack and Impeccable to improve the chat composer spacing.
-Use $pstack to review this design before implementing it.
+Use $pstack to reproduce and fix this bug, then verify the behavior.
+Use $pstack to review this design before implementation.
+Use $pstack to improve the chat composer while preserving Trellis's design.
 ```
 
-`pstack` is the installed skill name. Requests mentioning `poteto-mode` also
-route to it. The original Cursor `/add-plugin` and `/setup-pstack` commands do
-not configure this Codex integration. Subagents use the current model settings
-unless the user has requested supported overrides. Independent reviewers on
-the same model are not described as a diverse-model panel.
+Pstack routes to the appropriate upstream playbook. It loads focused source
+references instead of treating every vendored file as a separate local
+integration. Local `AGENTS.md` files specify what application boundaries and
+checks apply. Diagnosis-only, design-only, and review-only requests keep those
+scope limits.
 
-The adapter reads only the relevant upstream workflow, playbook, and principle
-references. It pairs these with the domain skills below. It does not register
-every upstream leaf as a separate slash command.
+For frontend work, preserve the Bun, Turbo, Vite, React, and TypeScript stack and
+read [`frontend/AGENTS.md`](../frontend/AGENTS.md). It records Trellis's visual
+system, React constraints, and shared icon rules alongside pstack workflow
+routing. For backend work, read [`backend/AGENTS.md`](../backend/AGENTS.md),
+including the required `make check` command and pinned uv version.
 
-## Skill ownership
+## Extend frontend guidance inside pstack
 
-| Work                                                        | Local owner                            |
-| ----------------------------------------------------------- | -------------------------------------- |
-| Multi-step engineering, investigations, and pstack requests | Root `pstack` adapter                  |
-| Frontend design, layout, spacing, and visual polish         | Root `impeccable`                      |
-| Requested UI, UX, and accessibility audits                  | Root `web-design-guidelines`           |
-| React rendering and performance                             | Frontend `vercel-react-best-practices` |
-| Reusable React APIs and composition                         | Frontend `vercel-composition-patterns` |
-| Requested prose audits                                      | Frontend `writing-guidelines`          |
-| FastAPI and Pydantic boundaries                             | Root `fastapi`                         |
-| Trellis runtime and provider contracts                      | Root `develop-trellis-runtime`         |
-| Bug investigation                                           | Root `systematic-debugging`            |
-| Behavior changes and reproducing tests                      | Root `test-driven-development`         |
-| Independent code review                                     | Root `requesting-code-review`          |
-| Completion claims and checks                                | Root `verification-before-completion`  |
-| Agent-facing controlled language                            | Root `asd-ste100`                      |
-| Visual explanations                                         | Root `show-me`                         |
+Keep the discoverable skill catalog to one pstack entrypoint. When future
+frontend work needs additional reusable guidance, place a focused Markdown
+reference in `.agents/skills/pstack/references/`. Link it from the pstack entry
+point and frontend instructions only when its trigger applies. Add executable
+helpers only when they have a clear maintenance benefit, and verify them.
 
-Read [root instructions](../AGENTS.md), then the instructions nearest the changed
-files. [Frontend instructions](../frontend/AGENTS.md) give explicit skill paths,
-including nested skills that a root-started chat may not list automatically.
-[Backend instructions](../backend/AGENTS.md) retain their architecture and
-verification requirements.
-
-The root and frontend directories already contain copies of
-`web-design-guidelines`. Route to the root copy; do not run two audits or merge
-their separate lock entries as part of unrelated work.
-
-Pstack's TDD, root-cause, and proof workflows reinforce the existing local
-skills. Read the local owner rather than following stale `superpowers:`
-namespace aliases or running a second conflicting workflow. Cursor-only
-companions such as `deslop` and `control-ui` are not installed here. Use the
-native adapter's mapping and report unavailable capabilities accurately.
-
-## Adding skills
-
-1. Choose the scope. Shared engineering skills go in
-   `.agents/skills/<name>/`. Frontend-only skills go in
-   `frontend/.agents/skills/<name>/`.
-2. Add a `SKILL.md` whose `name` matches its folder. Use a unique lowercase
-   kebab-case name. State a specific trigger so unrelated tasks do not load it.
-
-   ```markdown
-   ---
-   name: frontend-example
-   description: Use when implementing the specific frontend capability this skill owns.
-   ---
-
-   # Frontend example
-
-   Describe the decisions and project constraints this capability needs.
-   Link detailed references only where they apply.
-   ```
-
-3. Add the task and exact path to `frontend/AGENTS.md` for frontend skills, or
-   root `AGENTS.md` for shared skills. Keep visual design owned by Impeccable
-   unless the user explicitly requests a new design workflow. New skills do
-   not require changes to the pstack snapshot or adapter.
-4. Preserve third-party licensing and record the source and reviewed revision.
-   For skills installed through the skills CLI, keep its generated lock entry
-   in the matching root or frontend `skills-lock.json`. Local skills and this
-   pstack adapter do not need invented installer hashes.
-5. Validate required frontmatter, local references, and any executable helpers.
-   If the installed `skill-creator` provides `scripts/quick_validate.py`, run
-   it on the new skill folder. Check the skill's decisions against realistic
-   requests; syntax validation alone does not prove useful routing.
-
-Avoid duplicate skill names across scopes. Do not add frontend skill catalogs
-to every pstack playbook. Keep the routing decision in the scoped instructions.
+If a future request explicitly calls for more pstack workflows, evaluate the
+matching official source and Codex support first. Keep the official source
+immutable, preserve provenance, and update the pstack adapter to route into the
+new reference. Do not restore standalone third-party skill catalogs or their
+installer locks.
 
 ## Verification
 
-For an integration or source update:
+From the repository root, verify the snapshot:
 
 ```bash
 (cd .agents/pstack && shasum -a 256 -c upstream.sha256)
-git diff --check -- . ':!.agents/pstack/upstream/**'
 ```
 
-Also check the snapshot's file list, bytes, executable bits, commit, tree, and
-version against the source checkout. Validate the native adapter's frontmatter
-and local Markdown links. Keep upstream bytes unchanged instead of applying
-Trellis formatting to the imported tree.
-
-Exercise these read-only scenarios with an independent agent that reads the
-adapter and scoped instructions:
-
-- Investigate backend behavior. Identify a matching investigation path and
-  backend boundaries without editing files or installing packages.
-- Plan a composer spacing change. Identify Impeccable and frontend verification
-  without changing the application framework.
-- Plan a React composition improvement. Find the nested composition skill from
-  a repository-root start.
-- Plan an ordinary feature. Identify local TDD and completion checks and retain
-  the user's delivery scope when the upstream playbook reaches PR creation.
-
-Run application checks when application code changes. Backend changes require
-`make check` from `backend/` with uv `0.12.5`, as specified in `backend/AGENTS.md`.
-A documentation-only skill integration does not establish that backend or
-frontend application tests pass.
+When guidance or routing changes, validate pstack frontmatter, all local links,
+formatting, and that the only repository-local discoverable skill is pstack.
+When the app changes, run the checks required for the changed package. Backend
+code, dependencies, or configuration changes require `make check` from `backend/`
+with uv `0.12.5` as specified in `backend/AGENTS.md`.

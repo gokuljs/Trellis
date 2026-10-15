@@ -3,7 +3,7 @@
 The backend is a minimal FastAPI application. Keep this phase production-shaped
 but intentionally small; do not introduce runtime orchestration, authentication,
 databases, queues, containers, CORS, or model-provider SDKs without an explicit
-request.
+request. Use the repository's single pstack skill for engineering workflows.
 
 ## Boundaries
 
@@ -15,7 +15,9 @@ request.
 
 ## Safe implementation workflow
 
-- Follow RED–GREEN–REFACTOR for every behavior change.
+- Use pstack's bug-fix and `tdd` workflows when a focused test is practical.
+  Skip an unclear or expensive failing-test path and verify with the closest
+  useful check.
 - Use synchronous path operations for blocking work; use `async` only when the
   entire call path is non-blocking.
 - Bound concurrency and retries, set explicit timeouts, and propagate

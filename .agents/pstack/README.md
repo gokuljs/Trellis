@@ -5,18 +5,14 @@ from `cursor/plugins`, MIT licensed. [upstream.json](upstream.json) records the
 full commit, Git tree, version, import date, and file count.
 
 `upstream/` is a complete, unchanged copy of that commit's `pstack/` directory,
-including its license, agent prompts, playbooks, scripts, and documentation.
-It is supporting source outside `.agents/skills/`, so its Cursor entrypoints
-are not registered as native Codex skills. The discoverable Trellis entrypoint
-is [the pstack adapter](../skills/pstack/SKILL.md).
+including its license, skills, agent prompts, playbooks, scripts, and docs. It
+is reference material outside native skill discovery. The single discoverable
+Trellis skill is [pstack](../skills/pstack/SKILL.md).
 
-Keep Trellis routing and harness adaptations outside `upstream/`. The original
-Cursor plugin manifest, global rule paths, model slugs, tools, and automation
-instructions describe the original runtime. Copying them does not install a
-Cursor plugin, enable background jobs, or authorize external actions.
-No upstream scripts or package dependencies are required to use the adapter's
-Markdown workflows. Advanced tools such as the PR watcher and orchestrator
-need a separate compatibility review and task-specific setup before use.
+The original manifests, global rule paths, model names, tools, and automations
+describe Cursor. Their presence does not install or activate Cursor features.
+No upstream scripts or packages are needed for pstack's Markdown workflows.
+Review compatibility and effects before using an advanced script or helper.
 
 ## Check the snapshot
 
@@ -26,46 +22,29 @@ From the repository root:
 (cd .agents/pstack && shasum -a 256 -c upstream.sha256)
 ```
 
-All files must report `OK`. Checksums verify bytes against this import's
-manifest; the source commit and Git tree identify the upstream revision.
-The checksum list lives beside the snapshot so upstream files stay unchanged.
+All files must report `OK`. Checksums verify file contents; the source commit
+and Git tree identify the upstream revision. The checksum list stays outside
+the immutable source tree.
 
 ## Update deliberately
 
 1. Use a separate clone of `https://github.com/cursor/plugins.git` and check out
-   the full commit you intend to import. With a sparse clone, include `pstack/`.
-2. Review the diff from the recorded commit, including licenses, scripts,
-   model assumptions, and changes to playbooks or relative references.
-3. Replace `upstream/` with the complete `pstack/` tree. Remove files deleted
-   upstream; do not overlay a new tree onto stale files. Preserve executable
-   bits and include hidden files.
-4. Update `upstream.json` from that checkout. The commit is `git rev-parse HEAD`,
-   the subtree is `git rev-parse HEAD:pstack`, and the version is in
-   `pstack/.cursor-plugin/plugin.json`. Record the tracked file count and date.
-5. Regenerate checksums from the new tracked files, then compare the imported
-   file list, bytes, and executable bits with the checkout. From the Trellis
-   root, after replacing the tree:
+   the full commit you intend to import. Include `pstack/` when using a sparse
+   clone.
+2. Review upstream changes, including licenses, helper scripts, model and tool
+   assumptions, and relative links.
+3. Replace `upstream/` with the complete new `pstack/` tree. Remove files deleted
+   upstream, preserve executable bits, and include hidden files.
+4. Update `upstream.json` with the full commit (`git rev-parse HEAD`), tree
+   (`git rev-parse HEAD:pstack`), version from `pstack/.cursor-plugin/plugin.json`,
+   import date, and tracked file count.
+5. Regenerate `upstream.sha256` from the imported tracked files, then compare
+   paths, bytes, and executable bits with the source checkout.
+6. Recheck the pstack adapter and repository guidance against changed skills,
+   playbooks, prompts, and companion-tool assumptions. Verify hashes and have
+   an independent reviewer inspect the update. Commit source and adapter changes
+   as separate commits only when each commit remains usable.
 
-   ```bash
-   python3 - <<'PYCODE'
-   from hashlib import sha256
-   from pathlib import Path
-
-   bundle = Path('.agents/pstack')
-   files = sorted(path for path in (bundle / 'upstream').rglob('*') if path.is_file())
-   (bundle / 'upstream.sha256').write_text(''.join(
-       f'{sha256(path.read_bytes()).hexdigest()}  {path.relative_to(bundle).as_posix()}\n'
-       for path in files
-   ))
-   PYCODE
-   ```
-
-6. Recheck the native adapter against the new entrypoint, playbooks, agent
-   prompts, and companion-tool assumptions. Run the checks in
-   [the workflow guide](../../docs/agent-workflows.md#verification), including
-   the read-only routing scenarios. Commit the snapshot update separately
-   from local adaptation changes.
-
-Do not use a floating installer to overwrite `.agents/skills/` or replace
-existing skills. `skills-lock.json` tracks skills installed by the skills CLI;
-this separate upstream manifest tracks this vendored source.
+Keep the repository's discoverable skill list to the single pstack entrypoint.
+Add future Trellis guidance as a focused reference under
+`.agents/skills/pstack/references/` and route to it through the pstack adapter.

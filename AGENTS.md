@@ -10,35 +10,27 @@ to the requested area and preserve the existing frontend toolchain. Backend
 work lives under `backend/`; read its nested `AGENTS.md` before editing files
 there.
 
-## Agent workflow and skill discovery
+## Pstack workflow
 
-- Use the project-local [pstack adapter](.agents/skills/pstack/SKILL.md) for
-  pstack or poteto-mode requests and multi-step engineering work. It adapts
-  Lauren Tan's pinned upstream workflow to Codex and routes to existing skills.
-- Read only the skills relevant to the task. Pstack coordinates the workflow;
-  the domain-specific skills below own frontend and backend guidance.
-- Read [frontend/AGENTS.md](frontend/AGENTS.md) before frontend changes. It also
-  routes to skills in `frontend/.agents/skills/` for chats started at the root.
-- Keep imported pstack files in `.agents/pstack/upstream/` unchanged. They are
-  supporting references outside native skill discovery. Apply the local
-  adapter when interpreting Cursor tool names, model choices, and playbooks.
-- Treat upstream autonomy, PR, shipping, and automation instructions within
-  the user's authorized scope. They do not grant permission for external
-  messages, ticket updates, PR creation, merges, deployments, or background jobs.
-- Add shared skills under `.agents/skills/` and frontend-only skills under
-  `frontend/.agents/skills/`. Use unique names and record their trigger and path
-  in the applicable instructions. See [the extension guide](docs/agent-workflows.md).
+- Use the project-local [pstack skill](.agents/skills/pstack/SKILL.md) for
+  nontrivial engineering work and explicit pstack requests. It is the only
+  repository-local skill entrypoint.
+- Read the official workflow and only the relevant playbooks and principle
+  files from `.agents/pstack/upstream/`. Follow the mappings in the pstack
+  skill for Codex tools and user authorization.
+- Preserve the pinned upstream snapshot. Keep Trellis guidance in the pstack
+  adapter, its references, and this file.
+- Preserve the user's scope. A pstack playbook does not authorize creating a
+  pull request, sending messages, deploying, or merging unless requested.
 
-## Frontend design workflow
+## Frontend guidance
 
-- Use the project-local `impeccable` skill as the default workflow for frontend
-  design, layout, and spacing work. It takes precedence over generic global
-  design guidance for this repository.
-- Use the project-local `web-design-guidelines` skill for requested UI,
-  accessibility, and UX audits.
+- Read [frontend/AGENTS.md](frontend/AGENTS.md) before frontend changes.
 - Preserve Trellis's existing visual system unless a redesign is requested.
-  Use Impeccable's layout workflow to improve spacing and rhythm; do not reduce
-  padding indiscriminately or make the interface cramped.
+  Use pstack's relevant design and prototype workflows when they help answer
+  the request. Do not add spacing changes without a design reason.
+- Keep the existing frontend toolchain and use the relevant checks for changed
+  packages and user-facing behavior.
 
 ## SVG icon ownership and reuse
 
@@ -67,14 +59,16 @@ there.
 
 ## Development and review rules
 
-- Use RED–GREEN–REFACTOR for behavior changes: write a focused failing test,
-  implement the smallest passing change, then refactor.
+- Follow pstack's focused `tdd` workflow when a behavior change has a clear,
+  inexpensive test path. Otherwise choose the closest practical verification.
+- For defects, use the pstack bug-fix workflow and trace the cause before
+  changing code.
 - Keep async work bounded, timeout-aware, and cancellation-safe. Never hide
   blocking work in an async path operation.
 - Prefer the existing dependency policy and justify every new runtime package.
-- Prioritize public contract compatibility, error handling, data boundaries,
-  cancellation, test coverage, and dependency/security risk during review.
-- Do not claim completion without fresh evidence from the required checks.
+- Review public contracts, error handling, data boundaries, cancellation,
+  coverage, and dependency risk when those areas are in scope.
+- Prove the requested result with fresh evidence before claiming completion.
 
 ## Required backend verification
 

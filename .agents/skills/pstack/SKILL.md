@@ -1,65 +1,57 @@
 ---
 name: pstack
-description: Apply Lauren Tan's pstack workflows in Codex for pstack or poteto-mode requests, or substantial engineering work that needs investigation, design, parallel execution, and verification. Skip unrelated prose drafts and trivial edits unless explicitly invoked.
+description: Apply Lauren Tan's pstack workflows in Codex for substantial engineering work, including investigation, design, implementation, parallel work, and verification. Use for explicit pstack or poteto-mode requests; skip unrelated prose drafts and trivial edits unless requested.
 ---
 
 # Pstack for Trellis
 
-Use Lauren Tan's official pstack through this native Codex adapter. The unchanged
-source lives outside skill discovery at `../../pstack/upstream/`. Repository
-instructions and the user's task scope govern execution; this adapter translates
-Cursor assumptions without changing the official snapshot.
+This is Trellis's only repository-local skill entrypoint. It routes to Lauren
+Tan's official source, pinned under `../../pstack/upstream/`. Follow repository
+instructions and the user's task scope. The adapter maps Cursor assumptions to
+supported Codex tools; it does not change the upstream snapshot.
 
-## Start selectively
+## Choose the workflow
 
-Read [Codex execution mappings](references/codex-adapter.md) before executing an
-upstream workflow. Read the [official mode](../../pstack/upstream/skills/poteto-mode/SKILL.md)
-for its workflow and principle routing, then load only the playbook and leaf
-references that apply. Do not load all upstream skills or treat them as installed
-Codex skills. Resolve links inside an upstream file relative to that file.
-Choose the workflow by the requested deliverable. A diagnosis-only, review-only,
-or design-only request does not authorize implementing a fix or feature.
+Read [Codex execution mappings](references/codex-adapter.md), then load the
+[official mode](../../pstack/upstream/skills/poteto-mode/SKILL.md). Follow its
+workflow selection and read only the relevant playbook and principle leaves.
+Resolve references within an upstream file relative to that file.
 
-- Read-only explanation or recommendation: [Investigation](../../pstack/upstream/skills/poteto-mode/playbooks/investigation.md),
-  with [how](../../pstack/upstream/skills/how/SKILL.md) and, for rationale, [why](../../pstack/upstream/skills/why/SKILL.md).
-- New behavior: [Feature](../../pstack/upstream/skills/poteto-mode/playbooks/feature.md).
-  Reproduce a defect with [Bug fix](../../pstack/upstream/skills/poteto-mode/playbooks/bug-fix.md).
-- Structural change: [Refactoring](../../pstack/upstream/skills/poteto-mode/playbooks/refactoring.md).
-  Settle an empirical design choice with [Prototype](../../pstack/upstream/skills/poteto-mode/playbooks/prototype.md).
-- Architecture or contested design: read [architect](../../pstack/upstream/skills/architect/SKILL.md)
-  or [interrogate](../../pstack/upstream/skills/interrogate/SKILL.md) when that depth is warranted.
-  For parallel work, use [swarm](../../pstack/upstream/skills/swarm/SKILL.md).
-- For another explicit pstack mode, find its playbook through the official mode.
-  Load [figure-it-out](../../pstack/upstream/skills/figure-it-out/SKILL.md) only when
-  a large or unusual task needs a bespoke plan. Long-run and shipping playbooks
-  do not expand authorization or start background work by themselves.
+- For an investigation, read [how](../../pstack/upstream/skills/how/SKILL.md)
+  and the [investigation playbook](../../pstack/upstream/skills/poteto-mode/playbooks/investigation.md).
+  Read [why](../../pstack/upstream/skills/why/SKILL.md) when the question asks
+  why a decision was made.
+- For new behavior, follow the [feature playbook](../../pstack/upstream/skills/poteto-mode/playbooks/feature.md).
+  For a defect, follow [bug-fix](../../pstack/upstream/skills/poteto-mode/playbooks/bug-fix.md),
+  [`tdd`](../../pstack/upstream/skills/tdd/SKILL.md) when a focused test is
+  practical, and [Fix Root Causes](../../pstack/upstream/skills/principle-fix-root-causes/SKILL.md).
+- For a structure-only change, use [refactoring](../../pstack/upstream/skills/poteto-mode/playbooks/refactoring.md).
+- For architecture, parallel design, or review, use
+  [architect](../../pstack/upstream/skills/architect/SKILL.md),
+  [swarm](../../pstack/upstream/skills/swarm/SKILL.md), or
+  [interrogate](../../pstack/upstream/skills/interrogate/SKILL.md) when the
+  task warrants that depth. Use the Codex mappings when model diversity is
+  unavailable.
+- For an empirical design choice, use [prototype](../../pstack/upstream/skills/poteto-mode/playbooks/prototype.md).
+  Use [visual parity](../../pstack/upstream/skills/poteto-mode/playbooks/visual-parity.md)
+  only when the task compares implementations against an established visual
+  baseline. Do not use these workflows to expand the requested scope.
 
-Read each principle leaf before applying or citing it. Useful starting points are
-[Model the Domain](../../pstack/upstream/skills/principle-model-the-domain/SKILL.md)
-for state and data shapes, [Boundary Discipline](../../pstack/upstream/skills/principle-boundary-discipline/SKILL.md)
-for adapters, [Separate Before Serializing Shared State](../../pstack/upstream/skills/principle-separate-before-serializing-shared-state/SKILL.md)
-for concurrent writes, [Laziness Protocol](../../pstack/upstream/skills/principle-laziness-protocol/SKILL.md)
-for scope, and [Prove It Works](../../pstack/upstream/skills/principle-prove-it-works/SKILL.md)
-for completion claims. Choose other leaves from the official mode as needed.
+## Preserve Trellis constraints
 
-## Compose with the project
+Read the root and nearest `AGENTS.md` before editing. They define the product's
+frontend toolchain, shared icon ownership, backend architecture, and required
+checks. Apply those constraints through pstack; do not replace the application
+workflow or introduce another repository-local skill package.
 
-Use [test-driven-development](../test-driven-development/SKILL.md) for behavior
-changes, [systematic-debugging](../systematic-debugging/SKILL.md) for defects,
-[requesting-code-review](../requesting-code-review/SKILL.md) for review, and
-[verification-before-completion](../verification-before-completion/SKILL.md)
-for completion evidence. These local workflows govern their areas when an
-upstream shortcut differs. Documentation-only adapter edits need validation,
-not a behavior test.
+Read [frontend guidance](../../../frontend/AGENTS.md) before frontend work.
+Keep Trellis's visual system unless the user asks for a redesign. For future
+frontend-specific pstack guidance, add a focused reference in this folder and
+link it from the frontend guidance and this adapter as needed.
 
-[Impeccable](../impeccable/SKILL.md) owns frontend design, layout, spacing, and
-visual decisions. The root [web-design-guidelines](../web-design-guidelines/SKILL.md)
-owns requested UI, accessibility, and UX audits. Pstack coordinates the work;
-it does not replace either. Discover other existing or future frontend skills
-from the applicable repository instructions and touched area, then use only the
-relevant guidance. Apply the frontend React and composition skills conditionally
-within Trellis's Bun, Turbo, and Vite toolchain; do not introduce Next.js or React
-Server Components because an upstream example uses them.
+For backend changes, preserve the transport, application, domain, and provider
+boundaries. Run the required backend checks whenever backend code, dependencies,
+or configuration change. For completion, follow [Prove It Works](../../pstack/upstream/skills/principle-prove-it-works/SKILL.md).
 
-Keep upstream files immutable. Put Codex and Trellis adaptations in this wrapper
-or repository guidance, and record upstream updates separately.
+Keep upstream files immutable. Put Codex and Trellis adaptations in this adapter,
+its references, or repository instructions, and record source updates separately.
