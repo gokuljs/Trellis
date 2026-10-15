@@ -1553,7 +1553,14 @@ class RunService:
         for tool in await self._runs.list_tool_calls(run_id):
             if tool.status not in {ToolCallStatus.PENDING, ToolCallStatus.RUNNING}:
                 continue
-            _message, _updated, event = await self._runs.record_tool_result(
-                run_id, tool.id, content, status=status
-            )
+            try:
+                _message, _updated, event = await self._runs.record_tool_result(
+                    run_id, tool.id, content, status=status
+                )
+            except ApplicationError as error:
+                if error.code != "event_storage_limit":
+                    raise
+                # The terminal transition closes remaining tool records without
+                # consuming per-tool events from its finite reserved capacity.
+                break
             await self._publish(event)

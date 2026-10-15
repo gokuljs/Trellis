@@ -28,6 +28,7 @@ from app.domain.context import (
     ContextCheckpointDraft,
     ContextWindow,
 )
+from app.domain.event_limits import EVENT_STORAGE_LIMIT_MESSAGE
 from app.domain.models import (
     Message,
     ModelDescriptor,
@@ -382,6 +383,8 @@ class SupabaseRepository:
                 )
             raise ValueError("The cloud record conflicts with the current state")
         if response.status_code == 400 and error_code == "22023":
+            if error_message == "event_storage_limit":
+                raise ApplicationError("event_storage_limit", EVENT_STORAGE_LIMIT_MESSAGE)
             if isinstance(error_message, str) and len(error_message) <= 200:
                 raise ValueError(error_message)
             raise ValueError("The cloud operation is invalid")

@@ -8,8 +8,11 @@ Supabase repository.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, replace
+from collections.abc import Awaitable, Callable
+from copy import deepcopy
+from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 from pathlib import Path
 from typing import ClassVar, cast
 from uuid import UUID, uuid4
@@ -20,6 +23,11 @@ from app.application.budgets import BudgetPreset, limits_for_preset
 from app.application.errors import ApplicationError
 from app.core.config import Settings
 from app.domain.context import ContextCheckpoint, ContextCheckpointDraft, ContextWindow
+from app.domain.event_limits import (
+    EVENT_STORAGE_LIMIT_MESSAGE,
+    EventStorageLimit,
+    check_event_storage,
+)
 from app.domain.models import (
     Message,
     MessageRole,
@@ -103,6 +111,7 @@ class MemoryState:
     turn_claims: dict[str, str] = field(default_factory=dict)
     runs: dict[str, RunSnapshot] = field(default_factory=dict)
     events: dict[str, list[RunEvent]] = field(default_factory=dict)
+    event_storage_bytes: dict[str, int] = field(default_factory=dict)
     model_calls: dict[str, ModelCallRecord] = field(default_factory=dict)
     run_messages: dict[str, list[RunMessageRecord]] = field(default_factory=dict)
     tool_calls: dict[str, ToolCallRecord] = field(default_factory=dict)
@@ -111,6 +120,26 @@ class MemoryState:
     assistant_batches: dict[tuple[str, int], RunEvent] = field(default_factory=dict)
     context_checkpoints: dict[str, ContextCheckpoint] = field(default_factory=dict)
     latest_context_checkpoint: dict[str, str] = field(default_factory=dict)
+
+
+def _atomic_event_write[**P, T](operation: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
+    """Match RPC rollback when a multi-record event write exhausts storage."""
+
+    @wraps(operation)
+    async def execute(*args: P.args, **kwargs: P.kwargs) -> T:
+        repository = cast(MemoryRepository, args[0])
+        before = deepcopy(repository.state)
+        leases = set(repository._owned_leases)
+        try:
+            return await operation(*args, **kwargs)
+        except ApplicationError as error:
+            if error.code == "event_storage_limit":
+                for item in fields(before):
+                    setattr(repository.state, item.name, getattr(before, item.name))
+                repository._owned_leases = leases
+            raise
+
+    return execute
 
 
 class MemoryRepository:
@@ -518,12 +547,25 @@ class MemoryRepository:
         event_version: int = 1,
     ) -> RunEvent:
         run = self.state.runs[run_id]
+        try:
+            size = check_event_storage(
+                event_type,
+                data,
+                event_count=len(self.state.events[run_id]),
+                data_bytes=self.state.event_storage_bytes.get(run_id, 0),
+            )
+        except EventStorageLimit:
+            raise ApplicationError("event_storage_limit", EVENT_STORAGE_LIMIT_MESSAGE) from None
         sequence = run.last_event_sequence + 1
         event = RunEvent(run_id, sequence, event_type, event_version, data, _now())
         self.state.events[run_id].append(event)
+        self.state.event_storage_bytes[run_id] = (
+            self.state.event_storage_bytes.get(run_id, 0) + size
+        )
         self.state.runs[run_id] = replace(run, last_event_sequence=sequence)
         return event
 
+    @_atomic_event_write
     async def create_run(
         self,
         session_id: str,
@@ -699,6 +741,7 @@ class MemoryRepository:
             event for event in self.state.events.get(run_id, []) if event.sequence > after_sequence
         ][:limit]
 
+    @_atomic_event_write
     async def transition_run_record(
         self,
         run_id: str,
@@ -731,8 +774,23 @@ class MemoryRepository:
                         output, status="partial", stop_reason=stop_reason or next_status.value
                     )
             self._owned_leases.discard(run_id)
+            for key, tool in tuple(self.state.tool_calls.items()):
+                if tool.run_id == run_id and tool.status in {
+                    ToolCallStatus.PENDING,
+                    ToolCallStatus.RUNNING,
+                }:
+                    self.state.tool_calls[key] = replace(
+                        tool,
+                        status=(
+                            ToolCallStatus.FAILED
+                            if next_status is RunStatus.FAILED
+                            else ToolCallStatus.CANCELLED
+                        ),
+                        finished_at=now,
+                    )
         return self._event(run_id, event_type, data)
 
+    @_atomic_event_write
     async def complete_run(self, run_id: str, content: str) -> tuple[Message, tuple[RunEvent, ...]]:
         run = self.state.runs.get(run_id)
         if run is None:
@@ -854,6 +912,7 @@ class MemoryRepository:
         self.state.assistant_outputs[model_call_id] = finished
         return finished
 
+    @_atomic_event_write
     async def request_run_cancellation(self, run_id: str) -> tuple[RunSnapshot, RunEvent | None]:
         run = self.state.runs.get(run_id)
         if run is None:
@@ -901,6 +960,7 @@ class MemoryRepository:
         self.state.runs[run_id] = renewed
         return renewed
 
+    @_atomic_event_write
     async def recover_expired_run(self, run_id: str) -> RunSnapshot:
         run = self.state.runs.get(run_id)
         if run is None:
@@ -1016,6 +1076,7 @@ class MemoryRepository:
             key=lambda call: call.step_index,
         )
 
+    @_atomic_event_write
     async def record_assistant_message(
         self,
         run_id: str,
@@ -1120,6 +1181,7 @@ class MemoryRepository:
         )
         return assistant, calls, tuple(events)
 
+    @_atomic_event_write
     async def record_tool_result(
         self,
         run_id: str,
@@ -1186,6 +1248,7 @@ class MemoryRepository:
     async def list_tool_calls(self, run_id: str) -> list[ToolCallRecord]:
         return [call for call in self.state.tool_calls.values() if call.run_id == run_id]
 
+    @_atomic_event_write
     async def request_tool_approval(
         self,
         run_id: str,
@@ -1222,6 +1285,7 @@ class MemoryRepository:
         )
         return self.state.runs[run_id], event
 
+    @_atomic_event_write
     async def record_tool_approval_decision(
         self,
         run_id: str,
@@ -1254,6 +1318,7 @@ class MemoryRepository:
         )
         return updated, event
 
+    @_atomic_event_write
     async def resume_approved_run(self, run_id: str) -> tuple[RunSnapshot, RunEvent]:
         run = self.state.runs.get(run_id)
         if run is None:

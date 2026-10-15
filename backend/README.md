@@ -121,3 +121,12 @@ A complete empty availability snapshot disables generation choices while keeping
 account and conversation reads available. Existing account defaults are retained;
 a new account stores a verified, unavailable default until a provider recovers.
 Pending metadata never becomes the account default.
+
+Durable replay keeps each run's events until its chat is deleted. Each run may
+store at most 8192 events and 16 MiB of UTF-8 JSON event data; one payload may be
+at most 256 KiB. Ordinary events stop 16 events and 64 KiB before the hard caps.
+Cancellation, final-answer completion, failure and interruption can use that
+finite reserve. A storage-limit failure stops generation, preserves saved text
+as partial, and leaves earlier event sequences available for reconnect. If tool
+cleanup events cannot fit, the terminal transition closes remaining tool records
+without adding one event per tool. No old events are evicted to make room.

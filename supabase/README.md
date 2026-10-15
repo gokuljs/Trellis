@@ -72,3 +72,12 @@ The operator connects directly through PostgreSQL with this login. Keep its URL
 and provider keys outside the app's public configuration and browser environment.
 The worker's deployment supervisor starts and restarts it; the backend app does
 not start discovery workers during HTTP requests or application startup.
+
+Apply `202610150007_event_limits.sql` after the chat-model and context-checkpoint
+migrations. It backfills private per-run counters and serializes append admission
+under the run row lock. Event data enrichment also counts toward the byte cap.
+The migration aborts without deleting data if existing history exceeds the caps
+or its saved sequence disagrees with its event count; review that history before
+retrying. Authenticated callers cannot read or reset the counters, append through
+the private helper, or write replay rows directly. Authorized chat deletion still
+cascades to its retained run events.

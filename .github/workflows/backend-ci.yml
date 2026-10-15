@@ -71,6 +71,8 @@ jobs:
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/chat_models.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610150006_context_checkpoints.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/context_checkpoints.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610150007_event_limits.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/event_limits.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/chat_turn_security.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/schema_contract.sql
 
