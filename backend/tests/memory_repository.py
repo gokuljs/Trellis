@@ -427,7 +427,6 @@ class MemoryRepository:
             and model.enabled
             and model.supports_streaming
             and model.supports_tools
-            and getattr(model, "availability", "unknown") != "unavailable"
             and (model.provider_id, model.adapter_kind, model.upstream_model_id)
             == (profile.provider_id, profile.provider_id, profile.upstream_model_id)
             for model in await self.list_models()

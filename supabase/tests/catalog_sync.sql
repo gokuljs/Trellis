@@ -56,9 +56,9 @@ BEGIN
         AND metadata_status='ready' AND availability='available' AND availability_checked_at IS NOT NULL) THEN
         RAISE EXCEPTION 'known verified available model did not become ready';
     END IF;
-    IF NOT EXISTS(SELECT 1 FROM trellis.models WHERE id='openai:gpt-5.5' AND NOT enabled
+    IF NOT EXISTS(SELECT 1 FROM trellis.models WHERE id='openai:gpt-5.5' AND enabled
         AND metadata_status='ready' AND availability='unavailable') THEN
-        RAISE EXCEPTION 'successful snapshot did not disable unavailable verified model';
+        RAISE EXCEPTION 'successful snapshot removed reviewed eligibility or lost unavailable observation';
     END IF;
     IF NOT EXISTS(SELECT 1 FROM trellis.models WHERE id='openai:future-unverified' AND NOT enabled
         AND metadata_status='pending' AND trusted_metadata IS NULL AND metadata_verified_at IS NULL

@@ -2,7 +2,7 @@ import asyncio
 import json
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 import pytest
@@ -146,10 +146,8 @@ def test_preview_uses_only_atomic_bounded_suffix_and_portable_checkpoint(tmp_pat
         "unknown",
         "disabled",
         "pending",
-        "unavailable",
         "wrong_upstream",
         "missing_adapter",
-        "missing_key",
     ],
 )
 def test_unavailable_preview_never_borrows_model_limits(tmp_path: Path, mode: str) -> None:
@@ -161,7 +159,6 @@ def test_unavailable_preview_never_borrows_model_limits(tmp_path: Path, mode: st
         changes = {
             "disabled": {"enabled": False},
             "pending": {"metadata_status": "pending"},
-            "unavailable": {"availability": "unavailable"},
             "wrong_upstream": {"upstream_model_id": "untrusted-model"},
         }
         if mode in changes:
@@ -170,7 +167,7 @@ def test_unavailable_preview_never_borrows_model_limits(tmp_path: Path, mode: st
             database,
             database,
             database,
-            Credentials(mode != "missing_key"),
+            Credentials(),
             available_adapters=frozenset() if mode == "missing_adapter" else frozenset({"openai"}),
         )
         result = await preview.preview(
@@ -182,6 +179,37 @@ def test_unavailable_preview_never_borrows_model_limits(tmp_path: Path, mode: st
         assert result.input_tokens is None
         assert result.context_window_tokens is None
         assert result.percentage is None
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("availability", ["unknown", "unavailable"])
+def test_preview_estimates_without_provider_credentials(
+    tmp_path: Path, availability: Literal["unknown", "unavailable"]
+) -> None:
+    class UnconfiguredCredentials(Credentials):
+        checks = 0
+
+        async def status(self, provider: str) -> tuple[bool, str | None]:
+            self.checks += 1
+            return False, None
+
+    async def exercise() -> None:
+        database = MemoryRepository(tmp_path)
+        database.state.models[0] = replace(database.state.models[0], availability=availability)
+        credentials = UnconfiguredCredentials()
+        preview = ContextPreviewService(
+            database,
+            database,
+            database,
+            credentials,
+            available_adapters=frozenset({"openai"}),
+        )
+        result = await preview.preview(model_id=MODEL, draft="Hello", budget_preset="conservative")
+        assert result.status == "ready"
+        assert result.input_tokens is not None
+        assert result.context_window_tokens is not None
+        assert credentials.checks == 0
 
     asyncio.run(exercise())
 

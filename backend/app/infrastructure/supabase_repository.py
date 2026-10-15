@@ -584,7 +584,7 @@ class SupabaseRepository:
                     requires_api_key=row.get("requires_api_key") is True,
                     supports_streaming=row.get("supports_streaming") is True,
                     supports_tools=row.get("supports_tools") is True,
-                    enabled=row.get("enabled") is True and ready and availability != "unavailable",
+                    enabled=row.get("enabled") is True and ready,
                     context_window_tokens=profile.context_window_tokens
                     if ready and profile
                     else None,

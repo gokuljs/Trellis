@@ -63,3 +63,31 @@ def test_unknown_enabled_profile_cannot_be_selected(tmp_path: Path) -> None:
             await SettingsService(repository, Credentials()).select_model("openai:unknown")
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("availability", ["unavailable", "unknown"])
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("selection", ["model", "provider"])
+def test_reviewed_model_selection_preserves_choice_despite_availability_and_credentials(
+    tmp_path: Path, availability: str, configured: bool, selection: str
+) -> None:
+    class ProviderCredentials(Credentials):
+        async def status(self, provider: str) -> tuple[bool, str | None]:
+            return configured, None
+
+    async def exercise() -> None:
+        repository = MemoryRepository(tmp_path / "catalog")
+        repository.state.models = [replace(MODELS[1], availability=availability)]
+        service = SettingsService(repository, ProviderCredentials())
+        settings = (
+            await service.select_model("anthropic:claude-sonnet-5")
+            if selection == "model"
+            else await service.select_provider("anthropic")
+        )
+        assert repository.state.selected_model_id == "anthropic:claude-sonnet-5"
+        assert settings.selected_provider == "anthropic"
+        assert settings.models[0].selectable is True
+        assert settings.models[0].configured is configured
+        assert settings.models[0].availability == availability
+
+    asyncio.run(exercise())

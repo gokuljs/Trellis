@@ -13,7 +13,7 @@ and [Supabase setup](../supabase/README.md) for environment variables and startu
 commands.
 
 Apply all SQL migrations in filename order to the same Supabase project used by
-the frontend and backend. Stage 2 requires the ten `20261015` migrations below,
+the frontend and backend. Stage 2 requires the eleven `20261015` migrations below,
 after the earlier schema and import-retirement migrations. Expose `trellis` in
 the Supabase Data API settings; keep `trellis_private` unexposed. The app uses
 the publishable key and the signed-in user's access token. Provider keys belong
@@ -34,6 +34,7 @@ Enable local capabilities explicitly only for a trusted local installation.
 | [`202610150008_history_pages.sql`](../supabase/migrations/202610150008_history_pages.sql)                     | Add stable cursor pages for saved chats and the conversation timeline.                                              |
 | [`202610150009_unknown_usage_cost.sql`](../supabase/migrations/202610150009_unknown_usage_cost.sql)           | Clear stale cost estimates when required provider usage is unknown.                                                 |
 | [`202610150010_terminal_model_calls.sql`](../supabase/migrations/202610150010_terminal_model_calls.sql)       | Close unfinished calls atomically when their run becomes terminal, including a backfill for existing terminal runs. |
+| [`202610150011_reviewed_model_dispatch.sql`](../supabase/migrations/202610150011_reviewed_model_dispatch.sql) | Allow reviewed models to be selected and requested without an availability check.                                   |
 
 Migration 007 aborts without deleting history if existing events exceed its caps
 or stored event sequences disagree with their counts. Review that data before
@@ -65,18 +66,19 @@ command-line arguments. The login can execute the private sync function but
 cannot read or write tables, mutate reviewed profiles, or call account RPCs.
 Do not give this worker a Supabase service-role key or a user's access token.
 
-Provider list APIs establish availability only. A discovered model becomes
-selectable only when its exact ID also has reviewed limits, prices, adapter
-support, and complete verification metadata. Unknown IDs appear disabled with a
-pending-verification reason; they never inherit another model's profile.
+Provider list APIs record availability only. A reviewed model can be selected
+and requested without running discovery or checking cached availability. Missing
+credentials and provider failures are reported when a request is made. Runtime
+calls still require reviewed limits, prices, and adapter support for the exact
+model ID; unknown IDs never inherit another model's profile.
 Reviewed profiles in
 [`model_catalog.py`](../backend/app/application/model_catalog.py) and migration
 003 must change together when metadata is reviewed.
 
 A successful complete snapshot updates only that provider atomically. A failed,
 malformed, oversized, timed-out, or incomplete paginated response preserves its
-previous cache. A successful empty snapshot disables that provider's choices
-without blocking account and conversation reads. Availability timestamps can be
+previous cache. A successful empty snapshot records that provider's availability
+without disabling reviewed model choices. Availability timestamps can be
 stale during an outage. Each refresh has a 30-second deadline, at most 20 pages
 and 2,000 unique IDs, and a 2 MiB response limit. Database writes have a
 20-second process deadline, a 15-second statement timeout, and a 3-second lock
@@ -182,8 +184,9 @@ A chat remembers its model independently of the account default. New chats use
 the selected draft/default choice; changing an existing chat uses the dedicated
 selection mutation. The runtime locks the provider/model identity when a run is
 created, and both the API and frontend prevent changing it while that run is
-active. The model menu retains unavailable or pending saved choices with their
-reason instead of silently selecting another model.
+active. Dropdown options show model names only. Availability and credential
+flags do not disable them. Saved choices are retained until the user changes
+them, and request errors remain visible in the conversation.
 
 The small context gauge beside the composer opens on hover, keyboard focus, or
 tap; Escape dismisses its details. It exposes the selected model, active input

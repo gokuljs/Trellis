@@ -139,5 +139,4 @@ def is_selectable(model: ModelDescriptor) -> bool:
         and not pending_reasons(model)
         and model.supports_streaming
         and model.supports_tools
-        and model.availability != "unavailable"
     )

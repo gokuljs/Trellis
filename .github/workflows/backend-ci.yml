@@ -66,7 +66,6 @@ jobs:
           psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610150003_model_catalog.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/model_catalog.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610150004_catalog_sync.sql
-          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/catalog_sync.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610150005_chat_models.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/chat_models.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610150006_context_checkpoints.sql
@@ -81,6 +80,9 @@ jobs:
           psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610150010_terminal_model_calls.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/terminal_model_calls.sql
           python3 supabase/tests/terminal_model_call_lock_order.py
+          psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610150011_reviewed_model_dispatch.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/catalog_sync.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/reviewed_model_dispatch.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/chat_turn_security.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/schema_contract.sql
 

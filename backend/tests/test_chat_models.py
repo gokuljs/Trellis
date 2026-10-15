@@ -87,6 +87,24 @@ def test_chat_model_is_locked_for_an_active_run(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
+def test_chat_model_selection_does_not_require_positive_provider_availability(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        database = MemoryRepository(tmp_path)
+        database.state.models = [replace(MODELS[1], availability="unavailable")]
+        session = await database.create_session()
+        updated = await SessionService(database).select_model(
+            session.id, "anthropic:claude-sonnet-5"
+        )
+        assert updated.model_id == "anthropic:claude-sonnet-5"
+        saved = await database.get_session(session.id)
+        assert saved is not None and saved.model_id == "anthropic:claude-sonnet-5"
+        assert await database.get_selected_model_id() == "openai:gpt-5.5"
+
+    asyncio.run(exercise())
+
+
 def test_run_uses_chat_preference_and_locks_explicit_selection(tmp_path: Path) -> None:
     async def exercise():
         database = MemoryRepository(tmp_path / "memory")
@@ -117,6 +135,57 @@ def test_run_uses_chat_preference_and_locks_explicit_selection(tmp_path: Path) -
             assert explicit.model_id == "openai:gpt-5.5"
             saved = await database.get_session(session.id)
             assert saved is not None and saved.model_id == "anthropic:claude-sonnet-5"
+        finally:
+            await service.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("availability", ["unavailable", "unknown"])
+def test_reviewed_chat_choice_dispatches_exact_model_without_positive_availability(
+    tmp_path: Path, availability: str
+) -> None:
+    async def exercise() -> None:
+        database = MemoryRepository(tmp_path / "memory")
+        model = replace(
+            MODELS[0],
+            id="openai:gpt-6-luna",
+            upstream_model_id="gpt-6-luna",
+            name="GPT-6 Luna",
+            availability=availability,
+        )
+        database.state.models.append(model)
+        catalog_before = tuple(database.state.models)
+        secrets = SecretStore(tmp_path / ".env")
+        await secrets.set("openai", "test-key")
+        session = await database.create_session()
+        await SessionService(database).select_model(session.id, "openai:gpt-6-luna")
+        provider = RecordingProvider(
+            (
+                ModelStreamEvent(kind="text_delta", text="Done"),
+                ModelStreamEvent(
+                    kind="usage",
+                    input_tokens=1,
+                    output_tokens=1,
+                    cached_tokens=0,
+                    cache_creation_tokens=0,
+                    service_tier="standard",
+                ),
+                ModelStreamEvent(kind="completed"),
+            )
+        )
+        service = RunService(database, database, database, database, secrets, {"openai": provider})
+        try:
+            run = await service.create_run(session.id, "first", "Hi")
+            await service.wait_for_run(run.id)
+            saved = await database.get_run(run.id)
+            assert saved is not None
+            assert saved.status is RunStatus.COMPLETED, (saved.error_code, saved.error_message)
+            assert saved.model_id == "openai:gpt-6-luna"
+            assert provider.request is not None
+            assert provider.request.model_id == "openai:gpt-6-luna"
+            assert provider.request.upstream_model_id == "gpt-6-luna"
+            assert tuple(database.state.models) == catalog_before
         finally:
             await service.close()
 

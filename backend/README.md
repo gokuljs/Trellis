@@ -71,8 +71,9 @@ Model choices include verified context/output limits, native-compaction support,
 metadata readiness, verification sources and dates, and the latest cached
 provider availability. Settings includes pending choices with `selectable=false`
 and a reason; runtime model lookup returns only enabled, verified choices.
-Unknown IDs never inherit another model's limits or prices. The existing two
-choices remain enabled until a successful discovery refresh confirms availability.
+Unknown IDs never inherit another model's limits or prices. Reviewed models can
+be selected and requested without discovery or an availability check. Missing
+credentials and provider failures are reported when a request is made.
 
 `app/application/model_catalog.py` owns reviewed first-party token prices and
 limits as of 2026-10-15. The matching database documents live in migration
@@ -103,12 +104,12 @@ and accepts explicit `sslmode=require` or `verify-ca`. Install `psql` on the
 operator host. No new Python runtime package is required. Never use a Supabase
 service key or the app's user token for this process.
 
-Provider list APIs supply availability, not trusted limits or prices. A complete
-successful snapshot enables only its intersection with exact reviewed chat
-profiles. Unknown discoveries appear disabled and pending verification. A failed,
+Provider list APIs supply availability, not trusted limits or prices. Reviewed
+chat profiles remain enabled independently of the availability snapshot. Unknown
+discoveries require metadata verification before runtime calls. A failed,
 oversized, malformed, paginated-incomplete, or timed-out provider response leaves
 that provider's previous cache unchanged. A later successful cycle recovers
-availability automatically. Verified absent models stay visible and disabled;
+availability automatically. Verified absent models remain requestable;
 absent unknown discoveries are removed unless historical account/run rows refer
 to them. Availability timestamps show the last successful refresh, so a preserved
 cache can be stale during an outage. Operator logs contain provider names and
@@ -120,9 +121,9 @@ deadline, a 15-second statement timeout, and a 3-second lock timeout. Cancellati
 terminates and joins the child process. Database updates are atomic and snapshots
 are serialized. A failed database write preserves the previous cache.
 
-A complete empty availability snapshot disables generation choices while keeping
-account and conversation reads available. Existing account defaults are retained;
-a new account stores a verified, unavailable default until a provider recovers.
+A complete empty availability snapshot does not disable reviewed generation
+choices. Existing account defaults are retained; new accounts store a reviewed
+default. Provider request errors are returned through the normal run flow.
 Pending metadata never becomes the account default.
 
 Durable replay keeps each run's events until its chat is deleted. Each run may

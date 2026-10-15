@@ -124,10 +124,6 @@ class ContextPreviewService:
             or not is_selectable(model)
             or profile is None
             or model.adapter_kind not in self._available_adapters
-            or (
-                model.requires_api_key
-                and not (await self._credentials.status(model.provider_id))[0]
-            )
         ):
             return _unavailable(model_id)
         budget = context_budget(profile)

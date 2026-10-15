@@ -268,23 +268,30 @@ def test_onboarding_progress_and_answers_are_saved_after_each_step(tmp_path: Pat
     assert not account_repository_key(settings).exists()
 
 
-def test_onboarding_model_step_requires_credentials_without_advancing(tmp_path: Path) -> None:
+@pytest.mark.parametrize("model_id", ["openai:gpt-5.5", "anthropic:claude-sonnet-5"])
+def test_onboarding_model_choice_is_saved_without_provider_credentials(
+    tmp_path: Path, model_id: str
+) -> None:
     with TestClient(create_app(make_settings(tmp_path))) as client:
         client.put("/api/onboarding/steps/intro")
         client.put(
             "/api/onboarding/steps/profile",
             json={"display_name": "Ada"},
         )
-        model = client.get("/api/settings").json()["models"][0]
+        model = next(
+            item for item in client.get("/api/settings").json()["models"] if item["id"] == model_id
+        )
+        assert model["configured"] is False
         response = client.put(
             "/api/onboarding/steps/model",
             json={"model_id": model["id"]},
         )
         state = client.get("/api/onboarding")
+        saved = client.get("/api/settings")
 
-    assert response.status_code == 409
-    assert response.json()["error"]["code"] == "provider_not_configured"
-    assert state.json() == {"current_step": "model", "completed": False}
+    assert response.status_code == 200
+    assert state.json() == {"current_step": "complete", "completed": True}
+    assert saved.json()["selected_model_id"] == model_id
 
 
 def test_concurrent_secret_updates_preserve_both_provider_keys(tmp_path: Path) -> None:

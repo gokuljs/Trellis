@@ -1,6 +1,6 @@
 # Trellis web database
 
-See [Stage 2](../docs/stage-2.md) for migrations 001–010, catalog-worker setup,
+See [Stage 2](../docs/stage-2.md) for migrations 001–011, catalog-worker setup,
 streaming/replay limits, context checkpoints, and verification.
 
 Apply the numbered SQL files in `migrations/` in order to the Supabase project.
@@ -60,6 +60,12 @@ availability to model rows. Authenticated users can read pending model choices,
 but cannot write catalog tables. A trigger prevents enabling arbitrary upstream
 IDs or replacing reviewed limits/prices. Missing profiles remain disabled. The
 existing model-selection RPCs continue using the enabled-model invariant.
+
+Migration `202610150011_reviewed_model_dispatch.sql` makes `enabled` depend on
+reviewed runtime support rather than provider availability. Cached availability
+and discovery failures do not prevent selecting or requesting a reviewed model.
+The provider request reports access errors; unknown model metadata remains
+ineligible for runtime calls.
 
 Migration `202610150004_catalog_sync.sql` creates the restricted login
 `trellis_catalog_sync` without a password. Provision its credential separately

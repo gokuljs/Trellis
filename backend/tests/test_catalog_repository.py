@@ -3,6 +3,7 @@ import json
 from dataclasses import asdict
 
 import httpx
+import pytest
 
 from app.application.model_catalog import profile_for_model
 from app.infrastructure.supabase_repository import SupabaseRepository
@@ -91,5 +92,46 @@ def test_catalog_does_not_trust_modified_metadata_or_unknown_enabled_upstream() 
             assert models == []
             pending = (await repository.list_catalog_models())[0]
             assert pending.metadata_status == "pending" and not pending.enabled
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("availability", ["unavailable", "unknown"])
+def test_reviewed_runtime_models_remain_eligible_when_availability_is_not_positive(
+    availability: str,
+) -> None:
+    profile = profile_for_model("openai:gpt-6.1-sol")
+    assert profile is not None
+    row = {
+        "id": "openai:gpt-6.1-sol",
+        "provider_id": "openai",
+        "provider_name": "OpenAI",
+        "adapter_kind": "openai",
+        "upstream_model_id": "gpt-6.1-sol",
+        "name": "GPT-6.1 Sol",
+        "requires_api_key": True,
+        "supports_streaming": True,
+        "supports_tools": True,
+        "enabled": True,
+        "metadata_status": "ready",
+        "trusted_metadata": json.loads(json.dumps(asdict(profile))),
+        "metadata_verified_at": "2026-10-15T00:00:00Z",
+        "availability": availability,
+        "availability_checked_at": "2026-10-15T00:10:00Z",
+    }
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, json=[row]))
+        ) as client:
+            repository = SupabaseRepository(SETTINGS, ALICE, verified_token_source(ALICE), client)
+            runtime_models = await repository.list_models()
+            assert [model.id for model in runtime_models] == ["openai:gpt-6.1-sol"]
+            assert runtime_models[0].enabled is True
+            assert runtime_models[0].availability == availability
+            assert runtime_models[0].context_window_tokens == 1_050_000
+            catalog_model = (await repository.list_catalog_models())[0]
+            assert catalog_model.enabled is True
+            assert catalog_model.availability == availability
 
     asyncio.run(exercise())

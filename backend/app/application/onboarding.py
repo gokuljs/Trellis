@@ -61,13 +61,6 @@ class OnboardingService:
         if model is None:
             raise ApplicationError("model_not_available", "The selected model is not available.")
 
-        if model.requires_api_key:
-            configured, _ = await self._secret_store.status(model.provider_id)
-            if not configured:
-                raise ApplicationError(
-                    "provider_not_configured",
-                    f"{model.provider_name} is unavailable. Contact the Trellis operator.",
-                )
         if not await self._repository.complete_onboarding(model_id):
             raise ApplicationError(
                 "onboarding_step_out_of_order",
