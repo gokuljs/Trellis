@@ -1189,12 +1189,8 @@ export function AppShell({
     )
       return
     const model = settings?.models?.find((item) => item.id === selectedModelId)
-    if (!model || !isModelSelectable(model)) {
-      setError(
-        model
-          ? "The selected model is unavailable. Choose a ready-to-use model for this chat and try again."
-          : "Open Settings before starting a session."
-      )
+    if (!model) {
+      setError("Choose a model from the list before starting a session.")
       return
     }
 
@@ -1274,7 +1270,7 @@ export function AppShell({
         settings?.models?.find((model) => model.id === selectedModelId)
       )
     ) {
-      setError("Choose a ready-to-use model for this chat before retrying.")
+      setError("Choose a model from the list before retrying.")
       return
     }
     submissionLockRef.current = true
@@ -1579,9 +1575,6 @@ export function AppShell({
               models={settings?.models ?? []}
               selectedModelId={selectedModelId}
               modelSaving={modelSaving}
-              modelReady={isModelSelectable(
-                settings?.models?.find((model) => model.id === selectedModelId)
-              )}
               onModelChange={(modelId) => void changeChatModel(modelId)}
               contextGauge={
                 <ContextGauge

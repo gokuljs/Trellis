@@ -27,7 +27,7 @@ test("saved chat choices stay independent of the default and new-chat draft", as
   )
 })
 
-test("legacy chats use the default and an absent default uses the first selectable model", async () => {
+test("legacy chats use the default and an absent default uses the first catalog model", async () => {
   const { selectedChatModelId } = await helpers()
   expect(
     selectedChatModelId({}, { selected_model_id: "default" }, "draft")
@@ -36,7 +36,7 @@ test("legacy chats use the default and an absent default uses the first selectab
     selectedChatModelId(null, {
       models: [model("pending", { selectable: false }), model("ready")],
     })
-  ).toBe("ready")
+  ).toBe("pending")
 })
 
 test("a model save acknowledged after returning to a chat overrides its stale local preference", async () => {
@@ -63,61 +63,32 @@ test("a model save acknowledged after returning to a chat overrides its stale lo
   ).toBe("draft")
 })
 
-test("pending metadata, unavailable providers and disabled models cannot be selected", async () => {
-  const { isModelSelectable, modelAvailabilityLabel } = await helpers()
-  const pending = model("pending", { metadata_status: "pending" })
-  expect(isModelSelectable(pending)).toBe(false)
-  expect(modelAvailabilityLabel(pending)).toBe("Metadata pending review")
-  expect(isModelSelectable(model("blocked", { selectable: false }))).toBe(false)
-  expect(isModelSelectable(model("disabled", { enabled: false }))).toBe(false)
-  expect(
-    isModelSelectable(
-      model("known", { selectable: true, availability: "unknown" })
-    )
-  ).toBe(true)
-  expect(
-    isModelSelectable(model("unavailable", { availability: "unavailable" }))
-  ).toBe(false)
-  expect(
-    isModelSelectable(model("no-key", { selectable: true, configured: false }))
-  ).toBe(false)
-  expect(isModelSelectable(model("no-key", { configured: false }))).toBe(false)
+test("a missing catalog choice cannot be selected", async () => {
+  const { isModelSelectable } = await helpers()
   expect(isModelSelectable(undefined)).toBe(false)
-  expect(isModelSelectable(model("ready", { selectable: true }))).toBe(true)
-  expect(
-    isModelSelectable(
-      model("managed", { configured: false, requires_api_key: false })
-    )
-  ).toBe(true)
 })
 
 test.each([
-  [{ selectable: true }, "Ready to use"],
-  [{ configured: false, selectable: true }, "API key missing"],
-  [
-    { configured: false, enabled: false, availability: "unknown" },
-    "API key missing",
-  ],
-  [{ metadata_status: "pending" }, "Metadata pending review"],
-  [{ availability: "unavailable" }, "Not available from provider"],
-  [{ enabled: false, availability: "unknown" }, "Availability not checked"],
-  [
-    { enabled: false, pending_reasons: ["availability_unverified"] },
-    "Availability not checked",
-  ],
-  [{ enabled: false, availability: "available" }, "Disabled"],
-  [{ selectable: false, supports_streaming: false }, "Streaming not supported"],
-  [{ selectable: false, supports_tools: false }, "Tools not supported"],
-  [{ selectable: false }, "Unavailable"],
+  { selectable: true },
+  { configured: false, selectable: true },
+  { configured: false, enabled: false, availability: "unknown" },
+  { metadata_status: "pending" },
+  { availability: "unavailable" },
+  { enabled: false, availability: "unknown" },
+  { enabled: false, pending_reasons: ["availability_unverified"] },
+  { enabled: false, availability: "available" },
+  { selectable: false, supports_streaming: false },
+  { selectable: false, supports_tools: false },
+  { selectable: false },
 ])(
-  "model availability explains known DTO flags without guessing (%j)",
-  async (flags, expected) => {
-    const { modelAvailabilityLabel } = await helpers()
-    expect(modelAvailabilityLabel(model("example", flags))).toBe(expected)
+  "catalog models remain selectable regardless of availability flags (%j)",
+  async (flags) => {
+    const { isModelSelectable } = await helpers()
+    expect(isModelSelectable(model("example", flags))).toBe(true)
   }
 )
 
-test("keyboard model selection skips unavailable choices and respects Home and End", async () => {
+test("keyboard model selection includes every catalog choice and respects Home and End", async () => {
   const { nextSelectableModelIndex } = await helpers()
   const models = [
     model("pending", { selectable: false }),
@@ -125,12 +96,13 @@ test("keyboard model selection skips unavailable choices and respects Home and E
     model("no-key", { configured: false }),
     model("last"),
   ]
-  expect(nextSelectableModelIndex(models, 1, "ArrowDown")).toBe(3)
-  expect(nextSelectableModelIndex(models, 3, "ArrowRight")).toBe(1)
-  expect(nextSelectableModelIndex(models, 1, "ArrowUp")).toBe(3)
-  expect(nextSelectableModelIndex(models, 3, "Home")).toBe(1)
+  expect(nextSelectableModelIndex(models, 1, "ArrowDown")).toBe(2)
+  expect(nextSelectableModelIndex(models, 3, "ArrowRight")).toBe(0)
+  expect(nextSelectableModelIndex(models, 1, "ArrowUp")).toBe(0)
+  expect(nextSelectableModelIndex(models, 3, "Home")).toBe(0)
   expect(nextSelectableModelIndex(models, 1, "End")).toBe(3)
-  expect(nextSelectableModelIndex([models[0]], 0, "ArrowDown")).toBeNull()
+  expect(nextSelectableModelIndex([models[0]], 0, "ArrowDown")).toBe(0)
+  expect(nextSelectableModelIndex([], 0, "ArrowDown")).toBeNull()
   expect(nextSelectableModelIndex(models, 1, "Tab")).toBeNull()
 })
 

@@ -3,11 +3,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react"
 
 import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 import { ApiError } from "@/lib/api"
-import {
-  isModelSelectable,
-  modelAvailabilityLabel,
-  nextSelectableModelIndex,
-} from "@/lib/model-choice"
+import { isModelSelectable, nextSelectableModelIndex } from "@/lib/model-choice"
 import type {
   ModelId,
   ModelStatus,
@@ -86,8 +82,8 @@ export function OnboardingFlow({
   const modelRefs = useRef<Array<HTMLButtonElement | null>>([])
 
   const selectedModel = modelOptions.find((item) => item.id === modelId)
-  const selectedModelReady = isModelSelectable(selectedModel)
-  const firstReadyIndex = modelOptions.findIndex(isModelSelectable)
+  const hasSelectedModel = Boolean(selectedModel)
+  const firstModelIndex = modelOptions.findIndex(isModelSelectable)
   const busy = submitting || checkingModels
 
   useEffect(() => {
@@ -162,13 +158,6 @@ export function OnboardingFlow({
       setError("Choose a model.")
       return
     }
-    if (!selectedModelReady) {
-      setError(
-        "This model is unavailable. Choose another model or check availability again."
-      )
-      return
-    }
-
     setError(null)
     setSubmitting(true)
     try {
@@ -331,12 +320,12 @@ export function OnboardingFlow({
                           role="radio"
                           aria-checked={item.id === modelId}
                           tabIndex={
-                            (item.id === modelId && selectedModelReady) ||
-                            (!selectedModelReady && index === firstReadyIndex)
+                            (item.id === modelId && hasSelectedModel) ||
+                            (!hasSelectedModel && index === firstModelIndex)
                               ? 0
                               : -1
                           }
-                          disabled={busy || !isModelSelectable(item)}
+                          disabled={busy}
                           onClick={() => selectModel(item.id)}
                           onKeyDown={(event) => {
                             const nextIndex = nextSelectableModelIndex(
@@ -355,19 +344,16 @@ export function OnboardingFlow({
                         >
                           <span>{item.provider_name}</span>
                           <span>{item.name}</span>
-                          <span>{modelAvailabilityLabel(item)}</span>
                         </button>
                       ))}
                     </div>
 
-                    {!selectedModelReady ? (
+                    {!hasSelectedModel ? (
                       <div className="onboarding-model-status">
                         <span role="status">
-                          {selectedModel
-                            ? `${selectedModel.name} is unavailable. Choose another model or check availability again.`
-                            : modelOptions.length
-                              ? "Choose a model to continue."
-                              : "No models are available right now. Check availability to try again."}
+                          {modelOptions.length
+                            ? "Choose a model to continue."
+                            : "No models found. Reload models to try again."}
                         </span>
                         <button
                           className="onboarding-secondary-action"
@@ -375,7 +361,7 @@ export function OnboardingFlow({
                           disabled={busy}
                           onClick={() => void retryModels()}
                         >
-                          {checkingModels ? "Checking…" : "Check availability"}
+                          {checkingModels ? "Loading…" : "Reload models"}
                         </button>
                       </div>
                     ) : null}
@@ -397,7 +383,7 @@ export function OnboardingFlow({
                       <button
                         className="onboarding-primary-action"
                         type="submit"
-                        disabled={busy || !selectedModelReady}
+                        disabled={busy || !hasSelectedModel}
                       >
                         {submitting ? "Starting…" : "Start Trellis"}
                       </button>

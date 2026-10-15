@@ -9,7 +9,6 @@ import type {
   Settings,
 } from "@/lib/app-types"
 import { notifications } from "@/lib/notifications"
-import { isModelSelectable, modelAvailabilityLabel } from "@/lib/model-choice"
 import "./profile-summary.css"
 
 type SettingsPageProps = {
@@ -84,7 +83,7 @@ export function SettingsPage({
 
   const selectModel = (modelId: string) => {
     const nextModel = models.find((item) => item.id === modelId)
-    if (!nextModel || !isModelSelectable(nextModel)) return
+    if (!nextModel) return
     void runUpdate(
       "model",
       {
@@ -138,19 +137,7 @@ export function SettingsPage({
                 </div>
                 <div>
                   <dt>Default model</dt>
-                  <dd>
-                    {selectedModel
-                      ? `${selectedModel.provider_name} · ${selectedModel.name}`
-                      : "Selected model unavailable"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Model availability</dt>
-                  <dd>
-                    {selectedModel
-                      ? modelAvailabilityLabel(selectedModel)
-                      : "Unavailable"}
-                  </dd>
+                  <dd>{selectedModel?.name ?? selectedModelId}</dd>
                 </div>
               </dl>
             </section>
@@ -245,15 +232,11 @@ export function SettingsPage({
                 />
               </select>
             </span>
-            <span className="settings-field-help" role="status">
-              {saving === "model"
-                ? "Saving default model…"
-                : selectedModel
-                  ? modelAvailabilityLabel(selectedModel)
-                  : models.length
-                    ? "Choose a model for new chats."
-                    : "No models found."}
-            </span>
+            {saving === "model" ? (
+              <span className="settings-field-help" role="status">
+                Saving default model…
+              </span>
+            ) : null}
           </label>
         </section>
 

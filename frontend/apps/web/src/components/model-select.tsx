@@ -1,5 +1,4 @@
 import type { ModelStatus } from "@/lib/app-types"
-import { isModelSelectable, modelAvailabilityLabel } from "@/lib/model-choice"
 
 type ModelSelectProps = {
   models: ModelStatus[]
@@ -14,38 +13,17 @@ export function ModelOptions({
   selectedModelId,
 }: Pick<ModelSelectProps, "models" | "selectedModelId">) {
   const hasSelection = models.some((model) => model.id === selectedModelId)
-  const groups = new Map<string, ModelStatus[]>()
-  for (const model of models) {
-    const provider = model.provider_id || model.provider_name || "models"
-    const group = groups.get(provider) ?? []
-    group.push(model)
-    groups.set(provider, group)
-  }
   return (
     <>
       {!hasSelection ? (
         <option value={selectedModelId} disabled>
-          {selectedModelId ? "Saved model unavailable" : "Choose a model"}
+          {selectedModelId || "Choose a model"}
         </option>
       ) : null}
-      {[...groups].map(([provider, models]) => (
-        <optgroup
-          key={provider}
-          label={models[0].provider_name || models[0].provider_id || "Models"}
-        >
-          {models.map((model) => (
-            <option
-              key={model.id}
-              value={model.id}
-              disabled={!isModelSelectable(model)}
-            >
-              {model.name}
-              {!isModelSelectable(model)
-                ? ` · ${modelAvailabilityLabel(model)}`
-                : ""}
-            </option>
-          ))}
-        </optgroup>
+      {models.map((model) => (
+        <option key={model.id} value={model.id}>
+          {model.name}
+        </option>
       ))}
     </>
   )

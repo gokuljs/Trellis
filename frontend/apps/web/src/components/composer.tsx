@@ -26,7 +26,6 @@ type ComposerProps = {
   models: ModelStatus[]
   selectedModelId: string
   modelSaving: boolean
-  modelReady: boolean
   onModelChange: (modelId: string) => void
   contextGauge?: ReactNode
 }
@@ -61,13 +60,15 @@ export function Composer({
   models,
   selectedModelId,
   modelSaving,
-  modelReady,
   onModelChange,
   contextGauge,
 }: ComposerProps) {
   const { resolvedTheme } = useTheme()
   const prefersReducedMotion = usePrefersReducedMotion()
-  const isSendable = Boolean(value.trim()) && !disabled && modelReady
+  const isSendable =
+    Boolean(value.trim()) &&
+    !disabled &&
+    models.some((model) => model.id === selectedModelId)
   const sendRef = useRef<HTMLDivElement>(null)
   const getBendConfig = useCallback(
     () => ({

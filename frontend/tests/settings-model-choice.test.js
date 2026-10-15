@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server"
 
-test("Settings describes the model as a new-chat default and never offers pending metadata as ready", async () => {
+test("Settings keeps the saved default selectable without availability labels", async () => {
   const { SettingsPage } =
     await import("../apps/web/src/components/settings-page.tsx")
   const markup = renderToStaticMarkup(
@@ -31,12 +31,14 @@ test("Settings describes the model as a new-chat default and never offers pendin
   )
   expect(markup).toContain("Default model")
   expect(markup).toContain("Existing chats keep their own choice.")
-  expect(markup).toContain("Metadata pending review")
-  expect(markup).toContain('value="pending" disabled="" selected=""')
+  expect(markup).not.toContain("Metadata pending review")
+  expect(markup).not.toContain("Ready to use")
+  expect(markup).not.toContain("Model availability")
+  expect(markup).toContain('value="pending" selected="">Pending model</option>')
   expect(markup).not.toContain("will power new messages")
 })
 
-test("Settings uses one compact grouped model select and keeps unavailable saved model names visible", async () => {
+test("Settings uses one compact flat model select and keeps all saved catalog choices enabled", async () => {
   const { SettingsPage } =
     await import("../apps/web/src/components/settings-page.tsx")
   const markup = renderToStaticMarkup(
@@ -71,17 +73,17 @@ test("Settings uses one compact grouped model select and keeps unavailable saved
     markup.match(/aria-label="Default model for new chats"/g)
   ).toHaveLength(1)
   expect(markup).toContain('<select aria-label="Default model for new chats"')
-  expect(markup.match(/<optgroup label="Anthropic"/g)).toHaveLength(1)
-  expect(markup.match(/<optgroup label="OpenAI"/g)).toHaveLength(1)
+  expect(markup).not.toContain("<optgroup")
   expect(markup).toContain(
-    'value="anthropic:sonnet" disabled="" selected="">Claude Sonnet · API key missing</option>'
+    'value="anthropic:sonnet" selected="">Claude Sonnet</option>'
   )
-  expect(markup).toContain("Claude Opus · API key missing")
+  expect(markup).toContain('value="anthropic:opus">Claude Opus</option>')
+  expect(markup).not.toContain("API key missing")
   expect(markup).not.toContain('role="radio"')
   expect(markup).not.toContain('class="provider-model"')
 })
 
-test("onboarding keeps pending models disabled and gives a ready model the keyboard entry point", async () => {
+test("onboarding allows catalog models regardless of availability and uses the saved model as keyboard entry", async () => {
   const { OnboardingFlow } =
     await import("../apps/web/src/components/onboarding-flow.tsx")
   const markup = renderToStaticMarkup(
@@ -107,7 +109,9 @@ test("onboarding keeps pending models disabled and gives a ready model the keybo
       onComplete: async () => {},
     })
   )
-  expect(markup).toContain('aria-checked="true" tabindex="-1" disabled=""')
-  expect(markup).toContain('aria-checked="false" tabindex="0"')
-  expect(markup).toContain("Pending")
+  expect(markup).toContain('aria-checked="true" tabindex="0"')
+  expect(markup).not.toContain('aria-checked="true" tabindex="0" disabled=""')
+  expect(markup).toContain('aria-checked="false" tabindex="-1"')
+  expect(markup).not.toContain("Metadata pending review")
+  expect(markup).not.toContain("Ready to use")
 })
