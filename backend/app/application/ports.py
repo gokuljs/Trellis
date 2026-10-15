@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Protocol
 
 from app.application.budgets import BudgetPreset
+from app.domain.context import ContextCheckpoint, ContextCheckpointDraft, ContextWindow
 from app.domain.models import (
     Message,
     ModelDescriptor,
@@ -287,3 +288,17 @@ class StreamingProviderAdapter(ProviderAdapter, Protocol):
 
 class RunEventPublisher(Protocol):
     async def publish(self, event: RunEvent) -> None: ...
+
+
+class ContextCheckpointRepository(Protocol):
+    async def load_context_window(self, session_id: str, *, limit: int = 128) -> ContextWindow: ...
+
+    async def load_context_checkpoint(self, session_id: str) -> ContextCheckpoint | None: ...
+
+    async def save_context_checkpoint(
+        self, run_id: str, expected_revision: int, draft: ContextCheckpointDraft
+    ) -> ContextCheckpoint: ...
+
+    async def list_context_messages(
+        self, session_id: str, after_ordinal: int, *, limit: int = 128
+    ) -> list[Message]: ...

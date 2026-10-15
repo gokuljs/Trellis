@@ -144,10 +144,14 @@ def _tail_boundary(request: ModelRequest, units: Sequence[tuple[ContextItem, ...
             break
         boundary = index
         tokens += count
+    if all(item.source_kind == "checkpoint" for unit in units[:boundary] for item in unit):
+        return 0
     return boundary
 
 
-def _cost(profile: ModelProfile, input_tokens: int, output_tokens: int) -> float | None:
+def _cost(
+    profile: ModelProfile, input_tokens: int, output_tokens: int, pricing_context: int = 0
+) -> float | None:
     # Reserve the highest applicable input rate before the provider reports
     # cache writes. Actual billing still uses the provider's usage breakdown.
     reserved_profile = replace(
@@ -168,14 +172,22 @@ def _cost(profile: ModelProfile, input_tokens: int, output_tokens: int) -> float
             for tier in profile.price_tiers
         ),
     )
-    return estimate_profile_cost(reserved_profile, UsageTokens(input_tokens, output_tokens))
+    return estimate_profile_cost(
+        reserved_profile,
+        UsageTokens(input_tokens, output_tokens),
+        pricing_context_tokens=pricing_context
+        if profile.long_context_pricing_scope == "session"
+        else None,
+    )
 
 
-def _affordable_output(profile: ModelProfile, input_tokens: int, target: int, limit: float) -> int:
+def _affordable_output(
+    profile: ModelProfile, input_tokens: int, target: int, limit: float, pricing_context: int = 0
+) -> int:
     lower, upper = 0, target
     while lower < upper:
         middle = (lower + upper + 1) // 2
-        amount = _cost(profile, input_tokens, middle)
+        amount = _cost(profile, input_tokens, middle, pricing_context)
         if amount is not None and amount <= limit:
             lower = middle
         else:
@@ -192,6 +204,7 @@ def preflight_context(
     counted_input: InputTokenCount | None = None,
     checkpoint_id: str | None = None,
     remaining_run_cost_usd: float | None = None,
+    pricing_context_tokens: int = 0,
 ) -> ContextPreflight:
     if not isinstance(remaining_run_tokens, int) or isinstance(remaining_run_tokens, bool):
         raise ValueError("remaining run tokens must be integers")
@@ -244,12 +257,14 @@ def preflight_context(
     if reserve <= 0:
         raise ApplicationError("run_budget_exhausted", "The run has no output budget remaining.")
     if remaining_run_cost_usd is not None:
-        floor = _cost(profile, required_tokens, 1)
+        floor = _cost(profile, required_tokens, 1, pricing_context_tokens)
         if floor is None or floor > remaining_run_cost_usd:
             raise ApplicationError(
                 "budget_cost_limit", "The remaining run cost budget cannot fit the current input."
             )
-        affordable = _affordable_output(profile, count.tokens, reserve, remaining_run_cost_usd)
+        affordable = _affordable_output(
+            profile, count.tokens, reserve, remaining_run_cost_usd, pricing_context_tokens
+        )
         reserve = min(reserve, max(1, affordable))
     budget = context_budget(profile, output_reserve=reserve)
     if budget is None:
@@ -265,7 +280,7 @@ def preflight_context(
     boundary = _tail_boundary(prepared, units)
     prefix = tuple(item for unit in units[:boundary] for item in unit)
     tail = tuple(item for unit in units[boundary:] for item in unit)
-    estimated_cost = _cost(profile, count.tokens, reserve)
+    estimated_cost = _cost(profile, count.tokens, reserve, pricing_context_tokens)
     fits = count.tokens <= usable and (
         remaining_run_cost_usd is None
         or (estimated_cost is not None and estimated_cost <= remaining_run_cost_usd)
@@ -292,4 +307,5 @@ def preflight_context(
         checkpoint_id,
         estimated_cost,
         source_hash,
+        max(pricing_context_tokens, count.tokens),
     )

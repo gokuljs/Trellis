@@ -298,3 +298,39 @@ def test_output_reservation_covers_the_highest_input_cache_write_rate(
     assert plan.estimated_call_cost_usd == pytest.approx(
         (1000 * worst_input_rate + 250) / 1_000_000
     )
+
+
+def test_checkpoint_marker_stays_with_recent_turns_without_becoming_a_compactable_prefix() -> None:
+    checkpoint = replace(
+        item("cp", "checkpoint", "user", "Prior summary"), source_kind="checkpoint"
+    )
+    items = (
+        checkpoint,
+        *(item(f"m{i}", f"t{i}", "user", "Recent") for i in range(4)),
+        item("current", "now", "user", "Continue", required=True),
+    )
+    plan = preflight_context(
+        request(items), items=items, profile=profile(), remaining_run_tokens=100_000
+    )
+    assert plan.compactable_prefix == ()
+    assert plan.retained_tail == items
+
+
+def test_session_pricing_high_water_mark_survives_a_small_compacted_request() -> None:
+    items = (item("current", "now", "user", "Continue", required=True),)
+    ordinary = preflight_context(
+        request(items), items=items, profile=profile(), remaining_run_tokens=100_000
+    )
+    compacted = preflight_context(
+        request(items),
+        items=items,
+        profile=profile(),
+        remaining_run_tokens=100_000,
+        pricing_context_tokens=300_000,
+    )
+    assert (
+        compacted.estimated_call_cost_usd is not None
+        and ordinary.estimated_call_cost_usd is not None
+    )
+    assert compacted.estimated_call_cost_usd > ordinary.estimated_call_cost_usd
+    assert compacted.snapshot()["pricing_context_tokens"] == 300_000

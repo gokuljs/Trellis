@@ -17,7 +17,9 @@ from uuid import UUID, uuid4
 import httpx
 
 from app.application.budgets import BudgetPreset, limits_for_preset
+from app.application.errors import ApplicationError
 from app.core.config import Settings
+from app.domain.context import ContextCheckpoint, ContextCheckpointDraft, ContextWindow
 from app.domain.models import (
     Message,
     MessageRole,
@@ -107,12 +109,172 @@ class MemoryState:
     waiting_tool_call_id: dict[str, str] = field(default_factory=dict)
     assistant_outputs: dict[str, AssistantOutput] = field(default_factory=dict)
     assistant_batches: dict[tuple[str, int], RunEvent] = field(default_factory=dict)
+    context_checkpoints: dict[str, ContextCheckpoint] = field(default_factory=dict)
+    latest_context_checkpoint: dict[str, str] = field(default_factory=dict)
 
 
 class MemoryRepository:
     """An in-memory implementation of account ports used only by tests."""
 
     _states: ClassVar[dict[Path, MemoryState]] = {}
+
+    async def load_context_window(self, session_id: str, *, limit: int = 128) -> ContextWindow:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 128:
+            raise ValueError("context page limit is invalid")
+        checkpoint_id = self.state.latest_context_checkpoint.get(session_id)
+        checkpoint = self.state.context_checkpoints.get(checkpoint_id) if checkpoint_id else None
+        boundary = checkpoint.covered_message_ordinal if checkpoint else 0
+        return ContextWindow(
+            checkpoint,
+            tuple(
+                message
+                for message in self.state.messages.get(session_id, [])
+                if message.ordinal > boundary
+            )[:limit],
+        )
+
+    async def load_context_checkpoint(self, session_id: str) -> ContextCheckpoint | None:
+        checkpoint_id = self.state.latest_context_checkpoint.get(session_id)
+        return self.state.context_checkpoints.get(checkpoint_id) if checkpoint_id else None
+
+    async def save_context_checkpoint(
+        self, run_id: str, expected_revision: int, draft: ContextCheckpointDraft
+    ) -> ContextCheckpoint:
+        if not self.owns_run_lease(run_id):
+            raise ApplicationError("run_not_owned", "This run is active on another computer.")
+        run = self.state.runs[run_id]
+        if run.status is not RunStatus.RUNNING:
+            raise ValueError("checkpoint run is not running")
+        call = self.state.model_calls.get(draft.model_call_id)
+        if (
+            call is None
+            or call.run_id != run_id
+            or call.status is not ModelCallStatus.COMPLETED
+            or call.request_snapshot.get("purpose") not in {"summary", "native_compaction"}
+        ):
+            raise ValueError("checkpoint requires a completed compaction call")
+        existing = self.state.context_checkpoints.get(draft.id)
+        if existing is not None:
+            if (
+                replace(existing.draft, pricing_context_tokens=draft.pricing_context_tokens)
+                == draft
+                and existing.draft.pricing_context_tokens >= draft.pricing_context_tokens
+                and existing.run_id == run_id
+                and existing.revision == expected_revision + 1
+            ):
+                return existing
+            raise ValueError("checkpoint id conflicts with saved content")
+        previous = await self.load_context_checkpoint(run.session_id)
+        revision = previous.revision if previous else 0
+        if expected_revision != revision:
+            raise ApplicationError(
+                "context_checkpoint_conflict", "Context changed while compaction was being saved."
+            )
+        checkpoint_sources = [
+            source for source in draft.sources if source.source_kind == "checkpoint"
+        ]
+        if (previous is None and checkpoint_sources) or (
+            previous is not None
+            and [source.source_id for source in checkpoint_sources] != [previous.id]
+        ):
+            raise ValueError("checkpoint prefix must include its current parent")
+        messages = self.state.messages[run.session_id]
+        chosen: list[Message] = []
+        chosen_run: list[RunMessageRecord] = []
+        before_run = (
+            previous.covered_run_message_ordinal if previous and previous.run_id == run_id else 0
+        )
+        for source in draft.sources:
+            if source.source_kind == "message":
+                message = next(
+                    (
+                        item
+                        for item in messages
+                        if item.id == source.source_id and item.turn_id == source.turn_id
+                    ),
+                    None,
+                )
+                if message is None:
+                    raise ValueError("checkpoint source does not belong to chat")
+                if message.id == run.input_message_id:
+                    raise ValueError("checkpoint cannot cover the current request")
+                chosen.append(message)
+            elif source.source_kind == "run_message":
+                message = next(
+                    (
+                        item
+                        for item in self.state.run_messages[run_id]
+                        if item.id == source.source_id
+                    ),
+                    None,
+                )
+                if message is None or source.turn_id != run.turn_id:
+                    raise ValueError("checkpoint source does not belong to run")
+                if message.ordinal <= before_run:
+                    raise ValueError("checkpoint cannot rehydrate archived run messages")
+                chosen_run.append(message)
+        before = previous.covered_message_ordinal if previous else 0
+        covered = max((message.ordinal for message in chosen), default=before)
+        expected_ids = {message.id for message in messages if before < message.ordinal <= covered}
+        if expected_ids != {message.id for message in chosen} or any(
+            message.ordinal <= before for message in chosen
+        ):
+            raise ValueError("checkpoint must cover a contiguous unarchived prefix")
+        if chosen and any(
+            message.turn_id == chosen[-1].turn_id and message.ordinal > covered
+            for message in messages
+        ):
+            raise ValueError("checkpoint cannot split a conversation turn")
+        covered_run = max((message.ordinal for message in chosen_run), default=before_run)
+        if {
+            message.id
+            for message in self.state.run_messages[run_id]
+            if before_run < message.ordinal <= covered_run
+        } != {message.id for message in chosen_run}:
+            raise ValueError("checkpoint must cover a contiguous run prefix")
+        for tool in self.state.tool_calls.values():
+            if (
+                tool.run_id == run_id
+                and any(message.id == tool.assistant_message_id for message in chosen_run)
+                and not any(message.tool_call_id == tool.id for message in chosen_run)
+            ):
+                raise ValueError("checkpoint cannot split a tool exchange")
+        saved_draft = replace(
+            draft,
+            pricing_context_tokens=max(
+                draft.pricing_context_tokens,
+                previous.draft.pricing_context_tokens if previous else 0,
+            ),
+        )
+        saved = ContextCheckpoint(
+            run.session_id,
+            run_id,
+            revision + 1,
+            previous.id if previous else None,
+            run.provider_id,
+            run.model_id,
+            run.adapter_kind,
+            covered,
+            covered_run,
+            _now(),
+            saved_draft,
+        )
+        self.state.context_checkpoints[draft.id] = saved
+        self.state.latest_context_checkpoint[run.session_id] = draft.id
+        return saved
+
+    async def list_context_messages(
+        self, session_id: str, after_ordinal: int, *, limit: int = 128
+    ) -> list[Message]:
+        if after_ordinal < 0 or not 1 <= limit <= 128:
+            raise ValueError("context cursor or page limit is invalid")
+        checkpoint = await self.load_context_checkpoint(session_id)
+        boundary = max(after_ordinal, checkpoint.covered_message_ordinal if checkpoint else 0)
+        return [
+            message
+            for message in self.state.messages.get(session_id, [])
+            if message.ordinal > boundary
+        ][:limit]
 
     def __init__(self, path: Path, *, owner_id: UUID | None = None) -> None:
         self.path = path.resolve()

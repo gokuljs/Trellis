@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 from typing import Literal, cast
 from uuid import UUID
 
@@ -21,6 +22,12 @@ from app.application.errors import ApplicationError
 from app.application.model_catalog import profile_for_model
 from app.core.config import Settings
 from app.core.supabase import project_base_url
+from app.domain.context import (
+    CheckpointSource,
+    ContextCheckpoint,
+    ContextCheckpointDraft,
+    ContextWindow,
+)
 from app.domain.models import (
     Message,
     ModelDescriptor,
@@ -151,6 +158,146 @@ def _nullable_number(row: Mapping[str, object], key: str) -> float | None:
 
 
 class SupabaseRepository:
+    async def load_context_window(self, session_id: str, *, limit: int = 128) -> ContextWindow:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 128:
+            raise ValueError("context page limit is invalid")
+        row = _object(
+            await self._request(
+                "POST",
+                "rpc/read_context_window",
+                payload={"p_session_id": session_id, "p_limit": limit},
+            )
+        )
+        checkpoint_row = row.get("checkpoint")
+        checkpoint = (
+            self._checkpoint(_object(checkpoint_row)) if checkpoint_row is not None else None
+        )
+        messages = tuple(self._message(message) for message in _array(row.get("messages")))
+        if (checkpoint is not None and checkpoint.session_id != session_id) or any(
+            message.session_id != session_id for message in messages
+        ):
+            raise RuntimeError("Supabase returned another chat's context")
+        boundary = checkpoint.covered_message_ordinal if checkpoint else 0
+        if (
+            len(messages) > limit
+            or any(message.ordinal <= boundary for message in messages)
+            or any(a.ordinal >= b.ordinal for a, b in pairwise(messages))
+        ):
+            raise RuntimeError("Supabase returned an invalid context window")
+        return ContextWindow(checkpoint, messages)
+
+    async def load_context_checkpoint(self, session_id: str) -> ContextCheckpoint | None:
+        rows = await self._read(
+            "context_checkpoints",
+            select="*",
+            filters={
+                "user_id": f"eq.{self._user_id}",
+                "chat_id": f"eq.{session_id}",
+                "order": "revision.desc",
+                "limit": "1",
+            },
+        )
+        if not rows:
+            return None
+        checkpoint = self._checkpoint(rows[0])
+        if checkpoint.session_id != session_id:
+            raise RuntimeError("Supabase returned another chat's checkpoint")
+        return checkpoint
+
+    async def save_context_checkpoint(
+        self, run_id: str, expected_revision: int, draft: ContextCheckpointDraft
+    ) -> ContextCheckpoint:
+        if (
+            not isinstance(expected_revision, int)
+            or isinstance(expected_revision, bool)
+            or expected_revision < 0
+        ):
+            raise ValueError("checkpoint revision must be a non-negative integer")
+        from dataclasses import asdict, replace
+
+        try:
+            result = await self._rpc(
+                "save_context_checkpoint",
+                {**asdict(draft), "run_id": run_id, "expected_revision": expected_revision},
+                capability=self._run_capability(run_id),
+            )
+        except ValueError as error:
+            if str(error) == "checkpoint revision conflict":
+                raise ApplicationError(
+                    "context_checkpoint_conflict",
+                    "Context changed while compaction was being saved.",
+                ) from None
+            raise
+        saved = self._checkpoint(_object(result))
+        if (
+            saved.run_id != run_id
+            or replace(saved.draft, pricing_context_tokens=draft.pricing_context_tokens) != draft
+            or saved.draft.pricing_context_tokens < draft.pricing_context_tokens
+        ):
+            raise RuntimeError("Supabase returned another checkpoint result")
+        return saved
+
+    async def list_context_messages(
+        self, session_id: str, after_ordinal: int, *, limit: int = 128
+    ) -> list[Message]:
+        if after_ordinal < 0 or not 1 <= limit <= 128:
+            raise ValueError("context cursor or page limit is invalid")
+        checkpoint = await self.load_context_checkpoint(session_id)
+        boundary = max(after_ordinal, checkpoint.covered_message_ordinal if checkpoint else 0)
+        messages = await self._messages(
+            {"chat_id": f"eq.{session_id}", "ordinal": f"gt.{boundary}", "limit": str(limit)}
+        )
+        if any(message.session_id != session_id for message in messages):
+            raise RuntimeError("Supabase returned another chat's context")
+        return messages
+
+    def _checkpoint(self, row: dict[str, object]) -> ContextCheckpoint:
+        self._owned(row)
+        sources = _array(row.get("sources"))
+        native_kind = _nullable_text(row, "native_kind")
+        if native_kind not in {None, "openai_window", "anthropic_block"}:
+            raise RuntimeError("Supabase returned invalid native checkpoint metadata")
+        refs: list[CheckpointSource] = []
+        for source in sources:
+            kind = _text(source, "source_kind")
+            if kind not in {"message", "run_message", "checkpoint"}:
+                raise RuntimeError("Supabase returned an invalid checkpoint source")
+            refs.append(
+                CheckpointSource(
+                    _text(source, "source_id"),
+                    kind,
+                    _text(source, "turn_id"),
+                )
+            )
+        draft = ContextCheckpointDraft(
+            _text(row, "id"),
+            _text(row, "model_call_id"),
+            tuple(refs),
+            _text(row, "summary"),
+            _text(row, "source_hash"),
+            _text(row, "input_hash"),
+            _text(row, "instruction_hash"),
+            _text(row, "workspace_hash"),
+            _integer(row, "input_tokens_before"),
+            _integer(row, "input_tokens_after"),
+            native_kind,
+            _nullable_text(row, "native_payload_json"),
+            _integer(row, "pricing_context_tokens"),
+        )
+        return ContextCheckpoint(
+            _text(row, "chat_id"),
+            _text(row, "run_id"),
+            _integer(row, "revision"),
+            _nullable_text(row, "parent_id"),
+            _text(row, "provider_id"),
+            _text(row, "model_id"),
+            _text(row, "adapter_kind"),
+            _integer(row, "covered_message_ordinal"),
+            _integer(row, "covered_run_message_ordinal"),
+            _text(row, "created_at"),
+            draft,
+        )
+
     def __init__(
         self,
         settings: Settings,
