@@ -32,7 +32,7 @@ from app.application.ports import (
     StreamingProviderAdapter,
     WorkspaceBindingPort,
 )
-from app.application.run_context import RunContext, usage_cost
+from app.application.run_context import RunContext, billing_tier, usage_cost
 from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
 from app.application.streaming import TextStreamBatcher
 from app.application.tools import (
@@ -1106,6 +1106,11 @@ class RunService:
                 for tool in request.tools
             ],
             "max_output_tokens": request.max_output_tokens,
+            **(
+                {"native_context_json": request.native_context_json}
+                if request.native_context_json is not None
+                else {}
+            ),
         }
         return cast(dict[str, object], self._redactor.redact_record(snapshot))
 
@@ -1223,7 +1228,7 @@ class RunService:
                 continuation_items.append(item)
             elif event.kind == "usage":
                 if event.service_tier is not None:
-                    billing_context["service_tier"] = event.service_tier
+                    billing_context["service_tier"] = billing_tier(event.service_tier)
                 if event.cache_creation_tokens is not None:
                     billing_context["cache_creation_1h_tokens"] = (
                         event.cache_creation_1h_tokens if event.cache_creation_tokens else 0
@@ -1361,6 +1366,14 @@ class RunService:
         cost = 0.0
         missing_price = False
         for call in calls:
+            billing = cast(
+                Mapping[str, object], (call.response_snapshot or {}).get("usage_context", {})
+            )
+            if billing.get("usage_complete") is False:
+                raise ProviderError(
+                    "provider_usage_unavailable",
+                    "The provider did not report enough usage to enforce this run's budget.",
+                )
             if (
                 call.status is not ModelCallStatus.COMPLETED
                 and call.input_tokens is None
@@ -1376,7 +1389,7 @@ class RunService:
                     "cached_tokens": call.cached_tokens,
                     "cache_creation_tokens": call.cache_creation_tokens,
                 },
-                cast(Mapping[str, object], (call.response_snapshot or {}).get("usage_context", {})),
+                billing,
             )
             if call_tokens is None:
                 raise ProviderError(

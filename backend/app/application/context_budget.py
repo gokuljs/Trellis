@@ -63,7 +63,7 @@ def estimate_input_tokens(request: ModelRequest) -> InputTokenCount:
     return InputTokenCount(tokens, "utf8_bytes_estimate_v1", _hash_record(record))
 
 
-def _normalize(items: Sequence[ContextItem]) -> tuple[ContextItem, ...]:
+def normalize_context_items(items: Sequence[ContextItem]) -> tuple[ContextItem, ...]:
     normalized: list[ContextItem] = []
     seen: set[tuple[str, str]] = set()
     for item in items:
@@ -227,7 +227,7 @@ def preflight_context(
         raise ApplicationError("model_not_available", "The selected model metadata is unavailable.")
     if remaining_run_cost_usd is not None and not math.isfinite(remaining_run_cost_usd):
         raise ValueError("remaining cost must be finite")
-    normalized = _normalize(items)
+    normalized = normalize_context_items(items)
     if not normalized or request.messages not in (
         tuple(item.message for item in items),
         tuple(item.message for item in normalized),

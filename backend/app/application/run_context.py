@@ -14,7 +14,11 @@ from app.application.budgets import PricingUnavailable, count_total_tokens
 from app.application.compaction import build_summary_request, replay_checkpoint, summarize_prefix
 from app.application.context import build_model_context
 from app.application.context_budget import (
+    _cost as reserve_context_cost,
+)
+from app.application.context_budget import (
     estimate_input_tokens,
+    normalize_context_items,
     preflight_context,
 )
 from app.application.errors import ApplicationError, ProviderError
@@ -27,9 +31,11 @@ from app.application.model_catalog import (
 from app.application.ports import (
     ChatRepository,
     ContextCheckpointRepository,
+    NativeCompactingProvider,
     RunRepository,
     SessionRepository,
     StreamingProviderAdapter,
+    TokenCountingProvider,
 )
 from app.application.secret_redaction import SecretRedactor
 from app.domain.context import (
@@ -37,6 +43,8 @@ from app.domain.context import (
     ContextCheckpointDraft,
     ContextItem,
     ContextPreflight,
+    InputTokenCount,
+    NativeCompactionResult,
 )
 from app.domain.models import ModelDescriptor
 from app.domain.runtime import (
@@ -70,9 +78,40 @@ def _remaining(run: RunSnapshot) -> float:
     return seconds
 
 
+def billing_tier(value: object) -> str:
+    return (
+        value
+        if isinstance(value, str)
+        and value in {"standard", "fast", "batch", "flex", "ultrafast", "default", "priority"}
+        else "unknown"
+    )
+
+
 def usage_cost(
     model_id: str, usage: dict[str, int | None], billing: Mapping[str, object]
 ) -> tuple[int | None, float | None]:
+    iterations = billing.get("iterations")
+    if isinstance(iterations, list):
+        tokens, cost = 0, 0.0
+        known_tokens = known_cost = billing.get("usage_complete", True) is True
+        for raw in iterations:
+            if not isinstance(raw, dict):
+                raise ValueError("invalid native usage iteration")
+            entry = cast(dict[str, object], raw)
+            raw_usage = entry.get("usage")
+            raw_billing = entry.get("billing")
+            if not isinstance(raw_usage, dict) or not isinstance(raw_billing, dict):
+                raise ValueError("invalid native usage iteration")
+            part_tokens, part_cost = usage_cost(
+                model_id,
+                cast(dict[str, int | None], raw_usage),
+                cast(dict[str, object], raw_billing),
+            )
+            known_tokens = known_tokens and part_tokens is not None
+            known_cost = known_cost and part_cost is not None
+            tokens += part_tokens or 0
+            cost += part_cost or 0
+        return tokens if known_tokens else None, cost if known_cost else None
     profile = profile_for_model(model_id)
     if profile is None or not profile.metadata_ready:
         raise PricingUnavailable(model_id)
@@ -225,7 +264,46 @@ class RunContext:
             workspace_hash = _hash(
                 {"root": str(workspace_root) if workspace_root else None, "guidance": guidance}
             )
+            pricing_context = max(
+                checkpoint.draft.pricing_context_tokens if checkpoint else 0,
+                self._pricing_highwater(profile, calls),
+            )
             if checkpoint is not None:
+                native = replay_checkpoint(
+                    checkpoint,
+                    request,
+                    instruction_hash=instruction_hash,
+                    workspace_hash=workspace_hash,
+                    allow_native=profile.supports_native_compaction is True,
+                )
+                if native.native_payload_json is not None and current_present:
+                    try:
+                        native_plan = await self._preflight(
+                            run,
+                            provider,
+                            api_key,
+                            user_id,
+                            replace(request, native_context_json=native.native_payload_json),
+                            items=items,
+                            profile=profile,
+                            remaining_run_tokens=run.max_total_tokens - tokens,
+                            remaining_run_cost_usd=run.max_cost_usd - cost
+                            if cost is not None
+                            else None,
+                            checkpoint_id=checkpoint.id,
+                            pricing_context_tokens=pricing_context,
+                        )
+                        if not native_plan.needs_compaction:
+                            return native_plan
+                    except ApplicationError as error:
+                        if error.code not in {
+                            "native_context_count_required",
+                            "context_count_mismatch",
+                            "context_input_too_large",
+                            "run_budget_exhausted",
+                            "budget_cost_limit",
+                        }:
+                            raise
                 replay = replay_checkpoint(
                     checkpoint,
                     request,
@@ -241,8 +319,11 @@ class RunContext:
                 )
                 items = (marker, *items)
                 request = replace(request, messages=(replay.message, *request.messages))
-            pricing_context = checkpoint.draft.pricing_context_tokens if checkpoint else 0
-            plan = preflight_context(
+            plan = await self._preflight(
+                run,
+                provider,
+                api_key,
+                user_id,
                 request,
                 items=items,
                 profile=profile,
@@ -265,7 +346,11 @@ class RunContext:
             while True:
                 summary_request = build_summary_request(plan.request, prefix)
                 try:
-                    summary_plan = preflight_context(
+                    summary_plan = await self._preflight(
+                        run,
+                        provider,
+                        api_key,
+                        user_id,
                         summary_request,
                         items=(
                             ContextItem(
@@ -297,6 +382,38 @@ class RunContext:
                             "context_compaction_unavailable",
                             "No affordable complete prefix can be summarized.",
                         ) from None
+            native_result = await self._try_native(
+                run,
+                model,
+                profile,
+                provider,
+                api_key,
+                user_id,
+                plan,
+                summary_plan,
+                prefix,
+                len(calls),
+                tokens,
+                cost,
+            )
+            calls = await self.runs.list_model_calls(run.id)
+            tokens, cost = self.totals(run.model_id, calls)
+            # Native usage is actual spending. Recheck the private summary
+            # against what remains before dispatching another paid request.
+            summary_plan = await self._preflight(
+                run,
+                provider,
+                api_key,
+                user_id,
+                summary_plan.request,
+                items=summary_plan.sources,
+                profile=profile,
+                remaining_run_tokens=run.max_total_tokens - tokens,
+                remaining_run_cost_usd=run.max_cost_usd - cost if cost is not None else None,
+                pricing_context_tokens=max(
+                    plan.pricing_context_tokens, summary_plan.pricing_context_tokens
+                ),
+            )
             summary, call = await self._summarize(
                 run, model, provider, summary_plan, api_key, user_id, len(calls) + 1
             )
@@ -333,14 +450,334 @@ class RunContext:
                 workspace_hash,
                 plan.input_tokens,
                 estimate_input_tokens(after).tokens,
+                native_kind=native_result.native_kind if native_result else None,
+                native_payload_json=native_result.payload_json if native_result else None,
                 pricing_context_tokens=max(
-                    plan.pricing_context_tokens, summary_plan.pricing_context_tokens
+                    plan.pricing_context_tokens,
+                    summary_plan.pricing_context_tokens,
+                    self._pricing_highwater(profile, after_calls),
                 ),
             )
             await self.checkpoints.save_context_checkpoint(
                 run.id, checkpoint.revision if checkpoint else 0, draft
             )
         raise ProviderError("model_call_limit", "The run reached its model-call limit.")
+
+    @staticmethod
+    def _pricing_highwater(profile: ModelProfile, calls: list[ModelCallRecord]) -> int:
+        highwater = 0
+        for call in calls:
+            billing = (call.response_snapshot or {}).get("usage_context", {})
+            if not isinstance(billing, dict):
+                continue
+            prior = billing.get("pricing_context_tokens")
+            if isinstance(prior, int):
+                highwater = max(highwater, prior)
+            iterations = billing.get("iterations")
+            if isinstance(iterations, list):
+                # Iterations are separate requests. Their summed input is billed
+                # usage, not the size of one pricing context.
+                for entry in iterations:
+                    if not isinstance(entry, dict) or not isinstance(entry.get("usage"), dict):
+                        continue
+                    part = entry["usage"]
+                    prompt = part.get("input_tokens")
+                    if not isinstance(prompt, int):
+                        continue
+                    if not profile.cache_tokens_included_in_input:
+                        prompt += (part.get("cached_tokens") or 0) + (
+                            part.get("cache_creation_tokens") or 0
+                        )
+                    highwater = max(highwater, prompt)
+            elif call.input_tokens is not None:
+                prompt = call.input_tokens
+                if not profile.cache_tokens_included_in_input:
+                    prompt += (call.cached_tokens or 0) + (call.cache_creation_tokens or 0)
+                highwater = max(highwater, prompt)
+        return highwater
+
+    async def _try_native(
+        self,
+        run: RunSnapshot,
+        model: ModelDescriptor,
+        profile: ModelProfile,
+        provider: StreamingProviderAdapter,
+        api_key: str,
+        user_id: str,
+        plan: ContextPreflight,
+        summary_plan: ContextPreflight,
+        prefix: tuple[ContextItem, ...],
+        call_count: int,
+        tokens: int,
+        cost: float | None,
+    ) -> NativeCompactionResult | None:
+        if (
+            profile.supports_native_compaction is not True
+            or not callable(getattr(provider, "compact", None))
+            or not callable(getattr(provider, "count_input", None))
+            or call_count + 2 >= run.max_model_calls
+            or cost is None
+        ):
+            return None
+        native_request = replace(
+            plan.request,
+            messages=tuple(item.message for item in prefix),
+            native_context_json=None,
+            max_output_tokens=2048,
+            tools=() if profile.provider_id == "openai" else plan.request.tools,
+        )
+        try:
+            native_plan = await self._preflight(
+                run,
+                provider,
+                api_key,
+                user_id,
+                native_request,
+                items=tuple(replace(item, required=True) for item in prefix),
+                profile=profile,
+                remaining_run_tokens=run.max_total_tokens - tokens,
+                remaining_run_cost_usd=run.max_cost_usd - cost,
+                pricing_context_tokens=plan.pricing_context_tokens,
+            )
+        except ApplicationError as error:
+            if error.code in {
+                "context_input_too_large",
+                "run_budget_exhausted",
+                "budget_cost_limit",
+            }:
+                return None
+            raise
+        if native_plan.count_method != "provider":
+            return None
+        # OpenAI compact has no output cap. Reserve the verified model maximum
+        # before dispatch, plus both the portable companion and next generation.
+        output = profile.max_output_tokens if profile.provider_id == "openai" else 2048
+        assert output is not None
+        window = profile.context_window_tokens
+        assert window is not None
+        native_input_cap = min(window - output, profile.max_input_tokens or window)
+        native_input_cap -= max(2048, (window + 49) // 50)
+        if native_plan.input_tokens > native_input_cap:
+            return None
+        native_cost = reserve_context_cost(
+            profile, native_plan.input_tokens, output, plan.pricing_context_tokens
+        )
+        summary_tokens = summary_plan.input_tokens + summary_plan.output_reserve_tokens
+        generation_tokens = plan.input_tokens + plan.output_reserve_tokens
+        if (
+            native_cost is None
+            or native_plan.input_tokens + output + summary_tokens + generation_tokens
+            > run.max_total_tokens - tokens
+            or native_cost
+            + (summary_plan.estimated_call_cost_usd or 0)
+            + (plan.estimated_call_cost_usd or 0)
+            > run.max_cost_usd - cost
+        ):
+            return None
+        native_plan = replace(
+            native_plan,
+            request=replace(native_plan.request, max_output_tokens=output),
+            output_reserve_tokens=output,
+            estimated_call_cost_usd=native_cost,
+        )
+        return await self._compact(
+            run, model, provider, native_plan, api_key, user_id, call_count + 1
+        )
+
+    async def _compact(
+        self,
+        run: RunSnapshot,
+        model: ModelDescriptor,
+        provider: StreamingProviderAdapter,
+        plan: ContextPreflight,
+        api_key: str,
+        user_id: str,
+        step_index: int,
+    ) -> NativeCompactionResult | None:
+        call = await self.runs.create_model_call(
+            run.id,
+            step_index,
+            model,
+            {
+                "purpose": "native_compaction",
+                "context": plan.snapshot(),
+                "messages": [asdict(message) for message in plan.request.messages],
+                "system_instructions": plan.request.system_instructions,
+                "tools": [asdict(tool) for tool in plan.request.tools],
+                "max_output_tokens": plan.request.max_output_tokens,
+            },
+        )
+        usage: dict[str, int | None] = {
+            key: None
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cached_tokens",
+                "cache_creation_tokens",
+                "reasoning_tokens",
+            )
+        }
+        iterations: list[dict[str, object]] = []
+        billing: dict[str, object] = {
+            "pricing_context_tokens": plan.pricing_context_tokens,
+            "iterations": iterations,
+            "usage_complete": False,
+        }
+        try:
+            call = await self.runs.update_model_call(call.id, ModelCallStatus.STREAMING)
+            await self.publish(
+                await self.runs.append_run_event(
+                    run.id, RunEventType.PHASE, {"phase": "compacting", "model_call_id": call.id}
+                )
+            )
+            try:
+                async with asyncio.timeout(_remaining(run)):
+                    result = await cast(NativeCompactingProvider, provider).compact(
+                        plan.request, api_key, user_id
+                    )
+            except TimeoutError:
+                raise ProviderError("provider_timeout", "The run deadline was reached.") from None
+            for event in result.usage_events:
+                if event.kind != "usage":
+                    raise ProviderError(
+                        "native_usage_unknown", "Native compaction usage is unavailable."
+                    )
+                part = {key: getattr(event, key) for key in usage}
+                part_billing: dict[str, object] = {
+                    "pricing_context_tokens": plan.pricing_context_tokens,
+                    "cache_creation_1h_tokens": event.cache_creation_1h_tokens
+                    if event.cache_creation_tokens
+                    else 0,
+                }
+                if event.service_tier is not None:
+                    part_billing["service_tier"] = billing_tier(event.service_tier)
+                iterations.append({"usage": part, "billing": part_billing})
+                for key, value in part.items():
+                    if value is not None:
+                        usage[key] = (usage[key] or 0) + value
+            billing["usage_complete"] = (
+                bool(iterations) and result.failure_code != "native_usage_unknown"
+            )
+            total, cost = usage_cost(run.model_id, usage, billing)
+            call = await self.runs.update_model_call(
+                call.id,
+                ModelCallStatus.STREAMING,
+                input_tokens=usage["input_tokens"],
+                output_tokens=usage["output_tokens"],
+                cached_tokens=usage["cached_tokens"],
+                cache_creation_tokens=usage["cache_creation_tokens"],
+                reasoning_tokens=usage["reasoning_tokens"],
+                estimated_cost=cost,
+                clear_estimated_cost=cost is None,
+                response_snapshot={"usage_context": billing},
+                provider_response_id=self.redactor.redact_text(result.provider_response_id)
+                if result.provider_response_id
+                else None,
+            )
+            await self.publish(
+                await self.runs.append_run_event(
+                    run.id,
+                    RunEventType.MODEL_USAGE,
+                    {
+                        **{key: value for key, value in usage.items() if value is not None},
+                        "model_call_id": call.id,
+                        "estimated_cost_usd": cost,
+                        "purpose": "native_compaction",
+                    },
+                )
+            )
+            if total is None or cost is None:
+                raise ProviderError(
+                    "native_usage_unknown", "Native compaction usage is unavailable."
+                )
+            valid = result.failure_code is None and result.payload_json is not None
+            if valid:
+                assert result.payload_json is not None
+                valid = (
+                    len(result.payload_json.encode()) <= 262144
+                    and self.redactor.redact_text(result.payload_json) == result.payload_json
+                    and result.native_kind
+                    == ("openai_window" if run.provider_id == "openai" else "anthropic_block")
+                )
+                try:
+                    payload = json.loads(result.payload_json)
+                    valid = valid and (
+                        isinstance(payload, list) and bool(payload)
+                        if run.provider_id == "openai"
+                        else isinstance(payload, dict) and payload.get("type") == "compaction"
+                    )
+                except ValueError:
+                    valid = False
+            call = await self.runs.update_model_call(
+                call.id,
+                ModelCallStatus.COMPLETED if valid else ModelCallStatus.FAILED,
+                response_snapshot={
+                    "usage_context": billing,
+                    "native_kind": result.native_kind,
+                    "native_payload_json": result.payload_json if valid else None,
+                },
+                error_code=None if valid else "native_context_invalid",
+            )
+            if valid:
+                await self.publish(
+                    await self.runs.append_run_event(
+                        run.id,
+                        RunEventType.MODEL_COMPLETED,
+                        {"model_call_id": call.id, "purpose": "native_compaction"},
+                    )
+                )
+                return result
+            return None
+        except BaseException as error:
+            if call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
+                await self.runs.update_model_call(
+                    call.id,
+                    ModelCallStatus.CANCELLED
+                    if isinstance(error, asyncio.CancelledError)
+                    else ModelCallStatus.FAILED,
+                    response_snapshot={"usage_context": billing},
+                    clear_estimated_cost=billing["usage_complete"] is not True,
+                )
+            raise
+
+    async def _preflight(
+        self,
+        run: RunSnapshot,
+        provider: StreamingProviderAdapter,
+        api_key: str,
+        user_id: str,
+        request: ModelRequest,
+        *,
+        items: tuple[ContextItem, ...],
+        profile: ModelProfile,
+        remaining_run_tokens: int,
+        remaining_run_cost_usd: float | None,
+        checkpoint_id: str | None = None,
+        pricing_context_tokens: int = 0,
+    ) -> ContextPreflight:
+        normalized = normalize_context_items(items)
+        request = replace(request, messages=tuple(item.message for item in normalized))
+        counted: InputTokenCount | None = None
+        if callable(getattr(provider, "count_input", None)):
+            try:
+                async with asyncio.timeout(min(30.0, _remaining(run))):
+                    counted = await cast(TokenCountingProvider, provider).count_input(
+                        request, api_key, user_id
+                    )
+            except ProviderError, TimeoutError:
+                # Native state has no conservative byte-to-token fallback. The
+                # caller can instead use the stored portable summary.
+                counted = None
+        return preflight_context(
+            request,
+            items=normalized,
+            profile=profile,
+            remaining_run_tokens=remaining_run_tokens,
+            counted_input=counted,
+            checkpoint_id=checkpoint_id,
+            remaining_run_cost_usd=remaining_run_cost_usd,
+            pricing_context_tokens=pricing_context_tokens,
+        )
 
     async def _summarize(
         self,
@@ -362,12 +799,6 @@ class RunContext:
             "tools": [],
         }
         call = await self.runs.create_model_call(run.id, step_index, model, snapshot)
-        call = await self.runs.update_model_call(call.id, ModelCallStatus.STREAMING)
-        await self.publish(
-            await self.runs.append_run_event(
-                run.id, RunEventType.PHASE, {"phase": "compacting", "model_call_id": call.id}
-            )
-        )
         usage: dict[str, int | None] = {
             key: None
             for key in (
@@ -386,7 +817,7 @@ class RunContext:
                 {key: value for key in usage if (value := getattr(event, key)) is not None}
             )
             if event.service_tier is not None:
-                billing["service_tier"] = event.service_tier
+                billing["service_tier"] = billing_tier(event.service_tier)
             if event.cache_creation_tokens is not None:
                 billing["cache_creation_1h_tokens"] = (
                     event.cache_creation_1h_tokens if event.cache_creation_tokens else 0
@@ -417,6 +848,12 @@ class RunContext:
             )
 
         try:
+            call = await self.runs.update_model_call(call.id, ModelCallStatus.STREAMING)
+            await self.publish(
+                await self.runs.append_run_event(
+                    run.id, RunEventType.PHASE, {"phase": "compacting", "model_call_id": call.id}
+                )
+            )
             result = await summarize_prefix(
                 provider,
                 request,
