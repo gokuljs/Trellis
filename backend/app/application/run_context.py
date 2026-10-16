@@ -778,6 +778,8 @@ class RunContext:
                     reasoning_tokens=usage["reasoning_tokens"],
                     estimated_cost=cost,
                     clear_estimated_cost=cost is None,
+                    accounted_total_tokens=total,
+                    clear_accounted_total_tokens=total is None,
                     response_snapshot={"usage_context": billing},
                     provider_response_id=self.redactor.redact_text(result.provider_response_id)
                     if result.provider_response_id
@@ -953,6 +955,8 @@ class RunContext:
                     reasoning_tokens=usage["reasoning_tokens"],
                     estimated_cost=cost,
                     clear_estimated_cost=cost is None,
+                    accounted_total_tokens=total,
+                    clear_accounted_total_tokens=total is None,
                     response_snapshot={"usage_context": billing.copy()},
                 )
                 await self.publish(
@@ -1000,6 +1004,8 @@ class RunContext:
                     response_snapshot={"content": result.text, "usage_context": billing.copy()},
                     estimated_cost=cost,
                     clear_estimated_cost=cost is None,
+                    accounted_total_tokens=total,
+                    clear_accounted_total_tokens=total is None,
                 )
                 await self.publish(
                     await self.runs.append_run_event(

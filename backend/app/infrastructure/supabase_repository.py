@@ -1116,6 +1116,7 @@ class SupabaseRepository:
             error_message=_nullable_text(row, "error_message"),
             started_at=_text(row, "started_at"),
             finished_at=_nullable_text(row, "finished_at"),
+            accounted_total_tokens=_nullable_integer(row, "accounted_total_tokens"),
         )
 
     async def list_model_calls(self, run_id: str) -> list[ModelCallRecord]:
@@ -1126,7 +1127,7 @@ class SupabaseRepository:
                 "request_snapshot,response_snapshot,provider_response_id,finish_reason,"
                 "input_tokens,output_tokens,reasoning_tokens,cached_read_tokens,"
                 "cache_creation_tokens,estimated_cost,error_code,error_message,started_at,"
-                "finished_at"
+                "finished_at,accounted_total_tokens"
             ),
             filters={
                 "user_id": f"eq.{self._user_id}",
@@ -1406,6 +1407,8 @@ class SupabaseRepository:
         cache_creation_tokens: int | None = None,
         estimated_cost: float | None = None,
         clear_estimated_cost: bool = False,
+        accounted_total_tokens: int | None = None,
+        clear_accounted_total_tokens: bool = False,
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> ModelCallRecord:
@@ -1427,6 +1430,8 @@ class SupabaseRepository:
                 "cache_creation_tokens": cache_creation_tokens,
                 "estimated_cost": estimated_cost,
                 "clear_estimated_cost": clear_estimated_cost,
+                "accounted_total_tokens": accounted_total_tokens,
+                "clear_accounted_total_tokens": clear_accounted_total_tokens,
                 "error_code": error_code,
                 "error_message": error_message,
             },

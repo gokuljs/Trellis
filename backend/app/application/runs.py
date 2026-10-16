@@ -884,7 +884,7 @@ class RunService:
                 )
                 safe_calls, preflight_errors = _prepare_tool_calls(step.tool_calls, self._redactor)
                 step = replace(step, tool_calls=safe_calls)
-                _step_tokens, step_cost = _usage_measure(
+                step_tokens, step_cost = _usage_measure(
                     run.model_id, step.usage, step.billing_context
                 )
                 call = await self._runs.update_model_call(
@@ -900,6 +900,8 @@ class RunService:
                     cache_creation_tokens=step.usage["cache_creation_tokens"],
                     estimated_cost=step_cost,
                     clear_estimated_cost=step_cost is None,
+                    accounted_total_tokens=step_tokens,
+                    clear_accounted_total_tokens=step_tokens is None,
                 )
                 await self._append_and_publish(
                     run.id,
@@ -1526,6 +1528,8 @@ class RunService:
                     cache_creation_tokens=usage["cache_creation_tokens"],
                     estimated_cost=step_cost,
                     clear_estimated_cost=step_cost is None,
+                    accounted_total_tokens=step_tokens,
+                    clear_accounted_total_tokens=step_tokens is None,
                     response_snapshot={"usage_context": billing_context.copy()},
                 )
                 await self._append_and_publish(

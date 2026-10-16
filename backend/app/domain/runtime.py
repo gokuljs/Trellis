@@ -341,6 +341,7 @@ class ModelCallRecord:
     error_message: str | None
     started_at: str
     finished_at: str | None
+    accounted_total_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
