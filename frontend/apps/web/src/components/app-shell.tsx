@@ -339,8 +339,14 @@ export function AppShell({
       isCancelled: () => boolean,
       ownerGeneration?: number
     ) => {
-      runConnectionControllerRef.current?.abort()
-      const connection = new AbortController()
+      const existingConnection = runConnectionControllerRef.current
+      const connection =
+        ownerGeneration !== undefined &&
+        existingConnection &&
+        !existingConnection.signal.aborted
+          ? existingConnection
+          : new AbortController()
+      if (existingConnection !== connection) existingConnection?.abort()
       runConnectionControllerRef.current = connection
       const generation = ownerGeneration ?? ++runGenerationRef.current
       setContextGeneration(generation)
