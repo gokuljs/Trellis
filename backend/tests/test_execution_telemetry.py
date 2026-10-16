@@ -549,3 +549,35 @@ def test_started_transition_failure_marks_the_attempt_failed(recorded, monkeypat
     assert execution.status.status_code.name == "ERROR"
     assert repository.run.status is RunStatus.QUEUED
     assert logs.get_finished_logs()[-1].log_record.attributes["outcome"] == "failed"
+
+
+def test_empty_completed_response_marks_model_and_run_failed(recorded, monkeypatch) -> None:
+    telemetry, exporter, _logs = recorded
+    repository = Repository()
+
+    class EmptyProvider:
+        async def stream(self, *args):
+            yield ModelStreamEvent(
+                "usage", input_tokens=100, output_tokens=0, cached_tokens=0, cache_creation_tokens=0
+            )
+            yield ModelStreamEvent("completed", finish_kind="final")
+
+    monkeypatch.setattr(RunContext, "prepare", AsyncMock(return_value=plan()))
+    runtime = service(telemetry, repository, EmptyProvider())
+
+    async def exercise() -> None:
+        admitted = await runtime.create_run("session", "request", CANARY)
+        await runtime.wait_for_run(admitted.id)
+        await runtime.close()
+
+    asyncio.run(exercise())
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    for name in ("model.call", "run.execute"):
+        assert spans[name].attributes["outcome"] == "failed"
+        assert spans[name].attributes["error_code"] == "provider_invalid_response"
+        assert spans[name].status.status_code.name == "ERROR"
+    assert repository.run.status is RunStatus.FAILED
+    assert repository.calls[0].status is ModelCallStatus.FAILED
+    assert repository.calls[0].input_tokens == 100
+    assert repository.calls[0].output_tokens == 0
+    assert CANARY.encode() not in encode_spans(exporter.get_finished_spans()).SerializeToString()

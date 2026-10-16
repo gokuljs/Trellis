@@ -882,10 +882,6 @@ class RunService:
                     prior_cost,
                     pricing_context_tokens=plan.pricing_context_tokens,
                 )
-                if not step.content.strip() and not step.tool_calls:
-                    raise ProviderError(
-                        "provider_invalid_response", "The provider returned an empty response."
-                    )
                 safe_calls, preflight_errors = _prepare_tool_calls(step.tool_calls, self._redactor)
                 step = replace(step, tool_calls=safe_calls)
                 _step_tokens, step_cost = _usage_measure(
@@ -1352,6 +1348,10 @@ class RunService:
                     pricing_context_tokens=pricing_context_tokens,
                     observation=observation,
                 )
+                if not result.content.strip() and not result.tool_calls:
+                    raise ProviderError(
+                        "provider_invalid_response", "The provider returned an empty response."
+                    )
                 tokens, cost = _usage_measure(run.model_id, result.usage, result.billing_context)
                 usage: dict[str, Attribute] = {}
                 if tokens is not None:
@@ -1363,10 +1363,15 @@ class RunService:
                     if value is not None:
                         usage[name] = value
                 observation.set_attributes(usage)
-                outcome = "completed" if result.finish_kind != "incomplete" else "failed"
-                observation.outcome(
-                    outcome, "provider_response_incomplete" if outcome == "failed" else None
+                failure_code = (
+                    "provider_response_incomplete"
+                    if result.finish_kind == "incomplete"
+                    else "provider_invalid_response"
+                    if (result.finish_kind == "tool") != bool(result.tool_calls)
+                    else None
                 )
+                outcome = "failed" if failure_code else "completed"
+                observation.outcome(outcome, failure_code)
                 if tokens is not None:
                     self._telemetry.observe("model.tokens", tokens, attributes)
                 if cost is not None:
