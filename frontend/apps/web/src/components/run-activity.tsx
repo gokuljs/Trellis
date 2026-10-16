@@ -1,3 +1,9 @@
+import { useEffect, useState } from "react"
+
+import type { RunSummary } from "@/lib/app-types"
+import { describeActivity } from "@/lib/activity-status"
+import { activityTotals } from "@/lib/activity-summary"
+
 import type {
   RuntimeRunEvent,
   RuntimeRunInfo,
@@ -11,6 +17,9 @@ type RunActivityProps = {
   label?: string
   events: RuntimeRunEvent[]
   runInfo: RuntimeRunInfo | null
+  summary?: RunSummary | null
+  summaryError?: string | null
+  onRetrySummary?: () => void
   pending: boolean
   approvalPendingToolId: string | null
   approvalError: string | null
@@ -95,12 +104,29 @@ export function RunActivity({
   label = "Run activity",
   events,
   runInfo,
+  summary: savedSummary,
+  summaryError,
+  onRetrySummary,
   pending,
   approvalPendingToolId,
   approvalError,
   onApprovalDecision,
 }: RunActivityProps) {
-  if (events.length === 0) return null
+  const runId = runInfo?.runId ?? events.at(-1)?.runId ?? savedSummary?.run_id
+  const summary = savedSummary?.run_id === runId ? savedSummary : null
+  const [now, setNow] = useState(() => Date.now())
+  const status = describeActivity(
+    events,
+    pending,
+    now,
+    undefined,
+    summary ?? undefined
+  )
+  useEffect(() => {
+    if (status.terminal) return
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [status.terminal])
 
   const ordered = [...events].sort(
     (left, right) => left.sequence - right.sequence
@@ -118,21 +144,7 @@ export function RunActivity({
       .filter((event) => event.eventType === "tool.approval_decided")
       .map((event) => textField(event.data, "tool_call_id"))
   )
-  const modelCalls = ordered.filter(
-    (event) => event.eventType === "model.completed"
-  ).length
-  const toolCalls = ordered.filter(
-    (event) => event.eventType === "tool.call"
-  ).length
-  const latestUsage = ordered.findLast(
-    (event) => event.eventType === "model.usage"
-  )
-  const totalTokens = latestUsage
-    ? numberField(latestUsage.data, "total_tokens")
-    : null
-  const totalCost = latestUsage
-    ? numberField(latestUsage.data, "total_estimated_cost_usd")
-    : null
+  const totals = activityTotals(ordered, summary, runId)
   const approvalClosed = ordered.some((event) =>
     [
       "run.cancellation_requested",
@@ -142,10 +154,11 @@ export function RunActivity({
       "run.interrupted",
     ].includes(event.eventType)
   )
-  const modelLimit = runInfo?.limits?.maxModelCalls
-  const toolLimit = runInfo?.limits?.maxToolCalls
-  const tokenLimit = runInfo?.limits?.maxTotalTokens
-  const costLimit = runInfo?.limits?.maxCostUsd
+  const modelLimit = summary?.max_model_calls ?? runInfo?.limits?.maxModelCalls
+  const toolLimit = summary?.max_tool_calls ?? runInfo?.limits?.maxToolCalls
+  const tokenLimit =
+    summary?.max_total_tokens ?? runInfo?.limits?.maxTotalTokens
+  const costLimit = summary?.max_cost_usd ?? runInfo?.limits?.maxCostUsd
   const latestResumedDeadline = ordered.findLast(
     (event) =>
       event.eventType === "run.resumed" &&
@@ -154,7 +167,7 @@ export function RunActivity({
   )
   const deadlineAt = latestResumedDeadline
     ? (textField(latestResumedDeadline.data, "deadline_at") ?? undefined)
-    : runInfo?.limits?.deadlineAt
+    : (summary?.deadline_at ?? runInfo?.limits?.deadlineAt)
   const deadline = deadlineAt ? new Date(deadlineAt) : null
 
   return (
@@ -162,24 +175,34 @@ export function RunActivity({
       <div className="run-activity-header">
         <span className="run-activity-kicker">Activity</span>
         <span className="run-activity-budget-name">
-          {budgetLabel(runInfo?.budgetPreset)}
+          {budgetLabel(summary?.budget_preset ?? runInfo?.budgetPreset)}
         </span>
       </div>
       <div className="run-activity-budget" aria-label="Run limits and usage">
+        <span>{status.label}</span>
+        <span>Elapsed {status.duration ?? "—"}</span>
         <span>
-          {modelCalls} / {modelLimit ?? "—"} model calls
+          {totals.modelCalls ?? "—"} / {modelLimit ?? "—"} model calls
         </span>
         <span>
-          {toolCalls} / {toolLimit ?? "—"} tools
+          {totals.toolCalls ?? "—"} / {toolLimit ?? "—"} tools
         </span>
         <span>
-          {totalTokens === null ? "—" : numberFormat.format(totalTokens)} /{" "}
-          {tokenLimit === undefined ? "—" : numberFormat.format(tokenLimit)}{" "}
+          {totals.totalTokens === null
+            ? "—"
+            : numberFormat.format(totals.totalTokens)}{" "}
+          / {tokenLimit === undefined ? "—" : numberFormat.format(tokenLimit)}{" "}
           tokens
+          {totals.totalTokens !== null && !totals.usageComplete
+            ? " (partial)"
+            : ""}
         </span>
         <span>
-          {totalCost === null ? "—" : estimatedCost(totalCost)} /{" "}
+          {totals.totalCost === null ? "—" : estimatedCost(totals.totalCost)} /{" "}
           {costLimit === undefined ? "—" : estimatedCost(costLimit)} estimated
+          {totals.totalCost !== null && !totals.costComplete
+            ? " (partial)"
+            : ""}
         </span>
         {deadline && Number.isFinite(deadline.getTime()) ? (
           <time dateTime={deadlineAt}>
@@ -190,7 +213,37 @@ export function RunActivity({
             })}
           </time>
         ) : null}
+        {summary?.model_id ? <span>{summary.model_id}</span> : null}
+        {runId ? <code>Run {runId}</code> : null}
       </div>
+      {totals.updating ? (
+        <p className="run-activity-load-state">Saved totals are updating…</p>
+      ) : null}
+      {summaryError ? (
+        <p className="run-activity-load-state" role="alert">
+          {summaryError}{" "}
+          {onRetrySummary ? (
+            <button type="button" onClick={onRetrySummary}>
+              Retry totals
+            </button>
+          ) : null}
+        </p>
+      ) : !summary ? (
+        <p className="run-activity-load-state">Run totals are loading…</p>
+      ) : null}
+      {summary?.error_message && !totals.updating ? (
+        <p className="run-activity-load-state" role="status">
+          {summary.error_message}
+          {summary.error_code ? ` (${summary.error_code})` : ""}
+        </p>
+      ) : null}
+      {!events.length ? (
+        <p className="run-activity-load-state">
+          {pending
+            ? "Waiting for detailed activity…"
+            : "Detailed activity is unavailable. Saved run details remain above."}
+        </p>
+      ) : null}
       <ol className="run-activity-list" aria-label="Run activity steps">
         {groups.map((group) => (
           <li className={`run-activity-group ${group.kind}`} key={group.key}>
@@ -231,7 +284,7 @@ export function RunActivity({
                     break
                   }
                   case "model.completed":
-                    title = `Model step ${ordered.filter((item) => item.eventType === "model.completed" && item.sequence <= event.sequence).length} complete`
+                    title = "Model call completed"
                     break
                   case "assistant.message": {
                     title = "Working note"

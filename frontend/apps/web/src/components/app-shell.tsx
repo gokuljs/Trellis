@@ -1,5 +1,12 @@
 import { Menu } from "lucide-react"
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react"
 import { waitUntilServiceReady } from "@/lib/service-readiness"
 import {
   useInfiniteQuery,
@@ -21,6 +28,7 @@ import { Sidebar } from "@/components/sidebar"
 import { WelcomePanel } from "@/components/welcome-panel"
 import { WorkspaceTopbar } from "@/components/workspace-topbar"
 import { ApiError, api } from "@/lib/api"
+import { coalesceSummaryRefresh } from "@/lib/activity-summary"
 import {
   newAssistantOutputState,
   reduceAssistantOutputEvent,
@@ -223,6 +231,16 @@ export function AppShell({
   const approvalRequestRef = useRef<string | null>(null)
   const bootstrapControllerRef = useRef<AbortController | null>(null)
   const runConnectionControllerRef = useRef<AbortController | null>(null)
+  const summaryRefresh = useMemo(
+    () =>
+      coalesceSummaryRefresh((sessionId) => {
+        void queryClient.invalidateQueries({
+          queryKey: ["run-summaries", sessionId],
+        })
+      }),
+    [queryClient]
+  )
+  useEffect(() => () => summaryRefresh.dispose(), [summaryRefresh])
 
   const applyHistory = useCallback(
     (detail: SessionHistoryPage, keepTurnId?: string) => {
@@ -279,6 +297,8 @@ export function AppShell({
 
   const recordRunEvent = useCallback(
     (turnId: string, event: RuntimeRunEvent) => {
+      if (activeSessionIdRef.current)
+        summaryRefresh.schedule(activeSessionIdRef.current, event)
       setRunContextState((current) => reduceRunContext(current, event))
       setAssistantOutputState((current) =>
         reduceAssistantOutputEvent(current, event, turnId)
@@ -329,7 +349,7 @@ export function AppShell({
         setStreamingText((current) => (current ?? "") + event.data.text)
       }
     },
-    []
+    [summaryRefresh]
   )
 
   const restoreSessionRun = useCallback(
