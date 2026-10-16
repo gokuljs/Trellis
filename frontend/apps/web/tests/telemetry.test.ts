@@ -8,6 +8,8 @@ import {
   createTelemetryOptions,
   initializeTelemetry,
   reportFailure,
+  telemetryBrowserTracingOptions,
+  telemetryRootOptions,
 } from "../src/lib/telemetry"
 
 const origin = "https://trellis.test"
@@ -60,6 +62,48 @@ test("disabled configuration does not initialize and enabled initialization is i
   assert.ok(client)
   initializeTelemetry(config)
   assert.equal(Sentry.getClient(), client)
+})
+
+test("React root hooks capture once per failure and mark recoverable errors as warnings", async () => {
+  assert.equal(telemetryRootOptions(), undefined)
+  const { client, envelopes } = recordingClient()
+  const handlers = telemetryRootOptions()!
+  const info = {
+    componentStack: `\n    at Fixture (${origin}/src/Fixture.tsx:7:4)`,
+  }
+  handlers.onCaughtError!(new Error("private caught content"), {
+    ...info,
+    errorBoundary: null,
+  })
+  handlers.onUncaughtError!(new TypeError("private uncaught content"), info)
+  handlers.onRecoverableError!(new Error("private hydration content"), info)
+  await client.flush(1000)
+  const events = errorEvents(envelopes)
+  assert.equal(events.length, 3)
+  assert.deepEqual(
+    events.map((event) => event.level),
+    ["error", "error", "warning"]
+  )
+  assert.equal(JSON.stringify(envelopes).includes("private"), false)
+  assert.equal(events[0]?.exception?.values?.at(-1)?.mechanism?.handled, true)
+  assert.equal(events[1]?.exception?.values?.at(-1)?.mechanism?.handled, false)
+})
+
+test("browser tracing names paths early and instruments only Trellis API requests", () => {
+  const options = telemetryBrowserTracingOptions(config)
+  const span = options.beforeStartSpan!({
+    name: "/api/sessions/private?draft=private#oauth",
+  })
+  assert.equal(span.name, "/api/sessions/:id")
+  for (const [url, expected] of [
+    ["/api/sessions", true],
+    [`${origin}/api/settings`, true],
+    ["https://supabase.test/api/profile", false],
+    ["https://trellis.test.evil.test/api/settings", false],
+    ["/apiary", false],
+    ["/assets/index.js", false],
+  ] as const)
+    assert.equal(options.shouldCreateSpanForRequest!(url), expected, url)
 })
 
 test("outgoing SDK envelopes retain source frames while removing hostile scope and linked errors", async () => {

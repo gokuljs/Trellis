@@ -1,7 +1,10 @@
 import * as Sentry from "@sentry/react"
+import type { RootOptions } from "react-dom/client"
 
 import {
   classifyTelemetryFailure,
+  isSameOriginApiRequest,
+  normalizeTelemetryPath,
   sanitizeTelemetryDsc,
   sanitizeTelemetryEvent,
   sanitizeTelemetrySpan,
@@ -22,6 +25,25 @@ const excludedIntegrations = new Set([
   "CultureContext",
   "BrowserSession",
 ])
+
+type BrowserTracingOptions = NonNullable<
+  Parameters<typeof Sentry.browserTracingIntegration>[0]
+>
+
+export function telemetryBrowserTracingOptions(
+  config: TelemetryConfig
+): BrowserTracingOptions {
+  return {
+    beforeStartSpan: (options) => ({
+      ...options,
+      name: normalizeTelemetryPath(
+        typeof window === "undefined" ? options.name : window.location.pathname
+      ),
+    }),
+    shouldCreateSpanForRequest: (url: string) =>
+      isSameOriginApiRequest(url, config.origin),
+  }
+}
 
 export function createTelemetryOptions(
   config: TelemetryConfig
@@ -84,6 +106,13 @@ export function createTelemetryOptions(
           })
         },
       },
+      ...(typeof window !== "undefined" && typeof document !== "undefined"
+        ? [
+            Sentry.browserTracingIntegration(
+              telemetryBrowserTracingOptions(config)
+            ),
+          ]
+        : []),
     ],
     replaysSessionSampleRate: 0,
     replaysOnErrorSampleRate: 0,
@@ -100,6 +129,20 @@ export function createTelemetryOptions(
 export function initializeTelemetry(config: TelemetryConfig): void {
   if (!config.enabled || Sentry.getClient()) return
   Sentry.init(createTelemetryOptions(config))
+}
+
+export function telemetryRootOptions(): RootOptions | undefined {
+  if (!Sentry.isEnabled()) return undefined
+  return {
+    onCaughtError: Sentry.reactErrorHandler(() => undefined),
+    onUncaughtError: Sentry.reactErrorHandler(),
+    onRecoverableError(error, errorInfo) {
+      Sentry.withScope((scope) => {
+        scope.setLevel("warning")
+        Sentry.reactErrorHandler(() => undefined)(error, errorInfo)
+      })
+    },
+  }
 }
 
 export function reportFailure(
