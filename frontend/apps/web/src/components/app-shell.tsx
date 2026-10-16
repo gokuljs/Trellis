@@ -87,6 +87,7 @@ import {
   retainWindowActivities,
 } from "@/lib/activity-history"
 import { useContextPreview } from "@/lib/use-context-preview"
+import { reportFailure } from "@/lib/telemetry"
 import "./workspace-bootstrap.css"
 
 type BootstrapState =
@@ -609,6 +610,7 @@ export function AppShell({
       setBootstrap({ status: "ready", progress: restoredOnboarding })
     } catch (restoreError) {
       if (current()) {
+        reportFailure(restoreError, "workspace.bootstrap")
         setBootstrap({ status: "failed", message: visibleError(restoreError) })
         controller.abort()
       }
@@ -762,10 +764,18 @@ export function AppShell({
           .then((data) => data.pages.flatMap((page) => page.items))
           .then(
             (summaries) => ({ summaries, error: null }),
-            () => ({
-              summaries: [] as RunSummary[],
-              error: "Saved activity could not be loaded.",
-            })
+            (summaryError: unknown) => {
+              if (
+                bootstrapControllerRef.current &&
+                sessionLoadSequenceRef.current === loadSequence &&
+                activeSessionIdRef.current === sessionId
+              )
+                reportFailure(summaryError, "activity.summaries")
+              return {
+                summaries: [] as RunSummary[],
+                error: "Saved activity could not be loaded.",
+              }
+            }
           ),
       ])
       if (
@@ -787,6 +797,8 @@ export function AppShell({
       )
     } catch (sessionError) {
       if (sessionLoadSequenceRef.current === loadSequence) {
+        if (bootstrapControllerRef.current)
+          reportFailure(sessionError, "sessions.open")
         setError(visibleError(sessionError))
       }
     } finally {
@@ -819,8 +831,11 @@ export function AppShell({
           sessionId: activeSessionIdRef.current,
           generation: runGenerationRef.current,
         })
-      )
+      ) {
+        if (bootstrapControllerRef.current)
+          reportFailure(pageError, "history.load")
         setHistoryError(visibleError(pageError))
+      }
     }
   }
 
@@ -845,8 +860,11 @@ export function AppShell({
           sessionId: activeSessionIdRef.current,
           generation: runGenerationRef.current,
         })
-      )
+      ) {
+        if (bootstrapControllerRef.current)
+          reportFailure(pageError, "history.load")
         setHistoryError(visibleError(pageError))
+      }
     }
   }
 
@@ -1130,6 +1148,8 @@ export function AppShell({
       return updated
     } catch (saveError) {
       if (!isCurrent()) return null
+      if (bootstrapControllerRef.current)
+        reportFailure(saveError, "settings.save")
       throw saveError
     } finally {
       if (isCurrent()) {
@@ -1210,7 +1230,13 @@ export function AppShell({
     try {
       let session = activeSession
       if (!session) {
-        const createdSession = await api.createSession()
+        const createdSession = await api
+          .createSession()
+          .catch((createError: unknown) => {
+            if (bootstrapControllerRef.current && isCurrent())
+              reportFailure(createError, "sessions.create")
+            throw createError
+          })
         if (!isCurrent()) return
         session = createdSession
         sessionLoadSequenceRef.current += 1
