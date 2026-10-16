@@ -12,6 +12,7 @@ import { BEND, MetalFx, useMetalBend } from "metal-fx"
 import { useTheme } from "@/components/theme-provider"
 import { ModelSelect } from "@/components/model-select"
 import type { ModelStatus } from "@/lib/app-types"
+import { isModelSelectable } from "@/lib/model-choice"
 
 type BudgetPreset = "conservative" | "longer"
 
@@ -68,7 +69,7 @@ export function Composer({
   const isSendable =
     Boolean(value.trim()) &&
     !disabled &&
-    models.some((model) => model.id === selectedModelId)
+    isModelSelectable(models.find((model) => model.id === selectedModelId))
   const sendRef = useRef<HTMLDivElement>(null)
   const getBendConfig = useCallback(
     () => ({

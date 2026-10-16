@@ -1189,7 +1189,7 @@ export function AppShell({
     )
       return
     const model = settings?.models?.find((item) => item.id === selectedModelId)
-    if (!model) {
+    if (!isModelSelectable(model)) {
       setError("Choose a model from the list before starting a session.")
       return
     }

@@ -1,29 +1,15 @@
 import type { ModelStatus, Session, Settings } from "@/lib/app-types"
 import { ownsRun, type RunOwner } from "@/lib/run-recovery"
 
-export function isModelSelectable(model: ModelStatus | undefined): boolean {
-  return Boolean(model)
-}
-
-export function modelProviderId(
-  model: Pick<ModelStatus, "id"> & Partial<Pick<ModelStatus, "provider_id">>
-): string | null {
-  return model.provider_id || /^(openai|anthropic):/.exec(model.id)?.[1] || null
-}
-
-export function modelProviders(models: ModelStatus[]) {
-  const providers = new Map<string, { id: string; name: string }>()
-  for (const model of models) {
-    const id = modelProviderId(model)
-    if (id && !providers.has(id))
-      providers.set(id, {
-        id,
-        name:
-          model.provider_name ||
-          (id === "openai" ? "OpenAI" : id === "anthropic" ? "Anthropic" : id),
-      })
-  }
-  return [...providers.values()]
+export function isModelSelectable(
+  model: ModelStatus | undefined
+): model is ModelStatus {
+  return Boolean(
+    model &&
+    (!model.requires_api_key || model.configured) &&
+    model.selectable !== false &&
+    model.enabled !== false
+  )
 }
 
 export function selectedChatModelId(
