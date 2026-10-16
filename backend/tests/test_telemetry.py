@@ -89,16 +89,20 @@ def test_invalid_enabled_settings_have_safe_errors(changes: dict[str, object]) -
     assert CANARY not in str(raised.value)
 
 
+@pytest.mark.parametrize("headers", [f"Authorization={CANARY}", f"Authorization=Bearer%20{CANARY}"])
 def test_standard_environment_aliases_and_secret_representation(
     monkeypatch: pytest.MonkeyPatch,
+    headers: str,
 ) -> None:
     monkeypatch.setenv("TRELLIS_TELEMETRY_ENABLED", "true")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://example.com")
-    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", f"Authorization=Bearer%20{CANARY}")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", headers)
     monkeypatch.setenv("OTEL_SERVICE_NAME", "trellis-test")
     settings = Settings(_env_file=None)
     assert settings.telemetry_endpoint == "https://example.com"
     assert settings.telemetry_service_name == "trellis-test"
+    assert settings.telemetry_headers is not None
+    assert settings.telemetry_headers.get_secret_value() == headers
     assert CANARY not in repr(settings)
     Settings(
         _env_file=None,

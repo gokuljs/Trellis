@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from app.api import router
 from app.api.auth import SupabaseAuthVerifier, VerifiedUser
 from app.api.errors import ApiErrorResponse
+from app.api.telemetry import TransportTelemetryMiddleware
 from app.application.errors import ApplicationError
 from app.application.ports import ProviderAdapter, StreamingProviderAdapter
 from app.application.telemetry import Telemetry
@@ -172,6 +173,7 @@ def create_app(
         )
 
     application.include_router(router)
+    application.add_middleware(TransportTelemetryMiddleware)
     return application
 
 

@@ -6,6 +6,7 @@ import threading
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
+from typing import Literal
 from urllib.parse import unquote
 
 from opentelemetry import trace
@@ -218,6 +219,7 @@ class TelemetryRuntime:
         root: bool = False,
         links: Sequence[TraceLink] = (),
         parent: TraceLink | None = None,
+        kind: Literal["internal", "server", "client"] = "internal",
     ) -> Iterator[Operation]:
         if self._closed or not self._valid_name(name):
             yield NO_TELEMETRY
@@ -235,6 +237,11 @@ class TelemetryRuntime:
                 context=parent_context,
                 attributes=self.safe_attributes(attributes),
                 links=[trace.Link(_span_context(link)) for link in links],
+                kind={
+                    "internal": trace.SpanKind.INTERNAL,
+                    "server": trace.SpanKind.SERVER,
+                    "client": trace.SpanKind.CLIENT,
+                }[kind],
             )
         except Exception:
             yield NO_TELEMETRY

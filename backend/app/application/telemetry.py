@@ -1,7 +1,7 @@
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 type Attribute = str | int | float | bool
 type Attributes = Mapping[str, Attribute]
@@ -30,6 +30,7 @@ class Telemetry(Protocol):
         root: bool = False,
         links: Sequence[TraceLink] = (),
         parent: TraceLink | None = None,
+        kind: Literal["internal", "server", "client"] = "internal",
     ) -> AbstractContextManager[Operation]: ...
 
     def capture(self) -> TraceLink | None: ...
@@ -50,6 +51,7 @@ class NoTelemetry:
         root: bool = False,
         links: Sequence[TraceLink] = (),
         parent: TraceLink | None = None,
+        kind: Literal["internal", "server", "client"] = "internal",
     ) -> Iterator[Operation]:
         yield self
 
