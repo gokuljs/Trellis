@@ -139,6 +139,7 @@ def create_app(
                 ),
                 cloud_client=http_client,
                 repository_factory=repository_factory,
+                telemetry=application.state.telemetry,
             )
             application.state.account_registry = registry
             try:
