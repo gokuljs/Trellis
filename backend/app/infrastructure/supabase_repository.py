@@ -5,8 +5,10 @@ current verified user access token. Mutations are routed through audited SQL RPC
 run capabilities never leave the backend except in those RPC requests.
 """
 
+import asyncio
 import json
 import secrets
+import time
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import asdict
@@ -20,6 +22,7 @@ import httpx
 from app.application.budgets import BudgetPreset, limits_for_preset
 from app.application.errors import ApplicationError
 from app.application.model_catalog import profile_for_model
+from app.application.telemetry import NO_TELEMETRY, Telemetry
 from app.core.config import Settings
 from app.core.supabase import project_base_url
 from app.domain.context import (
@@ -60,6 +63,63 @@ from app.domain.runtime import (
 
 _REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=3.0)
 _READ_PAGE_SIZE = 500
+_TELEMETRY_TABLES = frozenset(
+    {
+        "context_checkpoints",
+        "messages",
+        "model_calls",
+        "models",
+        "onboarding_progress",
+        "profiles",
+        "run_assistant_outputs",
+        "run_events",
+        "run_messages",
+        "runs",
+        "tool_calls",
+        "user_settings",
+    }
+)
+_TELEMETRY_ACTIONS = frozenset(
+    {
+        "add_assistant_message",
+        "add_user_message",
+        "advance_onboarding_intro",
+        "append_assistant_batch",
+        "append_run_event",
+        "claim_turn",
+        "complete_onboarding",
+        "complete_run",
+        "create_model_call",
+        "create_run",
+        "create_session",
+        "ensure_account",
+        "finish_assistant_output",
+        "list_chat_summaries",
+        "read_chat_history",
+        "read_chat_summaries_page",
+        "read_context_window",
+        "read_session_run_summaries",
+        "record_assistant_message",
+        "record_tool_approval_decision",
+        "record_tool_result",
+        "recover_expired_run",
+        "release_turn",
+        "renew_run_lease",
+        "request_run_cancellation",
+        "request_tool_approval",
+        "resume_approved_run",
+        "save_context_checkpoint",
+        "save_onboarding_profile",
+        "set_default_budget_preset",
+        "set_selected_model",
+        "set_selected_provider",
+        "set_session_model",
+        "set_session_workspace",
+        "transition_run_record",
+        "update_model_call",
+        "update_profile",
+    }
+)
 
 
 class VerifiedTokenSource:
@@ -306,6 +366,8 @@ class SupabaseRepository:
         user_id: UUID,
         token_source: VerifiedTokenSource,
         client: httpx.AsyncClient,
+        *,
+        telemetry: Telemetry = NO_TELEMETRY,
     ) -> None:
         base_url = project_base_url(settings)
         if base_url is None:
@@ -315,6 +377,7 @@ class SupabaseRepository:
         self._user_id = user_id
         self._token_source = token_source
         self._client = client
+        self._telemetry = telemetry
         self._capabilities: dict[str, str] = {}
         self._lease_expires: dict[str, datetime] = {}
         self._model_call_runs: dict[str, str] = {}
@@ -401,13 +464,40 @@ class SupabaseRepository:
         params: dict[str, str] | None = None,
         payload: dict[str, object] | None = None,
     ) -> object:
-        response = await self._send(method, path, params=params, payload=payload)
-        if not response.content:
-            return None
-        try:
-            return response.json()
-        except ValueError:
-            raise RuntimeError("Supabase returned invalid JSON") from None
+        if path.startswith("rpc/"):
+            action = (payload or {}).get("p_action") if path == "rpc/mutate" else path[4:]
+            operation = (
+                action if isinstance(action, str) and action in _TELEMETRY_ACTIONS else "other"
+            )
+            collection = "rpc"
+        else:
+            operation = "select" if method in {"GET", "HEAD"} else "other"
+            collection = path if path in _TELEMETRY_TABLES else "other"
+        attributes = {"db.operation": operation, "db.collection": collection}
+        started = time.monotonic()
+        outcome = "completed"
+        with self._telemetry.operation("db.request", attributes, kind="client") as observation:
+            try:
+                response = await self._send(method, path, params=params, payload=payload)
+                if not response.content:
+                    return None
+                try:
+                    return response.json()
+                except ValueError:
+                    raise RuntimeError("Supabase returned invalid JSON") from None
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                observation.outcome(outcome)
+                raise
+            except Exception:
+                outcome = "error"
+                observation.outcome(outcome, "database_operation_failed")
+                raise
+            finally:
+                observation.outcome(outcome)
+                dimensions = {**attributes, "outcome": outcome}
+                self._telemetry.count("db.requests", attributes=dimensions)
+                self._telemetry.observe("db.duration", time.monotonic() - started, dimensions)
 
     async def _read(
         self, table: str, *, select: str, filters: dict[str, str] | None = None
