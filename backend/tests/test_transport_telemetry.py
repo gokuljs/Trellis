@@ -138,7 +138,7 @@ def test_health_unmatched_and_validation_use_safe_routes(recorded) -> None:
     runtime, exporter, _, _ = recorded
     with TestClient(application(runtime)) as client:
         assert client.get("/health").status_code == 200
-        assert client.get("/ready").status_code == 404
+        assert client.get("/ready").status_code == 503
         assert client.get(f"/{CANARY}").status_code == 404
         assert client.post(f"/api/probe/{CANARY}", json={CANARY: CANARY}).status_code == 422
     spans = exporter.get_finished_spans()

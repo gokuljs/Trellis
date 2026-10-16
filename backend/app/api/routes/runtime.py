@@ -5,15 +5,16 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from contextvars import Context
 from typing import cast
-from urllib.parse import urlsplit
 
 import anyio
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
+from app.api.access import require_private_access
 from app.api.telemetry import runtime_command, transport_telemetry
 from app.application.budgets import BudgetPreset
 from app.application.errors import ApplicationError
 from app.application.runs import RunService
+from app.core.origins import allowed_web_origins
 from app.domain.runtime import (
     RunEvent,
     RunEventType,
@@ -32,7 +33,6 @@ _TERMINAL_EVENTS = frozenset(
         RunEventType.INTERRUPTED,
     }
 )
-_WEB_ORIGINS = frozenset({"http://localhost:3000", "http://127.0.0.1:3000"})
 _AUTH_TIMEOUT_SECONDS = 5
 _AUTH_RECHECK_SECONDS = 30
 _AUTH_MONITOR_CANCEL_REASON = "runtime authentication ended"
@@ -41,28 +41,6 @@ _SEND_TIMEOUT_SECONDS = 5
 _MAX_ACTIVE_SUBSCRIPTIONS = 8
 _SLOW_TRANSPORT_CANCEL_REASON = "runtime transport send timed out"
 _MAX_AUTH_FRAME_BYTES = 20_000
-
-
-def _allowed_origins(environment: str, web_origin: str | None) -> frozenset[str]:
-    origins = set(_WEB_ORIGINS) if environment in {"development", "test"} else set()
-    if web_origin is None or web_origin != web_origin.strip() or "\\" in web_origin:
-        return frozenset(origins)
-    try:
-        parts = urlsplit(web_origin)
-        port = parts.port
-    except ValueError:
-        return frozenset(origins)
-    if (
-        parts.scheme == "https"
-        and parts.hostname
-        and parts.username is None
-        and parts.password is None
-        and port != 0
-        and "*" not in web_origin
-        and web_origin == f"https://{parts.netloc}"
-    ):
-        origins.add(web_origin)
-    return frozenset(origins)
 
 
 class RpcFault(Exception):
@@ -94,6 +72,12 @@ def _authentication_fault(status: int = 503) -> RpcFault:
 
 
 def _account_fault(error: ApplicationError) -> RpcFault:
+    if error.code == "private_access_denied":
+        return RpcFault(
+            -32004,
+            "This account does not have access to Trellis.",
+            data={"code": "private_access_denied", "status": 403},
+        )
     if error.code == "account_in_use":
         return RpcFault(
             -32009,
@@ -115,7 +99,7 @@ def _account_fault(error: ApplicationError) -> RpcFault:
 
 def _access_close_code(error: RpcFault) -> int:
     status = (error.data or {}).get("status")
-    return 4401 if status == 401 else 4409 if status == 409 else 1013
+    return 4401 if status == 401 else 4403 if status == 403 else 4409 if status == 409 else 1013
 
 
 def _error_response(
@@ -235,7 +219,7 @@ async def _close_transport(websocket: WebSocket, code: int) -> None:
 async def runtime_websocket(websocket: WebSocket) -> None:
     settings = websocket.app.state.settings
     telemetry = transport_telemetry(websocket.scope)
-    if websocket.headers.get("origin") not in _allowed_origins(
+    if websocket.headers.get("origin") not in allowed_web_origins(
         settings.environment, settings.web_origin
     ):
         await websocket.close(code=1008)
@@ -305,6 +289,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             await reject_access(_authentication_fault(), request_id)
             return
         try:
+            require_private_access(settings, verified.id)
             account = await asyncio.wait_for(
                 websocket.app.state.account_registry.get(
                     verified.id, access_token=token, expires_at=verified.expires_at
@@ -312,7 +297,12 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                 timeout=_AUTH_TIMEOUT_SECONDS,
             )
         except ApplicationError as error:
-            authentication.outcome("rejected", "account_unavailable")
+            authentication.outcome(
+                "rejected",
+                "private_access_denied"
+                if error.code == "private_access_denied"
+                else "account_unavailable",
+            )
             await reject_access(_account_fault(error), request_id)
             return
         except Exception as error:
@@ -376,6 +366,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
         if refreshed.id != verified.id or auth_lost.is_set():
             return _authentication_fault(401)
         try:
+            require_private_access(settings, refreshed.id)
             await asyncio.wait_for(
                 websocket.app.state.account_registry.get(
                     verified.id, access_token=token, expires_at=refreshed.expires_at

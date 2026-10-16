@@ -2,6 +2,7 @@ from typing import Annotated
 
 from fastapi import Depends, Request
 
+from app.api.access import require_private_access
 from app.api.auth import VerifiedUser
 from app.application.chat import ChatService
 from app.application.context_preview import ContextPreviewService
@@ -15,7 +16,11 @@ from app.infrastructure.accounts import AccountContext
 
 
 async def get_current_user(request: Request) -> VerifiedUser:
-    return await request.app.state.auth_verifier.verify_bearer(request.headers.get("Authorization"))
+    verified = await request.app.state.auth_verifier.verify_bearer(
+        request.headers.get("Authorization")
+    )
+    require_private_access(request.app.state.settings, verified.id)
+    return verified
 
 
 CurrentUserDep = Annotated[VerifiedUser, Depends(get_current_user)]

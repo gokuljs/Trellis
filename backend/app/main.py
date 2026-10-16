@@ -5,6 +5,7 @@ from typing import Protocol, cast
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api import router
@@ -20,10 +21,12 @@ from app.application.workspaces import (
     WorkspacePickerService,
 )
 from app.core.config import Settings
+from app.core.origins import allowed_web_origins
 from app.domain.capabilities import RuntimeCapabilities
 from app.domain.models import ProviderName
 from app.infrastructure.accounts import AccountRegistry, RepositoryFactory
 from app.infrastructure.providers import AnthropicProvider, OpenAIProvider
+from app.infrastructure.readiness import SupabaseReadiness
 from app.infrastructure.telemetry import TelemetryRuntime, create_telemetry
 from app.infrastructure.workspace_picker import NativeFolderPicker
 
@@ -36,6 +39,7 @@ class AuthVerifier(Protocol):
 
 
 ERROR_STATUS = {
+    "private_access_denied": 403,
     "model_not_available": 404,
     "session_not_found": 404,
     "run_not_found": 404,
@@ -115,6 +119,7 @@ def create_app(
         )
         timeout = httpx.Timeout(connect=10, read=120, write=30, pool=10)
         async with httpx.AsyncClient(timeout=timeout) as http_client:
+            application.state.readiness_probe = SupabaseReadiness(resolved_settings, http_client)
             application.state.auth_verifier = auth_verifier or SupabaseAuthVerifier(
                 resolved_settings, http_client
             )
@@ -174,6 +179,16 @@ def create_app(
         )
 
     application.include_router(router)
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=sorted(
+            allowed_web_origins(resolved_settings.environment, resolved_settings.web_origin)
+        ),
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
+        allow_headers=["Authorization", "Content-Type", "traceparent"],
+        max_age=600,
+    )
     application.add_middleware(TransportTelemetryMiddleware)
     return application
 
