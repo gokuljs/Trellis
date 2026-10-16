@@ -1,4 +1,8 @@
-import { apiUrl, parseBackendTargets } from "@/lib/backend-targets"
+import {
+  apiUrl,
+  parseBackendTargets,
+  requiresDatabaseReadiness,
+} from "@/lib/backend-targets"
 
 function getBackendTargets() {
   return parseBackendTargets(
@@ -9,6 +13,13 @@ function getBackendTargets() {
 
 export function configuredApiUrl(path: string): string {
   return apiUrl(path, getBackendTargets())
+}
+
+export function configuredDatabaseReadiness(): boolean {
+  return requiresDatabaseReadiness(
+    getBackendTargets(),
+    import.meta.env?.PROD === true
+  )
 }
 
 export function runtimeUrl(): string {

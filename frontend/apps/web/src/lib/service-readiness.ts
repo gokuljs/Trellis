@@ -1,17 +1,26 @@
-import { configuredApiUrl } from "@/lib/service-targets"
+import {
+  configuredApiUrl,
+  configuredDatabaseReadiness,
+} from "@/lib/service-targets"
 
 export class ServiceReadinessError extends Error {
-  readonly code = "service_unavailable"
+  readonly code: "service_unavailable" | "database_not_ready"
 
-  constructor() {
+  constructor(
+    code: "service_unavailable" | "database_not_ready" = "service_unavailable"
+  ) {
     super(
-      "Trellis is still starting or cannot be reached. Please try again shortly."
+      code === "database_not_ready"
+        ? "The Trellis API is running, but its database is not ready. Check the backend logs and apply any pending Supabase migrations, then try again."
+        : "Trellis is still starting or cannot be reached. Please try again shortly."
     )
     this.name = "ServiceReadinessError"
+    this.code = code
   }
 }
 
 type ReadinessDependencies = {
+  hosted?: boolean
   fetch?: typeof globalThis.fetch
   url?: () => string
   timeoutMs?: number
@@ -36,9 +45,10 @@ function pause(milliseconds: number, signal: AbortSignal): Promise<void> {
 }
 
 export function createServiceReadiness({
+  hosted,
   fetch: fetchRequest = (input, init) => globalThis.fetch(input, init),
-  url = () => configuredApiUrl("/ready"),
-  timeoutMs = 90_000,
+  url,
+  timeoutMs,
   probeTimeoutMs = 5_000,
   retryDelaysMs = [1_000, 2_000, 4_000, 5_000],
   readyTtlMs = 30_000,
@@ -48,12 +58,15 @@ export function createServiceReadiness({
   return async function waitUntilReady(signal: AbortSignal): Promise<void> {
     signal.throwIfAborted()
     if (Date.now() < readyUntil) return
+    const databaseReadiness = hosted ?? configuredDatabaseReadiness()
+    const probeUrl =
+      url ?? (() => configuredApiUrl(databaseReadiness ? "/ready" : "/health"))
     const controller = new AbortController()
     const abort = () => controller.abort(signal.reason)
     signal.addEventListener("abort", abort, { once: true })
     const timer = setTimeout(
       () => controller.abort(new ServiceReadinessError()),
-      timeoutMs
+      timeoutMs ?? (databaseReadiness ? 90_000 : 10_000)
     )
     let attempt = 0
     try {
@@ -68,24 +81,35 @@ export function createServiceReadiness({
         try {
           response = await Promise.race([
             (async () => {
-              const result = await fetchRequest(url(), {
+              const result = await fetchRequest(probeUrl(), {
                 signal: probe.signal,
                 cache: "no-store",
                 credentials: "omit",
                 headers: { Accept: "application/json" },
               })
-              if (result.status === 200) {
+              if (
+                result.status === 200 ||
+                (databaseReadiness && result.status === 503)
+              ) {
                 let body: unknown
                 try {
                   body = await result.json()
                 } catch {
-                  throw new ServiceReadinessError()
+                  if (result.status === 200) throw new ServiceReadinessError()
                 }
+                if (
+                  result.status === 503 &&
+                  typeof body === "object" &&
+                  body !== null &&
+                  "status" in body &&
+                  body.status === "unavailable"
+                )
+                  throw new ServiceReadinessError("database_not_ready")
                 ready =
                   typeof body === "object" &&
                   body !== null &&
                   "status" in body &&
-                  body.status === "ready"
+                  body.status === (databaseReadiness ? "ready" : "ok")
               }
               return result
             })(),

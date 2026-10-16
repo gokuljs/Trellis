@@ -6,7 +6,10 @@ import {
   type AuthCredential,
 } from "@/lib/auth-controller"
 import { runtimeUrl } from "@/lib/service-targets"
-import { waitUntilServiceReady } from "@/lib/service-readiness"
+import {
+  ServiceReadinessError,
+  waitUntilServiceReady,
+} from "@/lib/service-readiness"
 
 export type RuntimeRunEvent = {
   runId: string
@@ -121,6 +124,12 @@ type RunResult = { runId: string }
 
 const rpcTimeoutMs = 30_000
 const maxBufferedEvents = 500
+
+function serviceStartupError(error: unknown): RuntimeError {
+  const failure =
+    error instanceof ServiceReadinessError ? error : new ServiceReadinessError()
+  return new RuntimeError(failure.code, failure.message, 503)
+}
 
 function authenticationError() {
   return new RuntimeError(
@@ -594,14 +603,10 @@ function followRun(
       }
       try {
         await waitUntilServiceReady(startup.signal)
-      } catch {
+      } catch (error) {
         if (!settled)
           finish(
-            new RuntimeError(
-              "service_unavailable",
-              "Trellis is still starting or cannot be reached. Please try again shortly.",
-              503
-            )
+            stillCurrent() ? serviceStartupError(error) : authenticationError()
           )
         return
       }
@@ -766,13 +771,9 @@ async function requestRunAction(
   })
   try {
     await waitUntilServiceReady(startup.signal)
-  } catch {
+  } catch (error) {
     if (!stillCurrent()) throw authenticationError()
-    throw new RuntimeError(
-      "service_unavailable",
-      "Trellis is still starting or cannot be reached. Please try again shortly.",
-      503
-    )
+    throw serviceStartupError(error)
   } finally {
     unsubscribeStartup()
     startup.abort()

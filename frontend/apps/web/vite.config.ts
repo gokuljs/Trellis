@@ -22,6 +22,9 @@ export default defineConfig(({ command, mode }) => {
         "/ready": {
           target: "http://127.0.0.1:8000",
         },
+        "/health": {
+          target: "http://127.0.0.1:8000",
+        },
       },
     },
     preview: {

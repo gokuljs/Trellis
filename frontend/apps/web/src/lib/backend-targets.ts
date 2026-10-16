@@ -8,6 +8,20 @@ export type BackendTargets = {
   runtimeWebSocketUrl: string | null
 }
 
+function isLocalTarget(url: URL): boolean {
+  return ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)
+}
+
+export function requiresDatabaseReadiness(
+  targets: BackendTargets,
+  production: boolean
+): boolean {
+  return (
+    production ||
+    (targets.apiOrigin !== null && !isLocalTarget(new URL(targets.apiOrigin)))
+  )
+}
+
 export function parseBackendTargets(
   environment: BackendEnvironment,
   requireExplicit: boolean
@@ -31,8 +45,6 @@ export function parseBackendTargets(
       "The Trellis API and WebSocket addresses must be valid URLs."
     )
   }
-  const local = (url: URL) =>
-    ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)
   if (
     api.origin !== apiOrigin ||
     api.username ||
@@ -41,8 +53,8 @@ export function parseBackendTargets(
     api.search ||
     api.hash ||
     (api.protocol !== "https:" &&
-      (requireExplicit || api.protocol !== "http:" || !local(api))) ||
-    (requireExplicit && local(api))
+      (requireExplicit || api.protocol !== "http:" || !isLocalTarget(api))) ||
+    (requireExplicit && isLocalTarget(api))
   )
     throw new Error(
       "VITE_API_BASE_URL must be a canonical HTTPS origin without a path, trailing slash, or credentials."

@@ -3,7 +3,11 @@ import { test } from "bun:test"
 import type { User } from "@supabase/supabase-js"
 
 import { createApiClient, ApiError } from "../src/lib/api"
-import { apiUrl, parseBackendTargets } from "../src/lib/backend-targets"
+import {
+  apiUrl,
+  parseBackendTargets,
+  requiresDatabaseReadiness,
+} from "../src/lib/backend-targets"
 import {
   createServiceReadiness,
   ServiceReadinessError,
@@ -71,26 +75,99 @@ test("local explicit transport addresses remain available without weakening host
   )
 })
 
+test("only local development uses liveness instead of database readiness", () => {
+  assert.equal(
+    requiresDatabaseReadiness(parseBackendTargets({}, false), false),
+    false
+  )
+  assert.equal(
+    requiresDatabaseReadiness(
+      parseBackendTargets(
+        {
+          VITE_API_BASE_URL: "http://127.0.0.1:8000",
+          VITE_RUNTIME_WS_URL: "ws://127.0.0.1:8000/api/runtime",
+        },
+        false
+      ),
+      false
+    ),
+    false
+  )
+  assert.equal(
+    requiresDatabaseReadiness(parseBackendTargets(hosted, true), true),
+    true
+  )
+  assert.equal(
+    requiresDatabaseReadiness(parseBackendTargets(hosted, false), false),
+    true
+  )
+})
+
 test("cold startup probes are unauthenticated and succeed before the protected operation", async () => {
   let probes = 0
   const paths: string[] = []
   const readiness = createServiceReadiness({
+    hosted: true,
     url: () => "https://api.example.com/ready",
     retryDelaysMs: [1],
     fetch: async (input, init) => {
       paths.push(String(input))
       assert.equal(new Headers(init?.headers).has("Authorization"), false)
       assert.equal(init?.credentials, "omit")
-      return Response.json(
-        { status: "ready" },
-        { status: ++probes < 3 ? 503 : 200 }
-      )
+      return ++probes < 3
+        ? new Response("Service starting", { status: 503 })
+        : Response.json({ status: "ready" })
     },
   })
   const signal = new AbortController().signal
   await readiness(signal)
   await readiness(signal)
   assert.deepEqual(paths, Array(3).fill("https://api.example.com/ready"))
+})
+
+test("local startup checks API liveness without waiting for hosted database readiness", async () => {
+  const paths: string[] = []
+  const readiness = createServiceReadiness({
+    hosted: false,
+    fetch: async (input) => {
+      paths.push(String(input))
+      return Response.json({ status: "ok" })
+    },
+  })
+  await readiness(new AbortController().signal)
+  assert.deepEqual(paths, ["/health"])
+})
+
+test("a reachable hosted API reports database readiness failure without cold-start retries", async () => {
+  let requests = 0
+  const readiness = createServiceReadiness({
+    hosted: true,
+    retryDelaysMs: [1],
+    timeoutMs: 20,
+    fetch: async () => {
+      requests += 1
+      return Response.json({ status: "unavailable" }, { status: 503 })
+    },
+  })
+  await assert.rejects(
+    readiness(new AbortController().signal),
+    (error) =>
+      error instanceof ServiceReadinessError &&
+      error.code === "database_not_ready" &&
+      error.message.includes("Supabase migrations")
+  )
+  assert.equal(requests, 1)
+})
+
+test("hosted startup cannot accept a liveness response as database readiness", async () => {
+  const readiness = createServiceReadiness({
+    hosted: true,
+    fetch: async () => Response.json({ status: "ok" }),
+  })
+  await assert.rejects(
+    readiness(new AbortController().signal),
+    ServiceReadinessError
+  )
 })
 
 test("startup retries are bounded even when fetch ignores cancellation", async () => {

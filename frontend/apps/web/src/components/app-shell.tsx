@@ -7,7 +7,10 @@ import {
   useState,
   type ReactNode,
 } from "react"
-import { waitUntilServiceReady } from "@/lib/service-readiness"
+import {
+  ServiceReadinessError,
+  waitUntilServiceReady,
+} from "@/lib/service-readiness"
 import {
   useInfiniteQuery,
   useIsMutating,
@@ -113,7 +116,9 @@ type FailedTurn = {
 }
 
 function visibleError(error: unknown) {
-  return error instanceof ApiError || error instanceof RuntimeError
+  return error instanceof ApiError ||
+    error instanceof RuntimeError ||
+    error instanceof ServiceReadinessError
     ? error.message
     : "Trellis could not reach the service."
 }
