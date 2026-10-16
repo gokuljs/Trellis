@@ -12,6 +12,7 @@ from app.api.auth import SupabaseAuthVerifier, VerifiedUser
 from app.api.errors import ApiErrorResponse
 from app.application.errors import ApplicationError
 from app.application.ports import ProviderAdapter, StreamingProviderAdapter
+from app.application.telemetry import Telemetry
 from app.application.tools import ToolRegistry
 from app.application.workspaces import (
     DEFAULT_WORKSPACE_PICKER_TIMEOUT_SECONDS,
@@ -22,6 +23,7 @@ from app.domain.capabilities import RuntimeCapabilities
 from app.domain.models import ProviderName
 from app.infrastructure.accounts import AccountRegistry, RepositoryFactory
 from app.infrastructure.providers import AnthropicProvider, OpenAIProvider
+from app.infrastructure.telemetry import TelemetryRuntime, create_telemetry
 from app.infrastructure.workspace_picker import NativeFolderPicker
 
 WORKSPACE_PICKER_TIMEOUT_SECONDS = DEFAULT_WORKSPACE_PICKER_TIMEOUT_SECONDS
@@ -81,12 +83,24 @@ def create_app(
     workspace_picker: WorkspacePickerService | None = None,
     auth_verifier: AuthVerifier | None = None,
     repository_factory: RepositoryFactory | None = None,
+    telemetry: Telemetry | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings()
     capabilities = RuntimeCapabilities(resolved_settings.enabled_capabilities)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        runtime = telemetry if telemetry is not None else create_telemetry(resolved_settings)
+        application.state.telemetry = runtime
+        try:
+            async with application_services(application):
+                yield
+        finally:
+            if telemetry is None and isinstance(runtime, TelemetryRuntime):
+                await runtime.close()
+
+    @asynccontextmanager
+    async def application_services(application: FastAPI) -> AsyncIterator[None]:
         application.state.settings = resolved_settings
         application.state.workspace_picker = (
             workspace_picker
