@@ -145,6 +145,36 @@ export function telemetryRootOptions(): RootOptions | undefined {
   }
 }
 
+export type RuntimeTelemetryMethod =
+  "run.start" | "run.subscribe" | "run.cancel" | "run.respond"
+type RuntimeTelemetryOutcome = "ok" | "error" | "timeout" | "cancelled"
+
+export function startRuntimeRequestSpan(
+  method: RuntimeTelemetryMethod
+): (outcome: RuntimeTelemetryOutcome) => void {
+  if (!Sentry.isEnabled()) return () => undefined
+  const span = Sentry.startInactiveSpan({ name: method, op: "rpc.client" })
+  let ended = false
+  return (outcome: RuntimeTelemetryOutcome): void => {
+    if (ended) return
+    ended = true
+    span.setStatus(
+      outcome === "ok"
+        ? { code: 1 }
+        : {
+            code: 2,
+            message:
+              outcome === "timeout"
+                ? "deadline_exceeded"
+                : outcome === "cancelled"
+                  ? "cancelled"
+                  : "internal_error",
+          }
+    )
+    span.end()
+  }
+}
+
 export function reportFailure(
   error: unknown,
   operation: TelemetryOperation

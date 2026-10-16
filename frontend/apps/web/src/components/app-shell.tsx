@@ -49,6 +49,7 @@ import type {
 } from "@/lib/app-types"
 import {
   ownsRun,
+  isReconciledRunOutcome,
   recoveryTranscript,
   turnFailureAction,
   type TerminalRunOutcome,
@@ -341,7 +342,9 @@ export function AppShell({
       const generation = ownerGeneration ?? ++runGenerationRef.current
       setContextGeneration(generation)
       const isStale = () =>
-        isCancelled() || runGenerationRef.current !== generation
+        !bootstrapControllerRef.current ||
+        isCancelled() ||
+        runGenerationRef.current !== generation
       setReconnectAvailable(false)
       if (!activeRunRef.current) setActiveRunTurnId(null)
       setApprovalPendingToolId(null)
@@ -365,8 +368,9 @@ export function AppShell({
       let latest: LatestRun | null
       try {
         latest = await api.getLatestRun(sessionId)
-      } catch {
+      } catch (discoveryError) {
         if (isStale()) return
+        reportFailure(discoveryError, "run.restore")
         waitForDiscovery(
           "Trellis could not check the previous run. Reconnect when the service returns."
         )
@@ -376,6 +380,13 @@ export function AppShell({
       if (latest && (!turn || turn.turnId === latest.turn_id)) {
         turn = retryInputForRun(sessionId, transcript, latest)
         if (!turn && activeRunStatuses.has(latest.status)) {
+          reportFailure(
+            new RuntimeError(
+              "runtime_protocol_error",
+              "The active run input is unavailable."
+            ),
+            "run.restore"
+          )
           waitForDiscovery(
             "Trellis could not load the active run's input. Reconnect to try again."
           )
@@ -497,11 +508,13 @@ export function AppShell({
                 if (lookupError === streamError) throw streamError
                 // The service may still be restarting; retry the stream.
               }
+              if (isStale()) return
               reconnectAttempts += 1
               if (reconnectAttempts >= maxRestoredReconnectAttempts) {
                 keepActive =
                   currentStatus === null || activeRunStatuses.has(currentStatus)
                 if (keepActive) {
+                  reportFailure(streamError, "run.restore")
                   setError(
                     "Connection to Trellis is unavailable. Reconnect when it returns."
                   )
@@ -525,6 +538,8 @@ export function AppShell({
         } catch (restoreError) {
           if (isStale()) return
           setError(visibleError(restoreError))
+          let finalError = restoreError
+          let reconciled = false
           try {
             const currentRun = await api.getLatestRun(sessionId)
             if (isStale()) return
@@ -540,11 +555,17 @@ export function AppShell({
               setFailedTurn(null)
               setError(null)
             }
-          } catch {
+            reconciled =
+              !keepActive && isReconciledRunOutcome(currentRun?.status)
+          } catch (reconcileError) {
+            if (isStale()) return
+            finalError = reconcileError
             keepActive = true
             setReconnectAvailable(true)
             // The run may still be active while the service is unavailable.
           }
+          if (!isStale() && !reconciled)
+            reportFailure(finalError, "run.restore")
         } finally {
           if (!isStale() && !keepActive) {
             setPending(false)
@@ -883,6 +904,7 @@ export function AppShell({
     }
     setContextGeneration(owner.generation)
     const isCurrent = () =>
+      !!bootstrapControllerRef.current &&
       ownsRun(owner, {
         sessionId: activeSessionIdRef.current,
         generation: runGenerationRef.current,
@@ -1025,6 +1047,7 @@ export function AppShell({
         )
         setFailedTurn(failureAction === "reload" ? null : turn)
         if (failureAction === "reload") {
+          reportFailure(turnError, "history.load")
           setReconnectAvailable(true)
           return false
         }
@@ -1041,6 +1064,7 @@ export function AppShell({
         if (!isCurrent()) return true
         // Keep the optimistic user message if the saved transcript cannot be refreshed.
       }
+      if (isCurrent()) reportFailure(turnError, "run.start")
       if (
         (turnError instanceof ApiError || turnError instanceof RuntimeError) &&
         turnError.code === "provider_not_configured"
@@ -1075,6 +1099,8 @@ export function AppShell({
         return
       cancelRequestRef.current = false
       setCancellingRun(false)
+      if (bootstrapControllerRef.current)
+        reportFailure(cancelError, "run.cancel")
       if (activeSessionIdRef.current) setError(visibleError(cancelError))
     }
   }
@@ -1111,6 +1137,8 @@ export function AppShell({
       )
     } catch (responseError) {
       if (isCurrent() && approvalRequestRef.current === toolCallId) {
+        if (bootstrapControllerRef.current)
+          reportFailure(responseError, "run.respond")
         setApprovalError(visibleError(responseError))
         setApprovalPendingToolId((current) =>
           current === toolCallId ? null : current
@@ -1353,6 +1381,8 @@ export function AppShell({
         runGenerationRef.current !== generation
       )
         return
+      if (bootstrapControllerRef.current)
+        reportFailure(restoreError, "run.restore")
       setError(visibleError(restoreError))
       setReconnectAvailable(true)
     })
