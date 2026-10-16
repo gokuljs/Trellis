@@ -1,5 +1,6 @@
 import { Menu } from "lucide-react"
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
+import { waitUntilServiceReady } from "@/lib/service-readiness"
 import {
   useInfiniteQuery,
   useIsMutating,
@@ -221,6 +222,7 @@ export function AppShell({
   const cancelRequestRef = useRef(false)
   const approvalRequestRef = useRef<string | null>(null)
   const bootstrapControllerRef = useRef<AbortController | null>(null)
+  const runConnectionControllerRef = useRef<AbortController | null>(null)
 
   const applyHistory = useCallback(
     (detail: SessionHistoryPage, keepTurnId?: string) => {
@@ -337,10 +339,15 @@ export function AppShell({
       isCancelled: () => boolean,
       ownerGeneration?: number
     ) => {
+      runConnectionControllerRef.current?.abort()
+      const connection = new AbortController()
+      runConnectionControllerRef.current = connection
       const generation = ownerGeneration ?? ++runGenerationRef.current
       setContextGeneration(generation)
       const isStale = () =>
-        isCancelled() || runGenerationRef.current !== generation
+        connection.signal.aborted ||
+        isCancelled() ||
+        runGenerationRef.current !== generation
       setReconnectAvailable(false)
       if (!activeRunRef.current) setActiveRunTurnId(null)
       setApprovalPendingToolId(null)
@@ -456,6 +463,7 @@ export function AppShell({
               await resumeRun(
                 latest.run_id,
                 {
+                  signal: connection.signal,
                   reconnectAttempts: 0,
                   onRunId: (runId) => {
                     if (!isStale()) setActiveRunId(runId)
@@ -565,19 +573,21 @@ export function AppShell({
     const controller = new AbortController()
     bootstrapControllerRef.current = controller
     const options = { signal: controller.signal }
-    const timer = setTimeout(
-      () =>
-        controller.abort(
-          new ApiError(
-            "request_timeout",
-            "Trellis took too long to load your chats. Try again.",
-            0
-          )
-        ),
-      15000
-    )
+    let timer: ReturnType<typeof setTimeout> | undefined
     const current = () => bootstrapControllerRef.current === controller
     try {
+      await waitUntilServiceReady(controller.signal)
+      timer = setTimeout(
+        () =>
+          controller.abort(
+            new ApiError(
+              "request_timeout",
+              "Trellis took too long to load your chats. Try again.",
+              0
+            )
+          ),
+        15000
+      )
       const [restoredProfile, , restoredOnboarding] = await Promise.all([
         api.getProfile(options),
         queryClient.fetchQuery({
@@ -626,6 +636,8 @@ export function AppShell({
       mounted = false
       bootstrapControllerRef.current?.abort()
       bootstrapControllerRef.current = null
+      runConnectionControllerRef.current?.abort()
+      runConnectionControllerRef.current = null
     }
   }, [restoreWorkspace])
 
@@ -670,6 +682,7 @@ export function AppShell({
   }
 
   const startNewSession = useCallback(() => {
+    runConnectionControllerRef.current?.abort()
     runGenerationRef.current += 1
     setContextGeneration(runGenerationRef.current)
     submissionLockRef.current = false
@@ -718,6 +731,7 @@ export function AppShell({
 
   const selectSession = async (sessionId: string) => {
     if (pending) return
+    runConnectionControllerRef.current?.abort()
     runGenerationRef.current += 1
     setContextGeneration(runGenerationRef.current)
     modelRequestSequenceRef.current += 1
@@ -859,12 +873,16 @@ export function AppShell({
   }
 
   const completeTurn = async (turn: FailedTurn, optimistic: boolean) => {
+    runConnectionControllerRef.current?.abort()
+    const connection = new AbortController()
+    runConnectionControllerRef.current = connection
     const owner = {
       sessionId: turn.sessionId,
       generation: ++runGenerationRef.current,
     }
     setContextGeneration(owner.generation)
     const isCurrent = () =>
+      !connection.signal.aborted &&
       ownsRun(owner, {
         sessionId: activeSessionIdRef.current,
         generation: runGenerationRef.current,
@@ -918,6 +936,7 @@ export function AppShell({
           ...(turn.budgetPreset ? { budgetPreset: turn.budgetPreset } : {}),
         },
         {
+          signal: connection.signal,
           onRunId: (runId) => {
             if (!isCurrent()) return
             activeRunRef.current = { runId, lastSequence: 0 }

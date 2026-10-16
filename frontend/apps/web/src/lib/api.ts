@@ -18,6 +18,8 @@ import {
   type AuthController,
   type AuthCredential,
 } from "@/lib/auth-controller"
+import { configuredApiUrl } from "@/lib/service-targets"
+import { waitUntilServiceReady } from "@/lib/service-readiness"
 
 type ErrorPayload = {
   error?: {
@@ -70,6 +72,8 @@ type RequestAuth = Pick<
 type ApiClientDependencies = {
   getAuthController?: () => RequestAuth
   fetch?: typeof globalThis.fetch
+  waitUntilReady?: (signal: AbortSignal) => Promise<void>
+  resolveUrl?: (path: string) => string
 }
 
 function authenticationRequired() {
@@ -91,12 +95,24 @@ function serviceUnavailable() {
 export function createApiClient({
   getAuthController: resolveAuth = getAuthController,
   fetch: fetchRequest = (path, init) => globalThis.fetch(path, init),
+  waitUntilReady = waitUntilServiceReady,
+  resolveUrl = configuredApiUrl,
 }: ApiClientDependencies = {}) {
   async function request<T>(
     path: string,
     init: RequestInit = {},
     options: RequestOptions = {}
   ): Promise<T> {
+    let auth: RequestAuth
+    try {
+      auth = resolveAuth()
+    } catch {
+      throw serviceUnavailable()
+    }
+    const original = auth.getSnapshot()
+    const sessionEpoch = original.sessionEpoch
+    const userId = original.status === "signed-in" ? original.user?.id : null
+    if (!userId) throw authenticationRequired()
     const controller = new AbortController()
     const abort = () => controller.abort(options.signal?.reason)
     const aborted = new Promise<never>((_, reject) => {
@@ -108,20 +124,34 @@ export function createApiClient({
     })
     options.signal?.addEventListener("abort", abort, { once: true })
     if (options.signal?.aborted) abort()
-    const timer = setTimeout(
-      () =>
-        controller.abort(
-          new ApiError(
-            "request_timeout",
-            "Trellis took too long to respond. Try again.",
-            0
-          )
-        ),
-      options.timeoutMs ?? requestTimeoutMs
-    )
+    let timer: ReturnType<typeof setTimeout> | undefined
     try {
       return await Promise.race([
-        authorizedRequest<T>(path, { ...init, signal: controller.signal }),
+        (async () => {
+          await waitUntilReady(controller.signal)
+          controller.signal.throwIfAborted()
+          timer = setTimeout(
+            () =>
+              controller.abort(
+                new ApiError(
+                  "request_timeout",
+                  "Trellis took too long to respond. Try again.",
+                  0
+                )
+              ),
+            options.timeoutMs ?? requestTimeoutMs
+          )
+          return authorizedRequest<T>(
+            path,
+            {
+              ...init,
+              signal: controller.signal,
+            },
+            auth,
+            userId,
+            sessionEpoch
+          )
+        })(),
         aborted,
       ])
     } finally {
@@ -132,19 +162,12 @@ export function createApiClient({
 
   async function authorizedRequest<T>(
     path: string,
-    init: RequestInit
+    init: RequestInit,
+    auth: RequestAuth,
+    userId: string,
+    sessionEpoch: number
   ): Promise<T> {
     init.signal?.throwIfAborted()
-    let auth: RequestAuth
-    try {
-      auth = resolveAuth()
-    } catch {
-      throw serviceUnavailable()
-    }
-    const original = auth.getSnapshot()
-    const sessionEpoch = original.sessionEpoch
-    const userId = original.status === "signed-in" ? original.user?.id : null
-    if (!userId) throw authenticationRequired()
 
     function assertOriginalAccount() {
       init.signal?.throwIfAborted()
@@ -157,6 +180,7 @@ export function createApiClient({
         throw authenticationRequired()
     }
 
+    assertOriginalAccount()
     let credential: AuthCredential
     try {
       credential = await auth.getAccessToken()
@@ -184,7 +208,7 @@ export function createApiClient({
     headers.set("Authorization", `Bearer ${credential.token}`)
     let response: Response
     try {
-      response = await fetchRequest(path, {
+      response = await fetchRequest(resolveUrl(path), {
         ...init,
         headers,
       })
