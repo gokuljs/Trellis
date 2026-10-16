@@ -205,28 +205,67 @@ export function cacheSession(client: QueryClient, session: Session) {
     void client.invalidateQueries({ queryKey: serverKeys.sessionPages })
     return
   }
-  const exists = data.pages.some((page) =>
-    page.items.some((item) => item.id === session.id)
-  )
-  if (!exists) {
-    void client.resetQueries({ queryKey: serverKeys.sessionPages, exact: true })
-    return
-  }
+  void client.cancelQueries({ queryKey: serverKeys.sessionPages, exact: true })
+  let overflow = false
   client.setQueryData<InfiniteData<SessionPage>>(
     serverKeys.sessionPages,
-    (current) =>
-      current
-        ? {
-            ...current,
-            pages: current.pages.map((page) => ({
-              ...page,
-              items: page.items.map((item) =>
-                item.id === session.id ? session : item
-              ),
-            })),
-          }
-        : undefined
+    (current) => {
+      if (!current) return undefined
+      overflow = current.pages.some((page) => page.items.length > 40)
+      const exists = current.pages.some((page) =>
+        page.items.some((item) => item.id === session.id)
+      )
+      if (exists)
+        return {
+          ...current,
+          pages: current.pages.map((page) => ({
+            ...page,
+            items: page.items.map((item) =>
+              item.id === session.id ? session : item
+            ),
+          })),
+        }
+
+      const timestampMicros = (value: string) => {
+        const fraction = value.match(/\.(\d+)/)?.[1] ?? ""
+        return (
+          Date.parse(value) * 1000 + Number(fraction.padEnd(6, "0").slice(3, 6))
+        )
+      }
+      const updatedAt = timestampMicros(session.updated_at)
+      const comesAfter = (item: Session) => {
+        const itemUpdatedAt = timestampMicros(item.updated_at)
+        return (
+          updatedAt > itemUpdatedAt ||
+          (updatedAt === itemUpdatedAt && session.id > item.id)
+        )
+      }
+      const foundPage = current.pages.findIndex((page) =>
+        page.items.some(comesAfter)
+      )
+      const pageIndex = foundPage < 0 ? current.pages.length - 1 : foundPage
+      const page = current.pages[pageIndex]
+      const foundItem = page.items.findIndex(comesAfter)
+      const itemIndex = foundItem < 0 ? page.items.length : foundItem
+      const items = page.items.toSpliced(itemIndex, 0, session)
+      overflow ||= items.length > 40
+      return {
+        ...current,
+        pages: current.pages.map((page, index) =>
+          index === pageIndex ? { ...page, items } : page
+        ),
+        pageParams:
+          pageIndex === 0 && itemIndex === 0
+            ? [null, ...current.pageParams.slice(1)]
+            : current.pageParams,
+      }
+    }
   )
+  if (overflow)
+    void client.invalidateQueries({
+      queryKey: serverKeys.sessionPages,
+      exact: true,
+    })
 }
 
 export function runSummariesQueryOptions(
