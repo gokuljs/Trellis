@@ -57,7 +57,7 @@ export function OnboardingFlow({
   const [step, setStep] = useState<OnboardingStep>(initialStep)
   const [direction, setDirection] = useState<"forward" | "back">("forward")
   const [displayName, setDisplayName] = useState(profile.display_name ?? "")
-  const modelOptions: ModelStatus[] =
+  const modelOptions: ModelStatus[] = (
     settings.models ??
     settings.providers.map((provider) => ({
       id: provider.id,
@@ -72,6 +72,7 @@ export function OnboardingFlow({
       configured: provider.configured,
       key_hint: provider.key_hint,
     }))
+  ).filter(isModelSelectable)
   const [modelId, setModelId] = useState<ModelId>(
     settings.selected_model_id ?? modelOptions[0]?.id ?? ""
   )
@@ -82,7 +83,7 @@ export function OnboardingFlow({
   const modelRefs = useRef<Array<HTMLButtonElement | null>>([])
 
   const selectedModel = modelOptions.find((item) => item.id === modelId)
-  const hasSelectedModel = Boolean(selectedModel)
+  const hasSelectedModel = isModelSelectable(selectedModel)
   const firstModelIndex = modelOptions.findIndex(isModelSelectable)
   const busy = submitting || checkingModels
 
@@ -154,7 +155,7 @@ export function OnboardingFlow({
   }
 
   const submit = async () => {
-    if (!selectedModel) {
+    if (!isModelSelectable(selectedModel)) {
       setError("Choose a model.")
       return
     }

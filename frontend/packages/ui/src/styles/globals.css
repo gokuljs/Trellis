@@ -1929,14 +1929,7 @@ html.theme-ripple-fallback::before {
     background: var(--shell-hover);
   }
 
-  .composer-box:has(textarea:disabled) {
-    border-color: var(--shell-line);
-    background: var(--shell-disabled-surface);
-  }
-
   .composer-box textarea:disabled {
-    color: var(--shell-disabled-text);
-    -webkit-text-fill-color: var(--shell-disabled-text);
     cursor: not-allowed;
   }
 
