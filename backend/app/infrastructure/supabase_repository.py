@@ -56,6 +56,7 @@ from app.domain.runtime import (
     RunMessageRecord,
     RunSnapshot,
     RunStatus,
+    RunSummary,
     ToolApprovalDecision,
     ToolCallRecord,
     ToolCallStatus,
@@ -197,6 +198,13 @@ def _nullable_text(row: Mapping[str, object], key: str) -> str | None:
 def _integer(row: Mapping[str, object], key: str) -> int:
     value = row.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
+        raise RuntimeError(f"Supabase row has invalid {key}")
+    return value
+
+
+def _boolean(row: Mapping[str, object], key: str) -> bool:
+    value = row.get(key)
+    if not isinstance(value, bool):
         raise RuntimeError(f"Supabase row has invalid {key}")
     return value
 
@@ -1052,7 +1060,7 @@ class SupabaseRepository:
         )
         return rows[0] if rows else None
 
-    async def list_runs_for_session(
+    async def list_run_summaries_for_session(
         self,
         session_id: str,
         offset: int,
@@ -1060,18 +1068,39 @@ class SupabaseRepository:
         *,
         turn_id: str | None = None,
         newest_first: bool = False,
-    ) -> list[RunSnapshot]:
+    ) -> list[RunSummary]:
         if offset < 0 or not 1 <= limit <= 101:
             raise ValueError("run offset and limit are outside the supported range")
-        return await self._runs(
-            {
-                "chat_id": f"eq.{session_id}",
-                "order": "created_at.desc,id.desc" if newest_first else "created_at.asc,id.asc",
-                **({"turn_id": f"eq.{turn_id}"} if turn_id is not None else {}),
-                "offset": str(offset),
-                "limit": str(limit),
-            }
+        rows = _array(
+            await self._request(
+                "POST",
+                "rpc/read_session_run_summaries",
+                payload={
+                    "p_chat_id": session_id,
+                    "p_offset": offset,
+                    "p_limit": limit,
+                    "p_turn_id": turn_id,
+                    "p_newest_first": newest_first,
+                },
+            )
         )
+        summaries: list[RunSummary] = []
+        for row in rows:
+            run = self._run(_object(row.get("run")))
+            if run.session_id != session_id or (turn_id is not None and run.turn_id != turn_id):
+                raise RuntimeError("Supabase returned another session's run summary")
+            summaries.append(
+                RunSummary(
+                    run=run,
+                    model_call_count=_integer(row, "model_call_count"),
+                    tool_call_count=_integer(row, "tool_call_count"),
+                    total_tokens=_nullable_integer(row, "total_tokens"),
+                    usage_complete=_boolean(row, "usage_complete"),
+                    estimated_cost_usd=_nullable_number(row, "estimated_cost_usd"),
+                    cost_complete=_boolean(row, "cost_complete"),
+                )
+            )
+        return summaries
 
     async def list_run_events(
         self, run_id: str, after_sequence: int = 0, *, limit: int = 500

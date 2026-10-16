@@ -59,6 +59,7 @@ from app.domain.runtime import (
     RunEventType,
     RunSnapshot,
     RunStatus,
+    RunSummary,
     ToolApprovalDecision,
     ToolCallRecord,
     ToolCallStatus,
@@ -395,16 +396,21 @@ class RunService:
         *,
         turn_id: str | None = None,
         newest_first: bool = False,
-    ) -> tuple[list[RunSnapshot], int | None]:
+    ) -> tuple[list[RunSummary], int | None]:
         if await self._sessions.get_session(session_id) is None:
             raise ApplicationError("session_not_found", "Session not found.")
-        runs = await self._runs.list_runs_for_session(
+        summaries = await self._runs.list_run_summaries_for_session(
             session_id, offset, limit + 1, turn_id=turn_id, newest_first=newest_first
         )
-        visible = [await self._recover_if_expired(run) for run in runs[:limit]]
-        return [run for run in visible if run is not None], offset + limit if len(
-            runs
-        ) > limit else None
+        recovered = False
+        for summary in summaries[:limit]:
+            if await self._recover_if_expired(summary.run) != summary.run:
+                recovered = True
+        if recovered:
+            summaries = await self._runs.list_run_summaries_for_session(
+                session_id, offset, limit + 1, turn_id=turn_id, newest_first=newest_first
+            )
+        return summaries[:limit], offset + limit if len(summaries) > limit else None
 
     async def list_session_run_events(
         self, session_id: str, run_id: str, after_sequence: int, limit: int

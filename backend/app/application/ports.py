@@ -32,6 +32,7 @@ from app.domain.runtime import (
     RunMessageRecord,
     RunSnapshot,
     RunStatus,
+    RunSummary,
     ToolApprovalDecision,
     ToolCallRecord,
     ToolCallStatus,
@@ -136,7 +137,7 @@ class RunRepository(Protocol):
 
     async def get_latest_run_for_session(self, session_id: str) -> RunSnapshot | None: ...
 
-    async def list_runs_for_session(
+    async def list_run_summaries_for_session(
         self,
         session_id: str,
         offset: int,
@@ -144,7 +145,7 @@ class RunRepository(Protocol):
         *,
         turn_id: str | None = None,
         newest_first: bool = False,
-    ) -> list[RunSnapshot]: ...
+    ) -> list[RunSummary]: ...
 
     async def append_run_event(
         self,

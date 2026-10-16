@@ -319,6 +319,17 @@ class RunSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class RunSummary:
+    run: RunSnapshot
+    model_call_count: int
+    tool_call_count: int
+    total_tokens: int | None
+    usage_complete: bool
+    estimated_cost_usd: float | None
+    cost_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ModelCallRecord:
     id: str
     run_id: str
