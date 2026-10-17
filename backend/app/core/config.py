@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr | None = Field(default=None, repr=False)
     anthropic_api_key: SecretStr | None = Field(default=None, repr=False)
     telemetry_enabled: bool = False
+    telemetry_exporter: Literal["otlp", "console"] = "otlp"
     telemetry_endpoint: str | None = Field(
         default=None,
         validation_alias=AliasChoices("TRELLIS_TELEMETRY_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT"),
@@ -64,6 +65,10 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_telemetry(self) -> Settings:
         if not self.telemetry_enabled:
+            return self
+        if self.telemetry_exporter == "console":
+            if self.environment not in {"development", "test"}:
+                raise ValueError("Console telemetry is only available in development and test.")
             return self
         if not self.telemetry_endpoint or not self.telemetry_headers:
             raise ValueError("Telemetry endpoint and authorization headers are required.")

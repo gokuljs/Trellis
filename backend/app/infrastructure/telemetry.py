@@ -2,6 +2,7 @@ import asyncio
 import logging
 import math
 import re
+import sys
 import threading
 import time
 from collections.abc import Iterator, Sequence
@@ -17,12 +18,12 @@ from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExp
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.metrics import Counter, Histogram
 from opentelemetry.sdk._logs import LoggerProvider
-from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor, ConsoleLogRecordExporter
 from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.sdk.metrics.export import ConsoleMetricExporter, PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import SpanLimits, TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
 
 from app.application.secret_redaction import SecretRedactor
@@ -334,13 +335,19 @@ class TelemetryRuntime:
 def create_telemetry(settings: Settings) -> TelemetryRuntime | Telemetry:
     if not settings.telemetry_enabled:
         return NO_TELEMETRY
-    assert settings.telemetry_endpoint is not None
-    assert settings.telemetry_headers is not None
+    console = settings.telemetry_exporter == "console"
+    if not console:
+        assert settings.telemetry_endpoint is not None
+        assert settings.telemetry_headers is not None
     _safe_exporter_diagnostics()
+    raw_headers = (
+        settings.telemetry_headers.get_secret_value() if settings.telemetry_headers else ""
+    )
     headers = {
         name.strip(): unquote(value.strip())
-        for pair in settings.telemetry_headers.get_secret_value().split(",")
-        for name, _, value in [pair.partition("=")]
+        for pair in raw_headers.split(",")
+        for name, separator, value in [pair.partition("=")]
+        if separator
     }
     secrets = [
         value.get_secret_value()
@@ -356,7 +363,7 @@ def create_telemetry(settings: Settings) -> TelemetryRuntime | Telemetry:
             "deployment.environment.name": settings.environment,
         }
     )
-    endpoint = settings.telemetry_endpoint.rstrip("/")
+    endpoint = settings.telemetry_endpoint.rstrip("/") if settings.telemetry_endpoint else ""
     cleanup: list[TracerProvider | LoggerProvider | PeriodicExportingMetricReader] = []
     try:
         tracer_provider = TracerProvider(
@@ -368,10 +375,12 @@ def create_telemetry(settings: Settings) -> TelemetryRuntime | Telemetry:
         cleanup.append(tracer_provider)
         tracer_provider.add_span_processor(
             BatchSpanProcessor(
-                OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces", headers=headers, timeout=3),
+                ConsoleSpanExporter(out=sys.stdout)
+                if console
+                else OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces", headers=headers, timeout=3),
                 max_queue_size=2048,
                 max_export_batch_size=256,
-                schedule_delay_millis=5000,
+                schedule_delay_millis=1000 if console else 5000,
                 export_timeout_millis=3000,
             )
         )
@@ -379,16 +388,20 @@ def create_telemetry(settings: Settings) -> TelemetryRuntime | Telemetry:
         cleanup.append(logger_provider)
         logger_provider.add_log_record_processor(
             BatchLogRecordProcessor(
-                OTLPLogExporter(endpoint=f"{endpoint}/v1/logs", headers=headers, timeout=3),
+                ConsoleLogRecordExporter(out=sys.stdout)
+                if console
+                else OTLPLogExporter(endpoint=f"{endpoint}/v1/logs", headers=headers, timeout=3),
                 max_queue_size=2048,
                 max_export_batch_size=256,
-                schedule_delay_millis=5000,
+                schedule_delay_millis=1000 if console else 5000,
                 export_timeout_millis=3000,
             )
         )
         reader = PeriodicExportingMetricReader(
-            OTLPMetricExporter(endpoint=f"{endpoint}/v1/metrics", headers=headers, timeout=3),
-            export_interval_millis=60000,
+            ConsoleMetricExporter(out=sys.stdout)
+            if console
+            else OTLPMetricExporter(endpoint=f"{endpoint}/v1/metrics", headers=headers, timeout=3),
+            export_interval_millis=5000 if console else 60000,
             export_timeout_millis=3000,
         )
         cleanup.append(reader)
