@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 from app.api.dependencies import ChatServiceDep, RunServiceDep, SessionServiceDep
 from app.domain.models import Message, Session
+from app.domain.runtime import RunSummary
 
 
 class SessionResponse(BaseModel):
@@ -80,6 +81,17 @@ class RunSummaryResponse(BaseModel):
     created_at: str
     started_at: str | None
     finished_at: str | None
+    provider_id: str
+    model_id: str
+    model_call_count: int
+    tool_call_count: int
+    total_tokens: int | None
+    usage_complete: bool
+    estimated_cost_usd: float | None
+    cost_complete: bool
+    stop_reason: str | None
+    error_code: str | None
+    error_message: str | None
 
 
 class RunSummariesResponse(BaseModel):
@@ -137,6 +149,43 @@ def serialize_message(message: Message) -> MessageResponse:
         provider=message.provider,
         model=message.model,
         created_at=message.created_at,
+    )
+
+
+def serialize_run_summary(summary: RunSummary) -> RunSummaryResponse:
+    run = summary.run
+    lease_expired = run.stop_reason == "lease_expired"
+    return RunSummaryResponse(
+        run_id=run.id,
+        turn_id=run.turn_id,
+        retry_of=run.retry_of,
+        status=run.status.value,
+        budget_preset=run.budget_preset,
+        max_model_calls=run.max_model_calls,
+        max_tool_calls=run.max_tool_calls,
+        max_total_tokens=run.max_total_tokens,
+        max_cost_usd=run.max_cost_usd,
+        deadline_at=run.deadline_at,
+        last_sequence=run.last_event_sequence,
+        created_at=run.created_at,
+        started_at=run.started_at,
+        finished_at=run.finished_at,
+        provider_id=run.provider_id,
+        model_id=run.model_id,
+        model_call_count=summary.model_call_count,
+        tool_call_count=summary.tool_call_count,
+        total_tokens=summary.total_tokens,
+        usage_complete=summary.usage_complete,
+        estimated_cost_usd=summary.estimated_cost_usd,
+        cost_complete=summary.cost_complete,
+        stop_reason=run.stop_reason,
+        error_code=run.error_code or ("lease_expired" if lease_expired else None),
+        error_message=run.error_message
+        or (
+            "The API stopped before this run finished. Start a new run to continue."
+            if lease_expired
+            else None
+        ),
     )
 
 
@@ -219,25 +268,7 @@ async def list_session_runs(
         session_id, offset, limit, turn_id=turn_id, newest_first=newest_first
     )
     return RunSummariesResponse(
-        items=[
-            RunSummaryResponse(
-                run_id=run.id,
-                turn_id=run.turn_id,
-                retry_of=run.retry_of,
-                status=run.status.value,
-                budget_preset=run.budget_preset,
-                max_model_calls=run.max_model_calls,
-                max_tool_calls=run.max_tool_calls,
-                max_total_tokens=run.max_total_tokens,
-                max_cost_usd=run.max_cost_usd,
-                deadline_at=run.deadline_at,
-                last_sequence=run.last_event_sequence,
-                created_at=run.created_at,
-                started_at=run.started_at,
-                finished_at=run.finished_at,
-            )
-            for run in runs
-        ],
+        items=[serialize_run_summary(summary) for summary in runs],
         next_offset=next_offset,
     )
 

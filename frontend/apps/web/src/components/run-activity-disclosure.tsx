@@ -1,11 +1,14 @@
 import { ChevronDown } from "lucide-react"
 import { useEffect, useId, useRef, useState } from "react"
 import { ThinkingOrb } from "thinking-orbs"
+import { useInfiniteQuery } from "@tanstack/react-query"
 
 import { SavedTurnActivity } from "@/components/saved-turn-activity"
 import { SavedRunActivity } from "@/components/saved-run-activity"
 import { RunActivity } from "@/components/run-activity"
 import { describeActivity } from "@/lib/activity-status"
+import { runSummariesQueryOptions } from "@/lib/server-queries"
+import { newestRunSummary } from "@/lib/activity-summary"
 import type {
   ToolApprovalDecision,
   TurnRunActivity,
@@ -45,12 +48,27 @@ export function RunActivityDisclosure({
   const detailsId = useId()
   const [openAttemptId, setOpenAttemptId] = useState<string | null>(null)
   const [now, setNow] = useState(() => Date.now())
+  const summaries = useInfiniteQuery({
+    ...runSummariesQueryOptions(sessionId ?? "", undefined, turnId),
+    enabled: expanded && pending && Boolean(sessionId && turnId),
+  })
+  const runId =
+    activity.runInfo?.runId ??
+    activity.latestEvent?.runId ??
+    activity.summary?.run_id
+  const summary = newestRunSummary(
+    runId,
+    summaries.data?.pages
+      .flatMap((page) => page.items)
+      .find((item) => item.run_id === runId),
+    activity.summary
+  )
   const status = describeActivity(
     activity.events,
     pending,
     now,
     activity.latestEvent,
-    activity.summary
+    summary
   )
   const available = Boolean(
     (sessionId && turnId) ||
@@ -61,11 +79,10 @@ export function RunActivityDisclosure({
   )
 
   useEffect(() => {
-    if (status.terminal || (!activity.events.length && !activity.summary))
-      return
+    if (status.terminal || (!activity.events.length && !summary)) return
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(timer)
-  }, [status.terminal, activity.events.length, activity.summary])
+  }, [status.terminal, activity.events.length, summary])
 
   useEffect(() => {
     if (!expanded) return
@@ -138,7 +155,11 @@ export function RunActivityDisclosure({
           tabIndex={0}
         >
           {sessionId && turnId && !pending ? (
-            <SavedTurnActivity sessionId={sessionId} turnId={turnId} />
+            <SavedTurnActivity
+              sessionId={sessionId}
+              turnId={turnId}
+              fallback={summary}
+            />
           ) : (
             <>
               {activity.priorAttempts?.map((attempt, index) => (
@@ -170,6 +191,7 @@ export function RunActivityDisclosure({
                           sessionId={sessionId}
                           runId={attempt.runId}
                           runInfo={attempt.runInfo}
+                          summary={attempt.summary}
                           label={`Attempt ${index + 1} activity`}
                         />
                       ) : null}
@@ -179,6 +201,7 @@ export function RunActivityDisclosure({
                       label={`Attempt ${index + 1} activity`}
                       events={attempt.events}
                       runInfo={attempt.runInfo}
+                      summary={attempt.summary}
                       pending={false}
                       approvalPendingToolId={null}
                       approvalError={null}
@@ -204,12 +227,18 @@ export function RunActivityDisclosure({
                   sessionId={sessionId}
                   runId={(activity.summary?.run_id ?? activity.runInfo?.runId)!}
                   runInfo={activity.runInfo}
+                  summary={summary}
                 />
-              ) : activity.events.length ? (
+              ) : activity.events.length || summary || activity.runInfo ? (
                 <RunActivity
                   events={activity.events}
                   runInfo={activity.runInfo}
+                  summary={summary}
                   pending={pending}
+                  summaryError={
+                    summaries.error ? "Run totals could not be loaded." : null
+                  }
+                  onRetrySummary={() => void summaries.refetch()}
                   approvalPendingToolId={approvalPendingToolId}
                   approvalError={approvalError}
                   onApprovalDecision={onApprovalDecision}

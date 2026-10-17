@@ -5,6 +5,11 @@ import {
   type AuthController,
   type AuthCredential,
 } from "@/lib/auth-controller"
+import { runtimeUrl } from "@/lib/service-targets"
+import {
+  ServiceReadinessError,
+  waitUntilServiceReady,
+} from "@/lib/service-readiness"
 
 export type RuntimeRunEvent = {
   runId: string
@@ -107,6 +112,7 @@ type RpcRequest = {
 }
 
 type RuntimeClientOptions = {
+  signal?: AbortSignal
   onEvent?: (event: RuntimeRunEvent) => void
   onRunId?: (runId: string) => void
   onRunInfo?: (run: RuntimeRunInfo) => void
@@ -118,6 +124,12 @@ type RunResult = { runId: string }
 
 const rpcTimeoutMs = 30_000
 const maxBufferedEvents = 500
+
+function serviceStartupError(error: unknown): RuntimeError {
+  const failure =
+    error instanceof ServiceReadinessError ? error : new ServiceReadinessError()
+  return new RuntimeError(failure.code, failure.message, 503)
+}
 
 function authenticationError() {
   return new RuntimeError(
@@ -171,12 +183,6 @@ function expireRejectedCredential(
       // A newer or temporarily unavailable credential must remain untouched.
     }
   })()
-}
-
-function runtimeUrl() {
-  const url = new URL("/api/runtime", window.location.href)
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:"
-  return url.toString()
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -291,6 +297,9 @@ function followRun(
   const initialEpoch = auth.getSessionEpoch()
 
   return new Promise((resolve, reject) => {
+    const startup = new AbortController()
+    const abort = () =>
+      finish(new RuntimeError("connection_cancelled", "Connection cancelled."))
     let socket: WebSocket | null = null
     let runId: string | null = resumedRunId
     let lastSequence = initialSequence
@@ -324,6 +333,8 @@ function followRun(
     const finish = (error?: Error) => {
       if (settled) return
       settled = true
+      startup.abort()
+      options.signal?.removeEventListener("abort", abort)
       unsubscribeAuth?.()
       unsubscribeAuth = null
       if (reconnectTimer !== null) clearTimeout(reconnectTimer)
@@ -590,6 +601,20 @@ function followRun(
         finish(authenticationError())
         return
       }
+      try {
+        await waitUntilServiceReady(startup.signal)
+      } catch (error) {
+        if (!settled)
+          finish(
+            stillCurrent() ? serviceStartupError(error) : authenticationError()
+          )
+        return
+      }
+      if (settled) return
+      if (!stillCurrent()) {
+        finish(authenticationError())
+        return
+      }
       let credential: AuthCredential
       try {
         credential = await auth.getAccessToken()
@@ -697,6 +722,8 @@ function followRun(
     unsubscribeAuth = auth.subscribe(() => {
       if (!stillCurrent()) finish(authenticationError())
     })
+    options.signal?.addEventListener("abort", abort, { once: true })
+    if (options.signal?.aborted) abort()
     void connect()
   })
 }
@@ -737,6 +764,21 @@ async function requestRunAction(
       auth.getSessionEpoch() === initialEpoch
     )
   }
+  if (!stillCurrent()) throw authenticationError()
+  const startup = new AbortController()
+  const unsubscribeStartup = auth.subscribe(() => {
+    if (!stillCurrent()) startup.abort()
+  })
+  try {
+    await waitUntilServiceReady(startup.signal)
+  } catch (error) {
+    if (!stillCurrent()) throw authenticationError()
+    throw serviceStartupError(error)
+  } finally {
+    unsubscribeStartup()
+    startup.abort()
+  }
+  if (!stillCurrent()) throw authenticationError()
   let credential: AuthCredential
   try {
     credential = await auth.getAccessToken()

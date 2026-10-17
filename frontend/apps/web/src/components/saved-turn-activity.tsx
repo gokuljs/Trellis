@@ -4,25 +4,33 @@ import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query"
 import { SavedRunActivity } from "@/components/saved-run-activity"
 import { runInfoFromSummary } from "@/lib/activity-history"
 import { runSummariesQueryOptions } from "@/lib/server-queries"
+import type { RunSummary } from "@/lib/app-types"
+import { newestRunSummary } from "@/lib/activity-summary"
 
 export function SavedTurnActivity({
   sessionId,
   turnId,
+  fallback,
 }: {
   sessionId: string
   turnId: string
+  fallback?: RunSummary | null
 }) {
   const client = useQueryClient()
   const options = runSummariesQueryOptions(sessionId, undefined, turnId)
   const history = useInfiniteQuery(options)
   const [chosenRunId, setChosenRunId] = useState<string | null>(null)
-  const summaries = [
-    ...new Map(
-      history.data?.pages
-        .flatMap((page) => page.items)
-        .map((summary) => [summary.run_id, summary]) ?? []
-    ).values(),
-  ].sort(
+  const byRun = new Map<string, RunSummary>()
+  for (const summary of [
+    ...(fallback?.turn_id === turnId ? [fallback] : []),
+    ...(history.data?.pages.flatMap((page) => page.items) ?? []),
+  ]) {
+    byRun.set(
+      summary.run_id,
+      newestRunSummary(summary.run_id, byRun.get(summary.run_id), summary)!
+    )
+  }
+  const summaries = [...byRun.values()].sort(
     (left, right) =>
       right.created_at.localeCompare(left.created_at) ||
       right.run_id.localeCompare(left.run_id)
@@ -72,6 +80,7 @@ export function SavedTurnActivity({
           sessionId={sessionId}
           runId={selected.run_id}
           runInfo={runInfoFromSummary(selected)}
+          summary={selected}
         />
       ) : !history.isPending && !history.error ? (
         <p className="run-activity-load-state">

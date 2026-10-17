@@ -4,7 +4,12 @@
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
-      "env": ["VITE_SUPABASE_URL", "VITE_SUPABASE_PUBLISHABLE_KEY"],
+      "env": [
+        "VITE_SUPABASE_URL",
+        "VITE_SUPABASE_PUBLISHABLE_KEY",
+        "VITE_API_BASE_URL",
+        "VITE_RUNTIME_WS_URL"
+      ],
       "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/.env*"],
       "outputs": ["dist/**"]
     },
@@ -18,7 +23,12 @@
       "dependsOn": ["^typecheck"]
     },
     "dev": {
-      "env": ["VITE_SUPABASE_URL", "VITE_SUPABASE_PUBLISHABLE_KEY"],
+      "env": [
+        "VITE_SUPABASE_URL",
+        "VITE_SUPABASE_PUBLISHABLE_KEY",
+        "VITE_API_BASE_URL",
+        "VITE_RUNTIME_WS_URL"
+      ],
       "cache": false,
       "persistent": true
     }

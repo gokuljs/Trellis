@@ -144,7 +144,17 @@ export type RunSummary = {
   created_at: string
   started_at: string | null
   finished_at: string | null
-  model_id?: ModelId
+  provider_id: ProviderId
+  model_id: ModelId
+  model_call_count: number
+  tool_call_count: number
+  total_tokens: number | null
+  usage_complete: boolean
+  estimated_cost_usd: number | null
+  cost_complete: boolean
+  stop_reason: string | null
+  error_code: string | null
+  error_message: string | null
 }
 
 export type ContextPreviewRequest = {

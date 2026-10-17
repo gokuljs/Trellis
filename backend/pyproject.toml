@@ -8,12 +8,17 @@ dependencies = [
     "anyio>=4.14.2,<5",
     "fastapi[standard-no-fastapi-cloud-cli]>=0.141.1,<1",
     "httpx>=0.28.1,<1",
+    "opentelemetry-api>=1.43,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.43,<2",
+    "opentelemetry-sdk>=1.43,<2",
     "pydantic-settings>=2.15,<3",
     "python-dotenv>=1.2,<2",
 ]
 
 [dependency-groups]
 dev = [
+    "pytest>=9,<10",
+    "pytest-cov>=7,<8",
     "ruff==0.16.3",
     "ty==0.0.74",
 ]
@@ -33,3 +38,9 @@ select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "FAST", "RUF"]
 
 [tool.ruff.format]
 quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "--strict-config --strict-markers --cov=app.application.telemetry --cov=app.infrastructure.telemetry --cov-report=term-missing --cov-fail-under=90"
+filterwarnings = ["error"]

@@ -1,0 +1,51 @@
+# Demo configuration only. Free services can sleep and lose local filesystem changes.
+# Durable history stays in Supabase. One process owns the in-memory execution runtime.
+# Preview services must use TRELLIS_ENVIRONMENT=preview and separate origins, users,
+# Supabase credentials, and Logfire tokens. Automatic previews and deploys stay off.
+previews:
+  generation: "off"
+
+services:
+  - type: web
+    name: trellis-api
+    runtime: python
+    rootDir: backend
+    plan: free
+    numInstances: 1
+    autoDeployTrigger: "off"
+    buildCommand: uv sync --locked --no-dev
+    startCommand: env TRELLIS_RELEASE="$RENDER_GIT_COMMIT" uv run --locked --no-dev uvicorn app.main:app --host 0.0.0.0 --port "$PORT" --workers 1 --no-access-log
+    healthCheckPath: /ready
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.14.7
+      - key: UV_VERSION
+        value: 0.12.5
+      - key: TRELLIS_ENVIRONMENT
+        value: production
+      - key: TRELLIS_DEBUG
+        value: "false"
+      - key: TRELLIS_ENABLED_CAPABILITIES
+        value: "[]"
+      - key: TRELLIS_DATA_DIR
+        value: /tmp/trellis
+      - key: TRELLIS_WEB_ORIGIN
+        sync: false
+      - key: TRELLIS_PRIVATE_USER_IDS
+        sync: false
+      - key: TRELLIS_SUPABASE_URL
+        sync: false
+      - key: TRELLIS_SUPABASE_PUBLISHABLE_KEY
+        sync: false
+      - key: TRELLIS_OPENAI_API_KEY
+        sync: false
+      - key: TRELLIS_ANTHROPIC_API_KEY
+        sync: false
+      - key: TRELLIS_TELEMETRY_ENABLED
+        value: "true"
+      - key: OTEL_SERVICE_NAME
+        value: trellis-api
+      - key: OTEL_EXPORTER_OTLP_ENDPOINT
+        sync: false
+      - key: OTEL_EXPORTER_OTLP_HEADERS
+        sync: false

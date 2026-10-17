@@ -4,16 +4,19 @@ import { RunActivity } from "@/components/run-activity"
 import { eventsFromPages } from "@/lib/activity-history"
 import { runEventsQueryOptions } from "@/lib/server-queries"
 import type { RuntimeRunInfo } from "@/lib/runtime-client"
+import type { RunSummary } from "@/lib/app-types"
 
 export function SavedRunActivity({
   sessionId,
   runId,
   runInfo,
+  summary,
   label = "Saved run activity",
 }: {
   sessionId: string
   runId: string
   runInfo: RuntimeRunInfo | null
+  summary?: RunSummary | null
   label?: string
 }) {
   const client = useQueryClient()
@@ -29,11 +32,12 @@ export function SavedRunActivity({
           Loading activity…
         </p>
       ) : null}
-      {events.length ? (
+      {summary || events.length ? (
         <RunActivity
           label={label}
           events={events}
           runInfo={runInfo}
+          summary={summary}
           pending={false}
           approvalPendingToolId={null}
           approvalError={null}
@@ -41,7 +45,7 @@ export function SavedRunActivity({
         />
       ) : !history.isPending && !history.error ? (
         <p className="run-activity-load-state">
-          Activity is no longer available.
+          Detailed activity is unavailable.
         </p>
       ) : null}
       {history.error ? (
