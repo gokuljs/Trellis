@@ -33,6 +33,7 @@ class AuthVerifier(Protocol):
 
 
 ERROR_STATUS = {
+    "synchronous_execution_retired": 410,
     "runtime_unavailable": 503,
     "runtime_not_configured": 503,
     "model_not_available": 404,
