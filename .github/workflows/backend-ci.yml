@@ -84,6 +84,9 @@ jobs:
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/catalog_sync.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/reviewed_model_dispatch.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/chat_turn_security.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610180001_durable_jobs.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/durable_acceptance.sql
+          python3 supabase/tests/durable_acceptance_concurrency.py
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/schema_contract.sql
 
   quality:
