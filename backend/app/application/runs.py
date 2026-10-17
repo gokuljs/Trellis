@@ -23,6 +23,7 @@ from app.application.errors import ApplicationError, ProviderError
 from app.application.model_catalog import profile_for_model
 from app.application.ports import (
     ContextCheckpointRepository,
+    DurableAcceptanceRepository,
     ProfileRepository,
     RunEventPublisher,
     RunLeasePort,
@@ -174,6 +175,7 @@ class RunService:
         providers: Mapping[str, StreamingProviderAdapter],
         event_publisher: RunEventPublisher | None = None,
         *,
+        acceptance_repository: DurableAcceptanceRepository | None = None,
         tool_registry: ToolRegistry | None = None,
         workspace_guidance_reader: Callable[[Path], Awaitable[str | None]] | None = None,
         workspace_bindings: WorkspaceBindingPort | None = None,
@@ -188,6 +190,7 @@ class RunService:
         if lease_renew_interval_seconds <= 0:
             raise ValueError("lease renewal interval must be positive")
         self._runs = runs
+        self._acceptance = acceptance_repository
         self._sessions = sessions
         self._settings = settings
         self._profiles = profiles
@@ -284,6 +287,98 @@ class RunService:
             if run.status is RunStatus.QUEUED and self._can_execute(run.id):
                 self._schedule(run.id)
             return run
+
+    async def lookup_run(self, session_id: str, client_request_id: str) -> RunSnapshot | None:
+        if self._acceptance is None:
+            raise ApplicationError("runtime_not_configured", "Durable execution is unavailable.")
+        try:
+            return await self._acceptance.lookup_run(session_id, client_request_id)
+        except ValueError as error:
+            raise self._acceptance_error(error) from None
+
+    async def accept_run(
+        self,
+        session_id: str,
+        client_request_id: str,
+        content: str,
+        *,
+        turn_id: str | None = None,
+        budget_preset: BudgetPreset | None = None,
+        model_id: str | None = None,
+    ) -> RunSnapshot:
+        if self._acceptance is None:
+            raise ApplicationError("runtime_not_configured", "Durable execution is unavailable.")
+        normalized = content.strip()
+        if not normalized:
+            raise ApplicationError("message_empty", "Message content cannot be empty.")
+        if len(content) > 100_000 or not 1 <= len(client_request_id) <= 200:
+            raise ApplicationError("run_invalid", "The run request is invalid.")
+        if turn_id is not None and not 1 <= len(turn_id) <= 200:
+            raise ApplicationError("run_invalid", "The run request is invalid.")
+        submission: dict[str, object] = {
+            "content": normalized,
+            "turnId": turn_id or client_request_id,
+        }
+        if model_id is not None:
+            submission["modelId"] = model_id
+        if budget_preset is not None:
+            submission["budgetPreset"] = budget_preset
+        try:
+            existing = await self._acceptance.match_run_request(
+                session_id, client_request_id, submission
+            )
+            if existing is not None:
+                return existing
+            session = await self._sessions.get_session(session_id)
+            if session is None:
+                raise ApplicationError("session_not_found", "Session not found.")
+            models = await self._settings.list_models()
+            selected_model_id = (
+                model_id
+                if model_id is not None
+                else (session.model_id or await self._settings.get_selected_model_id())
+            )
+            model = next((item for item in models if item.id == selected_model_id), None)
+            if model is None:
+                raise ApplicationError("model_not_available", "The selected model is unavailable.")
+            selected_budget = (
+                budget_preset
+                if budget_preset is not None
+                else (await self._settings.get_default_budget_preset())
+            )
+            if selected_budget not in {"conservative", "longer"}:
+                raise ApplicationError("invalid_budget_preset", "Choose an available run budget.")
+            self._require_provider(model)
+            if model.requires_api_key and await self._secret_store.get(model.provider_id) is None:
+                raise ApplicationError(
+                    "provider_not_configured",
+                    "The selected provider is not configured on this server.",
+                )
+            return await self._acceptance.accept_run(
+                session_id,
+                client_request_id,
+                self._redactor.redact_text(normalized),
+                model,
+                submission,
+                budget_preset=selected_budget,
+            )
+        except ValueError as error:
+            raise self._acceptance_error(error) from None
+
+    @staticmethod
+    def _acceptance_error(error: ValueError) -> ApplicationError:
+        message = str(error)
+        if "conflicts with a previous payload" in message:
+            return ApplicationError("run_conflict", "This request ID has different run input.")
+        if "session not found" in message:
+            return ApplicationError("session_not_found", "Session not found.")
+        if "active run already exists" in message:
+            return ApplicationError("run_in_progress", "Another run is in progress for this chat.")
+        if "account run capacity reached" in message:
+            return ApplicationError(
+                "run_capacity", "Your account has 16 accepted requests. Wait for one to finish."
+            )
+        return ApplicationError("run_invalid", "The run request could not be accepted.")
 
     def _can_execute(self, run_id: str) -> bool:
         return run_id not in self._lease_lost and (
@@ -1356,6 +1451,8 @@ class RunService:
 
     @staticmethod
     def _remaining_seconds(run: RunSnapshot) -> float:
+        if run.deadline_at is None:
+            raise ProviderError("run_not_started", "The run has not begun execution.")
         deadline = datetime.fromisoformat(run.deadline_at.replace("Z", "+00:00"))
         return (deadline - datetime.now(UTC)).total_seconds()
 
@@ -1422,6 +1519,8 @@ class RunService:
         tokens: int,
         cost_usd: float | None,
     ) -> None:
+        if run.deadline_at is None:
+            raise ProviderError("run_not_started", "The run has not begun execution.")
         deadline = datetime.fromisoformat(run.deadline_at.replace("Z", "+00:00"))
         if cost_usd is None and kind is not None:
             raise ProviderError(

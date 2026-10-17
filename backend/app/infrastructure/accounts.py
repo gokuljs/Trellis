@@ -23,6 +23,7 @@ from app.application.onboarding import OnboardingService
 from app.application.ports import (
     ChatRepository,
     ContextCheckpointRepository,
+    DurableAcceptanceRepository,
     OnboardingRepository,
     ProviderAdapter,
     RunLeasePort,
@@ -51,6 +52,7 @@ from app.infrastructure.workspace_bindings import LocalWorkspaceBindings
 class AccountRepository(
     ChatRepository,
     ContextCheckpointRepository,
+    DurableAcceptanceRepository,
     OnboardingRepository,
     RunRepository,
     RunLeasePort,
@@ -268,6 +270,7 @@ class AccountRegistry:
                         else None,
                         workspace_bindings=workspace_bindings,
                         lease_repository=database,
+                        acceptance_repository=database,
                     )
                     try:
                         await run_service.resume_decided_approvals()

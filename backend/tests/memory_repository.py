@@ -7,6 +7,7 @@ Supabase repository.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
@@ -111,6 +112,7 @@ class MemoryState:
     messages: dict[str, list[Message]] = field(default_factory=dict)
     turn_claims: dict[str, str] = field(default_factory=dict)
     runs: dict[str, RunSnapshot] = field(default_factory=dict)
+    durable_fingerprints: dict[str, str] = field(default_factory=dict)
     events: dict[str, list[RunEvent]] = field(default_factory=dict)
     event_storage_bytes: dict[str, int] = field(default_factory=dict)
     model_calls: dict[str, ModelCallRecord] = field(default_factory=dict)
@@ -626,6 +628,61 @@ class MemoryRepository:
         )
         self.state.runs[run_id] = replace(run, last_event_sequence=sequence)
         return event
+
+    async def lookup_run(self, session_id: str, client_request_id: str) -> RunSnapshot | None:
+        if session_id not in self.state.sessions:
+            raise ValueError("session not found")
+        return next(
+            (
+                run
+                for run in self.state.runs.values()
+                if run.session_id == session_id and run.client_request_id == client_request_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _submission_fingerprint(submission: dict[str, object]) -> str:
+        return hashlib.sha256(json.dumps(submission, sort_keys=True).encode()).hexdigest()
+
+    async def match_run_request(
+        self, session_id: str, client_request_id: str, submission: dict[str, object]
+    ) -> RunSnapshot | None:
+        run = await self.lookup_run(session_id, client_request_id)
+        if run is not None and self.state.durable_fingerprints.get(
+            run.id
+        ) != self._submission_fingerprint(submission):
+            raise ValueError("run request conflicts with a previous payload")
+        return run
+
+    async def accept_run(
+        self,
+        session_id: str,
+        client_request_id: str,
+        content: str,
+        model: ModelDescriptor,
+        submission: dict[str, object],
+        *,
+        budget_preset: BudgetPreset = "conservative",
+    ) -> RunSnapshot:
+        existing = await self.match_run_request(session_id, client_request_id, submission)
+        if existing is not None:
+            return existing
+        if sum(not is_terminal_run_status(run.status) for run in self.state.runs.values()) >= 16:
+            raise ValueError("account run capacity reached")
+        run = await self.create_run(
+            session_id,
+            str(submission["turnId"]),
+            client_request_id,
+            content,
+            model,
+            budget_preset=budget_preset,
+        )
+        run = replace(run, deadline_at=None, lease_expires_at=None)
+        self.state.runs[run.id] = run
+        self.state.durable_fingerprints[run.id] = self._submission_fingerprint(submission)
+        self._owned_leases.discard(run.id)
+        return run
 
     @_atomic_event_write
     async def create_run(
@@ -1441,6 +1498,8 @@ class MemoryRepository:
         waited = datetime.now(UTC) - datetime.fromisoformat(
             approval.created_at.replace("Z", "+00:00")
         )
+        if run.deadline_at is None:
+            raise ValueError("run has not started")
         deadline = datetime.fromisoformat(run.deadline_at.replace("Z", "+00:00")) + waited
         updated = replace(
             run,
