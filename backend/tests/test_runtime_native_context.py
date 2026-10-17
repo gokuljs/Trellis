@@ -229,7 +229,7 @@ def test_openai_native_compaction_reserves_uncapped_output_before_dispatch(
         profile = profile_for_model("openai:gpt-5.5")
         assert profile is not None
         monkeypatch.setattr(
-            "app.application.runs.profile_for_model",
+            "app.application.execution.profile_for_model",
             lambda _: replace(profile, context_window_tokens=129000),
         )
 

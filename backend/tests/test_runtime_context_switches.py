@@ -128,7 +128,9 @@ def test_checkpoint_replay_survives_switches_without_loading_archived_transcript
                         max_output_tokens=8192,
                         supports_native_compaction=False,
                     )
-                    monkeypatch.setattr("app.application.runs.profile_for_model", lambda _: fixture)
+                    monkeypatch.setattr(
+                        "app.application.execution.profile_for_model", lambda _: fixture
+                    )
                     provider.switched_window = True
             elif change == "provider":
                 target = "anthropic:claude-sonnet-5"
