@@ -66,6 +66,16 @@ ALTER TABLE trellis.runs ADD CONSTRAINT runs_current_attempt_fk
 REVOKE ALL ON trellis_private.jobs, trellis_private.execution_attempts
     FROM PUBLIC, anon, authenticated;
 
+CREATE FUNCTION trellis_private.trim_submission_content(p_content text)
+RETURNS text LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE SET search_path = '' AS $$
+    SELECT pg_catalog.btrim(p_content,
+        U&'\0009\000A\000B\000C\000D\001C\001D\001E\001F\0020\0085\00A0\1680' ||
+        U&'\2000\2001\2002\2003\2004\2005\2006\2007\2008\2009\200A' ||
+        U&'\2028\2029\202F\205F\3000');
+$$;
+REVOKE ALL ON FUNCTION trellis_private.trim_submission_content(text)
+    FROM PUBLIC, anon, authenticated;
+
 CREATE FUNCTION trellis_private.submission_fingerprint(p_submission jsonb, p_request_id text)
 RETURNS text LANGUAGE plpgsql IMMUTABLE SET search_path = '' AS $$
 DECLARE v_input jsonb; v_content text; v_turn text;
@@ -74,7 +84,7 @@ BEGIN
        OR jsonb_typeof(p_submission->'content') IS DISTINCT FROM 'string' THEN
         RAISE EXCEPTION 'invalid run submission' USING ERRCODE = '22023';
     END IF;
-    v_content := regexp_replace(p_submission->>'content', '^\s+|\s+$', '', 'g');
+    v_content := trellis_private.trim_submission_content(p_submission->>'content');
     v_turn := COALESCE(p_submission->>'turnId', p_request_id);
     IF length(v_content) NOT BETWEEN 1 AND 100000 OR length(v_turn) NOT BETWEEN 1 AND 200
        OR (p_submission ? 'turnId' AND jsonb_typeof(p_submission->'turnId') <> 'string')
@@ -155,7 +165,7 @@ BEGIN
     IF v_existing IS NOT NULL THEN RETURN v_existing; END IF;
     v_fingerprint := trellis_private.submission_fingerprint(
         p_payload->'submission', p_payload->>'client_request_id');
-    v_content := regexp_replace(p_payload->>'content', '^\s+|\s+$', '', 'g');
+    v_content := trellis_private.trim_submission_content(p_payload->>'content');
     v_turn := COALESCE(p_payload->'submission'->>'turnId', p_payload->>'client_request_id');
     v_budget := p_payload->>'budget_preset';
     IF v_content IS NULL OR length(v_content) NOT BETWEEN 1 AND 100000 THEN

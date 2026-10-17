@@ -1,4 +1,43 @@
 BEGIN;
+DO $$
+DECLARE
+    v_codepoint integer;
+    v_content text;
+    v_fingerprint text := trellis_private.submission_fingerprint(
+        '{"content":"Hello"}', 'whitespace');
+BEGIN
+    FOREACH v_codepoint IN ARRAY ARRAY[
+        9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 133, 160, 5760,
+        8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202,
+        8232, 8233, 8239, 8287, 12288
+    ] LOOP
+        v_content := chr(v_codepoint) || 'Hello' || chr(v_codepoint);
+        IF trellis_private.submission_fingerprint(
+            jsonb_build_object('content', v_content), 'whitespace') <> v_fingerprint THEN
+            RAISE EXCEPTION 'submission fingerprint differs from Python str.strip() for U+%',
+                upper(lpad(to_hex(v_codepoint), 4, '0'));
+        END IF;
+        BEGIN
+            PERFORM trellis_private.submission_fingerprint(
+                jsonb_build_object('content', chr(v_codepoint)), 'whitespace');
+            RAISE EXCEPTION 'accepted whitespace-only submission for U+%',
+                upper(lpad(to_hex(v_codepoint), 4, '0'));
+        EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+    END LOOP;
+    FOREACH v_codepoint IN ARRAY ARRAY[8203, 65279] LOOP
+        IF trellis_private.submission_fingerprint(
+            jsonb_build_object('content', chr(v_codepoint) || 'Hello' || chr(v_codepoint)),
+            'whitespace') = v_fingerprint THEN
+            RAISE EXCEPTION 'trimmed a non-whitespace character for U+%',
+                upper(lpad(to_hex(v_codepoint), 4, '0'));
+        END IF;
+    END LOOP;
+    IF trellis_private.submission_fingerprint(
+        jsonb_build_object('content', 'Hel' || chr(160) || 'lo'), 'whitespace') = v_fingerprint THEN
+        RAISE EXCEPTION 'removed interior whitespace';
+    END IF;
+END;
+$$;
 INSERT INTO auth.users(id,email) VALUES
     ('00000000-0000-0000-0000-0000000018a1','durable-a@example.test'),
     ('00000000-0000-0000-0000-0000000018b1','durable-b@example.test');
@@ -10,15 +49,17 @@ DECLARE v_chat uuid; v_run jsonb; v_retry jsonb; v_payload jsonb;
 BEGIN
     v_chat := (trellis.mutate('create_session','{}')->>'id')::uuid;
     v_payload := jsonb_build_object('session_id',v_chat,'client_request_id','durable-1',
-        'content','Hello','model_id','openai:gpt-5.5','budget_preset','conservative',
-        'submission',jsonb_build_object('content',' Hello ','turnId','durable-1'));
+        'content',U&'\00a0\2003 Hello \2003\00a0',
+        'model_id','openai:gpt-5.5','budget_preset','conservative',
+        'submission',jsonb_build_object('content',U&'\00a0\2003 Hello \2003\00a0','turnId','durable-1'));
     IF trellis.lookup_run(v_chat,'durable-1') IS NOT NULL THEN RAISE EXCEPTION 'lookup created work'; END IF;
     v_run := trellis.accept_run(v_payload);
     IF v_run->>'status' <> 'queued' OR v_run->>'deadline_at' IS NOT NULL
        OR v_run->>'lease_expires_at' IS NOT NULL OR v_run->>'last_event_sequence' <> '1'
        OR v_run->>'execution_mode' <> 'durable' THEN RAISE EXCEPTION 'invalid queued run %',v_run; END IF;
     IF v_run ? 'lease_token' OR v_run ? 'request_fingerprint' THEN RAISE EXCEPTION 'private fields exposed'; END IF;
-    v_retry := trellis.accept_run(v_payload || '{"model_id":"missing","budget_preset":"invalid"}');
+    v_retry := trellis.accept_run(jsonb_set(v_payload,'{submission,content}','"Hello"')
+        || '{"model_id":"missing","budget_preset":"invalid"}');
     IF v_retry->>'id' <> v_run->>'id' THEN RAISE EXCEPTION 'duplicate acceptance'; END IF;
     IF trellis.match_run_request(v_payload)->>'id' <> v_run->>'id'
        OR trellis.lookup_run(v_chat,'durable-1')->>'id' <> v_run->>'id' THEN
@@ -47,6 +88,8 @@ BEGIN
        OR (SELECT count(*) FROM trellis.messages WHERE run_id=v_run) <> 1
        OR (SELECT count(*) FROM trellis.run_events WHERE run_id=v_run AND event_type='run.queued') <> 1 THEN
         RAISE EXCEPTION 'acceptance records are incomplete or duplicated'; END IF;
+    IF (SELECT content FROM trellis.messages WHERE run_id=v_run) <> 'Hello' THEN
+        RAISE EXCEPTION 'accepted content differs from Python str.strip()'; END IF;
     IF has_table_privilege('authenticated','trellis_private.jobs','SELECT')
        OR has_table_privilege('authenticated','trellis_private.execution_attempts','INSERT')
        OR has_function_privilege('anon','trellis.accept_run(jsonb)','EXECUTE') THEN
