@@ -7,6 +7,11 @@ BEGIN
         CREATE ROLE trellis_runtime_worker LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
             NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 16;
     END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='trellis_runtime_worker'
+        AND (rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls OR NOT rolcanlogin))
+       OR EXISTS (SELECT 1 FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname='trellis_runtime_worker')) THEN
+        RAISE EXCEPTION 'worker login must have restricted attributes and no role memberships';
+    END IF;
 END;
 $role$;
 GRANT USAGE ON SCHEMA trellis_private TO trellis_runtime_worker;
@@ -83,7 +88,7 @@ REVOKE ALL ON FUNCTION trellis_private.worker_claim_result(trellis_private.jobs,
 CREATE FUNCTION trellis_private.require_assignment(p_claim jsonb,p_allow_finished boolean DEFAULT false)
 RETURNS trellis.runs LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
 DECLARE v_run trellis.runs%ROWTYPE; v_job trellis_private.jobs%ROWTYPE;
-    v_attempt trellis_private.execution_attempts%ROWTYPE; v_now timestamptz:=clock_timestamp();
+    v_attempt trellis_private.execution_attempts%ROWTYPE; v_now timestamptz;
 BEGIN
     PERFORM trellis_private.require_worker();
     SELECT * INTO v_run FROM trellis.runs WHERE id=(p_claim->>'run_id')::uuid FOR UPDATE;
@@ -94,6 +99,7 @@ BEGIN
     SELECT * INTO v_attempt FROM trellis_private.execution_attempts
         WHERE id=(p_claim->>'attempt_id')::uuid AND job_id=v_job.id AND run_id=v_run.id
             AND user_id=v_run.user_id FOR UPDATE;
+    v_now:=clock_timestamp();
     IF v_job.id IS NULL OR v_attempt.id IS NULL
        OR v_job.worker_id IS DISTINCT FROM p_claim->>'worker_id'
        OR v_run.worker_id IS DISTINCT FROM v_job.worker_id
@@ -316,7 +322,9 @@ RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path='' SET lock_time
 DECLARE v_run trellis.runs%ROWTYPE; v_expiry timestamptz;
 BEGIN
     v_run:=trellis_private.require_assignment(p_claim);
-    v_expiry:=clock_timestamp()+interval '60 seconds';
+    IF v_run.status<>'queued' AND v_run.deadline_at<=clock_timestamp() THEN
+        RAISE EXCEPTION 'execution budget expired' USING ERRCODE='42501'; END IF;
+    v_expiry:=LEAST(clock_timestamp()+interval '60 seconds',v_run.deadline_at);
     UPDATE trellis.runs SET lease_expires_at=v_expiry WHERE id=v_run.id RETURNING * INTO v_run;
     UPDATE trellis_private.jobs SET lease_expires_at=v_expiry,updated_at=clock_timestamp()
         WHERE id=(p_claim->>'job_id')::uuid;
@@ -338,4 +346,128 @@ BEGIN
     RETURN v_run;
 END;
 $$;
+CREATE FUNCTION trellis_private.release_assignment(p_run trellis.runs,p_outcome text)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
+BEGIN
+    UPDATE trellis_private.execution_attempts SET status='finished',finished_at=clock_timestamp(),outcome=p_outcome
+        WHERE id=p_run.attempt_id;
+    UPDATE trellis_private.jobs SET status='ready',worker_id=NULL,attempt_id=NULL,
+        lease_expires_at=NULL,updated_at=clock_timestamp() WHERE run_id=p_run.id;
+    UPDATE trellis.runs SET worker_id=NULL,attempt_id=NULL,lease_token=NULL,lease_expires_at=NULL,
+        recovery_count=recovery_count+CASE WHEN p_outcome='expired' THEN 1 ELSE 0 END WHERE id=p_run.id;
+END;
+$$;
+REVOKE ALL ON FUNCTION trellis_private.release_assignment(trellis.runs,text)
+    FROM PUBLIC,anon,authenticated,trellis_runtime_worker;
+
+CREATE FUNCTION trellis_private.worker_release_unstarted(p_claim jsonb)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path='' SET lock_timeout='2s' AS $$
+DECLARE v_run trellis.runs%ROWTYPE; v_job trellis_private.jobs%ROWTYPE;
+    v_attempt trellis_private.execution_attempts%ROWTYPE;
+BEGIN
+    PERFORM trellis_private.require_worker();
+    SELECT * INTO v_run FROM trellis.runs WHERE id=(p_claim->>'run_id')::uuid FOR UPDATE;
+    SELECT * INTO v_job FROM trellis_private.jobs WHERE id=(p_claim->>'job_id')::uuid AND run_id=v_run.id FOR UPDATE;
+    SELECT * INTO v_attempt FROM trellis_private.execution_attempts WHERE id=(p_claim->>'attempt_id')::uuid
+        AND job_id=v_job.id AND run_id=v_run.id;
+    IF v_attempt.status='finished' AND v_attempt.outcome='released' AND v_job.status='ready'
+       AND v_run.attempt_id IS NULL AND v_run.status='queued'
+       AND v_attempt.worker_id=p_claim->>'worker_id' AND v_attempt.lease_expires_at>clock_timestamp()
+       AND v_attempt.capability_digest=trellis_private.capability_digest(p_claim->>'capability') THEN
+        RETURN;
+    END IF;
+    v_run:=trellis_private.require_assignment(p_claim);
+    IF v_run.status<>'queued' THEN
+        RAISE EXCEPTION 'started execution cannot be released' USING ERRCODE='42501'; END IF;
+    PERFORM trellis_private.release_assignment(v_run,'released');
+END;
+$$;
+REVOKE ALL ON FUNCTION trellis_private.worker_release_unstarted(jsonb) FROM PUBLIC,anon,authenticated;
+GRANT EXECUTE ON FUNCTION trellis_private.worker_release_unstarted(jsonb) TO trellis_runtime_worker;
+
+CREATE FUNCTION trellis_private.worker_recover_expired(p_limit integer DEFAULT 100)
+RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path='' SET lock_timeout='2s' AS $$
+DECLARE v_run trellis.runs%ROWTYPE; v_job trellis_private.jobs%ROWTYPE; v_count integer:=0;
+BEGIN
+    PERFORM trellis_private.require_worker();
+    IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 100 THEN
+        RAISE EXCEPTION 'expiry recovery limit is invalid' USING ERRCODE='22023'; END IF;
+    FOR v_run IN SELECT r.* FROM trellis.runs r JOIN trellis_private.jobs j ON j.run_id=r.id
+        WHERE j.status IN ('claimed','running') AND j.lease_expires_at<=clock_timestamp()
+        ORDER BY j.lease_expires_at,j.id LIMIT p_limit FOR UPDATE OF r SKIP LOCKED
+    LOOP
+        SELECT * INTO v_job FROM trellis_private.jobs WHERE run_id=v_run.id FOR UPDATE;
+        IF v_job.status NOT IN ('claimed','running') OR v_job.lease_expires_at>clock_timestamp() THEN CONTINUE; END IF;
+        IF v_job.status='claimed' AND v_run.status='queued' AND v_run.started_at IS NULL THEN
+            PERFORM trellis_private.release_assignment(v_run,'expired');
+        ELSE
+            UPDATE trellis.runs SET status='interrupted',finished_at=clock_timestamp(),
+                stop_reason='lease_expired',error_code='lease_expired',
+                error_message='The worker stopped before this request finished.',
+                waiting_tool_call_id=NULL,lease_token=NULL,lease_expires_at=NULL,
+                recovery_count=recovery_count+1 WHERE id=v_run.id;
+            UPDATE trellis_private.jobs SET status='finished',updated_at=clock_timestamp() WHERE id=v_job.id;
+            UPDATE trellis_private.execution_attempts SET status='finished',finished_at=clock_timestamp(),outcome='interrupted'
+                WHERE id=v_job.attempt_id;
+            PERFORM trellis_private.append_event(v_run.user_id,v_run.id,'run.interrupted',
+                jsonb_build_object('status','interrupted','code','lease_expired',
+                    'message','The worker stopped before this request finished.'));
+        END IF;
+        v_count:=v_count+1;
+    END LOOP;
+    RETURN v_count;
+END;
+$$;
+REVOKE ALL ON FUNCTION trellis_private.worker_recover_expired(integer) FROM PUBLIC,anon,authenticated;
+GRANT EXECUTE ON FUNCTION trellis_private.worker_recover_expired(integer) TO trellis_runtime_worker;
+
+ALTER FUNCTION trellis_private.mutate(text,jsonb,text) RENAME TO mutate_before_worker_authority;
+REVOKE ALL ON FUNCTION trellis_private.mutate_before_worker_authority(text,jsonb,text)
+    FROM PUBLIC,anon,authenticated,trellis_runtime_worker;
+CREATE FUNCTION trellis_private.mutate(p_action text,p_payload jsonb,p_capability text DEFAULT NULL)
+RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
+DECLARE v_owner uuid:=trellis_private.require_user(); v_run trellis.runs%ROWTYPE;
+    v_run_id uuid; v_event jsonb; v_now timestamptz;
+BEGIN
+    v_run_id:=(p_payload->>'run_id')::uuid;
+    IF v_run_id IS NULL AND p_payload ? 'call_id' THEN
+        SELECT run_id INTO v_run_id FROM trellis.model_calls WHERE id=(p_payload->>'call_id')::uuid AND user_id=v_owner;
+    END IF;
+    IF v_run_id IS NOT NULL THEN
+        SELECT * INTO v_run FROM trellis.runs WHERE id=v_run_id AND user_id=v_owner FOR UPDATE;
+        IF NOT FOUND THEN RAISE EXCEPTION 'run not found' USING ERRCODE='42501'; END IF;
+        IF v_run.execution_mode='durable' THEN
+            IF p_action='request_run_cancellation' THEN
+                IF v_run.status IN ('cancelling','completed','failed','cancelled','interrupted') THEN
+                    RETURN jsonb_build_object('run',to_jsonb(v_run)-'lease_token','event',NULL); END IF;
+                v_now:=clock_timestamp();
+                UPDATE trellis.runs SET status=CASE WHEN status='queued' THEN 'cancelled' ELSE 'cancelling' END,
+                    cancel_requested_at=COALESCE(cancel_requested_at,v_now),
+                    finished_at=CASE WHEN status='queued' THEN v_now ELSE NULL END,
+                    stop_reason=CASE WHEN status='queued' THEN 'user_cancelled' ELSE stop_reason END,
+                    lease_token=CASE WHEN status='queued' THEN NULL ELSE lease_token END,
+                    lease_expires_at=CASE WHEN status='queued' THEN NULL ELSE lease_expires_at END
+                    WHERE id=v_run.id RETURNING * INTO v_run;
+                IF v_run.status='cancelled' THEN
+                    UPDATE trellis_private.jobs SET status='finished',updated_at=v_now WHERE run_id=v_run.id;
+                    UPDATE trellis_private.execution_attempts SET status='finished',finished_at=v_now,outcome='cancelled'
+                        WHERE id=v_run.attempt_id;
+                END IF;
+                v_event:=trellis_private.append_event(v_owner,v_run.id,
+                    CASE WHEN v_run.status='cancelled' THEN 'run.cancelled' ELSE 'run.cancellation_requested' END,
+                    jsonb_build_object('status',v_run.status,'code','user_cancelled','message','Cancellation requested.'));
+                SELECT * INTO v_run FROM trellis.runs WHERE id=v_run.id;
+                RETURN jsonb_build_object('run',to_jsonb(v_run)-'lease_token','event',v_event);
+            ELSIF p_action='record_tool_approval_decision' THEN
+                RAISE EXCEPTION 'durable chat has no tool approvals' USING ERRCODE='22023';
+            ELSE
+                RAISE EXCEPTION 'worker authority required for durable execution' USING ERRCODE='42501';
+            END IF;
+        END IF;
+    END IF;
+    RETURN trellis_private.mutate_before_worker_authority(p_action,p_payload,p_capability);
+END;
+$$;
+REVOKE ALL ON FUNCTION trellis_private.mutate(text,jsonb,text) FROM PUBLIC,anon,authenticated,trellis_runtime_worker;
+GRANT EXECUTE ON FUNCTION trellis_private.mutate(text,jsonb,text) TO authenticated;
 COMMIT;
