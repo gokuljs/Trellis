@@ -182,7 +182,7 @@ export function RunActivity({
           {costLimit === undefined ? "—" : estimatedCost(costLimit)} estimated
         </span>
         {deadline && Number.isFinite(deadline.getTime()) ? (
-          <time dateTime={deadlineAt}>
+          <time dateTime={deadline.toISOString()}>
             Deadline{" "}
             {deadline.toLocaleString(undefined, {
               dateStyle: "medium",

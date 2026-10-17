@@ -4,6 +4,7 @@ import { GitHubIcon } from "@trellis/ui/icons/github-icon"
 import { GoogleIcon } from "@trellis/ui/icons/google-icon"
 import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 import { useAuth } from "@/lib/use-auth"
+import { clearPendingRuns } from "@/lib/pending-run"
 import { SessionQueryProvider } from "@/components/session-query-provider"
 import "./auth-screen.css"
 
@@ -58,6 +59,10 @@ export function AuthGate({ children }: { children: ReactNode }) {
   const authPage = path === "/login" || path === "/signup"
   const signedIn = auth.status === "signed-in" && auth.user !== null
   const signup = path === "/signup"
+
+  useEffect(() => {
+    if (auth.status === "signed-out") clearPendingRuns()
+  }, [auth.status])
 
   useEffect(() => {
     // Let session restoration consume OAuth callback parameters first.

@@ -1,4 +1,5 @@
 import type { RunSummary } from "@/lib/app-types"
+import { forgetPendingRun, rememberPendingRun } from "@/lib/pending-run"
 import {
   AuthAccessError,
   getAuthController,
@@ -24,7 +25,7 @@ export type RuntimeRunInfo = {
     maxToolCalls: number
     maxTotalTokens: number
     maxCostUsd: number
-    deadlineAt: string
+    deadlineAt: string | null
   }
 }
 
@@ -91,7 +92,7 @@ export class RuntimeError extends Error {
 type RpcResponse = {
   jsonrpc: "2.0"
   id: string | null
-  result?: Record<string, unknown>
+  result?: Record<string, unknown> | null
   error?: {
     code: number
     message: string
@@ -265,7 +266,7 @@ function parseRunInfo(result: Record<string, unknown>): RuntimeRunInfo {
     typeof limits.maxToolCalls === "number" &&
     typeof limits.maxTotalTokens === "number" &&
     typeof limits.maxCostUsd === "number" &&
-    typeof limits.deadlineAt === "string"
+    (typeof limits.deadlineAt === "string" || limits.deadlineAt === null)
   ) {
     info.limits = {
       maxModelCalls: limits.maxModelCalls,
@@ -300,6 +301,7 @@ function followRun(
     let nextRpcId = 0
     let settled = false
     let subscriptionRequestPending = false
+    let acceptanceUncertain = false
     let bufferedEventOverflowed = false
     let replayRequiredForRun: string | null = null
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -438,8 +440,19 @@ function followRun(
       }
       if (subscriptionRequestPending) return
       subscriptionRequestPending = true
-      const method = runId ? "run.resume" : "run.start"
-      const params = runId ? { runId, afterSequence: lastSequence } : input
+      const method = runId
+        ? "run.resume"
+        : acceptanceUncertain
+          ? "run.lookup"
+          : "run.start"
+      const params = runId
+        ? { runId, afterSequence: lastSequence }
+        : method === "run.lookup" && input
+          ? {
+              sessionId: input.sessionId,
+              clientRequestId: input.clientRequestId,
+            }
+          : input
       if (!params) {
         finish(
           new RuntimeError(
@@ -449,6 +462,7 @@ function followRun(
         )
         return
       }
+      if (method === "run.start") acceptanceUncertain = true
       void sendRpc(activeSocket, method, params)
         .then((response) => {
           if (settled || socket !== activeSocket) return
@@ -456,6 +470,11 @@ function followRun(
           subscriptionRequestPending = false
           if (response.error) throw rpcError(response)
           const result = response.result
+          if (method === "run.lookup" && result === null) {
+            acceptanceUncertain = false
+            beginRequest(activeSocket)
+            return
+          }
           const responseRunId = result?.runId
           if (!result || typeof responseRunId !== "string") {
             throw new RuntimeError(
@@ -477,6 +496,10 @@ function followRun(
           if (settled || !stillCurrent()) return
           options.onRunInfo?.(parseRunInfo(result))
           if (settled || !stillCurrent()) return
+          if (method === "run.lookup") {
+            beginRequest(activeSocket)
+            return
+          }
           subscriptionReady = true
           flushBufferedEvents()
           if (!settled && replayRequiredForRun === runId) {
@@ -705,7 +728,28 @@ export function streamRun(
   input: StartRunInput,
   options: RuntimeClientOptions = {}
 ): Promise<RunResult> {
-  return followRun(input, null, options, 0)
+  const userId = getAuthController().getSnapshot().user?.id
+  const submission = userId ? rememberPendingRun(userId, input) : input
+  const forget = () => {
+    if (userId)
+      forgetPendingRun(userId, submission.sessionId, submission.clientRequestId)
+  }
+  return followRun(submission, null, options, 0).then(
+    (result) => {
+      forget()
+      return result
+    },
+    (error: unknown) => {
+      if (
+        error instanceof RuntimeError &&
+        !["connection_lost", "runtime_timeout", "auth_unavailable"].includes(
+          error.code
+        )
+      )
+        forget()
+      throw error
+    }
+  )
 }
 
 export function resumeRun(
@@ -725,7 +769,7 @@ async function requestRunAction(
   params: Record<string, unknown>,
   requestId: string,
   failureMessage: string
-): Promise<Record<string, unknown>> {
+): Promise<Record<string, unknown> | null> {
   const auth = getAuthController()
   const initialUser = auth.getSnapshot().user?.id
   const initialEpoch = auth.getSessionEpoch()
@@ -756,7 +800,10 @@ async function requestRunAction(
     let authenticated = false
     let socketCredential: AuthCredential | null = null
     let unsubscribeAuth: (() => void) | null = null
-    const finish = (result?: Record<string, unknown>, error?: RuntimeError) => {
+    const finish = (
+      result?: Record<string, unknown> | null,
+      error?: RuntimeError
+    ) => {
       if (settled) return
       settled = true
       unsubscribeAuth?.()
@@ -767,7 +814,7 @@ async function requestRunAction(
         reject(error)
         if (credentialWasRejected(error) && socketCredential)
           expireRejectedCredential(auth, socketCredential)
-      } else if (result) resolve(result)
+      } else if (result !== undefined) resolve(result)
       else
         reject(
           new RuntimeError(
@@ -894,7 +941,11 @@ async function requestRunAction(
         )
         return
       }
-      finish(asRecord(envelope.result) ?? undefined)
+      finish(
+        method === "run.lookup" && envelope.result === null
+          ? null
+          : (asRecord(envelope.result) ?? undefined)
+      )
     }
     socket.onerror = () => {
       finish(
@@ -934,7 +985,11 @@ export async function cancelRun(
     "runtime-cancel",
     "Trellis could not cancel that run."
   )
-  if (typeof result.runId !== "string" || typeof result.status !== "string") {
+  if (
+    !result ||
+    typeof result.runId !== "string" ||
+    typeof result.status !== "string"
+  ) {
     throw new RuntimeError(
       "runtime_protocol_error",
       "The Trellis service returned an invalid run."
@@ -960,6 +1015,7 @@ export async function respondToToolApproval(
     "Trellis could not answer that approval request."
   )
   if (
+    !result ||
     result.runId !== runId ||
     result.toolCallId !== toolCallId ||
     result.decision !== decision
@@ -970,4 +1026,32 @@ export async function respondToToolApproval(
     )
   }
   return { runId, toolCallId, decision }
+}
+
+export async function lookupRun(
+  sessionId: string,
+  clientRequestId: string
+): Promise<{ runId: string; status: string; lastSequence: number } | null> {
+  const result = await requestRunAction(
+    "run.lookup",
+    { sessionId, clientRequestId },
+    "runtime-lookup",
+    "Trellis could not check whether your request was accepted."
+  )
+  if (result === null) return null
+  if (
+    typeof result.runId !== "string" ||
+    typeof result.status !== "string" ||
+    !Number.isSafeInteger(result.lastSequence) ||
+    (result.lastSequence as number) < 0
+  )
+    throw new RuntimeError(
+      "runtime_protocol_error",
+      "The Trellis service returned an invalid run."
+    )
+  return {
+    runId: result.runId,
+    status: result.status,
+    lastSequence: result.lastSequence as number,
+  }
 }

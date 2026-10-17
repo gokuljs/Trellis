@@ -27,6 +27,7 @@ import {
 import {
   RuntimeError,
   cancelRun,
+  lookupRun,
   resumeRun,
   respondToToolApproval,
   streamRun,
@@ -87,6 +88,8 @@ import {
   retainWindowActivities,
 } from "@/lib/activity-history"
 import { useContextPreview } from "@/lib/use-context-preview"
+import { getAuthController } from "@/lib/auth-controller"
+import { forgetPendingRun, readPendingRun } from "@/lib/pending-run"
 import "./workspace-bootstrap.css"
 
 type BootstrapState =
@@ -363,7 +366,32 @@ export function AppShell({
       let turn = retryFromTranscript(sessionId, transcript)
       let latest: LatestRun | null
       try {
+        const userId = getAuthController().getSnapshot().user?.id
+        const pendingRequest = userId ? readPendingRun(userId, sessionId) : null
+        const accepted = pendingRequest
+          ? await lookupRun(sessionId, pendingRequest.clientRequestId)
+          : null
+        if (isStale()) return
+        if (
+          userId &&
+          pendingRequest &&
+          (!accepted || !activeRunStatuses.has(accepted.status))
+        )
+          forgetPendingRun(userId, sessionId, pendingRequest.clientRequestId)
         latest = await api.getLatestRun(sessionId)
+        if (
+          accepted &&
+          pendingRequest &&
+          activeRunStatuses.has(accepted.status)
+        ) {
+          latest = {
+            ...(latest?.run_id === accepted.runId ? latest : {}),
+            run_id: accepted.runId,
+            turn_id: pendingRequest.turnId,
+            status: accepted.status,
+            last_sequence: accepted.lastSequence,
+          }
+        }
       } catch {
         if (isStale()) return
         waitForDiscovery(

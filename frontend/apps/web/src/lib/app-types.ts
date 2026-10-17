@@ -139,7 +139,7 @@ export type RunSummary = {
   max_tool_calls: number
   max_total_tokens: number
   max_cost_usd: number
-  deadline_at: string
+  deadline_at: string | null
   last_sequence: number
   created_at: string
   started_at: string | null
