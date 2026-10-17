@@ -54,7 +54,7 @@ function currentState(event: RuntimeRunEvent): StatusCopy | null {
         ? (phaseStates.get(event.data.phase) ?? null)
         : null
     case "run.queued":
-      return { label: "Waiting", orb: "connecting" }
+      return { label: "Queued", orb: "connecting" }
     case "run.started":
     case "run.resumed":
       return { label: "Thinking", orb: "working" }

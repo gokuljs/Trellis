@@ -129,6 +129,12 @@ export function RunActivityDisclosure({
           </span>
         </div>
       )}
+      {status.label === "Queued" && !status.terminal ? (
+        <p className="run-activity-queue-message" role="status">
+          Your request is saved and queued. It will start when execution
+          capacity is available. You can close this page.
+        </p>
+      ) : null}
       {expanded && available ? (
         <div
           id={detailsId}
