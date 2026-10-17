@@ -62,6 +62,8 @@ class RunService(RunExecutor):
         event_publisher: RunEventPublisher | None = None,
         *,
         acceptance_repository: DurableAcceptanceRepository | None = None,
+        durable_execution: bool = False,
+        acceptance_enabled: bool = True,
         tool_registry: ToolRegistry | None = None,
         workspace_guidance_reader: Callable[[Path], Awaitable[str | None]] | None = None,
         workspace_bindings: WorkspaceBindingPort | None = None,
@@ -75,6 +77,8 @@ class RunService(RunExecutor):
             raise ValueError("maximum concurrent runs must be positive")
         if lease_renew_interval_seconds <= 0:
             raise ValueError("lease renewal interval must be positive")
+        self._durable_execution = durable_execution
+        self._acceptance_enabled = acceptance_enabled
         self._runs = runs
         self._acceptance = acceptance_repository
         self._sessions = sessions
@@ -109,6 +113,15 @@ class RunService(RunExecutor):
         budget_preset: BudgetPreset | None = None,
         model_id: str | None = None,
     ) -> RunSnapshot:
+        if self._durable_execution:
+            return await self.accept_run(
+                session_id,
+                client_request_id,
+                content,
+                turn_id=turn_id,
+                budget_preset=budget_preset,
+                model_id=model_id,
+            )
         session = await self._sessions.get_session(session_id)
         if session is None:
             raise ApplicationError("session_not_found", "Session not found.")
@@ -215,6 +228,11 @@ class RunService(RunExecutor):
             )
             if existing is not None:
                 return existing
+            if self._durable_execution and (not self._acceptance_enabled or self._closing):
+                raise ApplicationError(
+                    "runtime_unavailable",
+                    "New requests are temporarily paused. Saved work is safe.",
+                )
             session = await self._sessions.get_session(session_id)
             if session is None:
                 raise ApplicationError("session_not_found", "Session not found.")
@@ -267,8 +285,10 @@ class RunService(RunExecutor):
         return ApplicationError("run_invalid", "The run request could not be accepted.")
 
     def _can_execute(self, run_id: str) -> bool:
-        return run_id not in self._lease_lost and (
-            self._lease_repository is None or self._lease_repository.owns_run_lease(run_id)
+        return (
+            not self._durable_execution
+            and run_id not in self._lease_lost
+            and (self._lease_repository is None or self._lease_repository.owns_run_lease(run_id))
         )
 
     async def wait_for_run(self, run_id: str) -> None:
@@ -289,7 +309,12 @@ class RunService(RunExecutor):
         return await self._recover_if_expired(await self._runs.get_run(run_id))
 
     async def _recover_if_expired(self, run: RunSnapshot | None) -> RunSnapshot | None:
-        if self._lease_repository is None or run is None or is_terminal_run_status(run.status):
+        if (
+            self._durable_execution
+            or self._lease_repository is None
+            or run is None
+            or is_terminal_run_status(run.status)
+        ):
             return run
         if run.lease_expires_at is None:
             return run
@@ -359,13 +384,18 @@ class RunService(RunExecutor):
         return await self._runs.list_run_events(run_id, after_sequence, limit=limit)
 
     async def cancel_run(self, run_id: str) -> RunSnapshot:
-        await self._require_local_control(run_id)
+        if not self._durable_execution:
+            await self._require_local_control(run_id)
         try:
             run, event = await self._runs.request_run_cancellation(run_id)
         except ValueError as error:
             if str(error) == "run not found":
                 raise ApplicationError("run_not_found", "Run not found.") from None
             raise
+        if self._durable_execution:
+            if event is not None:
+                await self._publish(event)
+            return run
         task = self._tasks.get(run_id)
         if (
             event is not None
@@ -431,12 +461,13 @@ class RunService(RunExecutor):
     ) -> tuple[RunSnapshot, ToolCallRecord]:
         if self._closing:
             raise ApplicationError("runtime_shutting_down", "The runtime is shutting down.")
-        await self._require_local_control(run_id)
+        if not self._durable_execution:
+            await self._require_local_control(run_id)
         stored_call = next(
             (call for call in await self._runs.list_tool_calls(run_id) if call.id == tool_call_id),
             None,
         )
-        if stored_call is not None:
+        if stored_call is not None and not self._durable_execution:
             if self._tool_registry is None:
                 raise ApplicationError(
                     "tool_execution_unavailable", "Tool execution is unavailable."
@@ -472,11 +503,13 @@ class RunService(RunExecutor):
         run = await self._runs.get_run(run_id)
         if run is None:
             raise ApplicationError("run_not_found", "Run not found.")
-        if run.status is RunStatus.WAITING_FOR_APPROVAL:
+        if not self._durable_execution and run.status is RunStatus.WAITING_FOR_APPROVAL:
             self._schedule(run.id)
         return run, tool_call
 
     async def resume_decided_approvals(self) -> None:
+        if self._durable_execution:
+            return
         for run_id in await self._runs.list_decided_approval_runs():
             self._schedule(run_id)
 

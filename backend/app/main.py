@@ -33,6 +33,8 @@ class AuthVerifier(Protocol):
 
 
 ERROR_STATUS = {
+    "runtime_unavailable": 503,
+    "runtime_not_configured": 503,
     "model_not_available": 404,
     "session_not_found": 404,
     "run_not_found": 404,
