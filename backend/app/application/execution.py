@@ -1036,6 +1036,28 @@ class RunExecutor:
                 type(error).__name__,
             )
 
+    async def _finish_active_model_call(
+        self,
+        call: ModelCallRecord | None,
+        status: ModelCallStatus,
+        *,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        if call is None or call.status not in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
+            return
+        try:
+            await self._runs.update_model_call(
+                call.id,
+                status,
+                error_code=error_code,
+                error_message=error_message,
+            )
+        except ApplicationError as error:
+            if error.code != "event_storage_limit":
+                raise
+            # The atomic terminal transition closes calls using reserved capacity.
+
     async def _fail(
         self,
         run_id: str,
@@ -1045,18 +1067,14 @@ class RunExecutor:
     ) -> None:
         error_code = self._redactor.redact_text(error_code)
         error_message = self._redactor.redact_text(error_message)
-        if call is not None and call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
-            call_status = (
-                ModelCallStatus.TIMED_OUT
-                if error_code == "provider_timeout"
-                else ModelCallStatus.FAILED
-            )
-            await self._runs.update_model_call(
-                call.id,
-                call_status,
-                error_code=error_code,
-                error_message=error_message,
-            )
+        await self._finish_active_model_call(
+            call,
+            ModelCallStatus.TIMED_OUT
+            if error_code == "provider_timeout"
+            else ModelCallStatus.FAILED,
+            error_code=error_code,
+            error_message=error_message,
+        )
         await self._finish_pending_tools(
             run_id,
             ToolCallStatus.TIMED_OUT if error_code == "provider_timeout" else ToolCallStatus.FAILED,
@@ -1087,8 +1105,7 @@ class RunExecutor:
             await self._fail(run_id, call, error_code, error_message)
 
     async def _mark_interrupted(self, run_id: str, call: ModelCallRecord | None) -> None:
-        if call is not None and call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
-            await self._runs.update_model_call(call.id, ModelCallStatus.CANCELLED)
+        await self._finish_active_model_call(call, ModelCallStatus.CANCELLED)
         await self._finish_pending_tools(
             run_id, ToolCallStatus.CANCELLED, "The run was interrupted."
         )
@@ -1104,8 +1121,7 @@ class RunExecutor:
         await self._publish(event)
 
     async def _mark_cancelled(self, run_id: str, call: ModelCallRecord | None) -> None:
-        if call is not None and call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
-            await self._runs.update_model_call(call.id, ModelCallStatus.CANCELLED)
+        await self._finish_active_model_call(call, ModelCallStatus.CANCELLED)
         await self._finish_pending_tools(
             run_id, ToolCallStatus.CANCELLED, "The tool was cancelled."
         )
