@@ -5,17 +5,18 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
-PSQL = os.environ.get("PSQL", "/Library/PostgreSQL/15/bin/psql")
+PSQL = os.environ.get("PSQL", shutil.which("psql") or "/Library/PostgreSQL/15/bin/psql")
 DATABASE = os.environ.get("PGDATABASE", "trellis_authority")
 
 
 def query(sql: str, *, worker: bool = False, fails: bool = False) -> str:
     result = subprocess.run(
-        [PSQL, "-XAt", "-v", "ON_ERROR_STOP=1", "-h", "127.0.0.1", "-p", "56379",
-         "-U", "trellis_runtime_worker" if worker else "trellis_test_admin",
+        [PSQL, "-XAt", "-v", "ON_ERROR_STOP=1", "-h", os.environ.get("PGHOST", "127.0.0.1"), "-p", os.environ.get("PGPORT", "56379"),
+         "-U", "trellis_runtime_worker" if worker else os.environ.get("PGUSER", "trellis_test_admin"),
          "-d", DATABASE, "-c", sql],
         capture_output=True, text=True, timeout=10,
     )
@@ -76,6 +77,7 @@ def main() -> None:
     ))
     assert snapshot == retry
     assert snapshot["status"] == "running" and snapshot["deadline_at"]
+    assert json.loads(query(f"SELECT data FROM trellis.run_events WHERE run_id='{run}' AND event_type='run.started';"))["deadline_at"] == snapshot["deadline_at"]
     assert query(f"SELECT count(*) FROM trellis.run_events WHERE run_id='{run}' AND event_type='run.started';") == "1"
     altered = {**assignment, "worker_id": "intruder"}
     query(f"SELECT trellis_private.worker_begin({literal(altered)});", worker=True, fails=True)

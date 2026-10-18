@@ -73,6 +73,16 @@ def main() -> None:
     assert query(f"SELECT status FROM trellis_private.jobs WHERE run_id='{running}';") == "finished"
     query(f"SET ROLE authenticated; SELECT set_config('request.jwt.claim.sub','{owner}',false);"
           f"SELECT trellis.mutate('recover_expired_run',{literal({'run_id': running})});", fails=True)
+    expiring_cancel = accept()
+    assigned = claim()
+    assert assigned is not None
+    query(f"SELECT trellis_private.worker_begin({literal(assigned)});", worker=True)
+    owner = query(f"SELECT user_id FROM trellis.runs WHERE id='{expiring_cancel}';")
+    cancel(expiring_cancel, owner)
+    expire(assigned)
+    assert query("SELECT trellis_private.worker_recover_expired();", worker=True) == "1"
+    assert query(f"SELECT status FROM trellis.runs WHERE id='{expiring_cancel}';") == "cancelled"
+    assert query(f"SELECT outcome FROM trellis_private.execution_attempts WHERE run_id='{expiring_cancel}';") == "cancelled"
     print("PASS queued reclaim, running interruption, partial output, stale fencing, owner cancellation, and idempotent release")
 
 

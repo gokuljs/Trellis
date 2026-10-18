@@ -176,7 +176,8 @@ BEGIN
             WHERE id=(p_claim->>'job_id')::uuid;
         UPDATE trellis_private.execution_attempts SET status='running',started_at=v_now
             WHERE id=(p_claim->>'attempt_id')::uuid;
-        PERFORM trellis_private.append_event(v_run.user_id,v_run.id,'run.started','{}'::jsonb);
+        PERFORM trellis_private.append_event(v_run.user_id,v_run.id,'run.started',
+            jsonb_build_object('status','running','deadline_at',v_now+make_interval(secs=>v_run.max_seconds)));
     END IF;
     SELECT * INTO v_run FROM trellis.runs WHERE id=v_run.id;
     RETURN to_jsonb(v_run)-'lease_token';
@@ -184,6 +185,9 @@ END;
 $$;
 REVOKE ALL ON FUNCTION trellis_private.worker_begin(jsonb) FROM PUBLIC,anon,authenticated;
 GRANT EXECUTE ON FUNCTION trellis_private.worker_begin(jsonb) TO trellis_runtime_worker;
+ALTER TABLE trellis_private.execution_attempts
+    ADD COLUMN operation_storage_count integer NOT NULL DEFAULT 0 CHECK(operation_storage_count BETWEEN 0 AND 32784),
+    ADD COLUMN operation_storage_bytes bigint NOT NULL DEFAULT 0 CHECK(operation_storage_bytes BETWEEN 0 AND 16777216);
 CREATE TABLE trellis_private.worker_operations (
     attempt_id uuid NOT NULL REFERENCES trellis_private.execution_attempts(id) ON DELETE CASCADE,
     operation_id uuid NOT NULL,
@@ -196,7 +200,7 @@ REVOKE ALL ON trellis_private.worker_operations FROM PUBLIC,anon,authenticated,t
 CREATE FUNCTION trellis_private.worker_mutate(p_claim jsonb,p_operation_id uuid,p_action text,p_payload jsonb)
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path='' SET lock_timeout='2s' AS $$
 DECLARE v_run trellis.runs%ROWTYPE; v_result jsonb; v_prior trellis_private.worker_operations%ROWTYPE;
-    v_fingerprint text; v_call_id uuid;
+    v_fingerprint text; v_call_id uuid; v_receipt jsonb; v_content text; v_length integer; v_request jsonb; v_terminal boolean; v_size bigint;
 BEGIN
     v_run:=trellis_private.require_assignment(p_claim,true);
     IF p_operation_id IS NULL OR p_action IS NULL OR jsonb_typeof(p_payload) IS DISTINCT FROM 'object'
@@ -211,7 +215,25 @@ BEGIN
     IF FOUND THEN
         IF v_prior.fingerprint<>v_fingerprint THEN
             RAISE EXCEPTION 'operation identity conflicts with saved content' USING ERRCODE='22023'; END IF;
-        RETURN v_prior.result;
+        v_receipt:=v_prior.result;
+        IF v_receipt ? '_model_request_call_id' THEN
+            SELECT request_snapshot INTO v_request FROM trellis.model_calls
+                WHERE id=(v_receipt->>'_model_request_call_id')::uuid AND run_id=v_run.id AND user_id=v_run.user_id;
+            IF NOT FOUND THEN RAISE EXCEPTION 'publication receipt is unavailable' USING ERRCODE='22023'; END IF;
+            v_receipt:=jsonb_set(v_receipt-'_model_request_call_id','{request_snapshot}',v_request);
+        END IF;
+        IF v_receipt ? '_output_content_length' THEN
+            v_length:=(v_receipt->>'_output_content_length')::integer;
+            SELECT content INTO v_content FROM trellis.run_assistant_outputs
+                WHERE id=COALESCE(v_receipt->'output'->>'id',v_receipt->>'id')::uuid
+                    AND run_id=v_run.id AND user_id=v_run.user_id;
+            IF v_content IS NULL OR char_length(v_content)<v_length THEN
+                RAISE EXCEPTION 'publication receipt is unavailable' USING ERRCODE='22023'; END IF;
+            v_receipt:=jsonb_set(v_receipt-'_output_content_length',
+                CASE WHEN v_receipt ? 'output' THEN '{output,content}'::text[] ELSE '{content}'::text[] END,
+                to_jsonb(left(v_content,v_length)));
+        END IF;
+        RETURN v_receipt;
     END IF;
     IF v_run.status NOT IN ('running','cancelling') THEN
         RAISE EXCEPTION 'execution has not begun or is finished' USING ERRCODE='42501'; END IF;
@@ -230,9 +252,6 @@ BEGIN
         RAISE EXCEPTION 'worker cannot change execution ownership' USING ERRCODE='42501'; END IF;
     IF p_action='record_assistant_message' AND COALESCE(jsonb_array_length(p_payload->'message'->'tool_calls'),0)>0 THEN
         RAISE EXCEPTION 'durable tools are unavailable' USING ERRCODE='42501'; END IF;
-    IF (SELECT count(*) FROM trellis_private.worker_operations
-        WHERE attempt_id=(p_claim->>'attempt_id')::uuid)>=32768 THEN
-        RAISE EXCEPTION 'worker operation limit reached' USING ERRCODE='22023'; END IF;
     v_result:=trellis_private.mutate_owned(v_run.user_id,p_action,
         p_payload||jsonb_build_object('run_id',v_run.id),p_claim->>'capability');
     SELECT * INTO v_run FROM trellis.runs WHERE id=v_run.id;
@@ -242,8 +261,29 @@ BEGIN
         UPDATE trellis_private.execution_attempts SET status='finished',finished_at=clock_timestamp(),outcome=v_run.status
             WHERE id=(p_claim->>'attempt_id')::uuid;
     END IF;
+    v_receipt:=COALESCE(v_result,'null'::jsonb);
+    IF p_action='append_assistant_batch' THEN
+        -- The output is an append-only prefix. Saving it for every batch would
+        -- turn a bounded transcript into a quadratic retry journal.
+        v_receipt:=jsonb_set(v_result,'{output}',(v_result->'output')-'content')
+            ||jsonb_build_object('_output_content_length',char_length(v_result->'output'->>'content'));
+    END IF;
+    IF p_action='finish_assistant_output' AND v_result IS NOT NULL AND v_result<>'null'::jsonb THEN
+        v_receipt:=(v_result-'content')||jsonb_build_object('_output_content_length',char_length(v_result->>'content'));
+    END IF;
+    IF p_action IN ('create_model_call','update_model_call') THEN
+        v_receipt:=(v_result-'request_snapshot')||jsonb_build_object('_model_request_call_id',v_result->>'id');
+    END IF;
+    v_terminal:=p_action='complete_run' OR p_action='transition_run_record';
+    v_size:=octet_length(v_receipt::text);
+    UPDATE trellis_private.execution_attempts SET operation_storage_count=operation_storage_count+1,
+        operation_storage_bytes=operation_storage_bytes+v_size
+        WHERE id=(p_claim->>'attempt_id')::uuid
+            AND operation_storage_count+1<=CASE WHEN v_terminal THEN 32784 ELSE 32768 END
+            AND operation_storage_bytes+v_size<=CASE WHEN v_terminal THEN 16777216 ELSE 8388608 END;
+    IF NOT FOUND THEN RAISE EXCEPTION 'worker_operation_storage_limit' USING ERRCODE='22023'; END IF;
     INSERT INTO trellis_private.worker_operations(attempt_id,operation_id,fingerprint,result)
-        VALUES((p_claim->>'attempt_id')::uuid,p_operation_id,v_fingerprint,COALESCE(v_result,'null'::jsonb));
+        VALUES((p_claim->>'attempt_id')::uuid,p_operation_id,v_fingerprint,v_receipt);
     RETURN v_result;
 END;
 $$;
@@ -253,10 +293,11 @@ GRANT EXECUTE ON FUNCTION trellis_private.worker_mutate(jsonb,uuid,text,jsonb) T
 CREATE FUNCTION trellis_private.worker_read(p_claim jsonb,p_action text,p_payload jsonb DEFAULT '{}')
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path='' SET lock_timeout='2s' AS $$
 DECLARE v_run trellis.runs%ROWTYPE; v_result jsonb; v_checkpoint trellis.context_checkpoints%ROWTYPE;
-    v_limit integer:=COALESCE((p_payload->>'limit')::integer,128); v_chat jsonb;
+    v_limit integer:=COALESCE((p_payload->>'limit')::integer,128);
+    v_offset integer:=COALESCE((p_payload->>'offset')::integer,0); v_chat jsonb;
 BEGIN
     v_run:=trellis_private.require_assignment(p_claim);
-    IF jsonb_typeof(p_payload) IS DISTINCT FROM 'object' OR v_limit NOT BETWEEN 1 AND 501
+    IF jsonb_typeof(p_payload) IS DISTINCT FROM 'object' OR v_limit NOT BETWEEN 1 AND 501 OR v_offset NOT BETWEEN 0 AND 1000000
        OR (p_payload ? 'run_id' AND p_payload->>'run_id' IS DISTINCT FROM v_run.id::text)
        OR (p_payload ? 'session_id' AND p_payload->>'session_id' IS DISTINCT FROM v_run.chat_id::text) THEN
         RAISE EXCEPTION 'read is outside execution assignment' USING ERRCODE='42501'; END IF;
@@ -282,7 +323,7 @@ BEGIN
                 AND (NOT p_payload ? 'id' OR id=(p_payload->>'id')::uuid)
                 AND (NOT p_payload ? 'turn_id' OR turn_id=p_payload->>'turn_id')
                 AND ordinal>COALESCE((p_payload->>'after_ordinal')::integer,0)
-                ORDER BY ordinal LIMIT v_limit) m;
+                ORDER BY ordinal LIMIT v_limit OFFSET v_offset) m;
     ELSIF p_action='run_events' THEN
         SELECT jsonb_agg(to_jsonb(e) ORDER BY e.sequence) INTO v_result FROM (
             SELECT * FROM trellis.run_events WHERE user_id=v_run.user_id AND run_id=v_run.id
@@ -311,6 +352,7 @@ BEGIN
                     AND ordinal>COALESCE(v_checkpoint.covered_message_ordinal,0) ORDER BY ordinal LIMIT v_limit) m;
         END IF;
     ELSE RAISE EXCEPTION 'worker read is not permitted' USING ERRCODE='42501'; END IF;
+    IF v_offset>0 AND p_action<>'messages' THEN v_result:='[]'::jsonb; END IF;
     RETURN jsonb_build_object('owner_id',v_run.user_id,'result',COALESCE(v_result,'[]'::jsonb));
 END;
 $$;
@@ -387,7 +429,7 @@ GRANT EXECUTE ON FUNCTION trellis_private.worker_release_unstarted(jsonb) TO tre
 
 CREATE FUNCTION trellis_private.worker_recover_expired(p_limit integer DEFAULT 100)
 RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path='' SET lock_timeout='2s' AS $$
-DECLARE v_run trellis.runs%ROWTYPE; v_job trellis_private.jobs%ROWTYPE; v_count integer:=0;
+DECLARE v_run trellis.runs%ROWTYPE; v_job trellis_private.jobs%ROWTYPE; v_count integer:=0; v_status text;
 BEGIN
     PERFORM trellis_private.require_worker();
     IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 100 THEN
@@ -401,16 +443,18 @@ BEGIN
         IF v_job.status='claimed' AND v_run.status='queued' AND v_run.started_at IS NULL THEN
             PERFORM trellis_private.release_assignment(v_run,'expired');
         ELSE
-            UPDATE trellis.runs SET status='interrupted',finished_at=clock_timestamp(),
-                stop_reason='lease_expired',error_code='lease_expired',
+            v_status:=CASE WHEN v_run.status='cancelling' THEN 'cancelled' ELSE 'interrupted' END;
+            UPDATE trellis.runs SET status=v_status,finished_at=clock_timestamp(),
+                stop_reason=CASE WHEN v_status='cancelled' THEN 'user_cancelled' ELSE 'lease_expired' END,
+                error_code=CASE WHEN v_status='cancelled' THEN NULL ELSE 'lease_expired' END,
                 error_message='The worker stopped before this request finished.',
                 waiting_tool_call_id=NULL,lease_token=NULL,lease_expires_at=NULL,
                 recovery_count=recovery_count+1 WHERE id=v_run.id;
             UPDATE trellis_private.jobs SET status='finished',updated_at=clock_timestamp() WHERE id=v_job.id;
-            UPDATE trellis_private.execution_attempts SET status='finished',finished_at=clock_timestamp(),outcome='interrupted'
+            UPDATE trellis_private.execution_attempts SET status='finished',finished_at=clock_timestamp(),outcome=v_status
                 WHERE id=v_job.attempt_id;
-            PERFORM trellis_private.append_event(v_run.user_id,v_run.id,'run.interrupted',
-                jsonb_build_object('status','interrupted','code','lease_expired',
+            PERFORM trellis_private.append_event(v_run.user_id,v_run.id,'run.'||v_status,
+                jsonb_build_object('status',v_status,'code',CASE WHEN v_status='cancelled' THEN 'user_cancelled' ELSE 'lease_expired' END,
                     'message','The worker stopped before this request finished.'));
         END IF;
         v_count:=v_count+1;
