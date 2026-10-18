@@ -5,6 +5,7 @@ from typing import cast
 
 import pytest
 
+from app.application.errors import ApplicationError
 from app.application.worker import WorkerPolicy, WorkerSupervisor
 from app.application.worker_ports import WorkerExecutionRepository, WorkerQueuePort
 from app.domain.jobs import ExecutionClaim, RunExecutionContext
@@ -104,8 +105,8 @@ class QueueAdapter:
     def __init__(self, queue):
         self.queue = queue
 
-    async def claim(self, *args):
-        return await self.queue.claim_job(*args)
+    async def claim(self, worker_id, attempt_id, capability):
+        return await self.queue.claim_job(worker_id, attempt_id, capability)
 
     def __getattr__(self, name):
         return getattr(self.queue, name)
@@ -255,5 +256,33 @@ def test_cancel_during_startup_finishes_only_with_live_authority(
             assert queue.startup_finalized
             assert queue.context.run.status is RunStatus.CANCELLED
         assert not execution.started.is_set()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("code", ["run_not_owned", "worker_operation_invalid"])
+def test_definitively_rejected_claim_gets_fresh_identity(tmp_path: Path, code: str) -> None:
+    async def scenario():
+        queue, execution, supervisor = await setup(tmp_path)
+        identities = []
+
+        class ExpiredResponseQueue(QueueAdapter):
+            async def claim(self, worker_id, attempt_id, capability):
+                identities.append((attempt_id, capability))
+                if len(identities) == 1:
+                    raise ApplicationError("database_unavailable", "Committed response lost")
+                if len(identities) == 2:
+                    raise ApplicationError(code, "Old attempt expired")
+                return await self.queue.claim_job(worker_id, attempt_id, capability)
+
+        supervisor._queue = cast(WorkerQueuePort, ExpiredResponseQueue(queue))
+        stop = asyncio.Event()
+        task = asyncio.create_task(supervisor.run(stop))
+        await asyncio.wait_for(execution.started.wait(), 1)
+        execution.finished.set()
+        stop.set()
+        await task
+        assert identities[0] == identities[1]
+        assert identities[2] != identities[1]
 
     asyncio.run(scenario())

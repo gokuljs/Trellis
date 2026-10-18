@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol
 from uuid import uuid4
 
+from app.application.errors import ApplicationError
 from app.application.worker_ports import WorkerExecutionRepository, WorkerQueuePort
 from app.domain.jobs import ExecutionClaim, RunExecutionContext
 from app.domain.runtime import RunEventType, RunStatus, is_terminal_run_status
@@ -103,7 +104,13 @@ class WorkerSupervisor:
                     break
                 except asyncio.CancelledError:
                     raise
-                except Exception:
+                except Exception as error:
+                    if isinstance(error, ApplicationError) and error.code in {
+                        "run_not_owned",
+                        "worker_operation_invalid",
+                    }:
+                        logger.warning("Worker claim identity rejected; starting a fresh attempt")
+                        break
                     logger.warning("Worker claim failed; retrying the same attempt")
                     await _delay(stop, backoff)
                     backoff = min(backoff * 2, self._policy.max_backoff_seconds)
