@@ -89,6 +89,17 @@ function setup() {
     },
   } as unknown as AuthController
   spyOn(authModule, "getAuthController").mockReturnValue(auth)
+  spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url
+    const pathname = new URL(url, "https://trellis.test").pathname
+    assert.ok(pathname === "/health" || pathname === "/ready")
+    return Response.json({ status: pathname === "/ready" ? "ready" : "ok" })
+  })
   globalThis.WebSocket = FakeSocket as unknown as typeof WebSocket
   globalThis.window = {
     location: { href: "https://trellis.test/" },
@@ -377,4 +388,34 @@ test("reconciliation policy accepts completed and expected terminal outcomes and
   const current = { sessionId: "new-session", generation: 2 }
   if (ownsRun(owner, current)) reportFailure(new Error(secret), "run.restore")
   assert.equal((await recorded()).events.length, 0)
+})
+
+test("leaving a running chat closes its browser subscription without cancelling the run", async () => {
+  setup()
+  const connection = new AbortController()
+  const events: string[] = []
+  const followed = streamRun(
+    {
+      sessionId: secret,
+      turnId: secret,
+      clientRequestId: secret,
+      content: secret,
+    },
+    {
+      signal: connection.signal,
+      onEvent: (event) => events.push(event.eventType),
+    }
+  )
+  const socket = await authenticate()
+  acknowledge(socket, { runId: secret })
+  await until(() => socket.sent.length === 2)
+  connection.abort()
+  await assert.rejects(followed)
+  complete(socket)
+  assert.equal(socket.closed, true)
+  assert.deepEqual(
+    socket.sent.map((frame) => frame.method),
+    ["auth.authenticate", "run.start"]
+  )
+  assert.deepEqual(events, [])
 })

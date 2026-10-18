@@ -1,11 +1,18 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
-from app.api.dependencies import ChatServiceDep, RunServiceDep, SessionServiceDep
+from app.api.dependencies import (
+    ChatServiceDep,
+    RunServiceDep,
+    SessionServiceDep,
+    correlate_owned_chat,
+)
+from app.api.telemetry import owned_chat_telemetry
 from app.domain.models import Message, Session
+from app.domain.runtime import RunSummary
 
 
 class SessionResponse(BaseModel):
@@ -80,6 +87,17 @@ class RunSummaryResponse(BaseModel):
     created_at: str
     started_at: str | None
     finished_at: str | None
+    provider_id: str
+    model_id: str
+    model_call_count: int
+    tool_call_count: int
+    total_tokens: int | None
+    usage_complete: bool
+    estimated_cost_usd: float | None
+    cost_complete: bool
+    stop_reason: str | None
+    error_code: str | None
+    error_message: str | None
 
 
 class RunSummariesResponse(BaseModel):
@@ -140,6 +158,43 @@ def serialize_message(message: Message) -> MessageResponse:
     )
 
 
+def serialize_run_summary(summary: RunSummary) -> RunSummaryResponse:
+    run = summary.run
+    lease_expired = run.stop_reason == "lease_expired"
+    return RunSummaryResponse(
+        run_id=run.id,
+        turn_id=run.turn_id,
+        retry_of=run.retry_of,
+        status=run.status.value,
+        budget_preset=run.budget_preset,
+        max_model_calls=run.max_model_calls,
+        max_tool_calls=run.max_tool_calls,
+        max_total_tokens=run.max_total_tokens,
+        max_cost_usd=run.max_cost_usd,
+        deadline_at=run.deadline_at,
+        last_sequence=run.last_event_sequence,
+        created_at=run.created_at,
+        started_at=run.started_at,
+        finished_at=run.finished_at,
+        provider_id=run.provider_id,
+        model_id=run.model_id,
+        model_call_count=summary.model_call_count,
+        tool_call_count=summary.tool_call_count,
+        total_tokens=summary.total_tokens,
+        usage_complete=summary.usage_complete,
+        estimated_cost_usd=summary.estimated_cost_usd,
+        cost_complete=summary.cost_complete,
+        stop_reason=run.stop_reason,
+        error_code=run.error_code or ("lease_expired" if lease_expired else None),
+        error_message=run.error_message
+        or (
+            "The API stopped before this run finished. Start a new run to continue."
+            if lease_expired
+            else None
+        ),
+    )
+
+
 @router.get("")
 async def list_sessions(service: SessionServiceDep) -> list[SessionResponse]:
     return [await serialize_session(session, service) for session in await service.list_sessions()]
@@ -147,14 +202,14 @@ async def list_sessions(service: SessionServiceDep) -> list[SessionResponse]:
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_session(
-    service: SessionServiceDep, payload: SessionWorkspaceRequest | None = None
+    request: Request, service: SessionServiceDep, payload: SessionWorkspaceRequest | None = None
 ) -> SessionResponse:
-    return await serialize_session(
-        await service.create(payload.workspace_path if payload else None), service
-    )
+    session = await service.create(payload.workspace_path if payload else None)
+    with owned_chat_telemetry(request.scope, session):
+        return await serialize_session(session, service)
 
 
-@router.put("/{session_id}/workspace")
+@router.put("/{session_id}/workspace", dependencies=[Depends(correlate_owned_chat)])
 async def set_session_workspace(
     session_id: str, payload: SessionWorkspaceRequest, service: SessionServiceDep
 ) -> SessionResponse:
@@ -163,7 +218,7 @@ async def set_session_workspace(
     )
 
 
-@router.get("/{session_id}")
+@router.get("/{session_id}", dependencies=[Depends(correlate_owned_chat)])
 async def get_session(session_id: str, service: SessionServiceDep) -> SessionDetailResponse:
     detail = await service.get(session_id)
     if detail is None:
@@ -178,7 +233,7 @@ async def get_session(session_id: str, service: SessionServiceDep) -> SessionDet
     )
 
 
-@router.put("/{session_id}/model")
+@router.put("/{session_id}/model", dependencies=[Depends(correlate_owned_chat)])
 async def select_session_model(
     session_id: str, payload: SessionModelRequest, service: SessionServiceDep
 ) -> SessionResponse:
@@ -187,7 +242,7 @@ async def select_session_model(
     )
 
 
-@router.get("/{session_id}/runs/latest")
+@router.get("/{session_id}/runs/latest", dependencies=[Depends(correlate_owned_chat)])
 async def get_latest_run(
     session_id: str, service: RunServiceDep, sessions: SessionServiceDep
 ) -> LatestRunResponse | None:
@@ -206,7 +261,7 @@ async def get_latest_run(
     )
 
 
-@router.get("/{session_id}/runs")
+@router.get("/{session_id}/runs", dependencies=[Depends(correlate_owned_chat)])
 async def list_session_runs(
     session_id: str,
     service: RunServiceDep,
@@ -219,30 +274,12 @@ async def list_session_runs(
         session_id, offset, limit, turn_id=turn_id, newest_first=newest_first
     )
     return RunSummariesResponse(
-        items=[
-            RunSummaryResponse(
-                run_id=run.id,
-                turn_id=run.turn_id,
-                retry_of=run.retry_of,
-                status=run.status.value,
-                budget_preset=run.budget_preset,
-                max_model_calls=run.max_model_calls,
-                max_tool_calls=run.max_tool_calls,
-                max_total_tokens=run.max_total_tokens,
-                max_cost_usd=run.max_cost_usd,
-                deadline_at=run.deadline_at,
-                last_sequence=run.last_event_sequence,
-                created_at=run.created_at,
-                started_at=run.started_at,
-                finished_at=run.finished_at,
-            )
-            for run in runs
-        ],
+        items=[serialize_run_summary(summary) for summary in runs],
         next_offset=next_offset,
     )
 
 
-@router.get("/{session_id}/runs/{run_id}/events")
+@router.get("/{session_id}/runs/{run_id}/events", dependencies=[Depends(correlate_owned_chat)])
 async def list_session_run_events(
     session_id: str,
     run_id: str,
@@ -269,7 +306,11 @@ async def list_session_run_events(
     )
 
 
-@router.post("/{session_id}/turns", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/{session_id}/turns",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(correlate_owned_chat)],
+)
 async def complete_turn(
     session_id: str,
     payload: TurnRequest,

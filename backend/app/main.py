@@ -5,23 +5,29 @@ from typing import Protocol, cast
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api import router
 from app.api.auth import SupabaseAuthVerifier, VerifiedUser
 from app.api.errors import ApiErrorResponse
+from app.api.telemetry import TransportTelemetryMiddleware
 from app.application.errors import ApplicationError
 from app.application.ports import ProviderAdapter, StreamingProviderAdapter
+from app.application.telemetry import Telemetry
 from app.application.tools import ToolRegistry
 from app.application.workspaces import (
     DEFAULT_WORKSPACE_PICKER_TIMEOUT_SECONDS,
     WorkspacePickerService,
 )
 from app.core.config import Settings
+from app.core.origins import allowed_web_origins
 from app.domain.capabilities import RuntimeCapabilities
 from app.domain.models import ProviderName
 from app.infrastructure.accounts import AccountRegistry, RepositoryFactory
 from app.infrastructure.providers import AnthropicProvider, OpenAIProvider
+from app.infrastructure.readiness import SupabaseReadiness
+from app.infrastructure.telemetry import TelemetryRuntime, create_telemetry
 from app.infrastructure.workspace_picker import NativeFolderPicker
 
 WORKSPACE_PICKER_TIMEOUT_SECONDS = DEFAULT_WORKSPACE_PICKER_TIMEOUT_SECONDS
@@ -33,6 +39,7 @@ class AuthVerifier(Protocol):
 
 
 ERROR_STATUS = {
+    "private_access_denied": 403,
     "model_not_available": 404,
     "session_not_found": 404,
     "run_not_found": 404,
@@ -81,12 +88,24 @@ def create_app(
     workspace_picker: WorkspacePickerService | None = None,
     auth_verifier: AuthVerifier | None = None,
     repository_factory: RepositoryFactory | None = None,
+    telemetry: Telemetry | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings()
     capabilities = RuntimeCapabilities(resolved_settings.enabled_capabilities)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        runtime = telemetry if telemetry is not None else create_telemetry(resolved_settings)
+        application.state.telemetry = runtime
+        try:
+            async with application_services(application):
+                yield
+        finally:
+            if telemetry is None and isinstance(runtime, TelemetryRuntime):
+                await runtime.close()
+
+    @asynccontextmanager
+    async def application_services(application: FastAPI) -> AsyncIterator[None]:
         application.state.settings = resolved_settings
         application.state.workspace_picker = (
             workspace_picker
@@ -100,6 +119,7 @@ def create_app(
         )
         timeout = httpx.Timeout(connect=10, read=120, write=30, pool=10)
         async with httpx.AsyncClient(timeout=timeout) as http_client:
+            application.state.readiness_probe = SupabaseReadiness(resolved_settings, http_client)
             application.state.auth_verifier = auth_verifier or SupabaseAuthVerifier(
                 resolved_settings, http_client
             )
@@ -124,6 +144,7 @@ def create_app(
                 ),
                 cloud_client=http_client,
                 repository_factory=repository_factory,
+                telemetry=application.state.telemetry,
             )
             application.state.account_registry = registry
             try:
@@ -158,6 +179,17 @@ def create_app(
         )
 
     application.include_router(router)
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=sorted(
+            allowed_web_origins(resolved_settings.environment, resolved_settings.web_origin)
+        ),
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
+        allow_headers=["Authorization", "Content-Type", "traceparent"],
+        max_age=600,
+    )
+    application.add_middleware(TransportTelemetryMiddleware)
     return application
 
 

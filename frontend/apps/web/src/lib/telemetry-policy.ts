@@ -106,6 +106,7 @@ const apiPaths = [
 export function normalizeTelemetryPath(value: string): string {
   const path = parseUrl(value)?.pathname || ""
   if (path === "/") return "/"
+  if (/^\/chats\/[^/]+$/.test(path)) return "/chats/:chatId"
   if (apiPaths.some((pattern) => pattern.test(path))) return path
   const session = path.match(
     /^\/api\/sessions\/[^/]+(\/(?:history|model|runs(?:\/latest)?))?$/

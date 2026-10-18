@@ -7,6 +7,8 @@
       "env": [
         "VITE_SUPABASE_URL",
         "VITE_SUPABASE_PUBLISHABLE_KEY",
+        "VITE_API_BASE_URL",
+        "VITE_RUNTIME_WS_URL",
         "VITE_SENTRY_DSN",
         "VITE_SENTRY_ENABLED",
         "VITE_SENTRY_ENVIRONMENT",
@@ -33,6 +35,8 @@
       "env": [
         "VITE_SUPABASE_URL",
         "VITE_SUPABASE_PUBLISHABLE_KEY",
+        "VITE_API_BASE_URL",
+        "VITE_RUNTIME_WS_URL",
         "VITE_SENTRY_DSN",
         "VITE_SENTRY_ENABLED",
         "VITE_SENTRY_ENVIRONMENT",

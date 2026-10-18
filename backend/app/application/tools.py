@@ -9,6 +9,7 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
+from app.application.telemetry import NO_TELEMETRY, Telemetry
 from app.domain.capabilities import (
     DEFAULT_RUNTIME_CAPABILITIES,
     RuntimeCapabilities,
@@ -206,10 +207,12 @@ class ToolRegistry:
         capabilities: RuntimeCapabilities = DEFAULT_RUNTIME_CAPABILITIES,
         additional_tools: tuple[ToolRegistration, ...] = (),
         redactor: SecretRedactor | None = None,
+        telemetry: Telemetry = NO_TELEMETRY,
     ) -> None:
         self._executor = executor
         self._capabilities = capabilities
         self._redactor = redactor or COMMON_SECRET_REDACTOR
+        self._telemetry = telemetry
         self._patch_executor = patch_executor
         self._command_executor = command_executor
         self._generic_executors: dict[str, ToolExecutor] = {}
@@ -293,11 +296,18 @@ class ToolRegistry:
         *,
         capabilities: RuntimeCapabilities | None = None,
     ) -> None:
-        self.check_capabilities(call, capabilities=capabilities)
-        if self._requirements[call.name].requires_workspace and workspace_root is None:
-            raise ToolExecutionError(
-                "workspace_required", "This tool requires a selected workspace."
-            )
+        name = call.name if call.name in self._definitions else "unknown"
+        with self._telemetry.operation("tool.check", {"tool": name}) as observation:
+            try:
+                self.check_capabilities(call, capabilities=capabilities)
+                if self._requirements[call.name].requires_workspace and workspace_root is None:
+                    raise ToolExecutionError(
+                        "workspace_required", "This tool requires a selected workspace."
+                    )
+            except ToolExecutionError as error:
+                observation.outcome("rejected", error.code)
+                raise
+            observation.outcome("completed")
 
     def specs(
         self,
@@ -318,17 +328,24 @@ class ToolRegistry:
 
     def _validated_arguments(self, call: ModelToolCall) -> dict[str, object]:
         model = self._definitions.get(call.name)
-        if model is None:
-            raise ToolExecutionError("unknown_tool", "This tool is not available.")
-        try:
-            encoded = json.dumps(call.arguments, separators=(",", ":"))
-            if len(encoded.encode("utf-8")) > MAX_ARGUMENT_BYTES:
-                raise ValueError("tool arguments exceed the size limit")
-            return model.model_validate(call.arguments).model_dump()
-        except TypeError, ValueError, ValidationError:
-            raise ToolExecutionError(
-                "invalid_tool_arguments", "Tool arguments are invalid."
-            ) from None
+        with self._telemetry.operation(
+            "tool.validate", {"tool": call.name if model is not None else "unknown"}
+        ) as observation:
+            if model is None:
+                observation.outcome("rejected", "unknown_tool")
+                raise ToolExecutionError("unknown_tool", "This tool is not available.")
+            try:
+                encoded = json.dumps(call.arguments, separators=(",", ":"))
+                if len(encoded.encode("utf-8")) > MAX_ARGUMENT_BYTES:
+                    raise ValueError("tool arguments exceed the size limit")
+                result = model.model_validate(call.arguments).model_dump()
+            except TypeError, ValueError, ValidationError:
+                observation.outcome("rejected", "invalid_tool_arguments")
+                raise ToolExecutionError(
+                    "invalid_tool_arguments", "Tool arguments are invalid."
+                ) from None
+            observation.outcome("completed")
+            return result
 
     def _safe_error(self, call: ModelToolCall, error: ToolExecutionError) -> ToolResult:
         content = self._redactor.redact_text(error.message)

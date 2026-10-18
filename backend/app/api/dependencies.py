@@ -1,8 +1,11 @@
+from collections.abc import AsyncIterator
 from typing import Annotated
 
 from fastapi import Depends, Request
 
+from app.api.access import require_private_access
 from app.api.auth import VerifiedUser
+from app.api.telemetry import owned_chat_telemetry
 from app.application.chat import ChatService
 from app.application.context_preview import ContextPreviewService
 from app.application.onboarding import OnboardingService
@@ -15,7 +18,11 @@ from app.infrastructure.accounts import AccountContext
 
 
 async def get_current_user(request: Request) -> VerifiedUser:
-    return await request.app.state.auth_verifier.verify_bearer(request.headers.get("Authorization"))
+    verified = await request.app.state.auth_verifier.verify_bearer(
+        request.headers.get("Authorization")
+    )
+    require_private_access(request.app.state.settings, verified.id)
+    return verified
 
 
 CurrentUserDep = Annotated[VerifiedUser, Depends(get_current_user)]
@@ -30,6 +37,17 @@ async def get_account_context(request: Request, verified: CurrentUserDep) -> Acc
 
 
 AccountDep = Annotated[AccountContext, Depends(get_account_context)]
+
+
+async def correlate_owned_chat(
+    request: Request, session_id: str, account: AccountDep
+) -> AsyncIterator[None]:
+    session = await account.database.get_session(session_id)
+    if session is None:
+        yield
+        return
+    with owned_chat_telemetry(request.scope, session):
+        yield
 
 
 def get_context_preview_service(account: AccountDep) -> ContextPreviewService:

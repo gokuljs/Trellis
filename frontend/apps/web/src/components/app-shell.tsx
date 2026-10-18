@@ -1,5 +1,16 @@
 import { Menu } from "lucide-react"
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react"
+import {
+  ServiceReadinessError,
+  waitUntilServiceReady,
+} from "@/lib/service-readiness"
 import {
   useInfiniteQuery,
   useIsMutating,
@@ -20,6 +31,15 @@ import { Sidebar } from "@/components/sidebar"
 import { WelcomePanel } from "@/components/welcome-panel"
 import { WorkspaceTopbar } from "@/components/workspace-topbar"
 import { ApiError, api } from "@/lib/api"
+import {
+  chatPath,
+  currentPath,
+  navigate,
+  parseAppRoute,
+  subscribeToPath,
+  useAppPath,
+} from "@/lib/app-routes"
+import { coalesceSummaryRefresh } from "@/lib/activity-summary"
 import {
   newAssistantOutputState,
   reduceAssistantOutputEvent,
@@ -106,7 +126,9 @@ type FailedTurn = {
 }
 
 function visibleError(error: unknown) {
-  return error instanceof ApiError || error instanceof RuntimeError
+  return error instanceof ApiError ||
+    error instanceof RuntimeError ||
+    error instanceof ServiceReadinessError
     ? error.message
     : "Trellis could not reach the service."
 }
@@ -137,6 +159,9 @@ export function AppShell({
 }: {
   accountControl?: ReactNode | ((profile: Profile | null) => ReactNode)
 } = {}) {
+  const path = useAppPath()
+  const route = parseAppRoute(path)
+  const appliedPathRef = useRef<string | null>(null)
   const [activeView, setActiveView] = useState<WorkspaceView>("New session")
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
@@ -223,6 +248,17 @@ export function AppShell({
   const cancelRequestRef = useRef(false)
   const approvalRequestRef = useRef<string | null>(null)
   const bootstrapControllerRef = useRef<AbortController | null>(null)
+  const runConnectionControllerRef = useRef<AbortController | null>(null)
+  const summaryRefresh = useMemo(
+    () =>
+      coalesceSummaryRefresh((sessionId) => {
+        void queryClient.invalidateQueries({
+          queryKey: ["run-summaries", sessionId],
+        })
+      }),
+    [queryClient]
+  )
+  useEffect(() => () => summaryRefresh.dispose(), [summaryRefresh])
 
   const applyHistory = useCallback(
     (detail: SessionHistoryPage, keepTurnId?: string) => {
@@ -279,6 +315,8 @@ export function AppShell({
 
   const recordRunEvent = useCallback(
     (turnId: string, event: RuntimeRunEvent) => {
+      if (activeSessionIdRef.current)
+        summaryRefresh.schedule(activeSessionIdRef.current, event)
       setRunContextState((current) => reduceRunContext(current, event))
       setAssistantOutputState((current) =>
         reduceAssistantOutputEvent(current, event, turnId)
@@ -329,7 +367,7 @@ export function AppShell({
         setStreamingText((current) => (current ?? "") + event.data.text)
       }
     },
-    []
+    [summaryRefresh]
   )
 
   const restoreSessionRun = useCallback(
@@ -339,9 +377,19 @@ export function AppShell({
       isCancelled: () => boolean,
       ownerGeneration?: number
     ) => {
+      const existingConnection = runConnectionControllerRef.current
+      const connection =
+        ownerGeneration !== undefined &&
+        existingConnection &&
+        !existingConnection.signal.aborted
+          ? existingConnection
+          : new AbortController()
+      if (existingConnection !== connection) existingConnection?.abort()
+      runConnectionControllerRef.current = connection
       const generation = ownerGeneration ?? ++runGenerationRef.current
       setContextGeneration(generation)
       const isStale = () =>
+        connection.signal.aborted ||
         !bootstrapControllerRef.current ||
         isCancelled() ||
         runGenerationRef.current !== generation
@@ -468,6 +516,7 @@ export function AppShell({
               await resumeRun(
                 latest.run_id,
                 {
+                  signal: connection.signal,
                   reconnectAttempts: 0,
                   onRunId: (runId) => {
                     if (!isStale()) setActiveRunId(runId)
@@ -587,19 +636,21 @@ export function AppShell({
     const controller = new AbortController()
     bootstrapControllerRef.current = controller
     const options = { signal: controller.signal }
-    const timer = setTimeout(
-      () =>
-        controller.abort(
-          new ApiError(
-            "request_timeout",
-            "Trellis took too long to load your chats. Try again.",
-            0
-          )
-        ),
-      15000
-    )
+    let timer: ReturnType<typeof setTimeout> | undefined
     const current = () => bootstrapControllerRef.current === controller
     try {
+      await waitUntilServiceReady(controller.signal)
+      timer = setTimeout(
+        () =>
+          controller.abort(
+            new ApiError(
+              "request_timeout",
+              "Trellis took too long to load your chats. Try again.",
+              0
+            )
+          ),
+        15000
+      )
       const [restoredProfile, , restoredOnboarding] = await Promise.all([
         api.getProfile(options),
         queryClient.fetchQuery({
@@ -649,6 +700,11 @@ export function AppShell({
       mounted = false
       bootstrapControllerRef.current?.abort()
       bootstrapControllerRef.current = null
+      sessionLoadSequenceRef.current += 1
+      runGenerationRef.current += 1
+      activeSessionIdRef.current = null
+      runConnectionControllerRef.current?.abort()
+      runConnectionControllerRef.current = null
     }
   }, [restoreWorkspace])
 
@@ -692,7 +748,9 @@ export function AppShell({
     setBootstrap({ status: "onboarding", progress })
   }
 
-  const startNewSession = useCallback(() => {
+  const resetChatState = useCallback((sessionId: string | null) => {
+    runConnectionControllerRef.current?.abort()
+    runConnectionControllerRef.current = null
     runGenerationRef.current += 1
     setContextGeneration(runGenerationRef.current)
     submissionLockRef.current = false
@@ -701,7 +759,7 @@ export function AppShell({
     setModelSelection(null)
     setDraftModelId(null)
     sessionLoadSequenceRef.current += 1
-    activeSessionIdRef.current = null
+    activeSessionIdRef.current = sessionId
     setComposerValue("")
     setActiveSession(null)
     setMessages([])
@@ -721,112 +779,144 @@ export function AppShell({
     setCancellingRun(false)
     cancelRequestRef.current = false
     activeRunRef.current = null
-    setSessionLoading(false)
+    setSessionLoading(sessionId !== null)
     setFailedTurn(null)
     setError(null)
     setActivityHistoryError(null)
-    setActiveView("New session")
+    setActiveView(sessionId ? "session" : "New session")
     setSidebarOpen(false)
-    setSidebarCollapsed(false)
   }, [])
+
+  const loadSession = useCallback(
+    async (sessionId: string) => {
+      resetChatState(sessionId)
+      const loadSequence = sessionLoadSequenceRef.current
+      try {
+        const [detail, history] = await Promise.all([
+          loadLatestHistory(sessionId),
+          queryClient
+            .fetchInfiniteQuery({
+              ...runSummariesQueryOptions(sessionId),
+              staleTime: 0,
+            })
+            .then((data) => data.pages.flatMap((page) => page.items))
+            .then(
+              (summaries) => ({ summaries, error: null }),
+              (summaryError: unknown) => {
+                if (
+                  bootstrapControllerRef.current &&
+                  sessionLoadSequenceRef.current === loadSequence &&
+                  activeSessionIdRef.current === sessionId
+                )
+                  reportFailure(summaryError, "activity.summaries")
+                return {
+                  summaries: [] as RunSummary[],
+                  error: "Saved activity could not be loaded.",
+                }
+              }
+            ),
+        ])
+        if (
+          !bootstrapControllerRef.current ||
+          bootstrapControllerRef.current.signal.aborted ||
+          sessionLoadSequenceRef.current !== loadSequence ||
+          activeSessionIdRef.current !== sessionId
+        ) {
+          return
+        }
+        setActiveSession(detail.session)
+        applyHistory(detail)
+        setRunActivities(activitiesFromSummaries(history.summaries))
+        setActivityHistoryError(history.error)
+        await restoreSessionRun(
+          sessionId,
+          detail.messages,
+          () =>
+            sessionLoadSequenceRef.current !== loadSequence ||
+            activeSessionIdRef.current !== sessionId
+        )
+      } catch (sessionError) {
+        if (
+          !bootstrapControllerRef.current ||
+          bootstrapControllerRef.current.signal.aborted ||
+          sessionLoadSequenceRef.current !== loadSequence ||
+          activeSessionIdRef.current !== sessionId
+        )
+          return
+        if (
+          sessionError instanceof ApiError &&
+          [403, 404, 410].includes(sessionError.status)
+        ) {
+          resetChatState(null)
+          setError("This chat is unavailable.")
+          appliedPathRef.current = "/"
+          navigate("/", true)
+          return
+        }
+        if (bootstrapControllerRef.current)
+          reportFailure(sessionError, "sessions.open")
+        setError(visibleError(sessionError))
+      } finally {
+        if (sessionLoadSequenceRef.current === loadSequence) {
+          setSessionLoading(false)
+        }
+      }
+    },
+    [
+      applyHistory,
+      loadLatestHistory,
+      queryClient,
+      resetChatState,
+      restoreSessionRun,
+    ]
+  )
+
+  useEffect(() => {
+    if (bootstrap.status !== "ready") return
+    const synchronizeRoute = () => {
+      const next = parseAppRoute(currentPath())
+      if (next.kind === "unknown") {
+        navigate("/", true)
+        return
+      }
+      if (next.kind !== "home" && next.kind !== "chat") return
+      if (next.path !== currentPath()) {
+        navigate(next.path, true)
+        return
+      }
+      if (appliedPathRef.current === next.path) return
+      appliedPathRef.current = next.path
+      if (next.kind === "chat") void loadSession(next.chatId)
+      else resetChatState(null)
+    }
+    const unsubscribe = subscribeToPath(synchronizeRoute)
+    let mounted = true
+    void Promise.resolve().then(() => {
+      if (mounted) synchronizeRoute()
+    })
+    return () => {
+      mounted = false
+      unsubscribe()
+    }
+  }, [bootstrap.status, loadSession, resetChatState])
 
   const handleNavigate = (view: WorkspaceView) => {
     if (view === "New session") {
-      startNewSession()
+      if (currentPath() === "/") resetChatState(null)
+      else navigate("/")
+      setSidebarCollapsed(false)
       return
     }
     setActiveView(view)
     setSidebarOpen(false)
   }
 
-  const selectSession = async (sessionId: string) => {
-    if (pending) return
-    runGenerationRef.current += 1
-    setContextGeneration(runGenerationRef.current)
-    modelRequestSequenceRef.current += 1
-    modelSaveOwnerRef.current = null
-    setModelSelection(null)
-    const loadSequence = sessionLoadSequenceRef.current + 1
-    sessionLoadSequenceRef.current = loadSequence
-    activeSessionIdRef.current = sessionId
-    setSidebarOpen(false)
-    setActiveView("session")
-    setActiveSession(
-      sessions.find((session) => session.id === sessionId) ?? null
-    )
-    setMessages([])
-    setTimelineOrder([])
-    setHistoryError(null)
-    setAssistantOutputState(newAssistantOutputState())
-    setRunContextState(newRunContextState())
-    setStreamingText(null)
-    setActiveRunId(null)
-    setRunActivities({})
-    setActiveRunTurnId(null)
-    setApprovalPendingToolId(null)
-    setApprovalError(null)
-    approvalRequestRef.current = null
-    setReconnectAvailable(false)
-    setCancellingRun(false)
-    cancelRequestRef.current = false
-    activeRunRef.current = null
-    setSessionLoading(true)
-    setError(null)
-    setActivityHistoryError(null)
-    setFailedTurn(null)
-    try {
-      const [detail, history] = await Promise.all([
-        loadLatestHistory(sessionId),
-        queryClient
-          .fetchInfiniteQuery({
-            ...runSummariesQueryOptions(sessionId),
-            staleTime: 0,
-          })
-          .then((data) => data.pages.flatMap((page) => page.items))
-          .then(
-            (summaries) => ({ summaries, error: null }),
-            (summaryError: unknown) => {
-              if (
-                bootstrapControllerRef.current &&
-                sessionLoadSequenceRef.current === loadSequence &&
-                activeSessionIdRef.current === sessionId
-              )
-                reportFailure(summaryError, "activity.summaries")
-              return {
-                summaries: [] as RunSummary[],
-                error: "Saved activity could not be loaded.",
-              }
-            }
-          ),
-      ])
-      if (
-        sessionLoadSequenceRef.current !== loadSequence ||
-        activeSessionIdRef.current !== sessionId
-      ) {
-        return
-      }
-      setActiveSession(detail.session)
-      applyHistory(detail)
-      setRunActivities(activitiesFromSummaries(history.summaries))
-      setActivityHistoryError(history.error)
-      await restoreSessionRun(
-        sessionId,
-        detail.messages,
-        () =>
-          sessionLoadSequenceRef.current !== loadSequence ||
-          activeSessionIdRef.current !== sessionId
-      )
-    } catch (sessionError) {
-      if (sessionLoadSequenceRef.current === loadSequence) {
-        if (bootstrapControllerRef.current)
-          reportFailure(sessionError, "sessions.open")
-        setError(visibleError(sessionError))
-      }
-    } finally {
-      if (sessionLoadSequenceRef.current === loadSequence) {
-        setSessionLoading(false)
-      }
-    }
+  const selectSession = (sessionId: string) => {
+    const target = chatPath(sessionId)
+    if (currentPath() === target) {
+      setActiveView("session")
+      setSidebarOpen(false)
+    } else navigate(target)
   }
 
   const loadOlderHistory = async () => {
@@ -898,12 +988,16 @@ export function AppShell({
   }
 
   const completeTurn = async (turn: FailedTurn, optimistic: boolean) => {
+    runConnectionControllerRef.current?.abort()
+    const connection = new AbortController()
+    runConnectionControllerRef.current = connection
     const owner = {
       sessionId: turn.sessionId,
       generation: ++runGenerationRef.current,
     }
     setContextGeneration(owner.generation)
     const isCurrent = () =>
+      !connection.signal.aborted &&
       !!bootstrapControllerRef.current &&
       ownsRun(owner, {
         sessionId: activeSessionIdRef.current,
@@ -958,6 +1052,7 @@ export function AppShell({
           ...(turn.budgetPreset ? { budgetPreset: turn.budgetPreset } : {}),
         },
         {
+          signal: connection.signal,
           onRunId: (runId) => {
             if (!isCurrent()) return
             activeRunRef.current = { runId, lastSequence: 0 }
@@ -1191,6 +1286,7 @@ export function AppShell({
     if (
       pending ||
       sessionLoading ||
+      (route.kind === "chat" && activeSession?.id !== route.chatId) ||
       submissionLockRef.current ||
       modelSaveOwnerRef.current ||
       sessionModelSaving
@@ -1231,6 +1327,7 @@ export function AppShell({
       !content ||
       pending ||
       sessionLoading ||
+      (route.kind === "chat" && activeSession?.id !== route.chatId) ||
       submissionLockRef.current ||
       modelSaveOwnerRef.current ||
       sessionModelSaving
@@ -1273,6 +1370,8 @@ export function AppShell({
         setActiveSession(createdSession)
         cacheSession(queryClient, createdSession)
         setActiveView("session")
+        appliedPathRef.current = chatPath(createdSession.id)
+        navigate(chatPath(createdSession.id), true)
         const prepared = await ensureSessionModel(
           createdSession,
           model.id,
@@ -1314,6 +1413,7 @@ export function AppShell({
       !failedTurn ||
       pending ||
       sessionLoading ||
+      (route.kind === "chat" && activeSession?.id !== route.chatId) ||
       submissionLockRef.current ||
       modelSaveOwnerRef.current ||
       sessionModelSaving
@@ -1427,6 +1527,7 @@ export function AppShell({
       activeView !== "Settings" &&
       !pending &&
       !sessionLoading &&
+      (route.kind !== "chat" || activeSession?.id === route.chatId) &&
       !modelSaving &&
       Boolean(selectedModelId)
   )
@@ -1518,7 +1619,7 @@ export function AppShell({
         <Sidebar
           activeView={activeView}
           sessions={sessions}
-          activeSessionId={activeSession?.id ?? null}
+          activeSessionId={route.kind === "chat" ? route.chatId : null}
           onNavigate={handleNavigate}
           onSelectSession={(sessionId) => void selectSession(sessionId)}
           sidebarCollapsed={sidebarCollapsed}
@@ -1584,9 +1685,7 @@ export function AppShell({
               streamingText={streamingText}
               error={error}
               activityHistoryError={activityHistoryError}
-              onRetryActivityHistory={() =>
-                void selectSession(activeSession.id)
-              }
+              onRetryActivityHistory={() => void loadSession(activeSession.id)}
               canRetry={failedTurn !== null && !pending && !modelSaving}
               canReconnect={reconnectAvailable}
               canCancel={pending && activeRunId !== null}
@@ -1602,6 +1701,22 @@ export function AppShell({
               onReconnect={reconnectRestoredRun}
               onCancel={() => void cancelActiveRun()}
             />
+          ) : route.kind === "chat" ? (
+            <div className="welcome-state">
+              {sessionLoading || !error ? (
+                <p role="status">Loading chat…</p>
+              ) : (
+                <div className="chat-error welcome-error" role="alert">
+                  <span>{error}</span>
+                  <button
+                    type="button"
+                    onClick={() => void loadSession(route.chatId)}
+                  >
+                    Retry
+                  </button>
+                </div>
+              )}
+            </div>
           ) : (
             <div className="welcome-state">
               <WelcomePanel activeView={activeView} activeSessionTitle={null} />
@@ -1625,7 +1740,12 @@ export function AppShell({
               }
               onChange={setComposerValue}
               onSubmit={() => void submitComposer()}
-              disabled={pending || sessionLoading || modelSaving}
+              disabled={
+                pending ||
+                sessionLoading ||
+                modelSaving ||
+                (route.kind === "chat" && activeSession?.id !== route.chatId)
+              }
               budgetPreset={selectedBudgetPreset}
               onBudgetChange={setRunBudgetChoice}
               models={settings?.models ?? []}

@@ -1,6 +1,6 @@
 UV ?= uv
 
-.PHONY: dev format format-check lint typecheck check
+.PHONY: dev format format-check lint typecheck test check
 
 dev:
 	$(UV) run --locked fastapi dev
@@ -17,4 +17,7 @@ lint:
 typecheck:
 	$(UV) run --locked ty check
 
-check: format-check lint typecheck
+test:
+	COVERAGE_FILE=.coverage.stage3 $(UV) run --locked pytest
+
+check: format-check lint typecheck test

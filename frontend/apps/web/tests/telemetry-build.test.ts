@@ -15,6 +15,10 @@ const environment = {
   SENTRY_AUTH_TOKEN: token,
   VITE_SENTRY_RELEASE: "web@1234567",
 }
+const backendEnvironment = {
+  VITE_API_BASE_URL: "https://api.trellis.test",
+  VITE_RUNTIME_WS_URL: "wss://api.trellis.test/api/runtime",
+}
 const temporary: string[] = []
 afterEach(async () => {
   for (const directory of temporary.splice(0))
@@ -118,7 +122,12 @@ test("Vite keeps Sentry last and uses process configuration from the frontend en
     `
     const child = Bun.spawn(["node", "--input-type=module", "--eval", script], {
       cwd: webRoot,
-      env: { ...process.env, ...environment, SENTRY_UPLOAD_SOURCEMAPS: upload },
+      env: {
+        ...process.env,
+        ...environment,
+        ...backendEnvironment,
+        SENTRY_UPLOAD_SOURCEMAPS: upload,
+      },
       stdout: "pipe",
       stderr: "pipe",
     })
@@ -156,6 +165,7 @@ test("the explicit upload command fails before building when required settings a
     cwd: path.resolve(webRoot, "../.."),
     env: {
       ...process.env,
+      ...backendEnvironment,
       SENTRY_ORG: "",
       SENTRY_PROJECT: "",
       SENTRY_AUTH_TOKEN: "",
@@ -194,6 +204,7 @@ test("an ordinary isolated production build emits no maps or build-only token", 
       cwd: webRoot,
       env: {
         ...process.env,
+        ...backendEnvironment,
         SENTRY_UPLOAD_SOURCEMAPS: "false",
         SENTRY_AUTH_TOKEN: token,
       },

@@ -137,6 +137,9 @@ export function describeActivity(
   )
   const latest = ordered.at(-1)!
   const matchingSummary = summary?.run_id === latest.runId ? summary : undefined
+  const summaryIsCurrent = Boolean(
+    matchingSummary && matchingSummary.last_sequence >= latest.sequence
+  )
   const terminalEvent = ordered.findLast((event) =>
     terminalEvents.has(event.eventType)
   )
@@ -144,7 +147,9 @@ export function describeActivity(
     ? summaryEvents[matchingSummary.status]
     : undefined
   const summaryIsTerminal =
-    summaryEvent !== undefined && terminalEvents.has(summaryEvent)
+    summaryIsCurrent &&
+    summaryEvent !== undefined &&
+    terminalEvents.has(summaryEvent)
   const terminal = Boolean(terminalEvent || summaryIsTerminal)
   const queued = ordered.find((event) => event.eventType === "run.queued")
   const startedAt =
@@ -194,10 +199,11 @@ export function describeActivity(
       }
     } else if (!hasPhase && incoming) state = incoming
   }
-  if (matchingSummary?.status === "cancelling")
+  if (summaryIsCurrent && matchingSummary?.status === "cancelling")
     state = { label: "Stopping", orb: "shaping" }
   if (
     matchingSummary?.status === "waiting_for_approval" &&
+    summaryIsCurrent &&
     !ordered.some(
       (event) =>
         event.sequence > matchingSummary.last_sequence &&

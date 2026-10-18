@@ -301,3 +301,29 @@ test("streamed spans retain scalar measurements and discard arbitrary attributes
   assert.equal(span.links, undefined)
   assert.equal(span.end_timestamp, 2)
 })
+
+test("chat URLs become a route template in exported error URLs and browser spans", () => {
+  const chatId = "11111111-2222-4333-a444-555555555555"
+  const privateUrl = `${origin}/chats/${chatId}?code=private#private`
+  assert.equal(normalizeTelemetryPath(privateUrl), "/chats/:chatId")
+  const event = sanitizeTelemetryEvent(
+    { request: { url: privateUrl } },
+    { originalException: new Error(chatId) },
+    config
+  )
+  assert.equal(event?.request?.url, "/chats/:chatId")
+  for (const op of ["pageload", "navigation"]) {
+    const span = sanitizeTelemetrySpan(
+      {
+        name: privateUrl,
+        attributes: { "sentry.op": op, "url.full": privateUrl },
+        trace_id: "1".repeat(32),
+        span_id: "2".repeat(16),
+        start_timestamp: 1,
+      },
+      origin
+    )
+    assert.equal(span.name, "/chats/:chatId")
+    assert.equal(JSON.stringify({ event, span }).includes(chatId), false)
+  }
+})

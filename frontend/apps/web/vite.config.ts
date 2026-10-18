@@ -4,11 +4,13 @@ import react from "@vitejs/plugin-react"
 import { sentryVitePlugin } from "@sentry/vite-plugin"
 import { defineConfig, loadEnv } from "vite"
 import { sentryBuildConfig } from "./config/sentry-build.ts"
+import { parseBackendTargets } from "./src/lib/backend-targets.ts"
 
 // https://vite.dev/config/
 export default defineConfig(({ command, mode }) => {
   const envDir = path.resolve(import.meta.dirname, "../..")
   const environment = { ...loadEnv(mode, envDir, ""), ...process.env }
+  parseBackendTargets(environment, command === "build")
   const sentry = sentryBuildConfig(environment, import.meta.dirname, command)
   return {
     envDir,
@@ -25,6 +27,12 @@ export default defineConfig(({ command, mode }) => {
         "/api": {
           target: "http://127.0.0.1:8000",
           ws: true,
+        },
+        "/ready": {
+          target: "http://127.0.0.1:8000",
+        },
+        "/health": {
+          target: "http://127.0.0.1:8000",
         },
       },
     },

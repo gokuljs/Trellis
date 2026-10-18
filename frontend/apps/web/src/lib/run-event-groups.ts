@@ -16,7 +16,6 @@ export function groupRunEvents(events: RuntimeRunEvent[]): RunEventGroup[] {
   const tools = new Map<string, RunEventGroup>()
   let model: RunEventGroup | null = null
   let modelComplete = false
-  let modelIndex = 0
   let start: RunEventGroup | null = null
 
   for (const event of [...events].sort(
@@ -31,10 +30,9 @@ export function groupRunEvents(events: RuntimeRunEvent[]): RunEventGroup[] {
       )
     ) {
       if (!model || (event.eventType === "model.usage" && modelComplete)) {
-        modelIndex += 1
         model = {
           key: `model-${event.sequence}`,
-          title: `Model step ${modelIndex}`,
+          title: "Model call",
           kind: "model",
           events: [],
         }

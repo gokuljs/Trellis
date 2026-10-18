@@ -1,9 +1,9 @@
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 
-from app.api.dependencies import SessionServiceDep
+from app.api.dependencies import SessionServiceDep, correlate_owned_chat
 from app.api.routes.sessions import (
     AssistantOutputResponse,
     SessionDetailResponse,
@@ -44,7 +44,7 @@ async def read_session_page(
     )
 
 
-@router.get("/sessions/{session_id}/history")
+@router.get("/sessions/{session_id}/history", dependencies=[Depends(correlate_owned_chat)])
 async def read_history_page(
     session_id: str,
     service: SessionServiceDep,
