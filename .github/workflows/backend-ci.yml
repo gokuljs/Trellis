@@ -88,7 +88,32 @@ jobs:
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/durable_acceptance.sql
           python3 supabase/tests/durable_acceptance_concurrency.py
           python3 supabase/tests/durable_acceptance_lock_order.py
+          psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610180002_worker_authority.sql
+          psql -X -v ON_ERROR_STOP=1 -c "ALTER ROLE trellis_runtime_worker PASSWORD 'postgres'"
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/worker_role.sql
+          python3 supabase/tests/worker_claims.py
+          python3 supabase/tests/worker_publication.py
+          python3 supabase/tests/worker_recovery.py
+          python3 supabase/tests/worker_receipts.py
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/schema_contract.sql
+
+      - name: Set up uv for worker adapter contracts
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.5"
+
+      - name: Install worker adapter test runtime
+        working-directory: backend
+        run: |
+          uv python install 3.14
+          uv sync --locked
+
+      - name: Check the real restricted worker adapter
+        working-directory: backend
+        env:
+          TRELLIS_WORKER_TEST_ADMIN_DSN: postgresql://postgres:postgres@localhost:5432/postgres
+          TRELLIS_WORKER_TEST_DSN: postgresql://trellis_runtime_worker:postgres@localhost:5432/postgres
+        run: uv run --locked pytest tests/test_worker_database.py --no-cov
 
   quality:
     name: Backend quality
