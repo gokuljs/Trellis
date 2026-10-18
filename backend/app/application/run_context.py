@@ -3,12 +3,11 @@
 import asyncio
 import hashlib
 import json
-from collections.abc import Awaitable, Callable, Iterator, Mapping
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass, replace
+import logging
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from time import monotonic
 from typing import cast
 from uuid import uuid4
 
@@ -40,7 +39,6 @@ from app.application.ports import (
     TokenCountingProvider,
 )
 from app.application.secret_redaction import SecretRedactor
-from app.application.telemetry import NO_TELEMETRY, Attribute, Operation, Telemetry
 from app.domain.context import (
     CheckpointSource,
     ContextCheckpointDraft,
@@ -64,16 +62,7 @@ from app.domain.runtime import (
 
 Totals = Callable[[str, list[ModelCallRecord]], tuple[int, float | None]]
 Publish = Callable[[RunEvent], Awaitable[None]]
-
-
-@dataclass(slots=True)
-class _ModelObservation:
-    operation: Operation
-    outcome: str = "completed"
-
-    def finish(self, outcome: str, code: str | None = None) -> None:
-        self.outcome = outcome
-        self.operation.outcome(outcome, code)
+logger = logging.getLogger(__name__)
 
 
 def _hash(value: object) -> str:
@@ -177,10 +166,7 @@ class RunContext:
         totals: Totals,
         publish: Publish,
         redactor: SecretRedactor,
-        *,
-        telemetry: Telemetry = NO_TELEMETRY,
     ) -> None:
-        self.telemetry = telemetry
         self.runs = runs
         self.sessions = sessions
         self.checkpoints = checkpoints
@@ -201,27 +187,17 @@ class RunContext:
         guidance: str | None,
         tools: tuple[ModelToolSpec, ...],
     ) -> ContextPreflight:
-        with self.telemetry.operation("context.build", {"runId": run.id}) as observation:
-            try:
-                plan = await self._prepare(
-                    run,
-                    model,
-                    profile,
-                    provider,
-                    api_key,
-                    user_id,
-                    workspace_root=workspace_root,
-                    guidance=guidance,
-                    tools=tools,
-                )
-            except (ApplicationError, ProviderError) as error:
-                observation.outcome("failed", error.code)
-                raise
-            observation.set_attributes(
-                {"context_tokens": plan.input_tokens, "count_source": plan.count_method}
-            )
-            observation.outcome("completed")
-            return plan
+        return await self._prepare(
+            run,
+            model,
+            profile,
+            provider,
+            api_key,
+            user_id,
+            workspace_root=workspace_root,
+            guidance=guidance,
+            tools=tools,
+        )
 
     async def _prepare(
         self,
@@ -635,58 +611,6 @@ class RunContext:
             run, model, provider, native_plan, api_key, user_id, call_count + 1
         )
 
-    @contextmanager
-    def _model_operation(
-        self, run: RunSnapshot, call: ModelCallRecord, purpose: str
-    ) -> Iterator[_ModelObservation]:
-        attributes: dict[str, Attribute] = {
-            "runId": run.id,
-            "modelCallId": call.id,
-            "provider": run.provider_id,
-            "model": run.model_id,
-            "purpose": purpose,
-        }
-        started = monotonic()
-        with self.telemetry.operation("model.call", attributes, kind="client") as operation:
-            observation = _ModelObservation(operation)
-            try:
-                yield observation
-            except asyncio.CancelledError:
-                observation.finish("cancelled")
-                raise
-            except (ApplicationError, ProviderError) as error:
-                observation.finish("failed", error.code)
-                raise
-            except BaseException:
-                observation.finish("failed", "model_internal_error")
-                raise
-            finally:
-                attributes["outcome"] = observation.outcome
-                self.telemetry.event(
-                    "model.call.finished", attributes, error=observation.outcome == "failed"
-                )
-                self.telemetry.count("model.calls", attributes=attributes)
-                self.telemetry.observe("model.call.duration", monotonic() - started, attributes)
-
-    def _observe_usage(
-        self,
-        observation: _ModelObservation,
-        total: int | None,
-        cost: float | None,
-        *,
-        metrics: bool = True,
-    ) -> None:
-        attributes: dict[str, Attribute] = {}
-        if total is not None:
-            attributes["total_tokens"] = total
-            if metrics:
-                self.telemetry.observe("model.tokens", total)
-        if cost is not None:
-            attributes["estimated_cost_usd"] = cost
-            if metrics:
-                self.telemetry.observe("model.estimated_cost", cost)
-        observation.operation.set_attributes(attributes)
-
     async def _compact(
         self,
         run: RunSnapshot,
@@ -710,149 +634,151 @@ class RunContext:
                 "max_output_tokens": plan.request.max_output_tokens,
             },
         )
-        with self._model_operation(run, call, "native_compaction") as observation:
-            usage: dict[str, int | None] = {
-                key: None
-                for key in (
-                    "input_tokens",
-                    "output_tokens",
-                    "cached_tokens",
-                    "cache_creation_tokens",
-                    "reasoning_tokens",
+        usage: dict[str, int | None] = {
+            key: None
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cached_tokens",
+                "cache_creation_tokens",
+                "reasoning_tokens",
+            )
+        }
+        iterations: list[dict[str, object]] = []
+        billing: dict[str, object] = {
+            "pricing_context_tokens": plan.pricing_context_tokens,
+            "iterations": iterations,
+            "usage_complete": False,
+        }
+        try:
+            call = await self.runs.update_model_call(call.id, ModelCallStatus.STREAMING)
+            await self.publish(
+                await self.runs.append_run_event(
+                    run.id,
+                    RunEventType.PHASE,
+                    {"phase": "compacting", "model_call_id": call.id},
                 )
-            }
-            iterations: list[dict[str, object]] = []
-            billing: dict[str, object] = {
-                "pricing_context_tokens": plan.pricing_context_tokens,
-                "iterations": iterations,
-                "usage_complete": False,
-            }
+            )
             try:
-                call = await self.runs.update_model_call(call.id, ModelCallStatus.STREAMING)
-                await self.publish(
-                    await self.runs.append_run_event(
-                        run.id,
-                        RunEventType.PHASE,
-                        {"phase": "compacting", "model_call_id": call.id},
+                async with asyncio.timeout(_remaining(run)):
+                    result = await cast(NativeCompactingProvider, provider).compact(
+                        plan.request, api_key, user_id
                     )
-                )
-                try:
-                    async with asyncio.timeout(_remaining(run)):
-                        result = await cast(NativeCompactingProvider, provider).compact(
-                            plan.request, api_key, user_id
-                        )
-                except TimeoutError:
-                    raise ProviderError(
-                        "provider_timeout", "The run deadline was reached."
-                    ) from None
-                for event in result.usage_events:
-                    if event.kind != "usage":
-                        raise ProviderError(
-                            "native_usage_unknown", "Native compaction usage is unavailable."
-                        )
-                    part = {key: getattr(event, key) for key in usage}
-                    part_billing: dict[str, object] = {
-                        "pricing_context_tokens": plan.pricing_context_tokens,
-                        "cache_creation_1h_tokens": event.cache_creation_1h_tokens
-                        if event.cache_creation_tokens
-                        else 0,
-                    }
-                    if event.service_tier is not None:
-                        part_billing["service_tier"] = billing_tier(event.service_tier)
-                    iterations.append({"usage": part, "billing": part_billing})
-                    for key, value in part.items():
-                        if value is not None:
-                            usage[key] = (usage[key] or 0) + value
-                billing["usage_complete"] = (
-                    bool(iterations) and result.failure_code != "native_usage_unknown"
-                )
-                total, cost = usage_cost(run.model_id, usage, billing)
-                self._observe_usage(observation, total, cost)
-                call = await self.runs.update_model_call(
-                    call.id,
-                    ModelCallStatus.STREAMING,
-                    input_tokens=usage["input_tokens"],
-                    output_tokens=usage["output_tokens"],
-                    cached_tokens=usage["cached_tokens"],
-                    cache_creation_tokens=usage["cache_creation_tokens"],
-                    reasoning_tokens=usage["reasoning_tokens"],
-                    estimated_cost=cost,
-                    clear_estimated_cost=cost is None,
-                    accounted_total_tokens=total,
-                    clear_accounted_total_tokens=total is None,
-                    response_snapshot={"usage_context": billing},
-                    provider_response_id=self.redactor.redact_text(result.provider_response_id)
-                    if result.provider_response_id
-                    else None,
-                )
-                await self.publish(
-                    await self.runs.append_run_event(
-                        run.id,
-                        RunEventType.MODEL_USAGE,
-                        {
-                            **{key: value for key, value in usage.items() if value is not None},
-                            "model_call_id": call.id,
-                            "estimated_cost_usd": cost,
-                            "purpose": "native_compaction",
-                        },
-                    )
-                )
-                if total is None or cost is None:
+            except TimeoutError:
+                raise ProviderError("provider_timeout", "The run deadline was reached.") from None
+            for event in result.usage_events:
+                if event.kind != "usage":
                     raise ProviderError(
                         "native_usage_unknown", "Native compaction usage is unavailable."
                     )
-                valid = result.failure_code is None and result.payload_json is not None
-                if valid:
-                    assert result.payload_json is not None
-                    valid = (
-                        len(result.payload_json.encode()) <= 262144
-                        and self.redactor.redact_text(result.payload_json) == result.payload_json
-                        and result.native_kind
-                        == ("openai_window" if run.provider_id == "openai" else "anthropic_block")
-                    )
-                    try:
-                        payload = json.loads(result.payload_json)
-                        valid = valid and (
-                            isinstance(payload, list) and bool(payload)
-                            if run.provider_id == "openai"
-                            else isinstance(payload, dict) and payload.get("type") == "compaction"
-                        )
-                    except ValueError:
-                        valid = False
-                call = await self.runs.update_model_call(
-                    call.id,
-                    ModelCallStatus.COMPLETED if valid else ModelCallStatus.FAILED,
-                    response_snapshot={
-                        "usage_context": billing,
-                        "native_kind": result.native_kind,
-                        "native_payload_json": result.payload_json if valid else None,
+                part = {key: getattr(event, key) for key in usage}
+                part_billing: dict[str, object] = {
+                    "pricing_context_tokens": plan.pricing_context_tokens,
+                    "cache_creation_1h_tokens": event.cache_creation_1h_tokens
+                    if event.cache_creation_tokens
+                    else 0,
+                }
+                if event.service_tier is not None:
+                    part_billing["service_tier"] = billing_tier(event.service_tier)
+                iterations.append({"usage": part, "billing": part_billing})
+                for key, value in part.items():
+                    if value is not None:
+                        usage[key] = (usage[key] or 0) + value
+            billing["usage_complete"] = (
+                bool(iterations) and result.failure_code != "native_usage_unknown"
+            )
+            total, cost = usage_cost(run.model_id, usage, billing)
+            call = await self.runs.update_model_call(
+                call.id,
+                ModelCallStatus.STREAMING,
+                input_tokens=usage["input_tokens"],
+                output_tokens=usage["output_tokens"],
+                cached_tokens=usage["cached_tokens"],
+                cache_creation_tokens=usage["cache_creation_tokens"],
+                reasoning_tokens=usage["reasoning_tokens"],
+                estimated_cost=cost,
+                clear_estimated_cost=cost is None,
+                accounted_total_tokens=total,
+                clear_accounted_total_tokens=total is None,
+                response_snapshot={"usage_context": billing},
+                provider_response_id=self.redactor.redact_text(result.provider_response_id)
+                if result.provider_response_id
+                else None,
+            )
+            await self.publish(
+                await self.runs.append_run_event(
+                    run.id,
+                    RunEventType.MODEL_USAGE,
+                    {
+                        **{key: value for key, value in usage.items() if value is not None},
+                        "model_call_id": call.id,
+                        "estimated_cost_usd": cost,
+                        "purpose": "native_compaction",
                     },
-                    error_code=None if valid else "native_context_invalid",
                 )
-                observation.finish(
-                    "completed" if valid else "failed", None if valid else "native_context_invalid"
+            )
+            if total is None or cost is None:
+                raise ProviderError(
+                    "native_usage_unknown", "Native compaction usage is unavailable."
                 )
-                if valid:
-                    await self.publish(
-                        await self.runs.append_run_event(
-                            run.id,
-                            RunEventType.MODEL_COMPLETED,
-                            {"model_call_id": call.id, "purpose": "native_compaction"},
-                        )
+            valid = result.failure_code is None and result.payload_json is not None
+            if valid:
+                assert result.payload_json is not None
+                valid = (
+                    len(result.payload_json.encode()) <= 262144
+                    and self.redactor.redact_text(result.payload_json) == result.payload_json
+                    and result.native_kind
+                    == ("openai_window" if run.provider_id == "openai" else "anthropic_block")
+                )
+                try:
+                    payload = json.loads(result.payload_json)
+                    valid = valid and (
+                        isinstance(payload, list) and bool(payload)
+                        if run.provider_id == "openai"
+                        else isinstance(payload, dict) and payload.get("type") == "compaction"
                     )
-                    return result
-                return None
-            except BaseException as error:
-                if call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
-                    await self.runs.update_model_call(
-                        call.id,
-                        ModelCallStatus.CANCELLED
-                        if isinstance(error, asyncio.CancelledError)
-                        else ModelCallStatus.FAILED,
-                        response_snapshot={"usage_context": billing},
-                        clear_estimated_cost=billing["usage_complete"] is not True,
+                except ValueError:
+                    valid = False
+            call = await self.runs.update_model_call(
+                call.id,
+                ModelCallStatus.COMPLETED if valid else ModelCallStatus.FAILED,
+                response_snapshot={
+                    "usage_context": billing,
+                    "native_kind": result.native_kind,
+                    "native_payload_json": result.payload_json if valid else None,
+                },
+                error_code=None if valid else "native_context_invalid",
+            )
+            if valid:
+                await self.publish(
+                    await self.runs.append_run_event(
+                        run.id,
+                        RunEventType.MODEL_COMPLETED,
+                        {"model_call_id": call.id, "purpose": "native_compaction"},
                     )
-                raise
+                )
+                return result
+            logger.warning(
+                "context.native_compaction.fallback",
+                extra={
+                    "event": "context.native_compaction.fallback",
+                    "outcome": "fallback",
+                    "error_code": "native_context_invalid",
+                    "run_id": run.id,
+                },
+            )
+            return None
+        except BaseException as error:
+            if call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
+                await self.runs.update_model_call(
+                    call.id,
+                    ModelCallStatus.CANCELLED
+                    if isinstance(error, asyncio.CancelledError)
+                    else ModelCallStatus.FAILED,
+                    response_snapshot={"usage_context": billing},
+                    clear_estimated_cost=billing["usage_complete"] is not True,
+                )
+            raise
 
     async def _preflight(
         self,
@@ -873,21 +799,34 @@ class RunContext:
         request = replace(request, messages=tuple(item.message for item in normalized))
         counted: InputTokenCount | None = None
         if callable(getattr(provider, "count_input", None)):
-            with self.telemetry.operation(
-                "model.count_input",
-                {"runId": run.id, "provider": run.provider_id, "model": run.model_id},
-                kind="client",
-            ) as observation:
-                try:
-                    async with asyncio.timeout(min(30.0, _remaining(run))):
-                        counted = await cast(TokenCountingProvider, provider).count_input(
-                            request, api_key, user_id
-                        )
-                    observation.outcome("completed")
-                except ProviderError, TimeoutError:
-                    # Native state has no conservative byte-to-token fallback.
-                    observation.outcome("fallback", "token_count_unavailable")
-                    counted = None
+            try:
+                async with asyncio.timeout(min(30.0, _remaining(run))):
+                    counted = await cast(TokenCountingProvider, provider).count_input(
+                        request, api_key, user_id
+                    )
+            except ProviderError as error:
+                logger.warning(
+                    "context.token_count.fallback",
+                    extra={
+                        "event": "context.token_count.fallback",
+                        "outcome": "fallback",
+                        "error_code": error.code,
+                        "run_id": run.id,
+                    },
+                )
+                counted = None
+            except TimeoutError:
+                logger.warning(
+                    "context.token_count.fallback",
+                    extra={
+                        "event": "context.token_count.fallback",
+                        "outcome": "fallback",
+                        "error_code": "provider_timeout",
+                        "run_id": run.id,
+                    },
+                )
+                # Native state has no conservative byte-to-token fallback.
+                counted = None
         return preflight_context(
             request,
             items=normalized,
@@ -919,109 +858,105 @@ class RunContext:
             "tools": [],
         }
         call = await self.runs.create_model_call(run.id, step_index, model, snapshot)
-        with self._model_operation(run, call, "summary") as observation:
-            usage: dict[str, int | None] = {
-                key: None
-                for key in (
-                    "input_tokens",
-                    "output_tokens",
-                    "cached_tokens",
-                    "cache_creation_tokens",
-                    "reasoning_tokens",
-                )
-            }
-            billing: dict[str, object] = {"pricing_context_tokens": plan.pricing_context_tokens}
+        usage: dict[str, int | None] = {
+            key: None
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cached_tokens",
+                "cache_creation_tokens",
+                "reasoning_tokens",
+            )
+        }
+        billing: dict[str, object] = {"pricing_context_tokens": plan.pricing_context_tokens}
 
-            async def record(event: ModelStreamEvent) -> None:
-                nonlocal call
-                usage.update(
-                    {key: value for key in usage if (value := getattr(event, key)) is not None}
+        async def record(event: ModelStreamEvent) -> None:
+            nonlocal call
+            usage.update(
+                {key: value for key in usage if (value := getattr(event, key)) is not None}
+            )
+            if event.service_tier is not None:
+                billing["service_tier"] = billing_tier(event.service_tier)
+            if event.cache_creation_tokens is not None:
+                billing["cache_creation_1h_tokens"] = (
+                    event.cache_creation_1h_tokens if event.cache_creation_tokens else 0
                 )
-                if event.service_tier is not None:
-                    billing["service_tier"] = billing_tier(event.service_tier)
-                if event.cache_creation_tokens is not None:
-                    billing["cache_creation_1h_tokens"] = (
-                        event.cache_creation_1h_tokens if event.cache_creation_tokens else 0
-                    )
-                total, cost = usage_cost(run.model_id, usage, billing)
-                self._observe_usage(observation, total, cost, metrics=False)
-                call = await self.runs.update_model_call(
-                    call.id,
-                    ModelCallStatus.STREAMING,
-                    input_tokens=usage["input_tokens"],
-                    output_tokens=usage["output_tokens"],
-                    cached_tokens=usage["cached_tokens"],
-                    cache_creation_tokens=usage["cache_creation_tokens"],
-                    reasoning_tokens=usage["reasoning_tokens"],
-                    estimated_cost=cost,
-                    clear_estimated_cost=cost is None,
-                    accounted_total_tokens=total,
-                    clear_accounted_total_tokens=total is None,
-                    response_snapshot={"usage_context": billing.copy()},
+            total, cost = usage_cost(run.model_id, usage, billing)
+            call = await self.runs.update_model_call(
+                call.id,
+                ModelCallStatus.STREAMING,
+                input_tokens=usage["input_tokens"],
+                output_tokens=usage["output_tokens"],
+                cached_tokens=usage["cached_tokens"],
+                cache_creation_tokens=usage["cache_creation_tokens"],
+                reasoning_tokens=usage["reasoning_tokens"],
+                estimated_cost=cost,
+                clear_estimated_cost=cost is None,
+                accounted_total_tokens=total,
+                clear_accounted_total_tokens=total is None,
+                response_snapshot={"usage_context": billing.copy()},
+            )
+            await self.publish(
+                await self.runs.append_run_event(
+                    run.id,
+                    RunEventType.MODEL_USAGE,
+                    {
+                        **{key: value for key, value in usage.items() if value is not None},
+                        "model_call_id": call.id,
+                        "estimated_cost_usd": cost,
+                    },
                 )
-                await self.publish(
-                    await self.runs.append_run_event(
-                        run.id,
-                        RunEventType.MODEL_USAGE,
-                        {
-                            **{key: value for key, value in usage.items() if value is not None},
-                            "model_call_id": call.id,
-                            "estimated_cost_usd": cost,
-                        },
-                    )
-                )
+            )
 
-            try:
-                call = await self.runs.update_model_call(call.id, ModelCallStatus.STREAMING)
-                await self.publish(
-                    await self.runs.append_run_event(
-                        run.id,
-                        RunEventType.PHASE,
-                        {"phase": "compacting", "model_call_id": call.id},
-                    )
+        try:
+            call = await self.runs.update_model_call(call.id, ModelCallStatus.STREAMING)
+            await self.publish(
+                await self.runs.append_run_event(
+                    run.id,
+                    RunEventType.PHASE,
+                    {"phase": "compacting", "model_call_id": call.id},
                 )
-                result = await summarize_prefix(
-                    provider,
-                    request,
-                    api_key,
-                    user_id,
-                    timeout_seconds=_remaining(run),
-                    redactor=self.redactor,
-                    on_usage=record,
+            )
+            result = await summarize_prefix(
+                provider,
+                request,
+                api_key,
+                user_id,
+                timeout_seconds=_remaining(run),
+                redactor=self.redactor,
+                on_usage=record,
+            )
+            total, cost = usage_cost(run.model_id, usage, billing)
+            if total is None or cost is None:
+                raise ProviderError(
+                    "provider_usage_unavailable", "The summary did not report enough usage."
                 )
-                total, cost = usage_cost(run.model_id, usage, billing)
-                self._observe_usage(observation, total, cost)
-                if total is None or cost is None:
-                    raise ProviderError(
-                        "provider_usage_unavailable", "The summary did not report enough usage."
-                    )
-                call = await self.runs.update_model_call(
-                    call.id,
-                    ModelCallStatus.COMPLETED,
-                    provider_response_id=self.redactor.redact_text(result.provider_response_id)
-                    if result.provider_response_id
-                    else None,
-                    response_snapshot={"content": result.text, "usage_context": billing.copy()},
-                    estimated_cost=cost,
-                    clear_estimated_cost=cost is None,
-                    accounted_total_tokens=total,
-                    clear_accounted_total_tokens=total is None,
+            call = await self.runs.update_model_call(
+                call.id,
+                ModelCallStatus.COMPLETED,
+                provider_response_id=self.redactor.redact_text(result.provider_response_id)
+                if result.provider_response_id
+                else None,
+                response_snapshot={"content": result.text, "usage_context": billing.copy()},
+                estimated_cost=cost,
+                clear_estimated_cost=cost is None,
+                accounted_total_tokens=total,
+                clear_accounted_total_tokens=total is None,
+            )
+            await self.publish(
+                await self.runs.append_run_event(
+                    run.id,
+                    RunEventType.MODEL_COMPLETED,
+                    {"model_call_id": call.id, "purpose": "summary"},
                 )
-                await self.publish(
-                    await self.runs.append_run_event(
-                        run.id,
-                        RunEventType.MODEL_COMPLETED,
-                        {"model_call_id": call.id, "purpose": "summary"},
-                    )
-                )
-                observation.finish("completed")
-                return result.text, call
-            except BaseException as error:
-                status = (
-                    ModelCallStatus.CANCELLED
-                    if isinstance(error, asyncio.CancelledError)
-                    else ModelCallStatus.FAILED
-                )
-                if call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
-                    await self.runs.update_model_call(call.id, status)
-                raise
+            )
+            return result.text, call
+        except BaseException as error:
+            status = (
+                ModelCallStatus.CANCELLED
+                if isinstance(error, asyncio.CancelledError)
+                else ModelCallStatus.FAILED
+            )
+            if call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
+                await self.runs.update_model_call(call.id, status)
+            raise

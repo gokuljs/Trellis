@@ -41,11 +41,3 @@ services:
         sync: false
       - key: TRELLIS_ANTHROPIC_API_KEY
         sync: false
-      - key: TRELLIS_TELEMETRY_ENABLED
-        value: "true"
-      - key: OTEL_SERVICE_NAME
-        value: trellis-api
-      - key: OTEL_EXPORTER_OTLP_ENDPOINT
-        sync: false
-      - key: OTEL_EXPORTER_OTLP_HEADERS
-        sync: false

@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable, Mapping
-from contextlib import ExitStack, suppress
+from contextlib import suppress
 from contextvars import Context
 from typing import cast
 
@@ -10,11 +10,10 @@ import anyio
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
 from app.api.access import require_private_access
-from app.api.telemetry import CommandObservation, runtime_command, transport_telemetry
+from app.api.runtime_logging import CommandObservation, runtime_command
 from app.application.budgets import BudgetPreset
 from app.application.errors import ApplicationError
 from app.application.runs import RunService
-from app.application.telemetry import run_identifiers
 from app.core.origins import allowed_web_origins
 from app.domain.runtime import (
     RunEvent,
@@ -219,7 +218,6 @@ async def _close_transport(websocket: WebSocket, code: int) -> None:
 @router.websocket("/api/runtime")
 async def runtime_websocket(websocket: WebSocket) -> None:
     settings = websocket.app.state.settings
-    telemetry = transport_telemetry(websocket.scope)
     if websocket.headers.get("origin") not in allowed_web_origins(
         settings.environment, settings.web_origin
     ):
@@ -239,7 +237,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
         if await send_initial(_error_response(rpc_id, error.code, error.message, error.data)):
             await _close_transport(websocket, _access_close_code(error))
 
-    with runtime_command(telemetry, "auth.authenticate") as authentication:
+    with runtime_command("auth.authenticate") as authentication:
         try:
             raw_auth = await asyncio.wait_for(
                 websocket.receive_text(), timeout=_AUTH_TIMEOUT_SECONDS
@@ -284,9 +282,12 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             )
             await reject_access(_authentication_fault(error.status_code), request_id)
             return
-        except Exception as error:
+        except Exception:
             authentication.outcome("error", "auth_unavailable")
-            logger.error("Runtime authentication failed (%s)", type(error).__name__)
+            logger.error(
+                "runtime.authentication.failed",
+                extra={"event": "runtime.authentication.failed", "error_code": "auth_unavailable"},
+            )
             await reject_access(_authentication_fault(), request_id)
             return
         try:
@@ -306,9 +307,15 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             )
             await reject_access(_account_fault(error), request_id)
             return
-        except Exception as error:
+        except Exception:
             authentication.outcome("error", "account_unavailable")
-            logger.error("Runtime account startup failed (%s)", type(error).__name__)
+            logger.error(
+                "runtime.account.startup_failed",
+                extra={
+                    "event": "runtime.account.startup_failed",
+                    "error_code": "account_unavailable",
+                },
+            )
             await reject_access(
                 _account_fault(ApplicationError("database_unavailable", "")), request_id
             )
@@ -361,8 +368,14 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             )
         except HTTPException as error:
             return _authentication_fault(error.status_code)
-        except Exception as error:
-            logger.error("Runtime authentication check failed (%s)", type(error).__name__)
+        except Exception:
+            logger.error(
+                "runtime.authentication.check_failed",
+                extra={
+                    "event": "runtime.authentication.check_failed",
+                    "error_code": "auth_unavailable",
+                },
+            )
             return _authentication_fault()
         if refreshed.id != verified.id or auth_lost.is_set():
             return _authentication_fault(401)
@@ -376,8 +389,14 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             )
         except ApplicationError as error:
             return _account_fault(error)
-        except Exception as error:
-            logger.error("Runtime cloud token refresh failed (%s)", type(error).__name__)
+        except Exception:
+            logger.error(
+                "runtime.token.refresh_failed",
+                extra={
+                    "event": "runtime.token.refresh_failed",
+                    "error_code": "account_unavailable",
+                },
+            )
             return _account_fault(ApplicationError("database_unavailable", ""))
         return None
 
@@ -392,7 +411,14 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                         # The peer may already have disconnected while a check was in flight.
                         await reject_access(error, None)
         except TimeoutError:
-            logger.error("Runtime authentication close timed out")
+            logger.warning(
+                "runtime.authentication.close_timed_out",
+                extra={
+                    "event": "runtime.authentication.close_timed_out",
+                    "outcome": "interrupted",
+                    "error_code": "auth_close_timeout",
+                },
+            )
 
     teardown_started = False
 
@@ -459,54 +485,56 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                     return True
 
         try:
-            with ExitStack() as scopes:
-                run = await service.get_run(run_id)
-                if run is None:
-                    return
-                scopes.enter_context(telemetry.correlate(run_identifiers(run)))
-                if await replay_persisted(run.last_event_sequence):
-                    return
+            run = await service.get_run(run_id)
+            if run is None:
+                return
+            if await replay_persisted(run.last_event_sequence):
+                return
 
-                if is_terminal_run_status(run.status):
+            if is_terminal_run_status(run.status):
+                return
+            while True:
+                try:
+                    event = await asyncio.wait_for(subscription.receive(), timeout=0.5)
+                except TimeoutError:
+                    # Durable events are authoritative. Polling closes the rare gap where
+                    # persistence succeeds but in-process fanout is interrupted.
+                    if await replay_persisted():
+                        return
+                    current_run = await service.get_run(run_id)
+                    if current_run is None:
+                        return
+                    if is_terminal_run_status(current_run.status):
+                        # Completion may commit after the last page was read. Drain
+                        # through its durable cursor before ending the subscription.
+                        if sequence < current_run.last_event_sequence:
+                            await replay_persisted(current_run.last_event_sequence)
+                        return
+                    continue
+                if event is None:
+                    await send(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "run.replay_required",
+                            "params": {"runId": run_id, "afterSequence": sequence},
+                        }
+                    )
                     return
-                while True:
-                    try:
-                        event = await asyncio.wait_for(subscription.receive(), timeout=0.5)
-                    except TimeoutError:
-                        # Durable events are authoritative. Polling closes the rare gap where
-                        # persistence succeeds but in-process fanout is interrupted.
-                        if await replay_persisted():
-                            return
-                        current_run = await service.get_run(run_id)
-                        if current_run is None:
-                            return
-                        if is_terminal_run_status(current_run.status):
-                            # Completion may commit after the last page was read. Drain
-                            # through its durable cursor before ending the subscription.
-                            if sequence < current_run.last_event_sequence:
-                                await replay_persisted(current_run.last_event_sequence)
-                            return
-                        continue
-                    if event is None:
-                        await send(
-                            {
-                                "jsonrpc": "2.0",
-                                "method": "run.replay_required",
-                                "params": {"runId": run_id, "afterSequence": sequence},
-                            }
-                        )
-                        return
-                    if await emit_event(event):
-                        return
+                if await emit_event(event):
+                    return
         except asyncio.CancelledError:
             raise
         except WebSocketDisconnect:
             return
-        except Exception as error:
+        except Exception:
             logger.error(
-                "Could not relay runtime events for %s (error type: %s)",
-                run_id,
-                type(error).__name__,
+                "runtime.events.relay_failed",
+                extra={
+                    "event": "runtime.events.relay_failed",
+                    "outcome": "failed",
+                    "error_code": "event_relay_failed",
+                    "run_id": run_id,
+                },
             )
         finally:
             event_hub.unsubscribe(subscription)
@@ -648,7 +676,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             try:
                 requests, is_batch = _decode_requests(raw)
             except RpcFault as error:
-                with runtime_command(telemetry, "unknown") as command:
+                with runtime_command("unknown") as command:
                     command.outcome(
                         "rejected",
                         "rpc_parse_error" if error.code == -32700 else "rpc_invalid_request",
@@ -665,14 +693,12 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                 has_id = True
                 observed_method = request.get("method") if isinstance(request, dict) else None
                 with runtime_command(
-                    telemetry, observed_method if isinstance(observed_method, str) else "unknown"
+                    observed_method if isinstance(observed_method, str) else "unknown"
                 ) as command:
                     try:
                         method, params, request_id, has_id = _parse_request(request)
                         result = await dispatch(method, params, command)
-                        command.set_attributes({"runId": cast(str, result["runId"])})
-                        if method == "run.respond":
-                            command.set_attributes({"toolCallId": cast(str, result["toolCallId"])})
+                        command.identify_run(result.get("runId"))
                         if has_id:
                             responses.append({"jsonrpc": "2.0", "id": request_id, "result": result})
                     except RpcFault as error:
@@ -708,12 +734,8 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                                     {"code": error.code},
                                 )
                             )
-                    except Exception as error:
+                    except Exception:
                         command.outcome("error", "command_failed")
-                        logger.error(
-                            "Runtime JSON-RPC request failed (error type: %s)",
-                            type(error).__name__,
-                        )
                         if has_id:
                             responses.append(_error_response(request_id, -32603, "Internal error"))
 

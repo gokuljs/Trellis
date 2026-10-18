@@ -91,8 +91,15 @@ class ChatService:
             raise ApplicationError(
                 self._redactor.redact_text(error.code), self._redactor.redact_text(error.message)
             ) from None
-        except Exception as error:
-            logger.error("Provider completion failed (%s)", type(error).__name__)
+        except Exception:
+            logger.error(
+                "chat.provider.failed",
+                extra={
+                    "event": "chat.provider.failed",
+                    "outcome": "failed",
+                    "error_code": "provider_upstream_failed",
+                },
+            )
             raise ApplicationError(
                 "provider_upstream_failed", "The provider could not complete this turn."
             ) from None

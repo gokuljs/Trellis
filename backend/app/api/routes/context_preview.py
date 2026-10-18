@@ -5,7 +5,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field, field_validator
 
 from app.api.dependencies import AccountDep, ContextPreviewServiceDep
-from app.api.telemetry import owned_chat_telemetry
+from app.api.request_logging import owned_chat_logging
 from app.application.budgets import BudgetPreset
 
 
@@ -52,7 +52,7 @@ async def preview_context(
         if payload.session_id is not None
         else None
     )
-    with owned_chat_telemetry(request.scope, session) if session else nullcontext():
+    with owned_chat_logging(request.scope, session) if session else nullcontext():
         result = await service.preview(
             session_id=payload.session_id,
             model_id=payload.model_id,
