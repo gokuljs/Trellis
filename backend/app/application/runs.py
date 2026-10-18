@@ -672,6 +672,14 @@ class RunService(RunExecutor):
             if session is None:
                 raise ApplicationError("session_not_found", "Session not found.")
             await self.execute(RunExecutionContext(profile.id, run, session, model))
+        except asyncio.CancelledError:
+            if self._can_execute(run_id):
+                current = await self._runs.get_run(run_id)
+                if current is not None and current.status is RunStatus.CANCELLING:
+                    await self._mark_cancelled(run_id, None)
+                elif current is not None and current.status is RunStatus.RUNNING:
+                    await self._mark_interrupted(run_id, None)
+            raise
         except ApplicationError as error:
             if self._can_execute(run_id):
                 await self._fail_or_cancel(run_id, None, error.code, error.message)
