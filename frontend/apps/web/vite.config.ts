@@ -1,9 +1,7 @@
 import path from "path"
 import tailwindcss from "@tailwindcss/vite"
 import react from "@vitejs/plugin-react"
-import { sentryVitePlugin } from "@sentry/vite-plugin"
 import { defineConfig, loadEnv } from "vite"
-import { sentryBuildConfig } from "./config/sentry-build.ts"
 import { parseBackendTargets } from "./src/lib/backend-targets.ts"
 
 // https://vite.dev/config/
@@ -11,15 +9,9 @@ export default defineConfig(({ command, mode }) => {
   const envDir = path.resolve(import.meta.dirname, "../..")
   const environment = { ...loadEnv(mode, envDir, ""), ...process.env }
   parseBackendTargets(environment, command === "build")
-  const sentry = sentryBuildConfig(environment, import.meta.dirname, command)
   return {
     envDir,
-    plugins: [
-      react(),
-      tailwindcss(),
-      ...(sentry.pluginOptions ? sentryVitePlugin(sentry.pluginOptions) : []),
-    ],
-    build: { outDir: sentry.outDir, sourcemap: sentry.sourcemap },
+    plugins: [react(), tailwindcss()],
     server: {
       port: 3000,
       strictPort: true,

@@ -1,5 +1,3 @@
-import "./instrumentation"
-
 import { StrictMode } from "react"
 import { createRoot } from "react-dom/client"
 
@@ -7,7 +5,8 @@ import "@trellis/ui/globals.css"
 import { App } from "./App.tsx"
 import { ThemeProvider } from "@/components/theme-provider.tsx"
 import { RootErrorBoundary } from "@/components/root-error-boundary"
-import { telemetryRootOptions } from "@/lib/telemetry"
+import { logger } from "@/lib/logger"
+import { loggingRootOptions } from "@/lib/logging"
 
 const app = (
   <RootErrorBoundary>
@@ -18,6 +17,7 @@ const app = (
 )
 
 // metal-fx's shared WebGL renderer freezes when StrictMode replays effects in dev.
-createRoot(document.getElementById("root")!, telemetryRootOptions()).render(
+logger.info("application.started")
+createRoot(document.getElementById("root")!, loggingRootOptions()).render(
   import.meta.env.DEV ? app : <StrictMode>{app}</StrictMode>
 )

@@ -108,7 +108,7 @@ import {
   retainWindowActivities,
 } from "@/lib/activity-history"
 import { useContextPreview } from "@/lib/use-context-preview"
-import { reportFailure } from "@/lib/telemetry"
+import { logFailure } from "@/lib/logging"
 import "./workspace-bootstrap.css"
 
 type BootstrapState =
@@ -418,7 +418,7 @@ export function AppShell({
         latest = await api.getLatestRun(sessionId)
       } catch (discoveryError) {
         if (isStale()) return
-        reportFailure(discoveryError, "run.restore")
+        logFailure(discoveryError, "run.restore")
         waitForDiscovery(
           "Trellis could not check the previous run. Reconnect when the service returns."
         )
@@ -428,7 +428,7 @@ export function AppShell({
       if (latest && (!turn || turn.turnId === latest.turn_id)) {
         turn = retryInputForRun(sessionId, transcript, latest)
         if (!turn && activeRunStatuses.has(latest.status)) {
-          reportFailure(
+          logFailure(
             new RuntimeError(
               "runtime_protocol_error",
               "The active run input is unavailable."
@@ -563,7 +563,7 @@ export function AppShell({
                 keepActive =
                   currentStatus === null || activeRunStatuses.has(currentStatus)
                 if (keepActive) {
-                  reportFailure(streamError, "run.restore")
+                  logFailure(streamError, "run.restore")
                   setError(
                     "Connection to Trellis is unavailable. Reconnect when it returns."
                   )
@@ -613,8 +613,7 @@ export function AppShell({
             setReconnectAvailable(true)
             // The run may still be active while the service is unavailable.
           }
-          if (!isStale() && !reconciled)
-            reportFailure(finalError, "run.restore")
+          if (!isStale() && !reconciled) logFailure(finalError, "run.restore")
         } finally {
           if (!isStale() && !keepActive) {
             setPending(false)
@@ -682,7 +681,7 @@ export function AppShell({
       setBootstrap({ status: "ready", progress: restoredOnboarding })
     } catch (restoreError) {
       if (current()) {
-        reportFailure(restoreError, "workspace.bootstrap")
+        logFailure(restoreError, "workspace.bootstrap")
         setBootstrap({ status: "failed", message: visibleError(restoreError) })
         controller.abort()
       }
@@ -808,7 +807,7 @@ export function AppShell({
                   sessionLoadSequenceRef.current === loadSequence &&
                   activeSessionIdRef.current === sessionId
                 )
-                  reportFailure(summaryError, "activity.summaries")
+                  logFailure(summaryError, "activity.summaries")
                 return {
                   summaries: [] as RunSummary[],
                   error: "Saved activity could not be loaded.",
@@ -854,7 +853,7 @@ export function AppShell({
           return
         }
         if (bootstrapControllerRef.current)
-          reportFailure(sessionError, "sessions.open")
+          logFailure(sessionError, "sessions.open")
         setError(visibleError(sessionError))
       } finally {
         if (sessionLoadSequenceRef.current === loadSequence) {
@@ -944,7 +943,7 @@ export function AppShell({
         })
       ) {
         if (bootstrapControllerRef.current)
-          reportFailure(pageError, "history.load")
+          logFailure(pageError, "history.load")
         setHistoryError(visibleError(pageError))
       }
     }
@@ -973,7 +972,7 @@ export function AppShell({
         })
       ) {
         if (bootstrapControllerRef.current)
-          reportFailure(pageError, "history.load")
+          logFailure(pageError, "history.load")
         setHistoryError(visibleError(pageError))
       }
     }
@@ -1142,7 +1141,7 @@ export function AppShell({
         )
         setFailedTurn(failureAction === "reload" ? null : turn)
         if (failureAction === "reload") {
-          reportFailure(turnError, "history.load")
+          logFailure(turnError, "history.load")
           setReconnectAvailable(true)
           return false
         }
@@ -1159,7 +1158,7 @@ export function AppShell({
         if (!isCurrent()) return true
         // Keep the optimistic user message if the saved transcript cannot be refreshed.
       }
-      if (isCurrent()) reportFailure(turnError, "run.start")
+      if (isCurrent()) logFailure(turnError, "run.start")
       if (
         (turnError instanceof ApiError || turnError instanceof RuntimeError) &&
         turnError.code === "provider_not_configured"
@@ -1194,8 +1193,7 @@ export function AppShell({
         return
       cancelRequestRef.current = false
       setCancellingRun(false)
-      if (bootstrapControllerRef.current)
-        reportFailure(cancelError, "run.cancel")
+      if (bootstrapControllerRef.current) logFailure(cancelError, "run.cancel")
       if (activeSessionIdRef.current) setError(visibleError(cancelError))
     }
   }
@@ -1233,7 +1231,7 @@ export function AppShell({
     } catch (responseError) {
       if (isCurrent() && approvalRequestRef.current === toolCallId) {
         if (bootstrapControllerRef.current)
-          reportFailure(responseError, "run.respond")
+          logFailure(responseError, "run.respond")
         setApprovalError(visibleError(responseError))
         setApprovalPendingToolId((current) =>
           current === toolCallId ? null : current
@@ -1271,8 +1269,7 @@ export function AppShell({
       return updated
     } catch (saveError) {
       if (!isCurrent()) return null
-      if (bootstrapControllerRef.current)
-        reportFailure(saveError, "settings.save")
+      if (bootstrapControllerRef.current) logFailure(saveError, "settings.save")
       throw saveError
     } finally {
       if (isCurrent()) {
@@ -1359,7 +1356,7 @@ export function AppShell({
           .createSession()
           .catch((createError: unknown) => {
             if (bootstrapControllerRef.current && isCurrent())
-              reportFailure(createError, "sessions.create")
+              logFailure(createError, "sessions.create")
             throw createError
           })
         if (!isCurrent()) return
@@ -1482,7 +1479,7 @@ export function AppShell({
       )
         return
       if (bootstrapControllerRef.current)
-        reportFailure(restoreError, "run.restore")
+        logFailure(restoreError, "run.restore")
       setError(visibleError(restoreError))
       setReconnectAvailable(true)
     })

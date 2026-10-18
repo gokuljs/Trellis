@@ -1,6 +1,5 @@
 import assert from "node:assert/strict"
 import { afterEach, test, mock, spyOn } from "bun:test"
-import * as Sentry from "@sentry/react"
 
 import * as authModule from "../src/lib/auth-controller"
 import type { AuthController } from "../src/lib/auth-controller"
@@ -10,13 +9,9 @@ import {
   resumeRun,
   streamRun,
 } from "../src/lib/runtime-client"
-import { createTelemetryOptions, reportFailure } from "../src/lib/telemetry"
-import { parseTelemetryConfig } from "../src/lib/telemetry-policy"
+import { logFailure } from "../src/lib/logging"
 import { isReconciledRunOutcome, ownsRun } from "../src/lib/run-recovery"
 
-type Envelope = Parameters<
-  ReturnType<NonNullable<Sentry.BrowserOptions["transport"]>>["send"]
->[0]
 const secret = "private-runtime-token-prompt-session-tool"
 const originalSocket = globalThis.WebSocket
 const originalWindow = globalThis.window
@@ -24,6 +19,7 @@ const nativeSetTimeout = globalThis.setTimeout
 const nativeClearTimeout = globalThis.clearTimeout
 const sockets: FakeSocket[] = []
 const deadlines = new Map<ReturnType<typeof setTimeout>, () => void>()
+const records: Record<string, unknown>[] = []
 
 class FakeSocket {
   onopen: (() => void) | null = null
@@ -53,10 +49,8 @@ class FakeSocket {
   }
 }
 
-afterEach(async () => {
+afterEach(() => {
   for (const socket of sockets.splice(0)) socket.close()
-  await Sentry.close(1000)
-  Sentry.setCurrentClient(undefined)
   mock.restore()
   globalThis.WebSocket = originalSocket
   globalThis.window = originalWindow
@@ -104,24 +98,13 @@ function setup() {
   globalThis.window = {
     location: { href: "https://trellis.test/" },
   } as Window & typeof globalThis
-  const envelopes: Envelope[] = []
-  const client = Sentry.init({
-    ...createTelemetryOptions(
-      parseTelemetryConfig({
-        VITE_SENTRY_ENABLED: "true",
-        VITE_SENTRY_DSN: "https://public@o123.ingest.sentry.io/456",
-        VITE_SENTRY_TRACES_SAMPLE_RATE: "1",
-        origin: "https://trellis.test",
-      })
-    ),
-    transport: () => ({
-      send: (envelope) => {
-        envelopes.push(envelope)
-        return Promise.resolve({ statusCode: 200 })
-      },
-      flush: () => Promise.resolve(true),
-    }),
-  })!
+  records.length = 0
+  spyOn(console, "error").mockImplementation((record: unknown) => {
+    records.push(record as Record<string, unknown>)
+  })
+  spyOn(console, "warn").mockImplementation((record: unknown) => {
+    records.push(record as Record<string, unknown>)
+  })
   spyOn(globalThis, "setTimeout").mockImplementation(((
     handler: () => void,
     delay?: number
@@ -143,30 +126,9 @@ function setup() {
       epoch++
       for (const listener of listeners) listener()
     },
-    async recorded() {
-      await client.flush(1000)
-      assert.equal(JSON.stringify(envelopes).includes(secret), false)
-      const events = envelopes.flatMap((envelope) =>
-        envelope[1].filter(([header]) => header.type === "event")
-      )
-      const spans = envelopes.flatMap((envelope) =>
-        envelope[1].flatMap(([header, payload]) =>
-          header.type === "span"
-            ? (
-                payload as {
-                  items: {
-                    name: string
-                    status: string
-                    end_timestamp?: number
-                  }[]
-                }
-              ).items
-            : []
-        )
-      )
-      for (const span of spans)
-        assert.equal(typeof span.end_timestamp, "number")
-      return { events, spans }
+    recorded() {
+      assert.equal(JSON.stringify(records).includes(secret), false)
+      return records
     },
   }
 }
@@ -209,7 +171,7 @@ function complete(socket: FakeSocket) {
   })
 }
 
-test("start and subscribe spans end at acknowledgement before the run finishes", async () => {
+test("start and resume preserve run completion behavior without reporting successes", async () => {
   const { recorded } = setup()
   const started = streamRun({
     sessionId: secret,
@@ -220,27 +182,18 @@ test("start and subscribe spans end at acknowledgement before the run finishes",
   const first = await authenticate()
   acknowledge(first, { runId: secret, modelId: secret })
   await until(() => first.sent.length === 2)
-  const beforeCompletion = await recorded()
-  assert.deepEqual(
-    beforeCompletion.spans.map((span) => [span.name, span.status]),
-    [["run.start", "ok"]]
-  )
   complete(first)
-  await started
+  assert.deepEqual(await started, { runId: secret })
   const resumed = resumeRun(secret)
   const second = await authenticate(1)
   assert.equal(second.sent[1]?.method, "run.resume")
   acknowledge(second, { runId: secret })
   complete(second)
-  await resumed
-  assert.deepEqual(
-    (await recorded()).spans.map((span) => span.name),
-    ["run.start", "run.subscribe"]
-  )
-  assert.equal((await recorded()).events.length, 0)
+  assert.deepEqual(await resumed, { runId: secret })
+  assert.deepEqual(recorded(), [])
 })
 
-test("cancel and respond acknowledgements validate results before ending spans", async () => {
+test("cancel and respond acknowledgements validate returned results", async () => {
   const { recorded } = setup()
   const cancel = cancelRun(secret)
   const first = await authenticate()
@@ -259,17 +212,10 @@ test("cancel and respond acknowledgements validate results before ending spans",
     (error) =>
       error instanceof Error && error.message.includes("different approval")
   )
-  assert.deepEqual(
-    (await recorded()).spans.map((span) => [span.name, span.status]),
-    [
-      ["run.cancel", "ok"],
-      ["run.respond", "error"],
-    ]
-  )
-  assert.equal((await recorded()).events.length, 0)
+  assert.deepEqual(recorded(), [])
 })
 
-test("timeout and account teardown settle pending acknowledgement spans", async () => {
+test("timeout and account teardown settle pending requests", async () => {
   const { recorded, changeAccount } = setup()
   const timed = cancelRun(secret)
   await authenticate()
@@ -279,14 +225,7 @@ test("timeout and account teardown settle pending acknowledgement spans", async 
   await authenticate(1)
   changeAccount()
   await assert.rejects(stale)
-  assert.deepEqual(
-    (await recorded()).spans.map((span) => [span.name, span.status]),
-    [
-      ["run.cancel", "error"],
-      ["run.subscribe", "ok"],
-    ]
-  )
-  assert.equal((await recorded()).events.length, 0)
+  assert.deepEqual(recorded(), [])
 })
 
 test("successful transport reconnect stays quiet and exhausted reconnect reports only at the final caller", async () => {
@@ -302,19 +241,20 @@ test("successful transport reconnect stays quiet and exhausted reconnect reports
   acknowledge(second, { runId: secret })
   complete(second)
   await recovering
-  assert.equal((await recorded()).events.length, 0)
+  assert.deepEqual(recorded(), [])
   const exhausted = resumeRun(secret, { reconnectAttempts: 0 })
   const third = await authenticate(2)
   third.disconnect()
   await assert.rejects(exhausted, (error) => {
-    reportFailure(error, "run.restore")
-    reportFailure(error, "run.restore")
+    logFailure(error, "run.restore")
+    logFailure(error, "run.restore")
     return true
   })
-  assert.equal((await recorded()).events.length, 1)
+  assert.equal(recorded().length, 1)
+  assert.equal(recorded()[0]?.operation, "run.restore")
 })
 
-test("invalid start acknowledgements and mismatched cancellation end spans as failures", async () => {
+test("invalid start and cancellation responses still reject", async () => {
   const { recorded } = setup()
   const started = streamRun({
     sessionId: secret,
@@ -333,18 +273,10 @@ test("invalid start acknowledgements and mismatched cancellation end spans as fa
   const third = await authenticate(2)
   third.onmessage?.({ data: "not-json" })
   await assert.rejects(resumed)
-  assert.deepEqual(
-    (await recorded()).spans.map((span) => [span.name, span.status]),
-    [
-      ["run.start", "error"],
-      ["run.cancel", "error"],
-      ["run.subscribe", "error"],
-    ]
-  )
-  assert.equal((await recorded()).events.length, 0)
+  assert.deepEqual(recorded(), [])
 })
 
-test("RPC rejection settles a span while successful approval stays quiet", async () => {
+test("RPC rejection and successful approval preserve request outcomes", async () => {
   const { recorded } = setup()
   const failed = respondToToolApproval(secret, secret, "approved")
   const first = await authenticate()
@@ -366,17 +298,10 @@ test("RPC rejection settles a span while successful approval stays quiet", async
     decision: "approved",
   })
   await approved
-  assert.deepEqual(
-    (await recorded()).spans.map((span) => [span.name, span.status]),
-    [
-      ["run.respond", "error"],
-      ["run.respond", "ok"],
-    ]
-  )
-  assert.equal((await recorded()).events.length, 0)
+  assert.deepEqual(recorded(), [])
 })
 
-test("reconciliation policy accepts completed and expected terminal outcomes and rejects stale owners", async () => {
+test("reconciliation accepts terminal outcomes and suppresses stale owners", async () => {
   const { recorded } = setup()
   for (const status of ["completed", "cancelled", "interrupted"]) {
     assert.equal(isReconciledRunOutcome(status), true)
@@ -386,8 +311,8 @@ test("reconciliation policy accepts completed and expected terminal outcomes and
   }
   const owner = { sessionId: secret, generation: 1 }
   const current = { sessionId: "new-session", generation: 2 }
-  if (ownsRun(owner, current)) reportFailure(new Error(secret), "run.restore")
-  assert.equal((await recorded()).events.length, 0)
+  if (ownsRun(owner, current)) logFailure(new Error(secret), "run.restore")
+  assert.deepEqual(recorded(), [])
 })
 
 test("leaving a running chat closes its browser subscription without cancelling the run", async () => {

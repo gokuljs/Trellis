@@ -4,7 +4,6 @@
   "private": true,
   "scripts": {
     "build": "turbo build",
-    "build:sentry": "SENTRY_UPLOAD_SOURCEMAPS=true turbo build --filter=@trellis/web --force",
     "dev:all": "../scripts/dev-all.sh",
     "dev": "turbo dev",
     "lint": "turbo lint",

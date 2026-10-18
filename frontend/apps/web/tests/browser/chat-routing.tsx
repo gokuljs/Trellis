@@ -1,4 +1,3 @@
-import * as Sentry from "@sentry/react"
 import { createRoot } from "react-dom/client"
 import type { User } from "@supabase/supabase-js"
 
@@ -18,8 +17,6 @@ import type {
   Session,
   SessionHistoryPage,
 } from "../../src/lib/app-types"
-import { createTelemetryOptions } from "../../src/lib/telemetry"
-import { parseTelemetryConfig } from "../../src/lib/telemetry-policy"
 
 const ids = {
   a: "11111111-1111-4111-a111-111111111111",
@@ -48,21 +45,22 @@ const latest = new Map<string, LatestRun>()
 const requests: string[] = []
 const rpc: string[] = []
 const checks: string[] = []
-type Envelope = Parameters<
-  ReturnType<NonNullable<Sentry.BrowserOptions["transport"]>>["send"]
->[0]
-const envelopes: Envelope[] = []
-const chatPropagation: ReturnType<typeof Sentry.getTraceData>[] = []
-function exportedSpanNames() {
-  return envelopes.flatMap((envelope) =>
-    envelope[1].flatMap(([header, payload]) =>
-      header.type === "span"
-        ? (payload as { items: { name: string }[] }).items.map(
-            (span) => span.name
-          )
-        : []
-    )
-  )
+const browserLogs: unknown[] = []
+const blockedRequests: string[] = []
+const originalConsoleInfo = console.info.bind(console)
+const originalConsoleWarn = console.warn.bind(console)
+const originalConsoleError = console.error.bind(console)
+console.info = (...args) => {
+  browserLogs.push(args)
+  originalConsoleInfo(...args)
+}
+console.warn = (...args) => {
+  browserLogs.push(args)
+  originalConsoleWarn(...args)
+}
+console.error = (...args) => {
+  browserLogs.push(args)
+  originalConsoleError(...args)
 }
 const listeners = new Set<() => void>()
 const sockets: FixtureSocket[] = []
@@ -110,6 +108,7 @@ window.fetch = async (input) => {
   const path = new URL(String(input), window.location.href).pathname
   if (path === "/health" || path === "/ready")
     return Response.json({ status: path === "/ready" ? "ready" : "ok" })
+  blockedRequests.push(path)
   throw new Error(`Fixture blocked unexpected network request ${path}`)
 }
 
@@ -287,23 +286,6 @@ class FixtureSocket {
 }
 window.WebSocket = FixtureSocket as unknown as typeof WebSocket
 
-const telemetry = Sentry.init({
-  ...createTelemetryOptions(
-    parseTelemetryConfig({
-      VITE_SENTRY_ENABLED: "true",
-      VITE_SENTRY_DSN: "https://public@o123.ingest.sentry.io/456",
-      VITE_SENTRY_TRACES_SAMPLE_RATE: "1",
-      origin: window.location.origin,
-    })
-  ),
-  transport: () => ({
-    send(envelope) {
-      envelopes.push(envelope)
-      return Promise.resolve({ statusCode: 200 })
-    },
-    flush: () => Promise.resolve(true),
-  }),
-})!
 function evidence() {
   document.getElementById("fixture-evidence")!.textContent = JSON.stringify(
     {
@@ -313,16 +295,11 @@ function evidence() {
       rpc,
       historyLength: window.history.length,
       privacy: Object.values(ids).some((id) =>
-        JSON.stringify({
-          envelopes,
-          chatPropagation,
-          baggage: Sentry.getTraceData(),
-        }).includes(id)
+        JSON.stringify(browserLogs).includes(id)
       )
         ? "FAIL"
         : "PASS",
-      envelopes: envelopes.length,
-      exportedSpanNames: exportedSpanNames(),
+      blockedRequests,
     },
     null,
     2
@@ -401,22 +378,11 @@ async function runChecks() {
     "Off-page chat was not requested directly"
   )
   pass("Deep link loads a chat outside the sidebar page")
-  Sentry.captureException(new Error("synthetic-chat-error"))
-  chatPropagation.push(Sentry.getTraceData())
-  await until(
-    () => exportedSpanNames().includes("/chats/:chatId"),
-    "No normalized chat span was exported"
-  )
-  await telemetry.flush(1000)
   assert(
-    !Object.values(ids).some((id) =>
-      JSON.stringify({ envelopes, chatPropagation }).includes(id)
-    ),
-    "Chat UUID escaped while its route was active"
+    !Object.values(ids).some((id) => JSON.stringify(browserLogs).includes(id)),
+    "Chat UUID escaped into browser logs"
   )
-  pass(
-    "Active chat exports a /chats/:chatId span and keeps UUIDs out of error envelopes and baggage"
-  )
+  pass("Browser logs exclude chat UUIDs while a chat route is active")
   await open(ids.a)
   const count = window.history.length
   button("Fixture chat a").click()
@@ -623,18 +589,17 @@ async function runChecks() {
     "Unknown route did not normalize"
   )
   pass("Malformed and unknown routes replace with root")
-  Sentry.captureException(new Error("synthetic-error"))
-  await telemetry.flush(1000)
-  const encoded = JSON.stringify({
-    envelopes,
-    chatPropagation,
-    baggage: Sentry.getTraceData(),
-  })
   assert(
-    !Object.values(ids).some((id) => encoded.includes(id)),
-    "Chat ID escaped into telemetry"
+    blockedRequests.length === 0,
+    `Unexpected browser request: ${blockedRequests.join(", ")}`
   )
-  pass("Exported Sentry envelopes and propagation data contain no chat UUID")
+  assert(
+    !Object.values(ids).some((id) => JSON.stringify(browserLogs).includes(id)),
+    "Chat UUID escaped into browser logs"
+  )
+  pass(
+    "Browser logs exclude chat UUIDs and the fixture sends no external requests"
+  )
   checks.push("ALL ROUTING CHECKS PASSED")
   evidence()
 }
