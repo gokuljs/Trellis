@@ -310,6 +310,7 @@ class SupabaseRepository:
         base_url = project_base_url(settings)
         if base_url is None:
             raise RuntimeError("Supabase project URL or publishable key is not configured")
+        self._durable_execution = settings.durable_execution_enabled
         self._base_url = base_url
         self._publishable_key = cast(str, settings.supabase_publishable_key)
         self._user_id = user_id
@@ -1489,7 +1490,7 @@ class SupabaseRepository:
             await self._rpc(
                 "record_tool_approval_decision",
                 {"run_id": run_id, "tool_call_id": tool_call_id, "decision": decision.value},
-                capability=self._run_capability(run_id),
+                capability=None if self._durable_execution else self._run_capability(run_id),
             )
         )
         event = result.get("event")
@@ -1597,7 +1598,7 @@ class SupabaseRepository:
             await self._rpc(
                 "request_run_cancellation",
                 {"run_id": run_id},
-                capability=self._run_capability(run_id),
+                capability=None if self._durable_execution else self._run_capability(run_id),
             )
         )
         event = result.get("event")
