@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.domain.capabilities import RuntimeCapability
@@ -26,3 +26,16 @@ class Settings(BaseSettings):
     enabled_capabilities: frozenset[RuntimeCapability] = frozenset()
     openai_api_key: SecretStr | None = Field(default=None, repr=False)
     anthropic_api_key: SecretStr | None = Field(default=None, repr=False)
+
+    durable_execution_enabled: bool = False
+    durable_acceptance_enabled: bool = False
+    worker_database_url: SecretStr | None = Field(default=None, repr=False)
+    worker_capacity: int = Field(default=4, ge=1, le=64)
+
+    @model_validator(mode="after")
+    def validate_durable_mode(self) -> Settings:
+        if self.durable_acceptance_enabled and not self.durable_execution_enabled:
+            raise ValueError("Durable acceptance requires durable execution mode")
+        if self.durable_execution_enabled and self.enabled_capabilities:
+            raise ValueError("Durable execution supports chat only")
+        return self

@@ -1,10 +1,12 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import ChatServiceDep, RunServiceDep, SessionServiceDep
+from app.api.errors import ApiErrorResponse
+from app.application.errors import ApplicationError
 from app.domain.models import Message, Session
 
 
@@ -75,7 +77,7 @@ class RunSummaryResponse(BaseModel):
     max_tool_calls: int
     max_total_tokens: int
     max_cost_usd: float
-    deadline_at: str
+    deadline_at: str | None
     last_sequence: int
     created_at: str
     started_at: str | None
@@ -269,13 +271,23 @@ async def list_session_run_events(
     )
 
 
-@router.post("/{session_id}/turns", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/{session_id}/turns",
+    status_code=status.HTTP_201_CREATED,
+    responses={410: {"model": ApiErrorResponse, "description": "Use durable run.start"}},
+)
 async def complete_turn(
     session_id: str,
     payload: TurnRequest,
+    request: Request,
     chat_service: ChatServiceDep,
     session_service: SessionServiceDep,
 ) -> TurnResponse:
+    if request.app.state.settings.durable_execution_enabled:
+        raise ApplicationError(
+            "synchronous_execution_retired",
+            "Submit chat requests with run.start on /api/runtime and reconnect using the run ID.",
+        )
     result = await chat_service.complete_turn(session_id, str(payload.turn_id), payload.content)
     return TurnResponse(
         session=await serialize_session(result.session, session_service),

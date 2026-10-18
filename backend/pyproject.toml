@@ -8,6 +8,7 @@ dependencies = [
     "anyio>=4.14.2,<5",
     "fastapi[standard-no-fastapi-cloud-cli]>=0.141.1,<1",
     "httpx>=0.28.1,<1",
+    "psycopg[binary,pool]==3.3.6",
     "pydantic-settings>=2.15,<3",
     "python-dotenv>=1.2,<2",
 ]

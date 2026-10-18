@@ -1,9 +1,12 @@
 UV ?= uv
 
-.PHONY: dev format format-check lint typecheck test check
+.PHONY: dev worker format format-check lint typecheck test check
 
 dev:
 	$(UV) run --locked fastapi dev
+
+worker:
+	$(UV) run --locked python -m app.worker
 
 format:
 	$(UV) run --locked ruff format .

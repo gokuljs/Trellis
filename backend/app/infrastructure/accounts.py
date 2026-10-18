@@ -23,6 +23,7 @@ from app.application.onboarding import OnboardingService
 from app.application.ports import (
     ChatRepository,
     ContextCheckpointRepository,
+    DurableAcceptanceRepository,
     OnboardingRepository,
     ProviderAdapter,
     RunLeasePort,
@@ -51,6 +52,7 @@ from app.infrastructure.workspace_bindings import LocalWorkspaceBindings
 class AccountRepository(
     ChatRepository,
     ContextCheckpointRepository,
+    DurableAcceptanceRepository,
     OnboardingRepository,
     RunRepository,
     RunLeasePort,
@@ -212,17 +214,19 @@ class AccountRegistry:
                 if existing is not None:
                     return existing
 
-                account_dir = await asyncio.to_thread(
-                    _prepare_account_directory, self._settings.data_dir, user_id
-                )
-                lock_task = asyncio.create_task(
-                    asyncio.to_thread(_acquire_account_lock, account_dir)
-                )
-                try:
-                    lock_descriptor = await asyncio.shield(lock_task)
-                except BaseException:
-                    lock_task.add_done_callback(_release_unclaimed_lock)
-                    raise
+                lock_descriptor: int | None = None
+                if not self._settings.durable_execution_enabled:
+                    account_dir = await asyncio.to_thread(
+                        _prepare_account_directory, self._settings.data_dir, user_id
+                    )
+                    lock_task = asyncio.create_task(
+                        asyncio.to_thread(_acquire_account_lock, account_dir)
+                    )
+                    try:
+                        lock_descriptor = await asyncio.shield(lock_task)
+                    except BaseException:
+                        lock_task.add_done_callback(_release_unclaimed_lock)
+                        raise
                 try:
                     if self._cloud_client is None:
                         raise RuntimeError("A verified cloud client is required")
@@ -267,7 +271,12 @@ class AccountRegistry:
                         if self._capabilities.allows("local_read")
                         else None,
                         workspace_bindings=workspace_bindings,
-                        lease_repository=database,
+                        lease_repository=database
+                        if not self._settings.durable_execution_enabled
+                        else None,
+                        acceptance_repository=database,
+                        durable_execution=self._settings.durable_execution_enabled,
+                        acceptance_enabled=self._settings.durable_acceptance_enabled,
                     )
                     try:
                         await run_service.resume_decided_approvals()
@@ -308,10 +317,12 @@ class AccountRegistry:
                         await run_service.close()
                         raise
                 except BaseException:
-                    os.close(lock_descriptor)
+                    if lock_descriptor is not None:
+                        os.close(lock_descriptor)
                     raise
                 self._contexts[user_id] = context
-                self._locks[user_id] = lock_descriptor
+                if lock_descriptor is not None:
+                    self._locks[user_id] = lock_descriptor
                 if self._closed:
                     raise RuntimeError("Account registry is closed")
                 return context

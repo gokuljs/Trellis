@@ -526,8 +526,13 @@ async def runtime_websocket(websocket: WebSocket) -> None:
         )
         active_subscriptions[run_id] = (subscription, task)
 
-    async def dispatch(method: str, params: dict[str, object]) -> dict[str, object]:
+    async def dispatch(method: str, params: dict[str, object]) -> dict[str, object] | None:
         result: dict[str, object]
+        if method == "run.lookup":
+            session_id = _required_string(params, "sessionId", maximum=200)
+            client_request_id = _required_string(params, "clientRequestId", maximum=200)
+            run = await service.lookup_run(session_id, client_request_id)
+            return _run_result(run) if run is not None else None
         if method == "run.start":
             session_id = _required_string(params, "sessionId", maximum=200)
             client_request_id = _required_string(params, "clientRequestId", maximum=200)

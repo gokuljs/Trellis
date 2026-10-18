@@ -14,6 +14,12 @@ The queued run has no execution deadline or execution lease.
 Request identity is unique by owner, chat, and `clientRequestId`. The fingerprint
 contains trimmed submitted content, `turnId` defaulted to `clientRequestId`, and
 explicit `modelId` and `budgetPreset` values with their presence preserved.
+Trimming matches Python 3.14 `str.strip()` independently of the PostgreSQL locale.
+The shared SQL helper trims only the ends, using U+0009 through U+000D,
+U+001C through U+0020, U+0085, U+00A0, U+1680, U+2000 through U+200A,
+U+2028, U+2029, U+202F, U+205F, and U+3000. Interior whitespace, U+200B, and
+U+FEFF remain unchanged. Fingerprinting and persisted message content use the
+same trim rule.
 Absent and explicit values differ even when they resolve to the same default.
 Store a digest of this canonical input, never the unredacted input. Persist the
 redacted content as the message. Look up the request before reading mutable model

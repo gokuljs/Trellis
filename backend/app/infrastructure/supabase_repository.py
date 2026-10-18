@@ -310,6 +310,7 @@ class SupabaseRepository:
         base_url = project_base_url(settings)
         if base_url is None:
             raise RuntimeError("Supabase project URL or publishable key is not configured")
+        self._durable_execution = settings.durable_execution_enabled
         self._base_url = base_url
         self._publishable_key = cast(str, settings.supabase_publishable_key)
         self._user_id = user_id
@@ -880,7 +881,7 @@ class SupabaseRepository:
             budget_preset=_text(row, "budget_preset"),
             max_total_tokens=_integer(row, "max_total_tokens"),
             max_cost_usd=_number(row, "max_cost_usd"),
-            deadline_at=_text(row, "deadline_at"),
+            deadline_at=_nullable_text(row, "deadline_at"),
             cancel_requested_at=_nullable_text(row, "cancel_requested_at"),
             lease_expires_at=_nullable_text(row, "lease_expires_at"),
             recovery_count=_integer(row, "recovery_count"),
@@ -1168,6 +1169,56 @@ class SupabaseRepository:
         self._capabilities.pop(run_id, None)
         self._lease_expires.pop(run_id, None)
 
+    async def lookup_run(self, session_id: str, client_request_id: str) -> RunSnapshot | None:
+        result = await self._request(
+            "POST",
+            "rpc/lookup_run",
+            payload={"p_session_id": session_id, "p_client_request_id": client_request_id},
+        )
+        return self._run(_object(result)) if result is not None else None
+
+    async def match_run_request(
+        self, session_id: str, client_request_id: str, submission: dict[str, object]
+    ) -> RunSnapshot | None:
+        result = await self._request(
+            "POST",
+            "rpc/match_run_request",
+            payload={
+                "p_payload": {
+                    "session_id": session_id,
+                    "client_request_id": client_request_id,
+                    "submission": submission,
+                }
+            },
+        )
+        return self._run(_object(result)) if result is not None else None
+
+    async def accept_run(
+        self,
+        session_id: str,
+        client_request_id: str,
+        content: str,
+        model: ModelDescriptor,
+        submission: dict[str, object],
+        *,
+        budget_preset: BudgetPreset = "conservative",
+    ) -> RunSnapshot:
+        result = await self._request(
+            "POST",
+            "rpc/accept_run",
+            payload={
+                "p_payload": {
+                    "session_id": session_id,
+                    "client_request_id": client_request_id,
+                    "content": content,
+                    "model_id": model.id,
+                    "budget_preset": budget_preset,
+                    "submission": submission,
+                }
+            },
+        )
+        return self._run(_object(result))
+
     async def create_run(
         self,
         session_id: str,
@@ -1439,7 +1490,7 @@ class SupabaseRepository:
             await self._rpc(
                 "record_tool_approval_decision",
                 {"run_id": run_id, "tool_call_id": tool_call_id, "decision": decision.value},
-                capability=self._run_capability(run_id),
+                capability=None if self._durable_execution else self._run_capability(run_id),
             )
         )
         event = result.get("event")
@@ -1547,7 +1598,7 @@ class SupabaseRepository:
             await self._rpc(
                 "request_run_cancellation",
                 {"run_id": run_id},
-                capability=self._run_capability(run_id),
+                capability=None if self._durable_execution else self._run_capability(run_id),
             )
         )
         event = result.get("event")

@@ -1,7 +1,15 @@
 -- Local PostgreSQL fixture only. Supabase supplies these roles, auth schema and
 -- auth.uid() in hosted projects. Never apply this file to Supabase.
-CREATE ROLE anon NOLOGIN;
-CREATE ROLE authenticated NOLOGIN;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+        CREATE ROLE anon NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        CREATE ROLE authenticated NOLOGIN;
+    END IF;
+END;
+$$;
 CREATE SCHEMA auth;
 CREATE TABLE auth.users (
     id uuid PRIMARY KEY,

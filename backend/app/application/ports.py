@@ -262,6 +262,25 @@ class RunRepository(Protocol):
     async def list_tool_calls(self, run_id: str) -> list[ToolCallRecord]: ...
 
 
+class DurableAcceptanceRepository(Protocol):
+    async def lookup_run(self, session_id: str, client_request_id: str) -> RunSnapshot | None: ...
+
+    async def match_run_request(
+        self, session_id: str, client_request_id: str, submission: dict[str, object]
+    ) -> RunSnapshot | None: ...
+
+    async def accept_run(
+        self,
+        session_id: str,
+        client_request_id: str,
+        content: str,
+        model: ModelDescriptor,
+        submission: dict[str, object],
+        *,
+        budget_preset: BudgetPreset = "conservative",
+    ) -> RunSnapshot: ...
+
+
 class ChatRepository(ProfileRepository, SettingsRepository, SessionRepository, Protocol):
     async def get_turn_messages(self, session_id: str, turn_id: str) -> list[Message]: ...
 
