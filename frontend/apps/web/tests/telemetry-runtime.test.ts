@@ -389,3 +389,33 @@ test("reconciliation policy accepts completed and expected terminal outcomes and
   if (ownsRun(owner, current)) reportFailure(new Error(secret), "run.restore")
   assert.equal((await recorded()).events.length, 0)
 })
+
+test("leaving a running chat closes its browser subscription without cancelling the run", async () => {
+  setup()
+  const connection = new AbortController()
+  const events: string[] = []
+  const followed = streamRun(
+    {
+      sessionId: secret,
+      turnId: secret,
+      clientRequestId: secret,
+      content: secret,
+    },
+    {
+      signal: connection.signal,
+      onEvent: (event) => events.push(event.eventType),
+    }
+  )
+  const socket = await authenticate()
+  acknowledge(socket, { runId: secret })
+  await until(() => socket.sent.length === 2)
+  connection.abort()
+  await assert.rejects(followed)
+  complete(socket)
+  assert.equal(socket.closed, true)
+  assert.deepEqual(
+    socket.sent.map((frame) => frame.method),
+    ["auth.authenticate", "run.start"]
+  )
+  assert.deepEqual(events, [])
+})
