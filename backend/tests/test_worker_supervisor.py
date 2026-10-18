@@ -25,6 +25,8 @@ class Queue:
         self.fail_poll = False
         self.fail_recover = False
         self.fail_release = False
+        self.cancel_on_begin = False
+        self.startup_finalized = False
         self.attempts: list[tuple[str, str]] = []
         self.stop_after_claim: asyncio.Event | None = None
         self._claim: ExecutionClaim | None = None
@@ -56,7 +58,10 @@ class Queue:
         self.context = replace(
             self.context, run=replace(self.context.run, status=RunStatus.RUNNING)
         )
-        return self.context.run
+        running = self.context.run
+        if self.cancel_on_begin:
+            self.context = replace(self.context, run=replace(running, status=RunStatus.CANCELLING))
+        return running
 
     async def renew(self, claim):
         self.renewed += 1
@@ -77,7 +82,16 @@ class Queue:
         return 0
 
     async def get_execution_context(self):
+        if self.cancel_on_begin:
+            raise PermissionError("Context revoked by cancellation")
         return self.context
+
+    async def transition_run_record(self, run_id, status, event_type, data, **kwargs):
+        assert run_id == self.context.run.id
+        assert status is RunStatus.CANCELLED
+        assert kwargs["stop_reason"] == "user_cancelled"
+        self.startup_finalized = True
+        self.context = replace(self.context, run=replace(self.context.run, status=status))
 
     async def get_run(self, run_id):
         if self.fail_poll:
@@ -221,3 +235,25 @@ def test_ambiguous_begin_never_dispatches_provider(tmp_path: Path) -> None:
 def test_policy_rejects_unsafe_bounds(kwargs: dict[str, int]) -> None:
     with pytest.raises(ValueError):
         WorkerPolicy(**kwargs)
+
+
+@pytest.mark.parametrize("read_denied", [False, True])
+def test_cancel_during_startup_finishes_only_with_live_authority(
+    tmp_path: Path, read_denied: bool
+) -> None:
+    async def scenario():
+        queue, execution, supervisor = await setup(tmp_path)
+        queue.cancel_on_begin = True
+        queue.fail_poll = read_denied
+        claim = await queue.claim_job("worker", "attempt", "capability")
+        if read_denied:
+            with pytest.raises(OSError):
+                await supervisor._execute_claim(claim)
+            assert not queue.startup_finalized
+        else:
+            await supervisor._execute_claim(claim)
+            assert queue.startup_finalized
+            assert queue.context.run.status is RunStatus.CANCELLED
+        assert not execution.started.is_set()
+
+    asyncio.run(scenario())

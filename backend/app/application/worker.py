@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from app.application.worker_ports import WorkerExecutionRepository, WorkerQueuePort
 from app.domain.jobs import ExecutionClaim, RunExecutionContext
-from app.domain.runtime import RunStatus, is_terminal_run_status
+from app.domain.runtime import RunEventType, RunStatus, is_terminal_run_status
 
 logger = logging.getLogger(__name__)
 
@@ -137,8 +137,22 @@ class WorkerSupervisor:
         if running.status is not RunStatus.RUNNING:
             return
         repository = self._repository_factory(claim)
-        async with asyncio.timeout(self._policy.operation_seconds):
-            context = await repository.get_execution_context()
+        try:
+            async with asyncio.timeout(self._policy.operation_seconds):
+                context = await repository.get_execution_context()
+        except Exception:
+            async with asyncio.timeout(self._policy.operation_seconds):
+                current = await repository.get_run(claim.run_id)
+                if current is not None and current.status is RunStatus.CANCELLING:
+                    await repository.transition_run_record(
+                        claim.run_id,
+                        RunStatus.CANCELLED,
+                        RunEventType.CANCELLED,
+                        {"code": "user_cancelled", "message": "The run was cancelled."},
+                        stop_reason="user_cancelled",
+                    )
+                    return
+            raise
         context = replace(context, run=running)
         executor = self._executor_factory(repository)
         execution = asyncio.create_task(executor.execute(context))
