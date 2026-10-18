@@ -26,10 +26,6 @@ Requires Node.js 22.12 or newer and Bun 1.2.4.
 See [Stage 2 setup and guarantees](../docs/stage-2.md) for model discovery,
 streaming recovery, context compaction, and history limits.
 
-See [Configure and verify frontend Sentry](../docs/frontend-sentry.md) for project
-setup, privacy controls, source-map uploads, and verification. Reporting requires
-a configured DSN. Local development also requires explicit opt-in.
-
 Verification:
 
 ```bash
