@@ -24,6 +24,20 @@ Supabase's API settings. The service is available at `http://127.0.0.1:8000`.
 Interactive API docs are served at `/docs`, with the OpenAPI document at
 `/openapi.json`.
 
+## Durable execution
+
+An independent worker can execute saved chat jobs after the browser disconnects
+or the API restarts. Enable durable execution only after applying the job and
+worker authority migrations and draining legacy execution. New acceptance has a
+separate activation flag. Start the worker with `make worker` and a restricted
+`trellis_runtime_worker` PostgreSQL URL. Keep that URL on the worker service.
+The API continues using user authorization through PostgREST.
+
+See [durable workers](../docs/durable-workers.md) for configuration, Render setup,
+shutdown behavior, the cutover sequence, and repeatable process/browser proof.
+Queued work survives an API restart. An expired running attempt is interrupted;
+running-step continuation is not implemented.
+
 ## Runtime capabilities
 
 The backend starts in chat-only mode with `TRELLIS_ENABLED_CAPABILITIES=[]`.
@@ -54,8 +68,9 @@ accepts only a model selection. Encrypted user-owned credentials are deferred.
 
 Old account `.env` and SQLite files are left untouched and are no longer read
 for credentials or imported. Remove old key files yourself when no longer
-needed. `TRELLIS_DATA_DIR` controls account lock files under
+needed. In explicit legacy mode, `TRELLIS_DATA_DIR` controls account lock files under
 `~/.trellis/accounts/<user-id>/`; chats and settings are stored in Supabase.
+Durable mode does not create account directories or take local ownership locks.
 
 ## Session and service errors
 

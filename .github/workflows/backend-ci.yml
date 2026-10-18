@@ -115,6 +115,13 @@ jobs:
           TRELLIS_WORKER_TEST_DSN: postgresql://trellis_runtime_worker:postgres@localhost:5432/postgres
         run: uv run --locked pytest tests/test_worker_database.py --no-cov
 
+      - name: Prove independent API and worker processes
+        working-directory: backend
+        env:
+          TRELLIS_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+          TRELLIS_WORKER_DATABASE_URL: postgresql://trellis_runtime_worker:postgres@localhost:5432/postgres
+        run: uv run --locked pytest tests/test_worker_processes.py --no-cov -s
+
   quality:
     name: Backend quality
     runs-on: ubuntu-latest

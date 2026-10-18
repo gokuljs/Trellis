@@ -59,6 +59,11 @@ def test_executor_uses_only_assigned_context_and_preserves_streaming(tmp_path: P
         context = RunExecutionContext("assigned-owner", run, session, model)
         with pytest.raises(ValueError, match="does not match"):
             await executor.execute(replace(context, session=replace(session, id="foreign")))
+        with pytest.raises(ValueError, match="does not match"):
+            await executor.execute(
+                replace(context, model=replace(model, upstream_model_id="foreign"))
+            )
+        assert provider.request is None
         await executor.execute(context)
         saved = await repository.get_run(run.id)
         assert saved is not None and saved.status is RunStatus.COMPLETED

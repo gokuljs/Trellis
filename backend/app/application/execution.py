@@ -194,7 +194,17 @@ class RunExecutor:
     async def execute(self, context: RunExecutionContext) -> None:
         if context.run.status is not RunStatus.RUNNING or context.run.deadline_at is None:
             raise ValueError("Execution must begin before provider interaction")
-        if context.run.session_id != context.session.id or context.run.model_id != context.model.id:
+        if context.run.session_id != context.session.id or (
+            context.run.model_id,
+            context.run.provider_id,
+            context.run.adapter_kind,
+            context.run.upstream_model_id,
+        ) != (
+            context.model.id,
+            context.model.provider_id,
+            context.model.adapter_kind,
+            context.model.upstream_model_id,
+        ):
             raise ValueError("Execution context does not match the assigned run")
         await self._execute_context(context)
 
