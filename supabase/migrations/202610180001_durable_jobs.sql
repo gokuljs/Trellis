@@ -157,7 +157,8 @@ DECLARE
     v_cost numeric; v_seconds integer;
 BEGIN
     -- One account lock serializes backlog admission across different chats.
-    PERFORM 1 FROM trellis.profiles WHERE id = v_user FOR UPDATE;
+    -- Completion's message foreign key must still be able to take KEY SHARE.
+    PERFORM 1 FROM trellis.profiles WHERE id = v_user FOR NO KEY UPDATE;
     SELECT * INTO v_chat FROM trellis.chats
         WHERE id = (p_payload->>'session_id')::uuid AND user_id = v_user FOR UPDATE;
     IF NOT FOUND THEN RAISE EXCEPTION 'session not found' USING ERRCODE = '22023'; END IF;
