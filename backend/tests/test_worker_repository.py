@@ -150,3 +150,17 @@ def test_private_transport_has_no_account_storage_boundary():
             transport._run_capability(str(uuid4()))
 
     asyncio.run(exercise())
+
+
+def test_database_operation_budget_includes_retry_backoff(monkeypatch):
+    monkeypatch.setattr(module, "_DATABASE_OPERATION_TIMEOUT", 0.01)
+
+    async def exercise():
+        pool = FakePool([psycopg.OperationalError("lost response"), ({"sequence": 3},)])
+        transport = _ScopedTransport(queue(pool), claim())
+        with pytest.raises(ApplicationError) as caught:
+            await transport._rpc("append_run_event", {"data": {"text": "hello"}})
+        assert caught.value.code == "database_unavailable"
+        assert len(pool.calls) == 1
+
+    asyncio.run(exercise())

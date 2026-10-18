@@ -45,6 +45,8 @@ from app.domain.runtime import (
 )
 from app.infrastructure.supabase_repository import SupabaseRepository, _object, _text
 
+_DATABASE_OPERATION_TIMEOUT = 5.0
+
 _READ_TABLES = frozenset(
     {
         "runs",
@@ -112,39 +114,40 @@ class PostgresWorkerQueue:
         await self._pool.close(timeout=5)
 
     async def _call(self, statement: LiteralString, parameters: tuple[object, ...]) -> object:
-        for attempt in range(2):
-            try:
-                async with asyncio.timeout(5), self._pool.connection(timeout=5) as connection:
-                    row = await (await connection.execute(statement, parameters)).fetchone()
-                    if row is None:
-                        raise RuntimeError("worker function returned no result")
-                    return row[0]
-            except psycopg.errors.InsufficientPrivilege:
-                raise ApplicationError(
-                    "run_not_owned", "Execution ownership expired or was revoked."
-                ) from None
-            except psycopg.errors.InvalidParameterValue as error:
-                code = (
-                    "context_checkpoint_conflict"
-                    if "checkpoint revision conflict" in str(error)
-                    else "event_storage_limit"
-                    if "worker_operation_storage_limit" in str(error)
-                    else "worker_operation_invalid"
-                )
-                raise ApplicationError(
-                    code, "The execution operation could not be saved."
-                ) from None
-            except psycopg.OperationalError, psycopg.InterfaceError, TimeoutError:
-                if attempt == 0:
-                    await asyncio.sleep(0.05)
-                    continue
-                raise ApplicationError(
-                    "database_unavailable", "The worker database is temporarily unavailable."
-                ) from None
-            except psycopg.Error:
-                raise ApplicationError(
-                    "worker_operation_invalid", "The execution operation could not be saved."
-                ) from None
+        try:
+            async with asyncio.timeout(_DATABASE_OPERATION_TIMEOUT):
+                for attempt in range(2):
+                    try:
+                        async with self._pool.connection(timeout=5) as connection:
+                            row = await (await connection.execute(statement, parameters)).fetchone()
+                            if row is None:
+                                raise RuntimeError("worker function returned no result")
+                            return row[0]
+                    except psycopg.OperationalError, psycopg.InterfaceError, TimeoutError:
+                        if attempt:
+                            raise
+                        await asyncio.sleep(0.05)
+        except psycopg.errors.InsufficientPrivilege:
+            raise ApplicationError(
+                "run_not_owned", "Execution ownership expired or was revoked."
+            ) from None
+        except psycopg.errors.InvalidParameterValue as error:
+            code = (
+                "context_checkpoint_conflict"
+                if "checkpoint revision conflict" in str(error)
+                else "event_storage_limit"
+                if "worker_operation_storage_limit" in str(error)
+                else "worker_operation_invalid"
+            )
+            raise ApplicationError(code, "The execution operation could not be saved.") from None
+        except psycopg.OperationalError, psycopg.InterfaceError, TimeoutError:
+            raise ApplicationError(
+                "database_unavailable", "The worker database is temporarily unavailable."
+            ) from None
+        except psycopg.Error:
+            raise ApplicationError(
+                "worker_operation_invalid", "The execution operation could not be saved."
+            ) from None
 
     async def claim(
         self, worker_id: str, attempt_id: str, capability: str
