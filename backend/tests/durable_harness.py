@@ -220,6 +220,31 @@ async def seed() -> None:
             )
 
 
+async def expire(run_id: str) -> None:
+    run_uuid = UUID(run_id)
+    async with await psycopg.AsyncConnection.connect(os.environ["TRELLIS_TEST_DATABASE_URL"]) as db:
+        cursor = await db.execute(
+            "UPDATE trellis.runs SET lease_expires_at=now()-interval '1 second' "
+            "WHERE id=%s AND execution_mode='durable' "
+            "AND status IN ('queued','running','cancelling') "
+            "RETURNING id",
+            (run_uuid,),
+        )
+        if await cursor.fetchone() is None:
+            raise ValueError("Only active durable fixture runs may expire")
+        await db.execute(
+            "UPDATE trellis_private.jobs SET lease_expires_at=now()-interval '1 second' "
+            "WHERE run_id=%s AND status IN ('claimed','running')",
+            (run_uuid,),
+        )
+        await db.execute(
+            "UPDATE trellis_private.execution_attempts "
+            "SET lease_expires_at=now()-interval '1 second' "
+            "WHERE run_id=%s AND status IN ('claimed','running')",
+            (run_uuid,),
+        )
+
+
 async def worker() -> None:
     await run_worker(harness_settings(), providers={"openai": DeterministicProvider()})
 
@@ -240,7 +265,9 @@ async def hold_claim(*, begin: bool) -> None:
 
 if __name__ == "__main__":
     mode = sys.argv[1]
-    if mode in {"hold-claim", "hold-started"}:
+    if mode == "expire":
+        asyncio.run(expire(sys.argv[2]))
+    elif mode in {"hold-claim", "hold-started"}:
         asyncio.run(hold_claim(begin=mode == "hold-started"))
     else:
         asyncio.run({"bootstrap": bootstrap, "seed": seed, "worker": worker}[mode]())

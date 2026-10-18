@@ -13,7 +13,7 @@ import pytest
 from websockets.asyncio.client import connect
 from websockets.typing import Origin
 
-from tests.durable_harness import seed
+from tests.durable_harness import expire, seed
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("TRELLIS_TEST_DATABASE_URL"),
@@ -230,17 +230,7 @@ def test_independent_processes_preserve_accepted_work_and_fence_crashed_attempts
                     assert claim["run_id"] == recovery_run
                 holder.kill()
                 await holder.wait()
-                for table in (
-                    "trellis.runs",
-                    "trellis_private.jobs",
-                    "trellis_private.execution_attempts",
-                ):
-                    key = "id" if table == "trellis.runs" else "run_id"
-                    await query(
-                        f"UPDATE {table} SET lease_expires_at=now()-interval '1 second' "
-                        f"WHERE {key}=%s",
-                        (recovery_run,),
-                    )
+                await expire(recovery_run)
                 worker = await launch("-m", "tests.durable_harness", "worker")
                 children.append(worker)
                 await await_status(recovery_run, "interrupted" if begun else "completed")

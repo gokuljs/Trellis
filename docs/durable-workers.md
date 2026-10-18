@@ -155,3 +155,11 @@ WebSocket events, outlives a browser token, denies another user's controls,
 cancels a silent provider, reclaims an unstarted crash, and preserves partial
 output without replaying a crashed running step. Backend CI runs this proof
 against its PostgreSQL service.
+
+For a browser crash scenario, stop the assigned test worker after partial output,
+expire its lease, then start another test worker to reconcile the interruption.
+The helper accepts only active durable runs and updates all lease records together.
+
+```bash
+uv run --locked python -m tests.durable_harness expire RUN_UUID
+```
