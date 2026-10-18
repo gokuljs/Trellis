@@ -10,6 +10,7 @@ import {
   ServiceReadinessError,
   waitUntilServiceReady,
 } from "@/lib/service-readiness"
+import { startRuntimeRequestSpan } from "@/lib/telemetry"
 
 export type RuntimeRunEvent = {
   runId: string
@@ -460,6 +461,9 @@ function followRun(
         )
         return
       }
+      const endSpan = startRuntimeRequestSpan(
+        runId ? "run.subscribe" : "run.start"
+      )
       void sendRpc(activeSocket, method, params)
         .then((response) => {
           if (settled || socket !== activeSocket) return
@@ -480,13 +484,15 @@ function followRun(
               "The Trellis service resumed a different run."
             )
           }
+          const runInfo = parseRunInfo(result)
+          endSpan("ok")
           if (!runId) runId = responseRunId
           if (!runIdNotified) {
             runIdNotified = true
             options.onRunId?.(runId)
           }
           if (settled || !stillCurrent()) return
-          options.onRunInfo?.(parseRunInfo(result))
+          options.onRunInfo?.(runInfo)
           if (settled || !stillCurrent()) return
           subscriptionReady = true
           flushBufferedEvents()
@@ -496,6 +502,13 @@ function followRun(
           }
         })
         .catch((error: unknown) => {
+          endSpan(
+            error instanceof RuntimeError && error.code === "runtime_timeout"
+              ? "timeout"
+              : error instanceof RuntimeError && error.status === 401
+                ? "cancelled"
+                : "error"
+          )
           if (settled || socket !== activeSocket) return
           subscriptionRequestPending = false
           const runtimeError =
@@ -507,6 +520,7 @@ function followRun(
                 )
           failRequest(runtimeError)
         })
+        .finally(() => endSpan("cancelled"))
     }
 
     const scheduleReconnect = () => {
@@ -747,12 +761,13 @@ export function resumeRun(
   return followRun(null, runId, options, afterSequence)
 }
 
-async function requestRunAction(
-  method: string,
+async function requestRunAction<TResult>(
+  method: "run.cancel" | "run.respond",
   params: Record<string, unknown>,
   requestId: string,
-  failureMessage: string
-): Promise<Record<string, unknown>> {
+  failureMessage: string,
+  parseResult: (result: Record<string, unknown>) => TResult
+): Promise<TResult> {
   const auth = getAuthController()
   const initialUser = auth.getSnapshot().user?.id
   const initialEpoch = auth.getSessionEpoch()
@@ -798,9 +813,19 @@ async function requestRunAction(
     let authenticated = false
     let socketCredential: AuthCredential | null = null
     let unsubscribeAuth: (() => void) | null = null
-    const finish = (result?: Record<string, unknown>, error?: RuntimeError) => {
+    let endSpan: ReturnType<typeof startRuntimeRequestSpan> | undefined
+    const finish = (result?: TResult, error?: RuntimeError) => {
       if (settled) return
       settled = true
+      endSpan?.(
+        error?.code === "runtime_timeout"
+          ? "timeout"
+          : error?.status === 401
+            ? "cancelled"
+            : error || !result
+              ? "error"
+              : "ok"
+      )
       unsubscribeAuth?.()
       unsubscribeAuth = null
       clearTimeout(timeout)
@@ -909,6 +934,7 @@ async function requestRunAction(
           return
         }
         authenticated = true
+        endSpan = startRuntimeRequestSpan(method)
         try {
           socket.send(
             JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params })
@@ -936,7 +962,24 @@ async function requestRunAction(
         )
         return
       }
-      finish(asRecord(envelope.result) ?? undefined)
+      const result = asRecord(envelope.result)
+      if (!result) {
+        finish()
+        return
+      }
+      try {
+        finish(parseResult(result))
+      } catch (error) {
+        finish(
+          undefined,
+          error instanceof RuntimeError
+            ? error
+            : new RuntimeError(
+                "runtime_protocol_error",
+                "The Trellis service returned an invalid run."
+              )
+        )
+      }
     }
     socket.onerror = () => {
       finish(
@@ -970,19 +1013,21 @@ export async function cancelRun(
   runId: string,
   afterSequence = 0
 ): Promise<{ runId: string; status: string }> {
-  const result = await requestRunAction(
+  return requestRunAction(
     "run.cancel",
     { runId, afterSequence },
     "runtime-cancel",
-    "Trellis could not cancel that run."
+    "Trellis could not cancel that run.",
+    (result) => {
+      if (result.runId !== runId || typeof result.status !== "string") {
+        throw new RuntimeError(
+          "runtime_protocol_error",
+          "The Trellis service returned an invalid run."
+        )
+      }
+      return { runId: result.runId, status: result.status }
+    }
   )
-  if (typeof result.runId !== "string" || typeof result.status !== "string") {
-    throw new RuntimeError(
-      "runtime_protocol_error",
-      "The Trellis service returned an invalid run."
-    )
-  }
-  return { runId: result.runId, status: result.status }
 }
 
 export async function respondToToolApproval(
@@ -995,21 +1040,23 @@ export async function respondToToolApproval(
   toolCallId: string
   decision: ToolApprovalDecision
 }> {
-  const result = await requestRunAction(
+  return requestRunAction(
     "run.respond",
     { runId, toolCallId, decision, afterSequence },
     "runtime-respond",
-    "Trellis could not answer that approval request."
+    "Trellis could not answer that approval request.",
+    (result) => {
+      if (
+        result.runId !== runId ||
+        result.toolCallId !== toolCallId ||
+        result.decision !== decision
+      ) {
+        throw new RuntimeError(
+          "runtime_protocol_error",
+          "The Trellis service returned a different approval."
+        )
+      }
+      return { runId, toolCallId, decision }
+    }
   )
-  if (
-    result.runId !== runId ||
-    result.toolCallId !== toolCallId ||
-    result.decision !== decision
-  ) {
-    throw new RuntimeError(
-      "runtime_protocol_error",
-      "The Trellis service returned a different approval."
-    )
-  }
-  return { runId, toolCallId, decision }
 }

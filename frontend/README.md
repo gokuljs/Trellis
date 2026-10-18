@@ -29,6 +29,7 @@ streaming recovery, context compaction, and history limits.
 Verification:
 
 ```bash
+bun test apps/web/tests
 bun run format
 bun run format:check
 bun run lint

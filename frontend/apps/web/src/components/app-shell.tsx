@@ -61,6 +61,7 @@ import type {
 } from "@/lib/app-types"
 import {
   ownsRun,
+  isReconciledRunOutcome,
   recoveryTranscript,
   turnFailureAction,
   type TerminalRunOutcome,
@@ -99,6 +100,7 @@ import {
   retainWindowActivities,
 } from "@/lib/activity-history"
 import { useContextPreview } from "@/lib/use-context-preview"
+import { reportFailure } from "@/lib/telemetry"
 import "./workspace-bootstrap.css"
 
 type BootstrapState =
@@ -377,6 +379,7 @@ export function AppShell({
       setContextGeneration(generation)
       const isStale = () =>
         connection.signal.aborted ||
+        !bootstrapControllerRef.current ||
         isCancelled() ||
         runGenerationRef.current !== generation
       setReconnectAvailable(false)
@@ -402,8 +405,9 @@ export function AppShell({
       let latest: LatestRun | null
       try {
         latest = await api.getLatestRun(sessionId)
-      } catch {
+      } catch (discoveryError) {
         if (isStale()) return
+        reportFailure(discoveryError, "run.restore")
         waitForDiscovery(
           "Trellis could not check the previous run. Reconnect when the service returns."
         )
@@ -413,6 +417,13 @@ export function AppShell({
       if (latest && (!turn || turn.turnId === latest.turn_id)) {
         turn = retryInputForRun(sessionId, transcript, latest)
         if (!turn && activeRunStatuses.has(latest.status)) {
+          reportFailure(
+            new RuntimeError(
+              "runtime_protocol_error",
+              "The active run input is unavailable."
+            ),
+            "run.restore"
+          )
           waitForDiscovery(
             "Trellis could not load the active run's input. Reconnect to try again."
           )
@@ -535,11 +546,13 @@ export function AppShell({
                 if (lookupError === streamError) throw streamError
                 // The service may still be restarting; retry the stream.
               }
+              if (isStale()) return
               reconnectAttempts += 1
               if (reconnectAttempts >= maxRestoredReconnectAttempts) {
                 keepActive =
                   currentStatus === null || activeRunStatuses.has(currentStatus)
                 if (keepActive) {
+                  reportFailure(streamError, "run.restore")
                   setError(
                     "Connection to Trellis is unavailable. Reconnect when it returns."
                   )
@@ -563,6 +576,8 @@ export function AppShell({
         } catch (restoreError) {
           if (isStale()) return
           setError(visibleError(restoreError))
+          let finalError = restoreError
+          let reconciled = false
           try {
             const currentRun = await api.getLatestRun(sessionId)
             if (isStale()) return
@@ -578,11 +593,17 @@ export function AppShell({
               setFailedTurn(null)
               setError(null)
             }
-          } catch {
+            reconciled =
+              !keepActive && isReconciledRunOutcome(currentRun?.status)
+          } catch (reconcileError) {
+            if (isStale()) return
+            finalError = reconcileError
             keepActive = true
             setReconnectAvailable(true)
             // The run may still be active while the service is unavailable.
           }
+          if (!isStale() && !reconciled)
+            reportFailure(finalError, "run.restore")
         } finally {
           if (!isStale() && !keepActive) {
             setPending(false)
@@ -650,6 +671,7 @@ export function AppShell({
       setBootstrap({ status: "ready", progress: restoredOnboarding })
     } catch (restoreError) {
       if (current()) {
+        reportFailure(restoreError, "workspace.bootstrap")
         setBootstrap({ status: "failed", message: visibleError(restoreError) })
         controller.abort()
       }
@@ -807,10 +829,18 @@ export function AppShell({
           .then((data) => data.pages.flatMap((page) => page.items))
           .then(
             (summaries) => ({ summaries, error: null }),
-            () => ({
-              summaries: [] as RunSummary[],
-              error: "Saved activity could not be loaded.",
-            })
+            (summaryError: unknown) => {
+              if (
+                bootstrapControllerRef.current &&
+                sessionLoadSequenceRef.current === loadSequence &&
+                activeSessionIdRef.current === sessionId
+              )
+                reportFailure(summaryError, "activity.summaries")
+              return {
+                summaries: [] as RunSummary[],
+                error: "Saved activity could not be loaded.",
+              }
+            }
           ),
       ])
       if (
@@ -832,6 +862,8 @@ export function AppShell({
       )
     } catch (sessionError) {
       if (sessionLoadSequenceRef.current === loadSequence) {
+        if (bootstrapControllerRef.current)
+          reportFailure(sessionError, "sessions.open")
         setError(visibleError(sessionError))
       }
     } finally {
@@ -864,8 +896,11 @@ export function AppShell({
           sessionId: activeSessionIdRef.current,
           generation: runGenerationRef.current,
         })
-      )
+      ) {
+        if (bootstrapControllerRef.current)
+          reportFailure(pageError, "history.load")
         setHistoryError(visibleError(pageError))
+      }
     }
   }
 
@@ -890,8 +925,11 @@ export function AppShell({
           sessionId: activeSessionIdRef.current,
           generation: runGenerationRef.current,
         })
-      )
+      ) {
+        if (bootstrapControllerRef.current)
+          reportFailure(pageError, "history.load")
         setHistoryError(visibleError(pageError))
+      }
     }
   }
 
@@ -914,6 +952,7 @@ export function AppShell({
     setContextGeneration(owner.generation)
     const isCurrent = () =>
       !connection.signal.aborted &&
+      !!bootstrapControllerRef.current &&
       ownsRun(owner, {
         sessionId: activeSessionIdRef.current,
         generation: runGenerationRef.current,
@@ -1057,6 +1096,7 @@ export function AppShell({
         )
         setFailedTurn(failureAction === "reload" ? null : turn)
         if (failureAction === "reload") {
+          reportFailure(turnError, "history.load")
           setReconnectAvailable(true)
           return false
         }
@@ -1073,6 +1113,7 @@ export function AppShell({
         if (!isCurrent()) return true
         // Keep the optimistic user message if the saved transcript cannot be refreshed.
       }
+      if (isCurrent()) reportFailure(turnError, "run.start")
       if (
         (turnError instanceof ApiError || turnError instanceof RuntimeError) &&
         turnError.code === "provider_not_configured"
@@ -1107,6 +1148,8 @@ export function AppShell({
         return
       cancelRequestRef.current = false
       setCancellingRun(false)
+      if (bootstrapControllerRef.current)
+        reportFailure(cancelError, "run.cancel")
       if (activeSessionIdRef.current) setError(visibleError(cancelError))
     }
   }
@@ -1143,6 +1186,8 @@ export function AppShell({
       )
     } catch (responseError) {
       if (isCurrent() && approvalRequestRef.current === toolCallId) {
+        if (bootstrapControllerRef.current)
+          reportFailure(responseError, "run.respond")
         setApprovalError(visibleError(responseError))
         setApprovalPendingToolId((current) =>
           current === toolCallId ? null : current
@@ -1180,6 +1225,8 @@ export function AppShell({
       return updated
     } catch (saveError) {
       if (!isCurrent()) return null
+      if (bootstrapControllerRef.current)
+        reportFailure(saveError, "settings.save")
       throw saveError
     } finally {
       if (isCurrent()) {
@@ -1260,7 +1307,13 @@ export function AppShell({
     try {
       let session = activeSession
       if (!session) {
-        const createdSession = await api.createSession()
+        const createdSession = await api
+          .createSession()
+          .catch((createError: unknown) => {
+            if (bootstrapControllerRef.current && isCurrent())
+              reportFailure(createError, "sessions.create")
+            throw createError
+          })
         if (!isCurrent()) return
         session = createdSession
         sessionLoadSequenceRef.current += 1
@@ -1377,6 +1430,8 @@ export function AppShell({
         runGenerationRef.current !== generation
       )
         return
+      if (bootstrapControllerRef.current)
+        reportFailure(restoreError, "run.restore")
       setError(visibleError(restoreError))
       setReconnectAvailable(true)
     })

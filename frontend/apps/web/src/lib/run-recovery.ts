@@ -12,6 +12,12 @@ export function ownsRun(owner: RunOwner, current: RunOwner): boolean {
   )
 }
 
+export function isReconciledRunOutcome(
+  status: string | null | undefined
+): boolean {
+  return ["completed", "cancelled", "interrupted"].includes(status ?? "")
+}
+
 export function turnFailureAction(
   code: string | undefined,
   terminalOutcome: TerminalRunOutcome | null
