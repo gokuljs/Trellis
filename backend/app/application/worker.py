@@ -141,24 +141,18 @@ class WorkerSupervisor:
     async def _execute_claim(self, claim: ExecutionClaim) -> None:
         async with asyncio.timeout(self._policy.operation_seconds):
             running = await self._queue.begin(claim)
+        repository = self._repository_factory(claim)
+        if running.status is RunStatus.CANCELLING:
+            await self._finish_startup_cancellation(repository)
+            return
         if running.status is not RunStatus.RUNNING:
             return
-        repository = self._repository_factory(claim)
         try:
             async with asyncio.timeout(self._policy.operation_seconds):
                 context = await repository.get_execution_context()
         except Exception:
-            async with asyncio.timeout(self._policy.operation_seconds):
-                current = await repository.get_run(claim.run_id)
-                if current is not None and current.status is RunStatus.CANCELLING:
-                    await repository.transition_run_record(
-                        claim.run_id,
-                        RunStatus.CANCELLED,
-                        RunEventType.CANCELLED,
-                        {"code": "user_cancelled", "message": "The run was cancelled."},
-                        stop_reason="user_cancelled",
-                    )
-                    return
+            if await self._finish_startup_cancellation(repository):
+                return
             raise
         context = replace(context, run=running)
         executor = self._executor_factory(repository)
@@ -175,6 +169,21 @@ class WorkerSupervisor:
             renew.cancel()
             cancellation.cancel()
             await asyncio.gather(renew, cancellation, return_exceptions=True)
+
+    async def _finish_startup_cancellation(self, repository: WorkerExecutionRepository) -> bool:
+        async with asyncio.timeout(self._policy.operation_seconds):
+            run_id = repository.claim.run_id
+            current = await repository.get_run(run_id)
+            if current is None or current.status is not RunStatus.CANCELLING:
+                return False
+            await repository.transition_run_record(
+                run_id,
+                RunStatus.CANCELLED,
+                RunEventType.CANCELLED,
+                {"code": "user_cancelled", "message": "The run was cancelled."},
+                stop_reason="user_cancelled",
+            )
+            return True
 
     async def _renew(
         self, claim: ExecutionClaim, executor: ExecutionPort, execution: asyncio.Task[None]

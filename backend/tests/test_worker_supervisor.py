@@ -27,6 +27,7 @@ class Queue:
         self.fail_recover = False
         self.fail_release = False
         self.cancel_on_begin = False
+        self.cancelling_begin_response = False
         self.startup_finalized = False
         self.attempts: list[tuple[str, str]] = []
         self.stop_after_claim: asyncio.Event | None = None
@@ -62,7 +63,7 @@ class Queue:
         running = self.context.run
         if self.cancel_on_begin:
             self.context = replace(self.context, run=replace(running, status=RunStatus.CANCELLING))
-        return running
+        return self.context.run if self.cancelling_begin_response else running
 
     async def renew(self, claim):
         self.renewed += 1
@@ -239,12 +240,14 @@ def test_policy_rejects_unsafe_bounds(kwargs: dict[str, int]) -> None:
 
 
 @pytest.mark.parametrize("read_denied", [False, True])
+@pytest.mark.parametrize("cancelling_response", [False, True])
 def test_cancel_during_startup_finishes_only_with_live_authority(
-    tmp_path: Path, read_denied: bool
+    tmp_path: Path, read_denied: bool, cancelling_response: bool
 ) -> None:
     async def scenario():
         queue, execution, supervisor = await setup(tmp_path)
         queue.cancel_on_begin = True
+        queue.cancelling_begin_response = cancelling_response
         queue.fail_poll = read_denied
         claim = await queue.claim_job("worker", "attempt", "capability")
         if read_denied:
