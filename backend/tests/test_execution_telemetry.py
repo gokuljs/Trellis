@@ -13,6 +13,7 @@ from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from pydantic import BaseModel
 
 from app.application.errors import ApplicationError, ProviderError
 from app.application.model_catalog import profile_for_model
@@ -20,8 +21,9 @@ from app.application.ports import RunRepository, StreamingProviderAdapter
 from app.application.run_context import RunContext
 from app.application.runs import RunService
 from app.application.secret_redaction import SecretRedactor
-from app.domain.context import ContextItem, ContextPreflight, NativeCompactionResult
-from app.domain.models import ModelDescriptor, Session, UserProfile
+from app.application.tools import ToolRegistration, ToolRegistry
+from app.domain.context import ContextItem, ContextPreflight, ContextWindow, NativeCompactionResult
+from app.domain.models import Message, ModelDescriptor, Session, UserProfile
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -480,6 +482,7 @@ def test_portable_summary_has_its_own_correlated_model_call(recorded) -> None:
 def test_approval_reschedule_links_a_new_root_attempt(recorded, monkeypatch) -> None:
     telemetry, exporter, _logs = recorded
     repository = Repository()
+    repository.run = replace(repository.run, id=RUN_ID, session_id=CHAT_ID, turn_id=TURN_ID)
     repository.calls = [
         replace(
             model_record(),
@@ -526,6 +529,8 @@ def test_approval_reschedule_links_a_new_root_attempt(recorded, monkeypatch) -> 
     assert attempts[1].parent is None
     assert attempts[1].links[0].context.span_id == approval.context.span_id
     assert attempts[0].context.trace_id != attempts[1].context.trace_id
+    for attempt in attempts:
+        assert {key: attempt.attributes[key] for key in CORRELATION} == CORRELATION
 
 
 def test_started_transition_failure_marks_the_attempt_failed(recorded, monkeypatch) -> None:
@@ -580,4 +585,323 @@ def test_empty_completed_response_marks_model_and_run_failed(recorded, monkeypat
     assert repository.calls[0].status is ModelCallStatus.FAILED
     assert repository.calls[0].input_tokens == 100
     assert repository.calls[0].output_tokens == 0
+    assert CANARY.encode() not in encode_spans(exporter.get_finished_spans()).SerializeToString()
+
+
+CHAT_ID = "a0000000-0000-4000-8000-000000000001"
+TURN_ID = "b0000000-0000-4000-8000-000000000002"
+RUN_ID = "c0000000-0000-4000-8000-000000000003"
+CORRELATION = {"chatId": CHAT_ID, "turnId": TURN_ID, "runId": RUN_ID}
+
+
+def test_owned_snapshot_correlates_execution_and_events_after_isolated_schedule(
+    recorded, monkeypatch
+) -> None:
+    telemetry, exporter, logs = recorded
+    repository = Repository()
+    repository.run = replace(repository.run, id=RUN_ID, session_id=CHAT_ID, turn_id=TURN_ID)
+    provider = Provider()
+    monkeypatch.setattr(RunContext, "prepare", AsyncMock(return_value=plan()))
+
+    async def exercise() -> None:
+        runtime = service(telemetry, repository, provider)
+        with (
+            telemetry.correlate({"chatId": TURN_ID, "turnId": CHAT_ID, "runId": "wrong-run"}),
+            telemetry.operation("websocket.command"),
+        ):
+            admitted = await runtime.create_run(CHAT_ID, "request", CANARY)
+        await runtime.wait_for_run(admitted.id)
+        await runtime.close()
+        telemetry.event("after.run")
+
+    asyncio.run(exercise())
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    for name in ("run.admit", "run.execute", "model.call"):
+        assert {key: spans[name].attributes[key] for key in CORRELATION} == CORRELATION
+    assert spans["run.execute"].parent is None
+    assert spans["run.execute"].links[0].context.span_id == spans["run.admit"].context.span_id
+    records = [item.log_record for item in logs.get_finished_logs()]
+    assert records[-1].attributes == {}
+    for record in records[:-1]:
+        assert {key: record.attributes[key] for key in CORRELATION} == CORRELATION
+
+
+class CorrelatedRepository(Repository):
+    def __init__(self, telemetry):
+        super().__init__()
+        self.telemetry = telemetry
+        self.run = replace(self.run, id=RUN_ID, session_id=CHAT_ID, turn_id=TURN_ID)
+        self.tools: list[ToolCallRecord] = []
+
+    async def get_run(self, _run_id):
+        with self.telemetry.operation("db.request", {"db.operation": "select"}):
+            return await super().get_run(_run_id)
+
+    async def append_run_event(self, run_id, event_type, data):
+        with self.telemetry.operation("db.request", {"db.operation": "append_run_event"}):
+            return await super().append_run_event(run_id, event_type, data)
+
+    async def load_context_window(self, session_id):
+        with self.telemetry.operation("db.request", {"db.collection": "messages"}):
+            return ContextWindow(
+                None,
+                (
+                    Message(
+                        "input", session_id, self.run.turn_id, 1, "user", CANARY, None, None, "now"
+                    ),
+                ),
+            )
+
+    async def list_run_messages(self, _run_id):
+        return []
+
+    async def list_tool_calls(self, _run_id):
+        return self.tools.copy()
+
+    async def create_model_call(self, run_id, step_index, *args, **kwargs):
+        call = replace(
+            model_record(), id=f"call-{step_index}", run_id=run_id, step_index=step_index
+        )
+        self.calls.append(call)
+        return call
+
+    async def update_model_call(self, call_id, status, **kwargs):
+        call = next(call for call in self.calls if call.id == call_id)
+        fields = {key: value for key, value in kwargs.items() if key in call.__dataclass_fields__}
+        call = replace(call, status=status, **fields)
+        self.calls = [call if old.id == call_id else old for old in self.calls]
+        return call
+
+    async def finish_assistant_output(self, *_args):
+        return None
+
+    async def record_assistant_message(self, run_id, _call_id, message):
+        request = message.tool_calls[0]
+        call = ToolCallRecord(
+            "tool-record",
+            run_id,
+            "assistant",
+            0,
+            request.id,
+            request.name,
+            request.arguments,
+            ToolCallStatus.PENDING,
+            None,
+            None,
+            "now",
+            None,
+        )
+        self.tools.append(call)
+        return None, [call], [await self.append_run_event(run_id, RunEventType.TOOL_CALL, {})]
+
+    async def record_tool_result(self, run_id, call_id, _content, **kwargs):
+        call = next(call for call in self.tools if call.id == call_id)
+        call = replace(call, status=kwargs.get("status", ToolCallStatus.COMPLETED))
+        self.tools = [call]
+        return None, call, await self.append_run_event(run_id, RunEventType.TOOL_RESULT, {})
+
+
+def test_execution_correlates_real_context_counting_tool_validation_and_database_descendants(
+    recorded,
+) -> None:
+    telemetry, exporter, logs = recorded
+    repository = CorrelatedRepository(telemetry)
+
+    class Arguments(BaseModel):
+        query: str
+
+    class Executor:
+        async def execute(self, name, arguments, workspace_root):
+            with telemetry.operation("lookup.execute"):
+                await asyncio.to_thread(telemetry.event, "lookup.finished")
+                return CANARY, False
+
+    class ToolProvider:
+        calls = 0
+        closed = 0
+
+        async def count_input(self, *_args):
+            telemetry.event("provider.counting")
+            raise ProviderError("provider_unavailable", CANARY)
+
+        async def stream(self, *_args):
+            self.calls += 1
+            try:
+                if self.calls == 1:
+                    yield ModelStreamEvent(
+                        "tool_call",
+                        tool_call=ModelToolCall("provider-tool", "lookup", {"query": CANARY}),
+                    )
+                else:
+                    yield ModelStreamEvent("text_delta", text="answer")
+                yield ModelStreamEvent(
+                    "usage",
+                    input_tokens=100,
+                    output_tokens=10,
+                    cached_tokens=0,
+                    cache_creation_tokens=0,
+                )
+                yield ModelStreamEvent(
+                    "completed", finish_kind="tool" if self.calls == 1 else "final"
+                )
+            finally:
+                self.closed += 1
+
+    provider = ToolProvider()
+    tools = ToolRegistry(
+        additional_tools=(ToolRegistration("lookup", CANARY, Arguments, Executor()),),
+        telemetry=telemetry,
+    )
+
+    async def exercise():
+        runtime = service(telemetry, repository, provider)
+        runtime._tool_registry = tools
+        with telemetry.operation("runtime.command"):
+            run = await runtime.create_run(CHAT_ID, "request", CANARY, turn_id=TURN_ID)
+        await runtime.wait_for_run(run.id)
+        await runtime.close()
+
+    asyncio.run(exercise())
+    assert repository.run.status is RunStatus.COMPLETED
+    assert repository.tools[0].status is ToolCallStatus.COMPLETED
+    assert provider.calls == provider.closed == 2
+    spans = exporter.get_finished_spans()
+    assert {
+        "context.build",
+        "model.count_input",
+        "model.call",
+        "tool.check",
+        "tool.validate",
+        "tool.execute",
+        "db.request",
+        "lookup.execute",
+    } <= {span.name for span in spans}
+    execution = next(span for span in spans if span.name == "run.execute")
+    for span in spans:
+        if span.context.trace_id != execution.context.trace_id:
+            continue
+        assert span.attributes["runId"] == RUN_ID
+        if (
+            span.name == "db.request"
+            and span.attributes.get("db.operation") == "select"
+            and "chatId" not in span.attributes
+        ):
+            continue
+        assert span.attributes["chatId"] == CHAT_ID
+        assert span.attributes["turnId"] == TURN_ID
+    for item in logs.get_finished_logs():
+        assert {key: item.log_record.attributes[key] for key in CORRELATION} == CORRELATION
+    assert CANARY.encode() not in encode_spans(spans).SerializeToString()
+
+
+def test_retry_keeps_chat_and_turn_while_creating_a_distinct_run_trace(
+    recorded, monkeypatch
+) -> None:
+    telemetry, exporter, _logs = recorded
+    monkeypatch.setattr(RunContext, "prepare", AsyncMock(return_value=plan()))
+    retry_id = "d0000000-0000-4000-8000-000000000004"
+
+    async def exercise():
+        for run_id, failure in ((RUN_ID, True), (retry_id, False)):
+            repository = Repository()
+            repository.run = replace(
+                repository.run,
+                id=run_id,
+                session_id=CHAT_ID,
+                turn_id=TURN_ID,
+                retry_of=RUN_ID if not failure else None,
+            )
+            runtime = service(telemetry, repository, Provider(failure))
+            run = await runtime.create_run(CHAT_ID, "request", CANARY, turn_id=TURN_ID)
+            await runtime.wait_for_run(run.id)
+            assert repository.run.status is (RunStatus.FAILED if failure else RunStatus.COMPLETED)
+            await runtime.close()
+
+    asyncio.run(exercise())
+    attempts = [span for span in exporter.get_finished_spans() if span.name == "run.execute"]
+    assert [span.attributes["chatId"] for span in attempts] == [CHAT_ID, CHAT_ID]
+    assert [span.attributes["turnId"] for span in attempts] == [TURN_ID, TURN_ID]
+    assert [span.attributes["runId"] for span in attempts] == [RUN_ID, retry_id]
+    assert attempts[0].context.trace_id != attempts[1].context.trace_id
+    assert all(span.parent is None and len(span.links) == 1 for span in attempts)
+
+
+def test_lease_and_cancel_finalizer_restore_snapshot_identifiers_in_empty_contexts(
+    recorded,
+    monkeypatch,
+) -> None:
+    telemetry, exporter, logs = recorded
+    repository = CorrelatedRepository(telemetry)
+    runtime = service(telemetry, repository, Provider())
+    lease = Mock()
+    lease.owns_run_lease.return_value = True
+    renewals = 0
+
+    async def renew(_run_id):
+        nonlocal renewals
+        renewals += 1
+        with telemetry.operation("db.request", {"db.operation": "renew_run_lease"}):
+            return replace(
+                repository.run,
+                status=RunStatus.COMPLETED if renewals == 2 else RunStatus.RUNNING,
+            )
+
+    lease.renew_run_lease = AsyncMock(side_effect=renew)
+    runtime._lease_repository = lease
+    runtime._lease_renew_interval_seconds = 0.001
+
+    async def exercise():
+        with telemetry.correlate({"chatId": TURN_ID, "turnId": CHAT_ID, "runId": "wrong"}):
+            with monkeypatch.context() as patcher:
+                lookup = AsyncMock(side_effect=RuntimeError("must not read before renewal"))
+                patcher.setattr(repository, "get_run", lookup)
+                runtime._start_lease_monitor(RUN_ID)
+                await runtime._lease_monitors[RUN_ID]
+                lookup.assert_not_awaited()
+            repository.run = replace(repository.run, status=RunStatus.CANCELLING)
+            completed = asyncio.create_task(asyncio.sleep(0))
+            runtime._schedule_cancel_finalizer(RUN_ID, completed)
+            await runtime._cancel_finalizers[RUN_ID]
+        telemetry.event("after.boundaries")
+        await runtime.close()
+
+    asyncio.run(exercise())
+    assert repository.run.status is RunStatus.CANCELLED
+    spans = exporter.get_finished_spans()
+    for name in ("run.lease", "run.cancel.finalize"):
+        span = next(span for span in spans if span.name == name)
+        assert span.parent is None
+        assert {key: span.attributes[key] for key in CORRELATION} == CORRELATION
+    renewal_spans = [
+        span for span in spans if span.attributes.get("db.operation") == "renew_run_lease"
+    ]
+    assert renewal_spans[0].attributes == {"db.operation": "renew_run_lease", "runId": RUN_ID}
+    assert {key: renewal_spans[1].attributes[key] for key in CORRELATION} == CORRELATION
+    assert renewals == 2
+    records = [item.log_record for item in logs.get_finished_logs()]
+    assert {key: records[0].attributes[key] for key in CORRELATION} == CORRELATION
+    assert records[-1].attributes == {}
+
+
+def test_legacy_turn_content_is_omitted_without_rejecting_execution(recorded, monkeypatch) -> None:
+    telemetry, exporter, logs = recorded
+    repository = Repository()
+    repository.run = replace(repository.run, id=RUN_ID, session_id=CHAT_ID, turn_id=CANARY)
+    monkeypatch.setattr(RunContext, "prepare", AsyncMock(return_value=plan()))
+
+    async def exercise():
+        runtime = service(telemetry, repository, Provider())
+        admitted = await runtime.create_run(CHAT_ID, "request", CANARY)
+        await runtime.wait_for_run(admitted.id)
+        await runtime.close()
+
+    asyncio.run(exercise())
+    assert repository.run.status is RunStatus.COMPLETED
+    for span in exporter.get_finished_spans():
+        assert span.attributes["chatId"] == CHAT_ID
+        assert span.attributes["runId"] == RUN_ID
+        assert "turnId" not in span.attributes
+    for item in logs.get_finished_logs():
+        assert item.log_record.attributes["chatId"] == CHAT_ID
+        assert "turnId" not in item.log_record.attributes
     assert CANARY.encode() not in encode_spans(exporter.get_finished_spans()).SerializeToString()

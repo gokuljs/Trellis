@@ -4,7 +4,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import aclosing, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
@@ -38,7 +38,14 @@ from app.application.ports import (
 from app.application.run_context import RunContext, billing_tier, usage_cost
 from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
 from app.application.streaming import TextStreamBatcher
-from app.application.telemetry import NO_TELEMETRY, Attribute, Operation, Telemetry, TraceLink
+from app.application.telemetry import (
+    NO_TELEMETRY,
+    Attribute,
+    Operation,
+    Telemetry,
+    TraceLink,
+    run_identifiers,
+)
 from app.application.tools import (
     MAX_ARGUMENT_BYTES,
     ToolExecutionError,
@@ -93,6 +100,11 @@ class _RunObservation:
     operation: Operation
     outcome: str = "skipped"
     error_code: str | None = None
+    identifiers: dict[str, str] = field(default_factory=dict)
+
+    def bind(self, run: RunSnapshot) -> None:
+        self.identifiers = run_identifiers(run)
+        self.operation.set_attributes(self.identifiers)
 
     def finish(self, outcome: str, error_code: str | None = None) -> None:
         self.outcome = outcome
@@ -254,11 +266,10 @@ class RunService:
                 self._telemetry.event("run.admission.rejected", attributes, error=True)
                 self._telemetry.count("run.admissions", attributes=attributes)
                 raise
-            observation.set_attributes(
-                {"runId": run.id, "provider": run.provider_id, "model": run.model_id}
-            )
-            observation.outcome("accepted")
-            self._telemetry.event("run.admitted", {"runId": run.id, "outcome": "accepted"})
+            with self._telemetry.correlate(run_identifiers(run)):
+                observation.set_attributes({"provider": run.provider_id, "model": run.model_id})
+                observation.outcome("accepted")
+                self._telemetry.event("run.admitted", {"outcome": "accepted"})
             self._telemetry.count("run.admissions", attributes={"outcome": "accepted"})
             return run
 
@@ -357,7 +368,11 @@ class RunService:
                 await finalizer
 
     async def get_run(self, run_id: str) -> RunSnapshot | None:
-        return await self._recover_if_expired(await self._runs.get_run(run_id))
+        run = await self._runs.get_run(run_id)
+        if run is None:
+            return None
+        with self._telemetry.correlate(run_identifiers(run)):
+            return await self._recover_if_expired(run)
 
     async def _recover_if_expired(self, run: RunSnapshot | None) -> RunSnapshot | None:
         if self._lease_repository is None or run is None or is_terminal_run_status(run.status):
@@ -442,6 +457,11 @@ class RunService:
             if str(error) == "run not found":
                 raise ApplicationError("run_not_found", "Run not found.") from None
             raise
+        with self._telemetry.correlate(run_identifiers(run)):
+            return await self._cancel_requested_run(run, event)
+
+    async def _cancel_requested_run(self, run: RunSnapshot, event: RunEvent | None) -> RunSnapshot:
+        run_id = run.id
         task = self._tasks.get(run_id)
         if (
             event is not None
@@ -493,9 +513,16 @@ class RunService:
         await asyncio.gather(task, return_exceptions=True)
         if not self._can_execute(run_id):
             return
-        current = await self._runs.get_run(run_id)
-        if current is not None and current.status is RunStatus.CANCELLING:
-            await self._mark_cancelled(run_id, None)
+        with (
+            self._telemetry.correlate({"runId": run_id}),
+            self._telemetry.operation("run.cancel.finalize", root=True) as operation,
+        ):
+            current = await self._runs.get_run(run_id)
+            if current is not None:
+                with self._telemetry.correlate(run_identifiers(current)):
+                    operation.set_attributes(run_identifiers(current))
+                    if current.status is RunStatus.CANCELLING:
+                        await self._mark_cancelled(run_id, None)
 
     def _discard_cancel_finalizer(self, run_id: str, task: asyncio.Task[None]) -> None:
         if self._cancel_finalizers.get(run_id) is task:
@@ -574,7 +601,8 @@ class RunService:
             if self._can_execute(run_id):
                 run = await self._runs.get_run(run_id)
                 if run is not None and run.status is RunStatus.QUEUED:
-                    await self._interrupt_queued_run(run_id)
+                    with self._telemetry.correlate(run_identifiers(run)):
+                        await self._interrupt_queued_run(run_id)
         monitors = tuple(self._lease_monitors.values())
         for monitor in monitors:
             monitor.cancel()
@@ -618,11 +646,18 @@ class RunService:
 
     async def _monitor_lease(self, run_id: str) -> None:
         assert self._lease_repository is not None
+        identifiers = {"runId": run_id}
         while True:
             await asyncio.sleep(self._lease_renew_interval_seconds)
             try:
-                with self._telemetry.operation("run.lease", {"runId": run_id}, root=True):
+                with (
+                    self._telemetry.correlate(identifiers),
+                    self._telemetry.operation("run.lease", root=True) as operation,
+                ):
                     run = await self._lease_repository.renew_run_lease(run_id)
+                    identifiers = run_identifiers(run)
+                    with self._telemetry.correlate(identifiers):
+                        operation.set_attributes(identifiers)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -649,17 +684,21 @@ class RunService:
 
     async def _run_with_limit(self, run_id: str, link: TraceLink | None = None) -> None:
         started = monotonic()
-        with self._telemetry.operation(
-            "run.execute",
-            {"runId": run_id},
-            root=True,
-            links=(link,) if link else (),
-        ) as operation:
+        with (
+            self._telemetry.correlate({"runId": run_id}),
+            self._telemetry.operation(
+                "run.execute", root=True, links=(link,) if link else ()
+            ) as operation,
+        ):
             observation = _RunObservation(operation)
             try:
                 await self._run_bounded(run_id, observation)
             finally:
-                attributes: dict[str, Attribute] = {"runId": run_id, "outcome": observation.outcome}
+                attributes: dict[str, Attribute] = {
+                    **observation.identifiers,
+                    "runId": run_id,
+                    "outcome": observation.outcome,
+                }
                 if observation.error_code is not None:
                     attributes["error_code"] = observation.error_code
                 duration = monotonic() - started
@@ -683,14 +722,17 @@ class RunService:
                 observation.finish("interrupted", "run_lease_lost")
                 raise
             run = await self._runs.get_run(run_id)
-            if run is not None and run.status is RunStatus.QUEUED:
-                await self._interrupt_queued_run(run_id)
-                observation.finish("interrupted", "runtime_shutdown")
-            elif run is not None and run.status is RunStatus.CANCELLING:
-                await self._mark_cancelled(run_id, None)
-                observation.finish("cancelled")
-            elif observation.outcome == "skipped":
-                observation.finish("cancelled")
+            with self._telemetry.correlate(run_identifiers(run) if run else {"runId": run_id}):
+                if run is not None:
+                    observation.bind(run)
+                if run is not None and run.status is RunStatus.QUEUED:
+                    await self._interrupt_queued_run(run_id)
+                    observation.finish("interrupted", "runtime_shutdown")
+                elif run is not None and run.status is RunStatus.CANCELLING:
+                    await self._mark_cancelled(run_id, None)
+                    observation.finish("cancelled")
+                elif observation.outcome == "skipped":
+                    observation.finish("cancelled")
             raise
         except Exception as error:
             observation.finish("failed", "runtime_internal_error")
@@ -704,19 +746,21 @@ class RunService:
             try:
                 run = await self._runs.get_run(run_id)
                 if run is not None and run.status in {RunStatus.QUEUED, RunStatus.RUNNING}:
-                    event = await self._runs.transition_run_record(
-                        run_id,
-                        RunStatus.FAILED,
-                        RunEventType.FAILED,
-                        {
-                            "code": "runtime_internal_error",
-                            "message": "Trellis could not start this run.",
-                        },
-                        error_code="runtime_internal_error",
-                        error_message="Trellis could not start this run.",
-                        stop_reason="runtime_internal_error",
-                    )
-                    await self._publish(event)
+                    with self._telemetry.correlate(run_identifiers(run)):
+                        observation.bind(run)
+                        event = await self._runs.transition_run_record(
+                            run_id,
+                            RunStatus.FAILED,
+                            RunEventType.FAILED,
+                            {
+                                "code": "runtime_internal_error",
+                                "message": "Trellis could not start this run.",
+                            },
+                            error_code="runtime_internal_error",
+                            error_message="Trellis could not start this run.",
+                            stop_reason="runtime_internal_error",
+                        )
+                        await self._publish(event)
             except Exception as persist_error:
                 logger.error(
                     "Could not persist failure for run %s (error type: %s)",
@@ -741,11 +785,17 @@ class RunService:
 
     async def _execute(self, run_id: str, observation: _RunObservation) -> None:
         run = await self._runs.get_run(run_id)
-        if run is None or run.status not in {
-            RunStatus.QUEUED,
-            RunStatus.WAITING_FOR_APPROVAL,
-        }:
+        if run is None:
             return
+
+        with self._telemetry.correlate(run_identifiers(run)):
+            observation.bind(run)
+            if run.status not in {RunStatus.QUEUED, RunStatus.WAITING_FOR_APPROVAL}:
+                return
+            await self._execute_snapshot(run, observation)
+
+    async def _execute_snapshot(self, run: RunSnapshot, observation: _RunObservation) -> None:
+        run_id = run.id
 
         observation.operation.set_attributes(
             {

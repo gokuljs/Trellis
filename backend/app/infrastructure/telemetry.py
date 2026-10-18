@@ -7,6 +7,7 @@ import threading
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from typing import Literal
 from urllib.parse import unquote
 
@@ -38,8 +39,12 @@ from app.application.telemetry import (
 from app.core.config import Settings
 
 _NAME = re.compile(r"^[a-z][a-z0-9_.-]{0,95}$")
+_UUID = re.compile(r"^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
+_IDENTIFIERS = frozenset({"chatId", "turnId", "runId"})
 _ATTRIBUTES = frozenset(
     {
+        "chatId",
+        "turnId",
         "runId",
         "modelCallId",
         "toolCallId",
@@ -157,7 +162,7 @@ class _Operation:
 
     def set_attributes(self, attributes: Attributes) -> None:
         with suppress(Exception):
-            self.span.set_attributes(self.runtime.safe_attributes(attributes))
+            self.span.set_attributes(self.runtime.correlated_attributes(attributes))
 
     def outcome(self, name: str, error_code: str | None = None) -> None:
         self.has_outcome = True
@@ -188,6 +193,9 @@ class TelemetryRuntime:
         self.redactor = SecretRedactor(*secrets)
         self.counters: dict[str, Counter] = {}
         self.histograms: dict[str, Histogram] = {}
+        self._correlation: ContextVar[dict[str, Attribute] | None] = ContextVar(
+            "trellis.telemetry.correlation", default=None
+        )
         self._closed = False
 
     def safe_attributes(
@@ -198,6 +206,10 @@ class TelemetryRuntime:
         for key, value in (attributes or {}).items():
             if key not in allowed:
                 continue
+            if key in {"chatId", "turnId"}:
+                if not isinstance(value, str) or not _UUID.fullmatch(value):
+                    continue
+                value = value.lower()
             if isinstance(value, str):
                 if len(value) > 160 or self.redactor.redact_text(value) != value:
                     continue
@@ -207,6 +219,24 @@ class TelemetryRuntime:
                 continue
             result[key] = value
         return result
+
+    @contextmanager
+    def correlate(self, attributes: Attributes) -> Iterator[None]:
+        identifiers = {key: value for key, value in attributes.items() if key in _IDENTIFIERS}
+        bound = {
+            key: value
+            for key, value in (self._correlation.get() or {}).items()
+            if key not in identifiers
+        }
+        bound.update(self.safe_attributes(identifiers))
+        token = self._correlation.set(bound)
+        try:
+            yield
+        finally:
+            self._correlation.reset(token)
+
+    def correlated_attributes(self, attributes: Attributes | None) -> dict[str, Attribute]:
+        return self.safe_attributes(attributes) | (self._correlation.get() or {})
 
     def _valid_name(self, name: str) -> bool:
         return bool(_NAME.fullmatch(name)) and self.redactor.redact_text(name) == name
@@ -236,7 +266,7 @@ class TelemetryRuntime:
             span = self.tracer.start_span(
                 name,
                 context=parent_context,
-                attributes=self.safe_attributes(attributes),
+                attributes=self.correlated_attributes(attributes),
                 links=[trace.Link(_span_context(link)) for link in links],
                 kind={
                     "internal": trace.SpanKind.INTERNAL,
@@ -278,7 +308,7 @@ class TelemetryRuntime:
                 body=name,
                 event_name=name,
                 severity_number=SeverityNumber.ERROR if error else SeverityNumber.INFO,
-                attributes=self.safe_attributes(attributes),
+                attributes=self.correlated_attributes(attributes),
             )
 
     def count(self, name: str, value: int = 1, attributes: Attributes | None = None) -> None:

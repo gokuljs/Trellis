@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable, Mapping
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from contextvars import Context
 from typing import cast
 
@@ -10,10 +10,11 @@ import anyio
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
 from app.api.access import require_private_access
-from app.api.telemetry import runtime_command, transport_telemetry
+from app.api.telemetry import CommandObservation, runtime_command, transport_telemetry
 from app.application.budgets import BudgetPreset
 from app.application.errors import ApplicationError
 from app.application.runs import RunService
+from app.application.telemetry import run_identifiers
 from app.core.origins import allowed_web_origins
 from app.domain.runtime import (
     RunEvent,
@@ -458,43 +459,45 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                     return True
 
         try:
-            run = await service.get_run(run_id)
-            if run is None:
-                return
-            if await replay_persisted(run.last_event_sequence):
-                return
+            with ExitStack() as scopes:
+                run = await service.get_run(run_id)
+                if run is None:
+                    return
+                scopes.enter_context(telemetry.correlate(run_identifiers(run)))
+                if await replay_persisted(run.last_event_sequence):
+                    return
 
-            if is_terminal_run_status(run.status):
-                return
-            while True:
-                try:
-                    event = await asyncio.wait_for(subscription.receive(), timeout=0.5)
-                except TimeoutError:
-                    # Durable events are authoritative. Polling closes the rare gap where
-                    # persistence succeeds but in-process fanout is interrupted.
-                    if await replay_persisted():
-                        return
-                    current_run = await service.get_run(run_id)
-                    if current_run is None:
-                        return
-                    if is_terminal_run_status(current_run.status):
-                        # Completion may commit after the last page was read. Drain
-                        # through its durable cursor before ending the subscription.
-                        if sequence < current_run.last_event_sequence:
-                            await replay_persisted(current_run.last_event_sequence)
-                        return
-                    continue
-                if event is None:
-                    await send(
-                        {
-                            "jsonrpc": "2.0",
-                            "method": "run.replay_required",
-                            "params": {"runId": run_id, "afterSequence": sequence},
-                        }
-                    )
+                if is_terminal_run_status(run.status):
                     return
-                if await emit_event(event):
-                    return
+                while True:
+                    try:
+                        event = await asyncio.wait_for(subscription.receive(), timeout=0.5)
+                    except TimeoutError:
+                        # Durable events are authoritative. Polling closes the rare gap where
+                        # persistence succeeds but in-process fanout is interrupted.
+                        if await replay_persisted():
+                            return
+                        current_run = await service.get_run(run_id)
+                        if current_run is None:
+                            return
+                        if is_terminal_run_status(current_run.status):
+                            # Completion may commit after the last page was read. Drain
+                            # through its durable cursor before ending the subscription.
+                            if sequence < current_run.last_event_sequence:
+                                await replay_persisted(current_run.last_event_sequence)
+                            return
+                        continue
+                    if event is None:
+                        await send(
+                            {
+                                "jsonrpc": "2.0",
+                                "method": "run.replay_required",
+                                "params": {"runId": run_id, "afterSequence": sequence},
+                            }
+                        )
+                        return
+                    if await emit_event(event):
+                        return
         except asyncio.CancelledError:
             raise
         except WebSocketDisconnect:
@@ -537,7 +540,9 @@ async def runtime_websocket(websocket: WebSocket) -> None:
         )
         active_subscriptions[run_id] = (subscription, task)
 
-    async def dispatch(method: str, params: dict[str, object]) -> dict[str, object]:
+    async def dispatch(
+        method: str, params: dict[str, object], command: CommandObservation
+    ) -> dict[str, object]:
         result: dict[str, object]
         if method == "run.start":
             session_id = _required_string(params, "sessionId", maximum=200)
@@ -563,6 +568,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                 budget_preset=cast(BudgetPreset | None, budget_preset),
                 model_id=cast(str | None, model_id),
             )
+            command.correlate(run)
             await subscribe(run.id, 0)
             result = _run_result(run)
         elif method == "run.resume":
@@ -577,6 +583,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             run = await service.get_run(run_id)
             if run is None:
                 raise ApplicationError("run_not_found", "Run not found.")
+            command.correlate(run)
             if after_sequence > run.last_event_sequence:
                 raise RpcFault(-32602, "Invalid params: afterSequence exceeds the run cursor")
             await subscribe(run.id, after_sequence)
@@ -593,6 +600,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             existing_run = await service.get_run(run_id)
             if existing_run is None:
                 raise ApplicationError("run_not_found", "Run not found.")
+            command.correlate(existing_run)
             if after_sequence > existing_run.last_event_sequence:
                 raise RpcFault(-32602, "Invalid params: afterSequence exceeds the run cursor")
             run = await service.cancel_run(run_id)
@@ -614,6 +622,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             existing_run = await service.get_run(run_id)
             if existing_run is None:
                 raise ApplicationError("run_not_found", "Run not found.")
+            command.correlate(existing_run)
             if after_sequence > existing_run.last_event_sequence:
                 raise RpcFault(-32602, "Invalid params: afterSequence exceeds the run cursor")
             run, tool_call = await service.respond_to_tool_approval(
@@ -660,7 +669,7 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                 ) as command:
                     try:
                         method, params, request_id, has_id = _parse_request(request)
-                        result = await dispatch(method, params)
+                        result = await dispatch(method, params, command)
                         command.set_attributes({"runId": cast(str, result["runId"])})
                         if method == "run.respond":
                             command.set_attributes({"toolCallId": cast(str, result["toolCallId"])})

@@ -9,7 +9,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from app.api.dependencies import get_run_service
+from app.api.dependencies import correlate_owned_chat, get_run_service
 from app.api.routes.sessions import router, serialize_run_summary
 from app.application.errors import ApplicationError
 from app.application.runs import RunService
@@ -128,6 +128,7 @@ def test_summary_http_api_preserves_partial_usage_without_event_history() -> Non
     service = AsyncMock()
     service.list_session_runs.return_value = [summary_record()], 100
     app.dependency_overrides[get_run_service] = lambda: service
+    app.dependency_overrides[correlate_owned_chat] = lambda: None
 
     async def exercise() -> None:
         async with httpx.AsyncClient(

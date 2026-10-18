@@ -2,7 +2,7 @@ import asyncio
 import re
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -15,7 +15,10 @@ from app.application.telemetry import (
     Operation,
     Telemetry,
     TraceLink,
+    run_identifiers,
 )
+from app.domain.models import Session
+from app.domain.runtime import RunSnapshot
 
 _TRACEPARENT = re.compile(rb"00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})")
 _HTTP_METHODS = frozenset(
@@ -24,10 +27,19 @@ _HTTP_METHODS = frozenset(
 _RPC_METHODS = frozenset(
     {"auth.authenticate", "run.start", "run.resume", "run.cancel", "run.respond"}
 )
+_CHAT_CORRELATION = "trellis.telemetry.chat"
 
 
 def transport_telemetry(scope: Scope) -> Telemetry:
     return cast(Telemetry, getattr(scope["app"].state, "telemetry", NO_TELEMETRY))
+
+
+@contextmanager
+def owned_chat_telemetry(scope: Scope, session: Session) -> Iterator[None]:
+    identifiers = {"chatId": session.id}
+    scope[_CHAT_CORRELATION] = identifiers
+    with transport_telemetry(scope).correlate(identifiers):
+        yield
 
 
 def _trace_parent(scope: Scope) -> TraceLink | None:
@@ -82,11 +94,12 @@ class TransportTelemetryMiddleware:
             finally:
                 # The router supplies its declared template after matching. Never use scope["path"].
                 route = getattr(scope.get("route"), "path", "unmatched")
-                attributes = {
+                attributes: dict[str, Attribute] = {
                     "http.request.method": method,
                     "http.route": route,
                     "http.response.status_code": status,
                     "outcome": outcome,
+                    **scope.get(_CHAT_CORRELATION, {}),
                 }
                 operation.set_attributes(attributes)
                 operation.outcome(outcome)
@@ -99,6 +112,8 @@ class TransportTelemetryMiddleware:
 @dataclass(slots=True)
 class CommandObservation:
     operation: Operation
+    telemetry: Telemetry
+    scopes: ExitStack
     outcome_name: str = "completed"
     error_code: str | None = None
     attributes: dict[str, Attribute] = field(default_factory=dict)
@@ -111,15 +126,23 @@ class CommandObservation:
         self.attributes.update(attributes)
         self.operation.set_attributes(attributes)
 
+    def correlate(self, run: RunSnapshot) -> None:
+        identifiers = run_identifiers(run)
+        self.scopes.enter_context(self.telemetry.correlate(identifiers))
+        self.set_attributes(identifiers)
+
 
 @contextmanager
 def runtime_command(telemetry: Telemetry, method: str) -> Iterator[CommandObservation]:
     safe_method = method if method in _RPC_METHODS else "unknown"
     started = time.monotonic()
-    with telemetry.operation(
-        "runtime.command", {"rpc.method": safe_method}, root=True, kind="server"
-    ) as operation:
-        command = CommandObservation(operation)
+    with (
+        telemetry.operation(
+            "runtime.command", {"rpc.method": safe_method}, root=True, kind="server"
+        ) as operation,
+        ExitStack() as scopes,
+    ):
+        command = CommandObservation(operation, telemetry, scopes)
         try:
             yield command
         except asyncio.CancelledError:

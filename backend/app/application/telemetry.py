@@ -3,8 +3,14 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
+from app.domain.runtime import RunSnapshot
+
 type Attribute = str | int | float | bool
 type Attributes = Mapping[str, Attribute]
+
+
+def run_identifiers(run: RunSnapshot) -> dict[str, str]:
+    return {"chatId": run.session_id, "turnId": run.turn_id, "runId": run.id}
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +28,8 @@ class Operation(Protocol):
 
 
 class Telemetry(Protocol):
+    def correlate(self, attributes: Attributes) -> AbstractContextManager[None]: ...
+
     def operation(
         self,
         name: str,
@@ -42,6 +50,10 @@ class Telemetry(Protocol):
 
 
 class NoTelemetry:
+    @contextmanager
+    def correlate(self, attributes: Attributes) -> Iterator[None]:
+        yield
+
     @contextmanager
     def operation(
         self,

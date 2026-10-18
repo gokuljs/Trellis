@@ -333,3 +333,136 @@ def test_application_owns_runtime_after_services_close(monkeypatch) -> None:
     asyncio.run(
         exercise(create_app(Settings(_env_file=None), telemetry=NO_TELEMETRY), owns_runtime=False)
     )
+
+
+CHAT_ID = "a0000000-0000-4000-8000-000000000001"
+TURN_ID = "b0000000-0000-4000-8000-000000000002"
+RUN_ID = "c0000000-0000-4000-8000-000000000003"
+CORRELATION = {"chatId": CHAT_ID, "turnId": TURN_ID, "runId": RUN_ID}
+
+
+def test_scoped_identifiers_reach_spans_logs_but_never_metrics(recorded) -> None:
+    runtime, exporter, logs, reader = recorded
+    with (
+        runtime.correlate(CORRELATION | {"prompt": CANARY, "provider": "ignored"}),
+        runtime.operation("context.build", {"chatId": TURN_ID}) as operation,
+    ):
+        operation.set_attributes({"runId": "conflict", "turnId": CHAT_ID})
+        runtime.event("context.ready", {"runId": "conflict"})
+        runtime.count("context.count", attributes=CORRELATION | {"provider": "openai"})
+        runtime.observe("context.duration", 1, CORRELATION)
+    assert exporter.get_finished_spans()[0].attributes == CORRELATION
+    assert logs.get_finished_logs()[0].log_record.attributes == CORRELATION
+    metrics = reader.get_metrics_data()
+    assert metrics is not None
+    for metric in metrics.resource_metrics[0].scope_metrics[0].metrics:
+        for point in metric.data.data_points:
+            assert not set(CORRELATION) & point.attributes.keys()
+    with runtime.operation("outside"):
+        pass
+    assert exporter.get_finished_spans()[-1].attributes == {}
+
+
+@pytest.mark.parametrize("error", [RuntimeError(CANARY), asyncio.CancelledError(CANARY)])
+def test_scoped_identifiers_restore_after_nested_errors(recorded, error) -> None:
+    runtime, exporter, logs, _ = recorded
+    with runtime.correlate(CORRELATION):
+        with pytest.raises(type(error)), runtime.correlate({"turnId": CHAT_ID}):
+            runtime.event("nested")
+            raise error
+        runtime.event("restored")
+    with runtime.operation("outside"):
+        pass
+    assert logs.get_finished_logs()[0].log_record.attributes == CORRELATION | {"turnId": CHAT_ID}
+    assert logs.get_finished_logs()[1].log_record.attributes == CORRELATION
+    assert exporter.get_finished_spans()[0].attributes == {}
+
+
+def test_scope_canonicalizes_uuid_identifiers_and_omits_legacy_content(recorded) -> None:
+    runtime, exporter, logs, _ = recorded
+    with (
+        runtime.correlate(CORRELATION),
+        runtime.correlate({"chatId": CHAT_ID.upper(), "turnId": CANARY}),
+        runtime.operation("legacy.turn", {"turnId": CANARY}),
+    ):
+        runtime.event("legacy.turn")
+    expected = {"chatId": CHAT_ID, "runId": RUN_ID}
+    assert exporter.get_finished_spans()[0].attributes == expected
+    assert logs.get_finished_logs()[0].log_record.attributes == expected
+    assert runtime.safe_attributes({"chatId": CANARY, "turnId": TURN_ID.upper()}) == {
+        "turnId": TURN_ID
+    }
+    with NO_TELEMETRY.correlate(CORRELATION):
+        assert NO_TELEMETRY.capture() is None
+
+
+def test_scopes_are_isolated_between_concurrent_chats_and_runtime_instances(recorded) -> None:
+    runtime, exporter, logs, _ = recorded
+    other = TelemetryRuntime(
+        runtime.tracer_provider, runtime.logger_provider, runtime.meter_provider
+    )
+
+    async def exercise() -> None:
+        entered = asyncio.Event()
+        second_entered = asyncio.Event()
+
+        async def first() -> None:
+            with runtime.correlate(CORRELATION):
+                entered.set()
+                await second_entered.wait()
+                with runtime.operation("first"):
+                    other.event("other.runtime")
+                    await asyncio.to_thread(runtime.event, "first.thread")
+
+        async def second() -> None:
+            await entered.wait()
+            with runtime.correlate({"chatId": TURN_ID, "turnId": CHAT_ID, "runId": "other-run"}):
+                second_entered.set()
+                await asyncio.sleep(0)
+                with runtime.operation("second"):
+                    runtime.event("second.event")
+
+        await asyncio.gather(first(), second())
+        runtime.event("outside")
+
+    asyncio.run(exercise())
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    assert spans["first"].attributes == CORRELATION
+    assert spans["second"].attributes == {
+        "chatId": TURN_ID,
+        "turnId": CHAT_ID,
+        "runId": "other-run",
+    }
+    records = {item.log_record.body: item.log_record for item in logs.get_finished_logs()}
+    assert records["first.thread"].attributes == CORRELATION
+    assert records["other.runtime"].attributes == {}
+    assert records["outside"].attributes == {}
+
+
+def test_cancelling_suspended_task_keeps_cleanup_correlated_and_resets_scope(recorded) -> None:
+    runtime, exporter, logs, _ = recorded
+
+    async def exercise():
+        entered = asyncio.Event()
+
+        async def suspended():
+            with runtime.correlate(CORRELATION), runtime.operation("cancelled.task"):
+                try:
+                    entered.set()
+                    await asyncio.Event().wait()
+                finally:
+                    runtime.event("cancelled.cleanup")
+
+        task = asyncio.create_task(suspended())
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        runtime.event("outside.cancelled.task")
+
+    asyncio.run(exercise())
+    span = exporter.get_finished_spans()[0]
+    assert {key: span.attributes[key] for key in CORRELATION} == CORRELATION
+    assert span.attributes["outcome"] == "cancelled"
+    assert logs.get_finished_logs()[0].log_record.attributes == CORRELATION
+    assert logs.get_finished_logs()[1].log_record.attributes == {}
