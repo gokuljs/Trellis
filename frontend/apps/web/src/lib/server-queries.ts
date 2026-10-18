@@ -28,6 +28,7 @@ export function settingsQueryOptions(
   service: Pick<typeof api, "getSettings"> = api
 ) {
   return queryOptions({
+    meta: { telemetryOperation: "settings.load" },
     queryKey: serverKeys.settings,
     queryFn: ({ signal }) => service.getSettings({ signal }),
     refetchInterval: 10 * 60_000,
@@ -41,6 +42,7 @@ export function contextPreviewQueryOptions(
 ) {
   const tooLong = previewDraftTooLong(input.draft)
   return queryOptions({
+    meta: { telemetryOperation: "context.preview" },
     queryKey: [
       "context-preview",
       input.session_id ?? null,
@@ -78,6 +80,10 @@ export function sessionModelMutationOptions(
   service: Pick<typeof api, "selectSessionModel"> = api
 ) {
   return {
+    meta: {
+      telemetryOperation: "settings.save" as const,
+      telemetryOwner: "caller" as const,
+    },
     mutationKey: ["session-model"],
     scope: { id: "session-model-preference" },
     mutationFn: ({
@@ -154,6 +160,7 @@ export function sessionHistoryQueryOptions(
   service: Pick<typeof api, "getSessionHistory"> = api
 ) {
   return infiniteQueryOptions({
+    meta: { telemetryOperation: "history.load", telemetryOwner: "caller" },
     queryKey: serverKeys.history(sessionId),
     initialPageParam: null as string | null,
     queryFn: ({ pageParam, signal }) =>
@@ -185,6 +192,7 @@ export function sessionPagesQueryOptions(
   service: Pick<typeof api, "listSessionPages"> = api
 ) {
   return infiniteQueryOptions({
+    meta: { telemetryOperation: "sessions.list" },
     queryKey: serverKeys.sessionPages,
     initialPageParam: null as string | null,
     queryFn: ({ pageParam, signal }) =>
@@ -274,6 +282,10 @@ export function runSummariesQueryOptions(
   turnId?: string
 ) {
   return infiniteQueryOptions({
+    meta: {
+      telemetryOperation: "activity.summaries",
+      telemetryOwner: turnId === undefined ? "caller" : "cache",
+    },
     queryKey: ["run-summaries", sessionId, turnId ?? null, "newest-first"],
     initialPageParam: 0,
     queryFn: ({ pageParam, signal }) =>
@@ -298,6 +310,7 @@ export function runEventsQueryOptions(
   service: Pick<typeof api, "listRunEvents"> = api
 ) {
   return infiniteQueryOptions({
+    meta: { telemetryOperation: "activity.events" },
     queryKey: ["run-events", sessionId, runId],
     initialPageParam: 0,
     queryFn: ({ pageParam, signal }) =>
