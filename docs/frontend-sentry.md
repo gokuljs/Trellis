@@ -4,9 +4,6 @@ Trellis includes `@sentry/react@11.8.0` and `@sentry/vite-plugin@11.8.0`.
 Configure a Sentry project to collect unexpected frontend errors and sampled
 performance data. Backend instrumentation is outside this integration.
 
-Read the [integration design and research](frontend-sentry-design.md) for the
-original decisions and the eight-commit review sequence.
-
 ## Create the frontend project
 
 1. Open your Sentry organization and create a project with the React platform.
