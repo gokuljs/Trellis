@@ -7,13 +7,15 @@
     "dev:all": "../scripts/dev-all.sh",
     "dev": "turbo dev",
     "lint": "turbo lint",
-    "format": "prettier --write \"**/*.{js,jsx,ts,tsx,css,html,json,md,yml,yaml}\"",
-    "format:check": "prettier --check \"**/*.{js,jsx,ts,tsx,css,html,json,md,yml,yaml}\"",
+    "format": "prettier --write \"**/*.{js,jsx,ts,tsx,mts,css,html,json,md,yml,yaml}\"",
+    "format:check": "prettier --check \"**/*.{js,jsx,ts,tsx,mts,css,html,json,md,yml,yaml}\"",
     "typecheck": "turbo typecheck",
-    "test:contracts": "bun test tests/*.test.js apps/web/tests/*.test.ts"
+    "test:contracts": "bun test tests/*.test.js apps/web/tests/*.test.ts",
+    "test:browser": "bun test tests/browser/durable.test.ts"
   },
   "devDependencies": {
     "git-format-staged": "4.0.1",
+    "playwright": "1.62.1",
     "prettier": "^3.8.3",
     "prettier-plugin-tailwindcss": "^0.8.0",
     "turbo": "^2.9.18",

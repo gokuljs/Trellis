@@ -427,6 +427,34 @@ export function AppShell({
       }
 
       if (!activeRunStatuses.has(latest.status)) {
+        try {
+          const [detail, activity] = await Promise.all([
+            loadLatestHistory(sessionId),
+            queryClient
+              .fetchInfiniteQuery({
+                ...runSummariesQueryOptions(sessionId),
+                staleTime: 0,
+              })
+              .then(
+                (data) => data.pages.flatMap((page) => page.items),
+                () => null
+              ),
+          ])
+          if (isStale()) return
+          applyHistory(detail)
+          if (activity) {
+            setRunActivities(activitiesFromSummaries(activity))
+            setActivityHistoryError(null)
+          } else {
+            setActivityHistoryError("Saved activity could not be loaded.")
+          }
+        } catch {
+          if (isStale()) return
+          waitForDiscovery(
+            "Trellis could not load the saved result. Reconnect to try again."
+          )
+          return
+        }
         setPending(false)
         setStreamingText(null)
         setActiveRunId(null)
@@ -575,7 +603,13 @@ export function AppShell({
         }
       })()
     },
-    [applyHistory, loadLatestHistory, recordRunEvent, recordRunInfo]
+    [
+      applyHistory,
+      loadLatestHistory,
+      queryClient,
+      recordRunEvent,
+      recordRunInfo,
+    ]
   )
 
   const restoreWorkspace = useCallback(async () => {

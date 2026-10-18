@@ -32,3 +32,6 @@ dist-ssr
 
 # typescript
 *.tsbuildinfo
+
+# Browser recordings and screenshots
+test-results/
