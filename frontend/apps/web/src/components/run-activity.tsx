@@ -148,7 +148,7 @@ export function RunActivity({
   const costLimit = runInfo?.limits?.maxCostUsd
   const latestResumedDeadline = ordered.findLast(
     (event) =>
-      event.eventType === "run.resumed" &&
+      ["run.started", "run.resumed"].includes(event.eventType) &&
       typeof event.data.deadline_at === "string" &&
       Number.isFinite(Date.parse(event.data.deadline_at))
   )

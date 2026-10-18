@@ -50,7 +50,8 @@ export function RunActivityDisclosure({
     pending,
     now,
     activity.latestEvent,
-    activity.summary
+    activity.summary,
+    activity.runInfo?.status
   )
   const available = Boolean(
     (sessionId && turnId) ||

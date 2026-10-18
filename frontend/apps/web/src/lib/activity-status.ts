@@ -98,7 +98,8 @@ export function describeActivity(
   pending: boolean,
   now: number,
   latestEvent?: RuntimeRunEvent,
-  summary?: RunSummary
+  summary?: RunSummary,
+  runStatus?: string
 ): ActivityStatus {
   if (events.length === 0 && !latestEvent) {
     if (summary) {
@@ -122,6 +123,13 @@ export function describeActivity(
         terminal,
       }
     }
+    if (runStatus === "queued")
+      return {
+        label: "Queued",
+        orb: "connecting",
+        duration: null,
+        terminal: false,
+      }
     return pending
       ? { label: "Thinking", orb: "working", duration: null, terminal: false }
       : {

@@ -1,4 +1,4 @@
-import type { RunSummary, SavedRunEvent } from "@/lib/app-types"
+import type { LatestRun, RunSummary, SavedRunEvent } from "@/lib/app-types"
 import type {
   RuntimeRunEvent,
   RuntimeRunInfo,
@@ -9,6 +9,7 @@ import type {
 export function runInfoFromSummary(summary: RunSummary): RuntimeRunInfo {
   return {
     runId: summary.run_id,
+    status: summary.status,
     modelId: summary.model_id,
     budgetPreset: summary.budget_preset,
     limits: {
@@ -100,6 +101,26 @@ export function startNextAttempt(previous?: TurnRunActivity): TurnRunActivity {
     })
   }
   return { events: [], runInfo: null, priorAttempts: priorAttempts.slice(-500) }
+}
+
+export function restoreRunActivity(
+  previous: TurnRunActivity | undefined,
+  latest: LatestRun
+): TurnRunActivity {
+  const previousRunId = previous?.runInfo?.runId ?? previous?.summary?.run_id
+  const aligned =
+    previousRunId && previousRunId !== latest.run_id
+      ? startNextAttempt(previous)
+      : previous
+  return {
+    ...aligned,
+    events: aligned?.events ?? [],
+    runInfo: {
+      ...aligned?.runInfo,
+      runId: latest.run_id,
+      status: latest.status,
+    },
+  }
 }
 
 export function retainWindowActivities(

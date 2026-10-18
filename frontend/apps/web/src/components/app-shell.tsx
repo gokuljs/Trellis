@@ -86,6 +86,7 @@ import {
   activitiesFromSummaries,
   startNextAttempt,
   retainWindowActivities,
+  restoreRunActivity,
 } from "@/lib/activity-history"
 import { useContextPreview } from "@/lib/use-context-preview"
 import { getAuthController } from "@/lib/auth-controller"
@@ -448,31 +449,20 @@ export function AppShell({
       setPending(!!turn || activeRunStatuses.has(latest.status))
       setStreamingText(null)
       setRunActivities((current) => {
-        const previous = current[latest.turn_id]
-        const previousRunId =
-          previous?.runInfo?.runId ?? previous?.summary?.run_id
-        const aligned =
-          previousRunId && previousRunId !== latest.run_id
-            ? startNextAttempt(previous)
-            : previous
         return {
           ...current,
-          [latest.turn_id]: {
-            ...aligned,
-            events: [],
-            latestEvent: undefined,
-            runInfo: {
-              ...(aligned?.runInfo ?? {}),
-              runId: latest.run_id,
-            },
-          },
+          [latest.turn_id]: restoreRunActivity(current[latest.turn_id], latest),
         }
       })
       setActiveRunTurnId(latest.turn_id)
       setApprovalPendingToolId(null)
       setApprovalError(null)
       approvalRequestRef.current = null
-      activeRunRef.current = { runId: latest.run_id, lastSequence: 0 }
+      const lastSequence =
+        activeRunRef.current?.runId === latest.run_id
+          ? activeRunRef.current.lastSequence
+          : 0
+      activeRunRef.current = { runId: latest.run_id, lastSequence }
       setActiveRunId(latest.run_id)
 
       void (async () => {

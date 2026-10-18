@@ -18,6 +18,7 @@ export type RuntimeRunEvent = {
 
 export type RuntimeRunInfo = {
   runId: string
+  status?: string
   modelId?: string
   budgetPreset?: string
   limits?: {
@@ -255,6 +256,7 @@ function credentialWasRejected(error: RuntimeError): boolean {
 function parseRunInfo(result: Record<string, unknown>): RuntimeRunInfo {
   const runId = result.runId as string
   const info: RuntimeRunInfo = { runId }
+  if (typeof result.status === "string") info.status = result.status
   if (typeof result.modelId === "string") info.modelId = result.modelId
   if (typeof result.budgetPreset === "string") {
     info.budgetPreset = result.budgetPreset
