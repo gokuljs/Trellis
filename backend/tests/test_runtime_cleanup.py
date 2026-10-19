@@ -50,6 +50,8 @@ class PeerSocket:
     ):
         run = SimpleNamespace(
             id="test-run",
+            session_id="test-chat",
+            turn_id="test-turn",
             model_id="test-model",
             status=RunStatus.QUEUED,
             last_event_sequence=0,
@@ -89,12 +91,15 @@ class PeerSocket:
 
         self.app = SimpleNamespace(
             state=SimpleNamespace(
-                settings=SimpleNamespace(environment="test", web_origin=None),
+                settings=SimpleNamespace(
+                    environment="test", web_origin=None, private_user_ids=frozenset()
+                ),
                 auth_verifier=FakeVerifier(),
                 account_registry=FakeRegistry(),
             )
         )
         self.headers = {"origin": "http://localhost:3000"}
+        self.scope = {"app": self.app}
         self._receive_after_requests = receive_after_requests
         self._send_payload = send_payload
         self._close_socket = close_socket

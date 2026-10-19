@@ -756,10 +756,6 @@ def test_runtime_reads_map_rls_rows_and_omit_lease_token() -> None:
             latest = await repository.get_latest_run_for_session(str(run["chat_id"]))
             assert one is not None and one.session_id == run["chat_id"]
             assert latest is not None and latest.id == run_id
-            assert [
-                item.id
-                for item in await repository.list_runs_for_session(str(run["chat_id"]), 0, 20)
-            ] == [run_id]
             assert (await repository.list_run_events(run_id))[0].event_type is RunEventType.QUEUED
             assert (await repository.list_model_calls(run_id))[0].cached_tokens == 0
             messages = await repository.list_run_messages(run_id)

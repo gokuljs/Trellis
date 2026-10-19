@@ -68,14 +68,26 @@ END $check$;
 DO $check$
 DECLARE
     table_name text;
+    readiness_oid oid := to_regprocedure('trellis.readiness()');
 BEGIN
-    IF has_schema_privilege('anon', 'trellis', 'USAGE') THEN
+    IF readiness_oid IS NULL AND has_schema_privilege('anon', 'trellis', 'USAGE') THEN
         RAISE EXCEPTION 'anon can use trellis schema';
+    END IF;
+    IF readiness_oid IS NOT NULL AND (
+        NOT has_function_privilege('anon',readiness_oid,'EXECUTE')
+        OR EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+            WHERE n.nspname='trellis' AND p.oid<>readiness_oid
+                AND has_function_privilege('anon',p.oid,'EXECUTE'))
+    ) THEN
+        RAISE EXCEPTION 'anon function access must be limited to readiness';
     END IF;
     FOR table_name IN
         SELECT t.table_name FROM information_schema.tables t
         WHERE t.table_schema='trellis' AND t.table_type='BASE TABLE'
     LOOP
+        IF has_table_privilege('anon','trellis.' || table_name,'SELECT,INSERT,UPDATE,DELETE') THEN
+            RAISE EXCEPTION 'anon can access table directly: %',table_name;
+        END IF;
         IF has_table_privilege('authenticated', 'trellis.' || table_name, 'INSERT')
            OR has_table_privilege('authenticated', 'trellis.' || table_name, 'UPDATE')
            OR has_table_privilege('authenticated', 'trellis.' || table_name, 'DELETE') THEN

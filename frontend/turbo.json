@@ -4,7 +4,21 @@
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
-      "env": ["VITE_SUPABASE_URL", "VITE_SUPABASE_PUBLISHABLE_KEY"],
+      "env": [
+        "VITE_SUPABASE_URL",
+        "VITE_SUPABASE_PUBLISHABLE_KEY",
+        "VITE_API_BASE_URL",
+        "VITE_RUNTIME_WS_URL",
+        "VITE_SENTRY_DSN",
+        "VITE_SENTRY_ENABLED",
+        "VITE_SENTRY_ENVIRONMENT",
+        "VITE_SENTRY_RELEASE",
+        "VITE_SENTRY_TRACES_SAMPLE_RATE",
+        "SENTRY_UPLOAD_SOURCEMAPS",
+        "SENTRY_ORG",
+        "SENTRY_PROJECT"
+      ],
+      "passThroughEnv": ["SENTRY_AUTH_TOKEN"],
       "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/.env*"],
       "outputs": ["dist/**"]
     },
@@ -18,7 +32,17 @@
       "dependsOn": ["^typecheck"]
     },
     "dev": {
-      "env": ["VITE_SUPABASE_URL", "VITE_SUPABASE_PUBLISHABLE_KEY"],
+      "env": [
+        "VITE_SUPABASE_URL",
+        "VITE_SUPABASE_PUBLISHABLE_KEY",
+        "VITE_API_BASE_URL",
+        "VITE_RUNTIME_WS_URL",
+        "VITE_SENTRY_DSN",
+        "VITE_SENTRY_ENABLED",
+        "VITE_SENTRY_ENVIRONMENT",
+        "VITE_SENTRY_RELEASE",
+        "VITE_SENTRY_TRACES_SAMPLE_RATE"
+      ],
       "cache": false,
       "persistent": true
     }

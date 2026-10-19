@@ -525,6 +525,7 @@ def test_runtime_websocket_allows_only_configured_web_origin(
             environment="production",
             data_dir=tmp_path,
             web_origin="https://app.example.com",
+            private_user_ids=frozenset({UUID("a59673c1-78d0-4bc8-8c49-6bc2e7a01dd5")}),
         ),
         auth_verifier=StubVerifier(),
     )
@@ -567,20 +568,16 @@ def test_runtime_websocket_allows_only_configured_web_origin(
     "configured_origin",
     ["http://app.example.com", "https://*.example.com", "https://app.example.com/path"],
 )
-def test_runtime_websocket_rejects_invalid_production_origin_config(
+def test_invalid_production_origin_is_rejected_during_configuration(
     tmp_path: Path, configured_origin: str
 ) -> None:
-    app = create_app(
-        Settings(environment="production", data_dir=tmp_path, web_origin=configured_origin),
-        auth_verifier=StubVerifier(),
-    )
-
-    with (
-        TestClient(app) as client,
-        pytest.raises(WebSocketDisconnect),
-        client.websocket_connect("/api/runtime", headers={"origin": configured_origin}),
-    ):
-        pass
+    with pytest.raises(ValueError, match="Web origin"):
+        Settings(
+            environment="production",
+            data_dir=tmp_path,
+            web_origin=configured_origin,
+            private_user_ids=frozenset({UUID("a59673c1-78d0-4bc8-8c49-6bc2e7a01dd5")}),
+        )
 
 
 def test_runtime_websocket_rechecks_auth_before_dispatching_run_rpc(

@@ -1,26 +1,16 @@
-import { useEffect, useSyncExternalStore, type ReactNode } from "react"
+import { useEffect, type ReactNode } from "react"
 
 import { GitHubIcon } from "@trellis/ui/icons/github-icon"
 import { GoogleIcon } from "@trellis/ui/icons/google-icon"
 import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 import { useAuth } from "@/lib/use-auth"
+import { navigate, parseAppRoute, useAppPath } from "@/lib/app-routes"
+import {
+  consumeAuthReturnPath,
+  rememberAuthReturnPath,
+} from "@/lib/auth-return"
 import { SessionQueryProvider } from "@/components/session-query-provider"
 import "./auth-screen.css"
-
-function subscribeToPath(listener: () => void) {
-  window.addEventListener("popstate", listener)
-  return () => window.removeEventListener("popstate", listener)
-}
-
-function currentPath() {
-  return window.location.pathname
-}
-
-function navigate(path: "/" | "/login" | "/signup", replace = false) {
-  if (replace) window.history.replaceState(null, "", path)
-  else window.history.pushState(null, "", path)
-  window.dispatchEvent(new PopStateEvent("popstate"))
-}
 
 function AuthPageLink({
   href,
@@ -54,7 +44,7 @@ function AuthPageLink({
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const auth = useAuth()
-  const path = useSyncExternalStore(subscribeToPath, currentPath, currentPath)
+  const path = useAppPath()
   const authPage = path === "/login" || path === "/signup"
   const signedIn = auth.status === "signed-in" && auth.user !== null
   const signup = path === "/signup"
@@ -62,8 +52,22 @@ export function AuthGate({ children }: { children: ReactNode }) {
   useEffect(() => {
     // Let session restoration consume OAuth callback parameters first.
     if (auth.status === "loading") return
-    if (signedIn && authPage) navigate("/", true)
-    else if (!signedIn && !authPage) navigate("/login", true)
+    const route = parseAppRoute(path)
+    if (route.kind === "unknown") {
+      navigate("/", true)
+      return
+    }
+    if (route.path !== path) {
+      navigate(route.path, true)
+      return
+    }
+    if (signedIn && (authPage || route.kind === "home")) {
+      const target = consumeAuthReturnPath()
+      if (target || authPage) navigate(target ?? "/", true)
+    } else if (!signedIn && !authPage) {
+      if (route.kind === "chat") rememberAuthReturnPath(route.path)
+      navigate("/login", true)
+    }
   }, [auth.status, authPage, signedIn, path])
 
   if (signedIn && auth.user) {

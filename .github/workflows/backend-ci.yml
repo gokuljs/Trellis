@@ -84,6 +84,11 @@ jobs:
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/catalog_sync.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/reviewed_model_dispatch.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/chat_turn_security.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/accounted_usage_upgrade.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610160002_run_activity_summaries.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/run_activity.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610160003_readiness_probe.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/readiness.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610180001_durable_jobs.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/durable_acceptance.sql
           python3 supabase/tests/durable_acceptance_concurrency.py

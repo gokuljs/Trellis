@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Trellis chat routing verification</title>
+    <style>
+      #fixture-controls {
+        position: fixed;
+        z-index: 1000;
+        right: 12px;
+        bottom: 12px;
+        max-width: 520px;
+        max-height: 45vh;
+        overflow: auto;
+        padding: 12px;
+        border: 1px solid #777;
+        border-radius: 8px;
+        color: #eee;
+        background: #222;
+        font:
+          12px system-ui,
+          sans-serif;
+      }
+      #fixture-controls button {
+        padding: 6px 10px;
+        border: 1px solid #777;
+      }
+      #fixture-evidence {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <aside id="fixture-controls">
+      <button id="run-checks">Run routing checks</button>
+      <pre id="fixture-evidence" aria-live="polite">
+Synthetic fixture starting…</pre>
+    </aside>
+    <script type="module" src="/tests/browser/chat-routing.tsx"></script>
+  </body>
+</html>

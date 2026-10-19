@@ -36,6 +36,7 @@ from app.application.runs import RunService
 from app.application.secret_redaction import SecretRedactor
 from app.application.sessions import SessionService
 from app.application.settings import SettingsService
+from app.application.telemetry import NO_TELEMETRY, Telemetry
 from app.application.tools import ToolRegistry
 from app.core.config import Settings
 from app.domain.capabilities import RuntimeCapabilities
@@ -153,7 +154,9 @@ class AccountRegistry:
         tool_registry_factory: Callable[..., ToolRegistry] | None = None,
         cloud_client: httpx.AsyncClient | None = None,
         repository_factory: RepositoryFactory | None = None,
+        telemetry: Telemetry = NO_TELEMETRY,
     ) -> None:
+        self._telemetry = telemetry
         self._settings = settings
         self._capabilities = RuntimeCapabilities(settings.enabled_capabilities)
         self._credentials = ServerCredentialStore(settings)
@@ -168,7 +171,11 @@ class AccountRegistry:
         self._runtime_providers = runtime_providers
         self._tool_registry_factory = tool_registry_factory
         self._cloud_client = cloud_client
-        self._repository_factory: RepositoryFactory = repository_factory or SupabaseRepository
+        self._repository_factory: RepositoryFactory = repository_factory or (
+            lambda settings, user_id, source, client: SupabaseRepository(
+                settings, user_id, source, client, telemetry=self._telemetry
+            )
+        )
         self._token_sources: dict[UUID, VerifiedTokenSource] = {}
         self._contexts: dict[UUID, AccountContext] = {}
         self._locks: dict[UUID, int] = {}
@@ -252,6 +259,7 @@ class AccountRegistry:
                             else None,
                             capabilities=self._capabilities,
                             redactor=self._redactor,
+                            telemetry=self._telemetry,
                         )
                     )
                     run_service = RunService(
@@ -271,6 +279,7 @@ class AccountRegistry:
                         workspace_bindings=workspace_bindings,
                         lease_repository=database,
                         acceptance_repository=database,
+                        telemetry=self._telemetry,
                     )
                     try:
                         await run_service.resume_decided_approvals()

@@ -5,6 +5,12 @@ import {
   type AuthController,
   type AuthCredential,
 } from "@/lib/auth-controller"
+import { runtimeUrl } from "@/lib/service-targets"
+import {
+  ServiceReadinessError,
+  waitUntilServiceReady,
+} from "@/lib/service-readiness"
+import { startRuntimeRequestSpan } from "@/lib/telemetry"
 
 export type RuntimeRunEvent = {
   runId: string
@@ -107,6 +113,7 @@ type RpcRequest = {
 }
 
 type RuntimeClientOptions = {
+  signal?: AbortSignal
   onEvent?: (event: RuntimeRunEvent) => void
   onRunId?: (runId: string) => void
   onRunInfo?: (run: RuntimeRunInfo) => void
@@ -118,6 +125,12 @@ type RunResult = { runId: string }
 
 const rpcTimeoutMs = 30_000
 const maxBufferedEvents = 500
+
+function serviceStartupError(error: unknown): RuntimeError {
+  const failure =
+    error instanceof ServiceReadinessError ? error : new ServiceReadinessError()
+  return new RuntimeError(failure.code, failure.message, 503)
+}
 
 function authenticationError() {
   return new RuntimeError(
@@ -171,12 +184,6 @@ function expireRejectedCredential(
       // A newer or temporarily unavailable credential must remain untouched.
     }
   })()
-}
-
-function runtimeUrl() {
-  const url = new URL("/api/runtime", window.location.href)
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:"
-  return url.toString()
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -291,6 +298,9 @@ function followRun(
   const initialEpoch = auth.getSessionEpoch()
 
   return new Promise((resolve, reject) => {
+    const startup = new AbortController()
+    const abort = () =>
+      finish(new RuntimeError("connection_cancelled", "Connection cancelled."))
     let socket: WebSocket | null = null
     let runId: string | null = resumedRunId
     let lastSequence = initialSequence
@@ -324,6 +334,8 @@ function followRun(
     const finish = (error?: Error) => {
       if (settled) return
       settled = true
+      startup.abort()
+      options.signal?.removeEventListener("abort", abort)
       unsubscribeAuth?.()
       unsubscribeAuth = null
       if (reconnectTimer !== null) clearTimeout(reconnectTimer)
@@ -449,6 +461,9 @@ function followRun(
         )
         return
       }
+      const endSpan = startRuntimeRequestSpan(
+        runId ? "run.subscribe" : "run.start"
+      )
       void sendRpc(activeSocket, method, params)
         .then((response) => {
           if (settled || socket !== activeSocket) return
@@ -469,13 +484,15 @@ function followRun(
               "The Trellis service resumed a different run."
             )
           }
+          const runInfo = parseRunInfo(result)
+          endSpan("ok")
           if (!runId) runId = responseRunId
           if (!runIdNotified) {
             runIdNotified = true
             options.onRunId?.(runId)
           }
           if (settled || !stillCurrent()) return
-          options.onRunInfo?.(parseRunInfo(result))
+          options.onRunInfo?.(runInfo)
           if (settled || !stillCurrent()) return
           subscriptionReady = true
           flushBufferedEvents()
@@ -485,6 +502,13 @@ function followRun(
           }
         })
         .catch((error: unknown) => {
+          endSpan(
+            error instanceof RuntimeError && error.code === "runtime_timeout"
+              ? "timeout"
+              : error instanceof RuntimeError && error.status === 401
+                ? "cancelled"
+                : "error"
+          )
           if (settled || socket !== activeSocket) return
           subscriptionRequestPending = false
           const runtimeError =
@@ -496,6 +520,7 @@ function followRun(
                 )
           failRequest(runtimeError)
         })
+        .finally(() => endSpan("cancelled"))
     }
 
     const scheduleReconnect = () => {
@@ -585,6 +610,20 @@ function followRun(
     }
 
     async function connect() {
+      if (settled) return
+      if (!stillCurrent()) {
+        finish(authenticationError())
+        return
+      }
+      try {
+        await waitUntilServiceReady(startup.signal)
+      } catch (error) {
+        if (!settled)
+          finish(
+            stillCurrent() ? serviceStartupError(error) : authenticationError()
+          )
+        return
+      }
       if (settled) return
       if (!stillCurrent()) {
         finish(authenticationError())
@@ -697,6 +736,8 @@ function followRun(
     unsubscribeAuth = auth.subscribe(() => {
       if (!stillCurrent()) finish(authenticationError())
     })
+    options.signal?.addEventListener("abort", abort, { once: true })
+    if (options.signal?.aborted) abort()
     void connect()
   })
 }
@@ -720,12 +761,13 @@ export function resumeRun(
   return followRun(null, runId, options, afterSequence)
 }
 
-async function requestRunAction(
-  method: string,
+async function requestRunAction<TResult>(
+  method: "run.cancel" | "run.respond",
   params: Record<string, unknown>,
   requestId: string,
-  failureMessage: string
-): Promise<Record<string, unknown>> {
+  failureMessage: string,
+  parseResult: (result: Record<string, unknown>) => TResult
+): Promise<TResult> {
   const auth = getAuthController()
   const initialUser = auth.getSnapshot().user?.id
   const initialEpoch = auth.getSessionEpoch()
@@ -737,6 +779,21 @@ async function requestRunAction(
       auth.getSessionEpoch() === initialEpoch
     )
   }
+  if (!stillCurrent()) throw authenticationError()
+  const startup = new AbortController()
+  const unsubscribeStartup = auth.subscribe(() => {
+    if (!stillCurrent()) startup.abort()
+  })
+  try {
+    await waitUntilServiceReady(startup.signal)
+  } catch (error) {
+    if (!stillCurrent()) throw authenticationError()
+    throw serviceStartupError(error)
+  } finally {
+    unsubscribeStartup()
+    startup.abort()
+  }
+  if (!stillCurrent()) throw authenticationError()
   let credential: AuthCredential
   try {
     credential = await auth.getAccessToken()
@@ -756,9 +813,19 @@ async function requestRunAction(
     let authenticated = false
     let socketCredential: AuthCredential | null = null
     let unsubscribeAuth: (() => void) | null = null
-    const finish = (result?: Record<string, unknown>, error?: RuntimeError) => {
+    let endSpan: ReturnType<typeof startRuntimeRequestSpan> | undefined
+    const finish = (result?: TResult, error?: RuntimeError) => {
       if (settled) return
       settled = true
+      endSpan?.(
+        error?.code === "runtime_timeout"
+          ? "timeout"
+          : error?.status === 401
+            ? "cancelled"
+            : error || !result
+              ? "error"
+              : "ok"
+      )
       unsubscribeAuth?.()
       unsubscribeAuth = null
       clearTimeout(timeout)
@@ -867,6 +934,7 @@ async function requestRunAction(
           return
         }
         authenticated = true
+        endSpan = startRuntimeRequestSpan(method)
         try {
           socket.send(
             JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params })
@@ -894,7 +962,24 @@ async function requestRunAction(
         )
         return
       }
-      finish(asRecord(envelope.result) ?? undefined)
+      const result = asRecord(envelope.result)
+      if (!result) {
+        finish()
+        return
+      }
+      try {
+        finish(parseResult(result))
+      } catch (error) {
+        finish(
+          undefined,
+          error instanceof RuntimeError
+            ? error
+            : new RuntimeError(
+                "runtime_protocol_error",
+                "The Trellis service returned an invalid run."
+              )
+        )
+      }
     }
     socket.onerror = () => {
       finish(
@@ -928,19 +1013,21 @@ export async function cancelRun(
   runId: string,
   afterSequence = 0
 ): Promise<{ runId: string; status: string }> {
-  const result = await requestRunAction(
+  return requestRunAction(
     "run.cancel",
     { runId, afterSequence },
     "runtime-cancel",
-    "Trellis could not cancel that run."
+    "Trellis could not cancel that run.",
+    (result) => {
+      if (result.runId !== runId || typeof result.status !== "string") {
+        throw new RuntimeError(
+          "runtime_protocol_error",
+          "The Trellis service returned an invalid run."
+        )
+      }
+      return { runId: result.runId, status: result.status }
+    }
   )
-  if (typeof result.runId !== "string" || typeof result.status !== "string") {
-    throw new RuntimeError(
-      "runtime_protocol_error",
-      "The Trellis service returned an invalid run."
-    )
-  }
-  return { runId: result.runId, status: result.status }
 }
 
 export async function respondToToolApproval(
@@ -953,21 +1040,23 @@ export async function respondToToolApproval(
   toolCallId: string
   decision: ToolApprovalDecision
 }> {
-  const result = await requestRunAction(
+  return requestRunAction(
     "run.respond",
     { runId, toolCallId, decision, afterSequence },
     "runtime-respond",
-    "Trellis could not answer that approval request."
+    "Trellis could not answer that approval request.",
+    (result) => {
+      if (
+        result.runId !== runId ||
+        result.toolCallId !== toolCallId ||
+        result.decision !== decision
+      ) {
+        throw new RuntimeError(
+          "runtime_protocol_error",
+          "The Trellis service returned a different approval."
+        )
+      }
+      return { runId, toolCallId, decision }
+    }
   )
-  if (
-    result.runId !== runId ||
-    result.toolCallId !== toolCallId ||
-    result.decision !== decision
-  ) {
-    throw new RuntimeError(
-      "runtime_protocol_error",
-      "The Trellis service returned a different approval."
-    )
-  }
-  return { runId, toolCallId, decision }
 }

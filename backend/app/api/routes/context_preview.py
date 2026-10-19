@@ -1,9 +1,11 @@
+from contextlib import nullcontext
 from typing import Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field, field_validator
 
-from app.api.dependencies import ContextPreviewServiceDep
+from app.api.dependencies import AccountDep, ContextPreviewServiceDep
+from app.api.telemetry import owned_chat_telemetry
 from app.application.budgets import BudgetPreset
 
 
@@ -40,12 +42,21 @@ router = APIRouter(prefix="/api/context-preview", tags=["context"])
 
 @router.post("")
 async def preview_context(
-    payload: ContextPreviewRequest, service: ContextPreviewServiceDep
+    request: Request,
+    payload: ContextPreviewRequest,
+    service: ContextPreviewServiceDep,
+    account: AccountDep,
 ) -> ContextPreviewResponse:
-    result = await service.preview(
-        session_id=payload.session_id,
-        model_id=payload.model_id,
-        draft=payload.draft,
-        budget_preset=payload.budget_preset,
+    session = (
+        await account.database.get_session(payload.session_id)
+        if payload.session_id is not None
+        else None
     )
-    return ContextPreviewResponse.model_validate(result, from_attributes=True)
+    with owned_chat_telemetry(request.scope, session) if session else nullcontext():
+        result = await service.preview(
+            session_id=payload.session_id,
+            model_id=payload.model_id,
+            draft=payload.draft,
+            budget_preset=payload.budget_preset,
+        )
+        return ContextPreviewResponse.model_validate(result, from_attributes=True)

@@ -6,6 +6,7 @@ from uuid import UUID
 import httpx
 import pytest
 
+from app.application.telemetry import NO_TELEMETRY, Telemetry
 from app.core.config import Settings
 from app.infrastructure import accounts
 from app.infrastructure.supabase_repository import VerifiedTokenSource
@@ -21,9 +22,16 @@ def test_cloud_registry_initializes_account_and_refreshes_token(
 
     class FakeRepository:
         def __init__(
-            self, _settings: Settings, _user_id: UUID, source: VerifiedTokenSource, _client: object
+            self,
+            _settings: Settings,
+            _user_id: UUID,
+            source: VerifiedTokenSource,
+            _client: object,
+            *,
+            telemetry: Telemetry = NO_TELEMETRY,
         ):
             sources.append(source)
+            self.telemetry = telemetry
 
         async def ensure_account(self) -> None:
             events.append("ensure")

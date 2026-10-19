@@ -52,6 +52,7 @@ from app.domain.runtime import (
     RunMessageRecord,
     RunSnapshot,
     RunStatus,
+    RunSummary,
     ToolApprovalDecision,
     ToolCallRecord,
     ToolCallStatus,
@@ -844,6 +845,48 @@ class MemoryRepository:
             offset : offset + limit
         ]
 
+    async def list_run_summaries_for_session(
+        self,
+        session_id: str,
+        offset: int,
+        limit: int,
+        *,
+        turn_id: str | None = None,
+        newest_first: bool = False,
+    ) -> list[RunSummary]:
+        runs = await self.list_runs_for_session(
+            session_id, offset, limit, turn_id=turn_id, newest_first=newest_first
+        )
+        summaries = []
+        for run in runs:
+            calls = await self.list_model_calls(run.id)
+            tokens = [
+                call.accounted_total_tokens
+                for call in calls
+                if call.accounted_total_tokens is not None
+            ]
+            costs = [call.estimated_cost for call in calls if call.estimated_cost is not None]
+            summaries.append(
+                RunSummary(
+                    run=run,
+                    model_call_count=len(calls),
+                    tool_call_count=len(await self.list_tool_calls(run.id)),
+                    total_tokens=(sum(tokens) if tokens else None) if calls else 0,
+                    usage_complete=all(
+                        call.accounted_total_tokens is not None
+                        and call.status not in (ModelCallStatus.PENDING, ModelCallStatus.STREAMING)
+                        for call in calls
+                    ),
+                    estimated_cost_usd=(sum(costs) if costs else None) if calls else 0.0,
+                    cost_complete=all(
+                        call.estimated_cost is not None
+                        and call.status not in (ModelCallStatus.PENDING, ModelCallStatus.STREAMING)
+                        for call in calls
+                    ),
+                )
+            )
+        return summaries
+
     async def append_run_event(
         self,
         run_id: str,
@@ -1180,6 +1223,8 @@ class MemoryRepository:
         cache_creation_tokens: int | None = None,
         estimated_cost: float | None = None,
         clear_estimated_cost: bool = False,
+        accounted_total_tokens: int | None = None,
+        clear_accounted_total_tokens: bool = False,
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> ModelCallRecord:
@@ -1214,6 +1259,22 @@ class MemoryRepository:
             if estimated_cost is not None
             else record.estimated_cost,
             error_code=error_code or record.error_code,
+            accounted_total_tokens=None
+            if clear_accounted_total_tokens
+            else accounted_total_tokens
+            if accounted_total_tokens is not None
+            else None
+            if any(
+                value is not None
+                for value in (
+                    input_tokens,
+                    output_tokens,
+                    reasoning_tokens,
+                    cached_tokens,
+                    cache_creation_tokens,
+                )
+            )
+            else record.accounted_total_tokens,
             error_message=error_message or record.error_message,
             finished_at=None if next_status is ModelCallStatus.STREAMING else _now(),
         )

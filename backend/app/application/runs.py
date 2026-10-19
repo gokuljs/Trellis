@@ -1,11 +1,13 @@
 import asyncio
+import contextvars
 import json
 import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import aclosing, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 from typing import Literal, cast
 
 from app.application.budgets import (
@@ -37,6 +39,14 @@ from app.application.ports import (
 from app.application.run_context import RunContext, billing_tier, usage_cost
 from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
 from app.application.streaming import TextStreamBatcher
+from app.application.telemetry import (
+    NO_TELEMETRY,
+    Attribute,
+    Operation,
+    Telemetry,
+    TraceLink,
+    run_identifiers,
+)
 from app.application.tools import (
     MAX_ARGUMENT_BYTES,
     ToolExecutionError,
@@ -57,6 +67,7 @@ from app.domain.runtime import (
     RunEventType,
     RunSnapshot,
     RunStatus,
+    RunSummary,
     ToolApprovalDecision,
     ToolCallRecord,
     ToolCallStatus,
@@ -83,6 +94,23 @@ class _ModelStep:
     finish_reason: str | None
     finish_kind: ModelFinishKind
     billing_context: dict[str, object]
+
+
+@dataclass(slots=True)
+class _RunObservation:
+    operation: Operation
+    outcome: str = "skipped"
+    error_code: str | None = None
+    identifiers: dict[str, str] = field(default_factory=dict)
+
+    def bind(self, run: RunSnapshot) -> None:
+        self.identifiers = run_identifiers(run)
+        self.operation.set_attributes(self.identifiers)
+
+    def finish(self, outcome: str, error_code: str | None = None) -> None:
+        self.outcome = outcome
+        self.error_code = error_code
+        self.operation.outcome(outcome, error_code)
 
 
 def _usage_measure(
@@ -184,11 +212,13 @@ class RunService:
         max_concurrent_runs: int = DEFAULT_MAX_CONCURRENT_RUNS,
         capabilities: RuntimeCapabilities = DEFAULT_RUNTIME_CAPABILITIES,
         redactor: SecretRedactor | None = None,
+        telemetry: Telemetry = NO_TELEMETRY,
     ) -> None:
         if max_concurrent_runs < 1:
             raise ValueError("maximum concurrent runs must be positive")
         if lease_renew_interval_seconds <= 0:
             raise ValueError("lease renewal interval must be positive")
+        self._telemetry = telemetry
         self._runs = runs
         self._acceptance = acceptance_repository
         self._sessions = sessions
@@ -210,10 +240,43 @@ class RunService:
         self._cancel_finalizers: dict[str, asyncio.Task[None]] = {}
         self._lease_monitors: dict[str, asyncio.Task[None]] = {}
         self._lease_lost: set[str] = set()
-        self._reschedule_pending: set[str] = set()
+        self._reschedule_pending: dict[str, TraceLink | None] = {}
         self._closing = False
 
     async def create_run(
+        self,
+        session_id: str,
+        client_request_id: str,
+        content: str,
+        *,
+        turn_id: str | None = None,
+        budget_preset: BudgetPreset | None = None,
+        model_id: str | None = None,
+    ) -> RunSnapshot:
+        with self._telemetry.operation("run.admit") as observation:
+            try:
+                run = await self._admit_run(
+                    session_id,
+                    client_request_id,
+                    content,
+                    turn_id=turn_id,
+                    budget_preset=budget_preset,
+                    model_id=model_id,
+                )
+            except ApplicationError as error:
+                observation.outcome("rejected", error.code)
+                attributes = {"outcome": "rejected", "error_code": error.code}
+                self._telemetry.event("run.admission.rejected", attributes, error=True)
+                self._telemetry.count("run.admissions", attributes=attributes)
+                raise
+            with self._telemetry.correlate(run_identifiers(run)):
+                observation.set_attributes({"provider": run.provider_id, "model": run.model_id})
+                observation.outcome("accepted")
+                self._telemetry.event("run.admitted", {"outcome": "accepted"})
+            self._telemetry.count("run.admissions", attributes={"outcome": "accepted"})
+            return run
+
+    async def _admit_run(
         self,
         session_id: str,
         client_request_id: str,
@@ -400,7 +463,11 @@ class RunService:
                 await finalizer
 
     async def get_run(self, run_id: str) -> RunSnapshot | None:
-        return await self._recover_if_expired(await self._runs.get_run(run_id))
+        run = await self._runs.get_run(run_id)
+        if run is None:
+            return None
+        with self._telemetry.correlate(run_identifiers(run)):
+            return await self._recover_if_expired(run)
 
     async def _recover_if_expired(self, run: RunSnapshot | None) -> RunSnapshot | None:
         if self._lease_repository is None or run is None or is_terminal_run_status(run.status):
@@ -439,16 +506,21 @@ class RunService:
         *,
         turn_id: str | None = None,
         newest_first: bool = False,
-    ) -> tuple[list[RunSnapshot], int | None]:
+    ) -> tuple[list[RunSummary], int | None]:
         if await self._sessions.get_session(session_id) is None:
             raise ApplicationError("session_not_found", "Session not found.")
-        runs = await self._runs.list_runs_for_session(
+        summaries = await self._runs.list_run_summaries_for_session(
             session_id, offset, limit + 1, turn_id=turn_id, newest_first=newest_first
         )
-        visible = [await self._recover_if_expired(run) for run in runs[:limit]]
-        return [run for run in visible if run is not None], offset + limit if len(
-            runs
-        ) > limit else None
+        recovered = False
+        for summary in summaries[:limit]:
+            if await self._recover_if_expired(summary.run) != summary.run:
+                recovered = True
+        if recovered:
+            summaries = await self._runs.list_run_summaries_for_session(
+                session_id, offset, limit + 1, turn_id=turn_id, newest_first=newest_first
+            )
+        return summaries[:limit], offset + limit if len(summaries) > limit else None
 
     async def list_session_run_events(
         self, session_id: str, run_id: str, after_sequence: int, limit: int
@@ -480,6 +552,11 @@ class RunService:
             if str(error) == "run not found":
                 raise ApplicationError("run_not_found", "Run not found.") from None
             raise
+        with self._telemetry.correlate(run_identifiers(run)):
+            return await self._cancel_requested_run(run, event)
+
+    async def _cancel_requested_run(self, run: RunSnapshot, event: RunEvent | None) -> RunSnapshot:
+        run_id = run.id
         task = self._tasks.get(run_id)
         if (
             event is not None
@@ -520,7 +597,9 @@ class RunService:
         if existing is not None and not existing.done():
             return
         finalizer = asyncio.create_task(
-            self._finalize_cancelled_task(run_id, task), name=f"trellis-cancel-{run_id}"
+            self._finalize_cancelled_task(run_id, task),
+            name=f"trellis-cancel-{run_id}",
+            context=contextvars.Context(),
         )
         self._cancel_finalizers[run_id] = finalizer
         finalizer.add_done_callback(lambda done: self._discard_cancel_finalizer(run_id, done))
@@ -529,9 +608,16 @@ class RunService:
         await asyncio.gather(task, return_exceptions=True)
         if not self._can_execute(run_id):
             return
-        current = await self._runs.get_run(run_id)
-        if current is not None and current.status is RunStatus.CANCELLING:
-            await self._mark_cancelled(run_id, None)
+        with (
+            self._telemetry.correlate({"runId": run_id}),
+            self._telemetry.operation("run.cancel.finalize", root=True) as operation,
+        ):
+            current = await self._runs.get_run(run_id)
+            if current is not None:
+                with self._telemetry.correlate(run_identifiers(current)):
+                    operation.set_attributes(run_identifiers(current))
+                    if current.status is RunStatus.CANCELLING:
+                        await self._mark_cancelled(run_id, None)
 
     def _discard_cancel_finalizer(self, run_id: str, task: asyncio.Task[None]) -> None:
         if self._cancel_finalizers.get(run_id) is task:
@@ -610,22 +696,28 @@ class RunService:
             if self._can_execute(run_id):
                 run = await self._runs.get_run(run_id)
                 if run is not None and run.status is RunStatus.QUEUED:
-                    await self._interrupt_queued_run(run_id)
+                    with self._telemetry.correlate(run_identifiers(run)):
+                        await self._interrupt_queued_run(run_id)
         monitors = tuple(self._lease_monitors.values())
         for monitor in monitors:
             monitor.cancel()
         if monitors:
             await asyncio.gather(*monitors, return_exceptions=True)
 
-    def _schedule(self, run_id: str) -> None:
+    def _schedule(self, run_id: str, link: TraceLink | None = None) -> None:
+        link = link or self._telemetry.capture()
         if not self._can_execute(run_id):
             return
         self._start_lease_monitor(run_id)
         existing = self._tasks.get(run_id)
         if existing is not None and not existing.done():
-            self._reschedule_pending.add(run_id)
+            self._reschedule_pending[run_id] = link
             return
-        task = asyncio.create_task(self._run_with_limit(run_id), name=f"trellis-run-{run_id}")
+        task = asyncio.create_task(
+            self._run_with_limit(run_id, link),
+            name=f"trellis-run-{run_id}",
+            context=contextvars.Context(),
+        )
         self._tasks[run_id] = task
         task.add_done_callback(lambda done: self._discard_task(run_id, done))
 
@@ -635,7 +727,11 @@ class RunService:
         existing = self._lease_monitors.get(run_id)
         if existing is not None and not existing.done():
             return
-        task = asyncio.create_task(self._monitor_lease(run_id), name=f"trellis-lease-{run_id}")
+        task = asyncio.create_task(
+            self._monitor_lease(run_id),
+            name=f"trellis-lease-{run_id}",
+            context=contextvars.Context(),
+        )
         self._lease_monitors[run_id] = task
         task.add_done_callback(lambda done: self._discard_lease_monitor(run_id, done))
 
@@ -645,10 +741,18 @@ class RunService:
 
     async def _monitor_lease(self, run_id: str) -> None:
         assert self._lease_repository is not None
+        identifiers = {"runId": run_id}
         while True:
             await asyncio.sleep(self._lease_renew_interval_seconds)
             try:
-                run = await self._lease_repository.renew_run_lease(run_id)
+                with (
+                    self._telemetry.correlate(identifiers),
+                    self._telemetry.operation("run.lease", root=True) as operation,
+                ):
+                    run = await self._lease_repository.renew_run_lease(run_id)
+                    identifiers = run_identifiers(run)
+                    with self._telemetry.correlate(identifiers):
+                        operation.set_attributes(identifiers)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -669,24 +773,64 @@ class RunService:
         if self._tasks.get(run_id) is task:
             del self._tasks[run_id]
         if run_id in self._reschedule_pending:
-            self._reschedule_pending.discard(run_id)
+            link = self._reschedule_pending.pop(run_id)
             if not self._closing:
-                self._schedule(run_id)
+                self._schedule(run_id, link)
 
-    async def _run_with_limit(self, run_id: str) -> None:
+    async def _run_with_limit(self, run_id: str, link: TraceLink | None = None) -> None:
+        started = monotonic()
+        with (
+            self._telemetry.correlate({"runId": run_id}),
+            self._telemetry.operation(
+                "run.execute", root=True, links=(link,) if link else ()
+            ) as operation,
+        ):
+            observation = _RunObservation(operation)
+            try:
+                await self._run_bounded(run_id, observation)
+            finally:
+                attributes: dict[str, Attribute] = {
+                    **observation.identifiers,
+                    "runId": run_id,
+                    "outcome": observation.outcome,
+                }
+                if observation.error_code is not None:
+                    attributes["error_code"] = observation.error_code
+                duration = monotonic() - started
+                operation.set_attributes({"duration_seconds": duration})
+                self._telemetry.event(
+                    "run.attempt.finished", attributes, error=observation.outcome == "failed"
+                )
+                self._telemetry.count("run.attempts", attributes=attributes)
+                self._telemetry.observe("run.attempt.duration", duration, attributes)
+
+    async def _run_bounded(self, run_id: str, observation: _RunObservation) -> None:
+        queued_at = monotonic()
         try:
             async with self._slots:
-                await self._execute(run_id)
+                waited = monotonic() - queued_at
+                observation.operation.set_attributes({"queue_seconds": waited})
+                self._telemetry.observe("run.queue.duration", waited)
+                await self._execute(run_id, observation)
         except asyncio.CancelledError:
             if run_id in self._lease_lost:
+                observation.finish("interrupted", "run_lease_lost")
                 raise
             run = await self._runs.get_run(run_id)
-            if run is not None and run.status is RunStatus.QUEUED:
-                await self._interrupt_queued_run(run_id)
-            elif run is not None and run.status is RunStatus.CANCELLING:
-                await self._mark_cancelled(run_id, None)
+            with self._telemetry.correlate(run_identifiers(run) if run else {"runId": run_id}):
+                if run is not None:
+                    observation.bind(run)
+                if run is not None and run.status is RunStatus.QUEUED:
+                    await self._interrupt_queued_run(run_id)
+                    observation.finish("interrupted", "runtime_shutdown")
+                elif run is not None and run.status is RunStatus.CANCELLING:
+                    await self._mark_cancelled(run_id, None)
+                    observation.finish("cancelled")
+                elif observation.outcome == "skipped":
+                    observation.finish("cancelled")
             raise
         except Exception as error:
+            observation.finish("failed", "runtime_internal_error")
             logger.error(
                 "Unexpected failure before run execution completed for %s (error type: %s)",
                 run_id,
@@ -697,19 +841,21 @@ class RunService:
             try:
                 run = await self._runs.get_run(run_id)
                 if run is not None and run.status in {RunStatus.QUEUED, RunStatus.RUNNING}:
-                    event = await self._runs.transition_run_record(
-                        run_id,
-                        RunStatus.FAILED,
-                        RunEventType.FAILED,
-                        {
-                            "code": "runtime_internal_error",
-                            "message": "Trellis could not start this run.",
-                        },
-                        error_code="runtime_internal_error",
-                        error_message="Trellis could not start this run.",
-                        stop_reason="runtime_internal_error",
-                    )
-                    await self._publish(event)
+                    with self._telemetry.correlate(run_identifiers(run)):
+                        observation.bind(run)
+                        event = await self._runs.transition_run_record(
+                            run_id,
+                            RunStatus.FAILED,
+                            RunEventType.FAILED,
+                            {
+                                "code": "runtime_internal_error",
+                                "message": "Trellis could not start this run.",
+                            },
+                            error_code="runtime_internal_error",
+                            error_message="Trellis could not start this run.",
+                            stop_reason="runtime_internal_error",
+                        )
+                        await self._publish(event)
             except Exception as persist_error:
                 logger.error(
                     "Could not persist failure for run %s (error type: %s)",
@@ -732,14 +878,29 @@ class RunService:
         )
         await self._publish(event)
 
-    async def _execute(self, run_id: str) -> None:
+    async def _execute(self, run_id: str, observation: _RunObservation) -> None:
         run = await self._runs.get_run(run_id)
-        if run is None or run.status not in {
-            RunStatus.QUEUED,
-            RunStatus.WAITING_FOR_APPROVAL,
-        }:
+        if run is None:
             return
 
+        with self._telemetry.correlate(run_identifiers(run)):
+            observation.bind(run)
+            if run.status not in {RunStatus.QUEUED, RunStatus.WAITING_FOR_APPROVAL}:
+                return
+            await self._execute_snapshot(run, observation)
+
+    async def _execute_snapshot(self, run: RunSnapshot, observation: _RunObservation) -> None:
+        run_id = run.id
+
+        observation.operation.set_attributes(
+            {
+                "provider": run.provider_id,
+                "model": run.model_id,
+                "max_tokens": run.max_total_tokens,
+                "max_cost_usd": run.max_cost_usd,
+                "deadline_seconds": max(0.0, self._remaining_seconds(run)),
+            }
+        )
         call: ModelCallRecord | None = None
         started = False
         try:
@@ -793,12 +954,14 @@ class RunService:
                 self._budget_totals,
                 self._publish,
                 self._redactor,
+                telemetry=self._telemetry,
             )
 
             prior_model_steps = await self._runs.list_model_calls(run.id)
             if prior_model_steps:
                 call = prior_model_steps[-1]
                 if not await self._execute_pending_tools(run, workspace_root):
+                    observation.finish("waiting_for_approval")
                     return
 
             while True:
@@ -870,13 +1033,9 @@ class RunService:
                     prior_cost,
                     pricing_context_tokens=plan.pricing_context_tokens,
                 )
-                if not step.content.strip() and not step.tool_calls:
-                    raise ProviderError(
-                        "provider_invalid_response", "The provider returned an empty response."
-                    )
                 safe_calls, preflight_errors = _prepare_tool_calls(step.tool_calls, self._redactor)
                 step = replace(step, tool_calls=safe_calls)
-                _step_tokens, step_cost = _usage_measure(
+                step_tokens, step_cost = _usage_measure(
                     run.model_id, step.usage, step.billing_context
                 )
                 call = await self._runs.update_model_call(
@@ -892,6 +1051,8 @@ class RunService:
                     cache_creation_tokens=step.usage["cache_creation_tokens"],
                     estimated_cost=step_cost,
                     clear_estimated_cost=step_cost is None,
+                    accounted_total_tokens=step_tokens,
+                    clear_accounted_total_tokens=step_tokens is None,
                 )
                 await self._append_and_publish(
                     run.id,
@@ -938,6 +1099,7 @@ class RunService:
                     )
                     for event in completion_events:
                         await self._publish(event)
+                    observation.finish("completed")
                     return
 
                 if self._tool_registry is None:
@@ -998,35 +1160,63 @@ class RunService:
                     if result is not None:
                         await self._record_tool_result(run.id, stored_call, result)
                 if not await self._execute_pending_tools(run, workspace_root):
+                    observation.finish("waiting_for_approval")
                     return
             raise ProviderError("model_call_limit", "The run reached its model-call limit.")
         except asyncio.CancelledError:
             if run_id in self._lease_lost:
+                observation.finish("interrupted", "run_lease_lost")
                 raise
             current = await self._runs.get_run(run_id)
             if current is not None and current.status is RunStatus.CANCELLING:
                 await self._mark_cancelled(run_id, call)
+                observation.finish("cancelled")
             elif started and current is not None and current.status is RunStatus.RUNNING:
                 await self._mark_interrupted(run_id, call)
+                observation.finish("interrupted", "runtime_shutdown")
             raise
         except ProviderError as error:
+            observation.finish(
+                "failed" if self._can_execute(run_id) else "interrupted",
+                error.code if self._can_execute(run_id) else "run_lease_lost",
+            )
             if started and self._can_execute(run_id):
-                await self._fail_or_cancel(run_id, call, error.code, error.message)
+                status = await self._fail_or_cancel(run_id, call, error.code, error.message)
+                observation.finish(
+                    status.value if status else "skipped",
+                    error.code if status is RunStatus.FAILED else None,
+                )
         except ApplicationError as error:
+            observation.finish(
+                "failed" if self._can_execute(run_id) else "interrupted",
+                error.code if self._can_execute(run_id) else "run_lease_lost",
+            )
             if started and self._can_execute(run_id):
-                await self._fail_or_cancel(run_id, call, error.code, error.message)
+                status = await self._fail_or_cancel(run_id, call, error.code, error.message)
+                observation.finish(
+                    status.value if status else "skipped",
+                    error.code if status is RunStatus.FAILED else None,
+                )
         except Exception as error:
+            observation.finish(
+                "failed" if self._can_execute(run_id) else "interrupted",
+                "runtime_internal_error" if self._can_execute(run_id) else "run_lease_lost",
+            )
             logger.error(
                 "Unexpected failure while executing run %s (error type: %s)",
                 run_id,
                 type(error).__name__,
             )
             if started and self._can_execute(run_id):
-                await self._fail_or_cancel(
+                status = await self._fail_or_cancel(
                     run_id,
                     call,
                     "runtime_internal_error",
                     "Trellis could not complete this run.",
+                )
+                observation.finish(
+                    status.value if status else "skipped",
+                    "runtime_internal_error" if status is RunStatus.FAILED else None,
                 )
 
     async def _renew_before_local_tool(self, run_id: str) -> None:
@@ -1133,18 +1323,51 @@ class RunService:
                 continue
             try:
                 await self._renew_before_local_tool(run.id)
-                async with asyncio.timeout(remaining_seconds):
-                    result = await self._tool_registry.execute(
-                        tool_request,
-                        workspace_root,
-                        approved=(stored_call.approval_decision is ToolApprovalDecision.APPROVED),
-                        approval_preview=stored_call.approval_preview,
-                        capabilities=self._capabilities,
-                    )
+                result = await self._execute_tool(
+                    run, stored_call, tool_request, workspace_root, remaining_seconds
+                )
             except TimeoutError:
                 raise ProviderError("provider_timeout", "The run deadline was reached.") from None
             await self._record_tool_result(run.id, stored_call, result)
         return True
+
+    async def _execute_tool(
+        self,
+        run: RunSnapshot,
+        stored_call: ToolCallRecord,
+        request: ModelToolCall,
+        workspace_root: Path | None,
+        remaining_seconds: float,
+    ) -> ToolResult:
+        assert self._tool_registry is not None
+        attributes: dict[str, Attribute] = {"runId": run.id, "toolCallId": stored_call.id}
+        started = monotonic()
+        outcome = "failed"
+        with self._telemetry.operation("tool.execute", attributes) as observation:
+            try:
+                async with asyncio.timeout(remaining_seconds):
+                    result = await self._tool_registry.execute(
+                        request,
+                        workspace_root,
+                        approved=stored_call.approval_decision is ToolApprovalDecision.APPROVED,
+                        approval_preview=stored_call.approval_preview,
+                        capabilities=self._capabilities,
+                    )
+                outcome = "failed" if result.is_error else "completed"
+                observation.outcome(outcome, result.error_code if result.is_error else None)
+                return result
+            except TimeoutError:
+                observation.outcome("failed", "provider_timeout")
+                raise
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                observation.outcome(outcome)
+                raise
+            finally:
+                attributes["outcome"] = outcome
+                self._telemetry.event("tool.call.finished", attributes, error=outcome == "failed")
+                self._telemetry.count("tool.calls", attributes=attributes)
+                self._telemetry.observe("tool.call.duration", monotonic() - started, attributes)
 
     async def _record_tool_result(
         self,
@@ -1254,6 +1477,89 @@ class RunService:
         *,
         pricing_context_tokens: int = 0,
     ) -> _ModelStep:
+        started = monotonic()
+        attributes: dict[str, Attribute] = {
+            "runId": run.id,
+            "modelCallId": call.id,
+            "provider": run.provider_id,
+            "model": run.model_id,
+            "purpose": "generation",
+            "streamed": True,
+        }
+        with self._telemetry.operation("model.call", attributes, kind="client") as observation:
+            outcome = "failed"
+            try:
+                result = await self._read_model_stream(
+                    run,
+                    call,
+                    request,
+                    provider,
+                    api_key,
+                    user_id,
+                    prior_tokens,
+                    prior_cost,
+                    pricing_context_tokens=pricing_context_tokens,
+                    observation=observation,
+                )
+                if not result.content.strip() and not result.tool_calls:
+                    raise ProviderError(
+                        "provider_invalid_response", "The provider returned an empty response."
+                    )
+                tokens, cost = _usage_measure(run.model_id, result.usage, result.billing_context)
+                usage: dict[str, Attribute] = {}
+                if tokens is not None:
+                    usage["total_tokens"] = tokens
+                if cost is not None:
+                    usage["estimated_cost_usd"] = cost
+                for name in ("input_tokens", "output_tokens"):
+                    value = result.usage[name]
+                    if value is not None:
+                        usage[name] = value
+                observation.set_attributes(usage)
+                failure_code = (
+                    "provider_response_incomplete"
+                    if result.finish_kind == "incomplete"
+                    else "provider_invalid_response"
+                    if (result.finish_kind == "tool") != bool(result.tool_calls)
+                    else None
+                )
+                outcome = "failed" if failure_code else "completed"
+                observation.outcome(outcome, failure_code)
+                if tokens is not None:
+                    self._telemetry.observe("model.tokens", tokens, attributes)
+                if cost is not None:
+                    self._telemetry.observe("model.estimated_cost", cost, attributes)
+                return result
+            except (ProviderError, ApplicationError) as error:
+                observation.outcome("failed", error.code)
+                raise
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                observation.outcome(outcome)
+                raise
+            except Exception:
+                observation.outcome("failed", "model_internal_error")
+                raise
+            finally:
+                attributes["outcome"] = outcome
+                self._telemetry.event("model.call.finished", attributes, error=outcome == "failed")
+                self._telemetry.count("model.calls", attributes=attributes)
+                self._telemetry.observe("model.call.duration", monotonic() - started, attributes)
+
+    async def _read_model_stream(
+        self,
+        run: RunSnapshot,
+        call: ModelCallRecord,
+        request: ModelRequest,
+        provider: StreamingProviderAdapter,
+        api_key: str,
+        user_id: str,
+        prior_tokens: int,
+        prior_cost: float | None,
+        *,
+        pricing_context_tokens: int = 0,
+        observation: Operation | None = None,
+    ) -> _ModelStep:
         output_parts: list[str] = []
         batcher = TextStreamBatcher(secrets=(*self._redactor.streaming_secrets, api_key))
         batch_index = 0
@@ -1351,6 +1657,17 @@ class RunService:
                     self._safe_provider_metadata(event.provider_response_id) or provider_response_id
                 )
                 step_tokens, step_cost = _usage_measure(run.model_id, usage, billing_context)
+                if observation is not None:
+                    attributes: dict[str, Attribute] = {
+                        key: value
+                        for key, value in usage.items()
+                        if key in {"input_tokens", "output_tokens"} and value is not None
+                    }
+                    if step_tokens is not None:
+                        attributes["total_tokens"] = step_tokens
+                    if step_cost is not None:
+                        attributes["estimated_cost_usd"] = step_cost
+                    observation.set_attributes(attributes)
                 call = await self._runs.update_model_call(
                     call.id,
                     ModelCallStatus.STREAMING,
@@ -1362,6 +1679,8 @@ class RunService:
                     cache_creation_tokens=usage["cache_creation_tokens"],
                     estimated_cost=step_cost,
                     clear_estimated_cost=step_cost is None,
+                    accounted_total_tokens=step_tokens,
+                    clear_accounted_total_tokens=step_tokens is None,
                     response_snapshot={"usage_context": billing_context.copy()},
                 )
                 await self._append_and_publish(
@@ -1581,6 +1900,26 @@ class RunService:
         return event
 
     async def _publish(self, event: RunEvent) -> None:
+        lifecycle = {
+            RunEventType.STARTED,
+            RunEventType.COMPLETED,
+            RunEventType.FAILED,
+            RunEventType.CANCELLED,
+            RunEventType.INTERRUPTED,
+        }
+        if event.event_type in lifecycle:
+            attributes: dict[str, Attribute] = {
+                "runId": event.run_id,
+                "outcome": event.event_type.value,
+            }
+            # Stored event codes are bounded application metadata. Event bodies remain private.
+            code = event.data.get("code")
+            if isinstance(code, str):
+                attributes["error_code"] = code
+            self._telemetry.event(
+                "run.lifecycle", attributes, error=event.event_type is RunEventType.FAILED
+            )
+            self._telemetry.count("run.lifecycle", attributes=attributes)
         if self._event_publisher is None:
             return
         try:
@@ -1636,12 +1975,15 @@ class RunService:
         call: ModelCallRecord | None,
         error_code: str,
         error_message: str,
-    ) -> None:
+    ) -> RunStatus | None:
         current = await self._runs.get_run(run_id)
         if current is not None and current.status is RunStatus.CANCELLING:
             await self._mark_cancelled(run_id, call)
-        elif current is not None and current.status is RunStatus.RUNNING:
+            return RunStatus.CANCELLED
+        if current is not None and current.status is RunStatus.RUNNING:
             await self._fail(run_id, call, error_code, error_message)
+            return RunStatus.FAILED
+        return None
 
     async def _mark_interrupted(self, run_id: str, call: ModelCallRecord | None) -> None:
         if call is not None and call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:

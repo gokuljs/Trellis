@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient as FastAPITestClient
 from pydantic import SecretStr
 from starlette.testclient import WebSocketTestSession
+from starlette.types import ASGIApp
 
 from app.api.auth import VerifiedUser
 from app.core.config import Settings
@@ -108,5 +109,6 @@ def account_secrets_path(settings: Settings) -> Path:
     return account_path(settings) / ".env"
 
 
-def account_context(application: FastAPI) -> AccountContext:
+def account_context(application: ASGIApp) -> AccountContext:
+    assert isinstance(application, FastAPI)
     return application.state.account_registry._contexts[TEST_USER_ID]
