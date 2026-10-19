@@ -164,5 +164,5 @@ Migration ownership is reserved in this order.
 
 Durable acceptance stays dormant until the independent-worker integration. Review
 and integrate PR 1, PR 2, PR 3, and PR 4 in that order. Development after C0 can
-proceed against typed ports and the JSON fixtures in `backend/tests/fixtures/durable`.
+proceed against typed ports and the JSON fixtures in `docs/fixtures/durable`.
 Fake-port tests do not replace PostgreSQL authority and complete browser evidence.

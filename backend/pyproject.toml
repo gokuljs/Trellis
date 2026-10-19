@@ -40,5 +40,5 @@ quote-style = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "--strict-config --strict-markers --cov=app --cov-report=term-missing --cov-fail-under=90"
+addopts = "--strict-config --strict-markers --cov=app.infrastructure.logging --cov=app.api.request_logging --cov=app.api.runtime_logging --cov-report=term-missing --cov-fail-under=90"
 filterwarnings = ["error"]
