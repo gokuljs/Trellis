@@ -7,12 +7,11 @@ from uuid import UUID
 
 import httpx
 import pytest
-from test_execution_telemetry import MODEL, Provider, Repository, plan, run_record, service
+from run_fixtures import MODEL, Provider, Repository, plan, run_record, service
 
 from app.application.ports import RunRepository, StreamingProviderAdapter
 from app.application.run_context import RunContext
 from app.application.secret_redaction import SecretRedactor
-from app.application.telemetry import NO_TELEMETRY
 from app.core.config import Settings
 from app.domain.context import NativeCompactionResult
 from app.domain.runtime import ModelCallStatus, ModelStreamEvent
@@ -95,7 +94,7 @@ def test_billable_paths_persist_normalized_usage(purpose, monkeypatch) -> None:
     async def exercise() -> None:
         if purpose == "answer":
             monkeypatch.setattr(RunContext, "prepare", AsyncMock(return_value=plan()))
-            runtime = service(NO_TELEMETRY, repo, provider)
+            runtime = service(repo, provider)
             admitted = await runtime.create_run("session", "request", "test input")
             await runtime.wait_for_run(admitted.id)
             await runtime.close()

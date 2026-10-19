@@ -6,7 +6,6 @@ from uuid import UUID
 import httpx
 import pytest
 
-from app.application.telemetry import NO_TELEMETRY, Telemetry
 from app.core.config import Settings
 from app.infrastructure import accounts
 from app.infrastructure.supabase_repository import VerifiedTokenSource
@@ -17,16 +16,9 @@ BOB = UUID("55114a4d-aa42-4eb6-a61d-f91c7992c06d")
 
 class StubRepository:
     def __init__(
-        self,
-        _settings: Settings,
-        user_id: UUID,
-        _source: VerifiedTokenSource,
-        _client: object,
-        *,
-        telemetry: Telemetry = NO_TELEMETRY,
+        self, _settings: Settings, user_id: UUID, _source: VerifiedTokenSource, _client: object
     ) -> None:
         self.user_id = user_id
-        self.telemetry = telemetry
 
     async def ensure_account(self) -> None:
         pass

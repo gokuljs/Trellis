@@ -10,7 +10,7 @@ import type {
 } from "@/lib/app-types"
 import { notifications } from "@/lib/notifications"
 import { isModelSelectable } from "@/lib/model-choice"
-import { reportFailure } from "@/lib/telemetry"
+import { logFailure } from "@/lib/logging"
 import "./profile-summary.css"
 
 type SettingsPageProps = {
@@ -82,7 +82,7 @@ export function SettingsPage({
       await update()
       notifications[success.kind ?? "success"](success)
     } catch (updateError) {
-      if (mounted.current) reportFailure(updateError, "settings.save")
+      if (mounted.current) logFailure(updateError, "settings.save")
       notifications.error({
         title: "Change not saved",
         description: errorMessage(updateError),

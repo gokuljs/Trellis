@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from typing import Protocol, cast
@@ -11,10 +12,9 @@ from fastapi.responses import JSONResponse
 from app.api import router
 from app.api.auth import SupabaseAuthVerifier, VerifiedUser
 from app.api.errors import ApiErrorResponse
-from app.api.telemetry import TransportTelemetryMiddleware
+from app.api.request_logging import RequestLoggingMiddleware
 from app.application.errors import ApplicationError
 from app.application.ports import ProviderAdapter, StreamingProviderAdapter
-from app.application.telemetry import Telemetry
 from app.application.tools import ToolRegistry
 from app.application.workspaces import (
     DEFAULT_WORKSPACE_PICKER_TIMEOUT_SECONDS,
@@ -25,12 +25,13 @@ from app.core.origins import allowed_web_origins
 from app.domain.capabilities import RuntimeCapabilities
 from app.domain.models import ProviderName
 from app.infrastructure.accounts import AccountRegistry, RepositoryFactory
+from app.infrastructure.logging import configure_logging
 from app.infrastructure.providers import AnthropicProvider, OpenAIProvider
 from app.infrastructure.readiness import SupabaseReadiness
-from app.infrastructure.telemetry import TelemetryRuntime, create_telemetry
 from app.infrastructure.workspace_picker import NativeFolderPicker
 
 WORKSPACE_PICKER_TIMEOUT_SECONDS = DEFAULT_WORKSPACE_PICKER_TIMEOUT_SECONDS
+logger = logging.getLogger(__name__)
 
 
 class AuthVerifier(Protocol):
@@ -88,21 +89,19 @@ def create_app(
     workspace_picker: WorkspacePickerService | None = None,
     auth_verifier: AuthVerifier | None = None,
     repository_factory: RepositoryFactory | None = None,
-    telemetry: Telemetry | None = None,
 ) -> FastAPI:
+    configure_logging()
     resolved_settings = settings or Settings()
     capabilities = RuntimeCapabilities(resolved_settings.enabled_capabilities)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-        runtime = telemetry if telemetry is not None else create_telemetry(resolved_settings)
-        application.state.telemetry = runtime
+        logger.info("application.started", extra={"event": "application.started"})
         try:
             async with application_services(application):
                 yield
         finally:
-            if telemetry is None and isinstance(runtime, TelemetryRuntime):
-                await runtime.close()
+            logger.info("application.stopped", extra={"event": "application.stopped"})
 
     @asynccontextmanager
     async def application_services(application: FastAPI) -> AsyncIterator[None]:
@@ -144,7 +143,6 @@ def create_app(
                 ),
                 cloud_client=http_client,
                 repository_factory=repository_factory,
-                telemetry=application.state.telemetry,
             )
             application.state.account_registry = registry
             try:
@@ -186,10 +184,10 @@ def create_app(
         ),
         allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "DELETE"],
-        allow_headers=["Authorization", "Content-Type", "traceparent"],
+        allow_headers=["Authorization", "Content-Type"],
         max_age=600,
     )
-    application.add_middleware(TransportTelemetryMiddleware)
+    application.add_middleware(RequestLoggingMiddleware)
     return application
 
 

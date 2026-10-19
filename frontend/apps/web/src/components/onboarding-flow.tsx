@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react"
 import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 import { ApiError } from "@/lib/api"
 import { isModelSelectable, nextSelectableModelIndex } from "@/lib/model-choice"
-import { reportFailure } from "@/lib/telemetry"
+import { logFailure } from "@/lib/logging"
 import type {
   ModelId,
   ModelStatus,
@@ -115,7 +115,7 @@ export function OnboardingFlow({
       await onAdvanceIntro()
       changeStep("profile", "forward")
     } catch (submitError) {
-      if (mounted.current) reportFailure(submitError, "onboarding.save")
+      if (mounted.current) logFailure(submitError, "onboarding.save")
       setError(errorMessage(submitError))
     } finally {
       setSubmitting(false)
@@ -138,7 +138,7 @@ export function OnboardingFlow({
       await onSaveProfile(trimmedName)
       changeStep("model", "forward")
     } catch (submitError) {
-      if (mounted.current) reportFailure(submitError, "onboarding.save")
+      if (mounted.current) logFailure(submitError, "onboarding.save")
       setError(errorMessage(submitError))
     } finally {
       setSubmitting(false)
@@ -158,7 +158,7 @@ export function OnboardingFlow({
     try {
       await onRetryModels()
     } catch (retryError) {
-      if (mounted.current) reportFailure(retryError, "settings.load")
+      if (mounted.current) logFailure(retryError, "settings.load")
       setError(errorMessage(retryError))
     } finally {
       setCheckingModels(false)
@@ -177,7 +177,7 @@ export function OnboardingFlow({
         modelId: selectedModel.id,
       })
     } catch (submitError) {
-      if (mounted.current) reportFailure(submitError, "onboarding.save")
+      if (mounted.current) logFailure(submitError, "onboarding.save")
       setError(errorMessage(submitError))
     } finally {
       setSubmitting(false)

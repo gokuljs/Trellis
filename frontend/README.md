@@ -23,6 +23,19 @@ sent.
 
 Requires Node.js 22.12 or newer and Bun 1.2.4.
 
+## Browser logs
+
+The app writes structured records to the browser console. Open the browser
+developer tools to view them. Each record has an ISO 8601 UTC timestamp, a
+level, and an event name. Failure records may include an allowlisted operation,
+failure code, or HTTP status.
+
+The app logs startup, unexpected operation failures, and React errors. It uses
+`console.info`, `console.warn`, and `console.error` for the matching levels.
+Expected authentication failures, client rejections, and cancellations stay
+quiet. Browser records contain no chat IDs, run IDs, prompts, payloads, URLs,
+credentials, or exception text. The app does not upload logs to a service.
+
 See [Stage 2 setup and guarantees](../docs/stage-2.md) for model discovery,
 streaming recovery, context compaction, and history limits.
 

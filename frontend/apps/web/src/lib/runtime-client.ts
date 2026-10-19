@@ -10,7 +10,6 @@ import {
   ServiceReadinessError,
   waitUntilServiceReady,
 } from "@/lib/service-readiness"
-import { startRuntimeRequestSpan } from "@/lib/telemetry"
 
 export type RuntimeRunEvent = {
   runId: string
@@ -461,9 +460,6 @@ function followRun(
         )
         return
       }
-      const endSpan = startRuntimeRequestSpan(
-        runId ? "run.subscribe" : "run.start"
-      )
       void sendRpc(activeSocket, method, params)
         .then((response) => {
           if (settled || socket !== activeSocket) return
@@ -485,7 +481,6 @@ function followRun(
             )
           }
           const runInfo = parseRunInfo(result)
-          endSpan("ok")
           if (!runId) runId = responseRunId
           if (!runIdNotified) {
             runIdNotified = true
@@ -502,13 +497,6 @@ function followRun(
           }
         })
         .catch((error: unknown) => {
-          endSpan(
-            error instanceof RuntimeError && error.code === "runtime_timeout"
-              ? "timeout"
-              : error instanceof RuntimeError && error.status === 401
-                ? "cancelled"
-                : "error"
-          )
           if (settled || socket !== activeSocket) return
           subscriptionRequestPending = false
           const runtimeError =
@@ -520,7 +508,6 @@ function followRun(
                 )
           failRequest(runtimeError)
         })
-        .finally(() => endSpan("cancelled"))
     }
 
     const scheduleReconnect = () => {
@@ -813,19 +800,9 @@ async function requestRunAction<TResult>(
     let authenticated = false
     let socketCredential: AuthCredential | null = null
     let unsubscribeAuth: (() => void) | null = null
-    let endSpan: ReturnType<typeof startRuntimeRequestSpan> | undefined
     const finish = (result?: TResult, error?: RuntimeError) => {
       if (settled) return
       settled = true
-      endSpan?.(
-        error?.code === "runtime_timeout"
-          ? "timeout"
-          : error?.status === 401
-            ? "cancelled"
-            : error || !result
-              ? "error"
-              : "ok"
-      )
       unsubscribeAuth?.()
       unsubscribeAuth = null
       clearTimeout(timeout)
@@ -934,7 +911,6 @@ async function requestRunAction<TResult>(
           return
         }
         authenticated = true
-        endSpan = startRuntimeRequestSpan(method)
         try {
           socket.send(
             JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params })

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from functools import partial
 from pathlib import Path
 from uuid import uuid4
@@ -132,7 +133,10 @@ def test_acceptance_rejects_invalid_new_work(tmp_path: Path, reason: str, code: 
     asyncio.run(exercise())
 
 
-def test_lookup_websocket_restores_queued_run_and_history_deadline(tmp_path: Path) -> None:
+def test_lookup_websocket_restores_queued_run_and_history_deadline(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="app.api.runtime_logging")
     provider = StreamingProvider()
     with configured_client(tmp_path, provider) as client:
         session_id = client.post("/api/sessions").json()["id"]
@@ -165,6 +169,17 @@ def test_lookup_websocket_restores_queued_run_and_history_deadline(tmp_path: Pat
         summaries = client.get(f"/api/sessions/{session_id}/runs").json()
         assert summaries["items"][0]["deadline_at"] is None
         assert provider.request is None
+    commands = [
+        vars(record)
+        for record in caplog.records
+        if record.name == "app.api.runtime_logging" and vars(record).get("command") == "run.lookup"
+    ]
+    assert len(commands) == 3
+    assert commands[0]["run_id"] == accepted.id
+    assert commands[0]["outcome"] == commands[1]["outcome"] == "completed"
+    assert commands[2]["outcome"] == "rejected"
+    assert "run_id" not in commands[1]
+    assert "run_id" not in commands[2]
 
 
 def test_durable_repository_uses_user_authority_without_execution_token_lifetime() -> None:
