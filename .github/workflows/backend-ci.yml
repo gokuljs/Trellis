@@ -91,6 +91,7 @@ jobs:
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/readiness.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/202610180001_durable_jobs.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/durable_acceptance.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/durable_legacy_turns.sql
           python3 supabase/tests/durable_acceptance_concurrency.py
           python3 supabase/tests/durable_acceptance_lock_order.py
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/schema_contract.sql

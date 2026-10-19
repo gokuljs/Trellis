@@ -198,6 +198,11 @@ BEGIN
             RETURN to_jsonb(v_prior) - 'lease_token' - 'request_fingerprint';
         END IF;
     END IF;
+    IF EXISTS (SELECT 1 FROM trellis.turn_claims
+        WHERE user_id = v_user AND chat_id = v_chat.id
+            AND claimed_at > pg_catalog.clock_timestamp() - interval '5 minutes') THEN
+        RAISE SQLSTATE 'PT409' USING MESSAGE = 'session_turn_busy';
+    END IF;
     IF EXISTS (SELECT 1 FROM trellis.runs WHERE user_id = v_user AND chat_id = v_chat.id
         AND status IN ('queued', 'running', 'waiting_for_approval', 'cancelling')) THEN
         RAISE EXCEPTION 'active run already exists for this session' USING ERRCODE = '22023';
