@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     web_origin: str | None = None
     private_user_ids: frozenset[UUID] = Field(default=frozenset(), repr=False)
     enabled_capabilities: frozenset[RuntimeCapability] = frozenset()
+    max_active_runs: int = Field(default=16, ge=1, le=256)
+    max_active_runs_per_user: int = Field(default=4, ge=1, le=256)
     openai_api_key: SecretStr | None = Field(default=None, repr=False)
     anthropic_api_key: SecretStr | None = Field(default=None, repr=False)
     release: str = Field(default="development", pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}$")

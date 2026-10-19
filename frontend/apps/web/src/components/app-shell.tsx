@@ -47,6 +47,7 @@ import {
 import {
   RuntimeError,
   cancelRun,
+  lookupRun,
   resumeRun,
   respondToToolApproval,
   streamRun,
@@ -109,6 +110,12 @@ import {
 } from "@/lib/activity-history"
 import { useContextPreview } from "@/lib/use-context-preview"
 import { logFailure } from "@/lib/logging"
+import { getAuthController } from "@/lib/auth-controller"
+import {
+  clearPendingRun,
+  readPendingRun,
+  savePendingRun,
+} from "@/lib/pending-run"
 import "./workspace-bootstrap.css"
 
 type BootstrapState =
@@ -315,6 +322,23 @@ export function AppShell({
 
   const recordRunEvent = useCallback(
     (turnId: string, event: RuntimeRunEvent) => {
+      const userId = getAuthController().getSnapshot().user?.id
+      const sessionId = activeSessionIdRef.current
+      if (userId && sessionId) {
+        const saved = readPendingRun(userId, sessionId)
+        if (saved?.runId === event.runId) {
+          if (
+            [
+              "run.completed",
+              "run.failed",
+              "run.cancelled",
+              "run.interrupted",
+            ].includes(event.eventType)
+          )
+            clearPendingRun(userId, sessionId, saved.clientRequestId)
+          else savePendingRun({ ...saved, lastSequence: event.sequence })
+        }
+      }
       if (activeSessionIdRef.current)
         summaryRefresh.schedule(activeSessionIdRef.current, event)
       setRunContextState((current) => reduceRunContext(current, event))
@@ -393,6 +417,7 @@ export function AppShell({
         !bootstrapControllerRef.current ||
         isCancelled() ||
         runGenerationRef.current !== generation
+      setPending(true)
       setReconnectAvailable(false)
       if (!activeRunRef.current) setActiveRunTurnId(null)
       setApprovalPendingToolId(null)
@@ -414,8 +439,33 @@ export function AppShell({
       }
       let turn = retryFromTranscript(sessionId, transcript)
       let latest: LatestRun | null
+      let submissionMissing: boolean
+      const userId = getAuthController().getSnapshot().user?.id
+      const saved = userId ? readPendingRun(userId, sessionId) : null
       try {
+        const exact = saved
+          ? await lookupRun(sessionId, saved.clientRequestId)
+          : null
+        if (isStale()) return
+        if (saved?.runId && exact && exact.runId !== saved.runId)
+          throw new RuntimeError(
+            "runtime_protocol_error",
+            "The saved request returned a different run."
+          )
         latest = await api.getLatestRun(sessionId)
+        if (isStale()) return
+        submissionMissing =
+          !!saved && !exact && latest?.turn_id !== saved.turnId
+        if (exact && !latest)
+          throw new RuntimeError(
+            "runtime_protocol_error",
+            "The accepted run could not be loaded."
+          )
+        if (saved && userId) {
+          if (!exact || !activeRunStatuses.has(exact.status ?? ""))
+            clearPendingRun(userId, sessionId, saved.clientRequestId)
+          else savePendingRun({ ...saved, runId: exact.runId })
+        }
       } catch (discoveryError) {
         if (isStale()) return
         logFailure(discoveryError, "run.restore")
@@ -425,7 +475,10 @@ export function AppShell({
         return
       }
       if (isStale()) return
-      if (latest && (!turn || turn.turnId === latest.turn_id)) {
+      if (
+        latest &&
+        (!submissionMissing || activeRunStatuses.has(latest.status))
+      ) {
         turn = retryInputForRun(sessionId, transcript, latest)
         if (!turn && activeRunStatuses.has(latest.status)) {
           logFailure(
@@ -441,7 +494,8 @@ export function AppShell({
           return
         }
       }
-      if (!latest || (turn && latest.turn_id !== turn.turnId)) {
+      if (!latest) {
+        if (submissionMissing) setMessages(transcript)
         setPending(false)
         setStreamingText(null)
         setActiveRunId(null)
@@ -458,16 +512,91 @@ export function AppShell({
       }
 
       if (!activeRunStatuses.has(latest.status)) {
+        let historyReloadFailed = false
+        let summary: RunSummary | undefined
+        if (submissionMissing) setMessages(transcript)
+        else {
+          try {
+            const detail = await loadLatestHistory(sessionId)
+            if (isStale()) return
+            applyHistory(detail)
+          } catch (historyError) {
+            if (isStale()) return
+            historyReloadFailed = true
+            logFailure(historyError, "history.load")
+          }
+        }
+        try {
+          const summaries = await queryClient.fetchInfiniteQuery({
+            ...runSummariesQueryOptions(sessionId, undefined, latest.turn_id),
+            staleTime: 0,
+          })
+          if (isStale()) return
+          summary = summaries.pages
+            .flatMap((page) => page.items)
+            .find(
+              (item) =>
+                item.run_id === latest.run_id &&
+                item.status === latest.status &&
+                item.last_sequence >= latest.last_sequence
+            )
+          if (!summary)
+            throw new RuntimeError(
+              "runtime_protocol_error",
+              "The finished run's saved activity could not be loaded."
+            )
+        } catch (summaryError) {
+          if (isStale()) return
+          historyReloadFailed = true
+          logFailure(summaryError, "activity.summaries")
+        }
+        setRunActivities((current) => {
+          if (isStale()) return current
+          const previous = current[latest.turn_id]
+          const previousRunId =
+            previous?.runInfo?.runId ?? previous?.summary?.run_id
+          const aligned =
+            previousRunId && previousRunId !== latest.run_id
+              ? startNextAttempt(previous)
+              : previous
+          return {
+            ...current,
+            [latest.turn_id]: {
+              ...aligned,
+              events: aligned?.events ?? [],
+              runInfo: {
+                ...aligned?.runInfo,
+                runId: latest.run_id,
+                status: latest.status,
+              },
+              ...(summary ? { summary } : {}),
+            },
+          }
+        })
+        if (userId && saved)
+          clearPendingRun(userId, sessionId, saved.clientRequestId)
         setPending(false)
         setStreamingText(null)
         setActiveRunId(null)
         setActiveRunTurnId(null)
         activeRunRef.current = null
-        setReconnectAvailable(false)
+        setReconnectAvailable(historyReloadFailed)
         setCancellingRun(false)
-        if (turn && latest.status !== "completed") {
+        if (historyReloadFailed) {
+          setFailedTurn(null)
+          setError(
+            "The run has finished, but some saved details could not be loaded. Reconnect to try again."
+          )
+        } else if (
+          turn &&
+          (submissionMissing || latest.status !== "completed")
+        ) {
           setFailedTurn(turn)
-          setError("The previous assistant response did not complete.")
+          setError(
+            submissionMissing
+              ? "Your request was not accepted. Retry when you are ready."
+              : "The previous assistant response did not complete."
+          )
         } else {
           setFailedTurn(null)
           setError(null)
@@ -477,7 +606,9 @@ export function AppShell({
 
       setFailedTurn(null)
       setError(null)
-      setPending(!!turn || activeRunStatuses.has(latest.status))
+      if (turn) setMessages(recoveryTranscript(transcript, turn))
+      setPending(true)
+      setCancellingRun(latest.status === "cancelling")
       setStreamingText(null)
       setRunActivities((current) => {
         const previous = current[latest.turn_id]
@@ -496,6 +627,7 @@ export function AppShell({
             runInfo: {
               ...(aligned?.runInfo ?? {}),
               runId: latest.run_id,
+              status: latest.status,
             },
           },
         }
@@ -596,6 +728,8 @@ export function AppShell({
               currentRun?.run_id === latest.run_id &&
               activeRunStatuses.has(currentRun.status)
             setReconnectAvailable(keepActive)
+            if (!keepActive && userId && saved)
+              clearPendingRun(userId, sessionId, saved.clientRequestId)
             if (!keepActive && turn) setFailedTurn(turn)
             const detail = await loadLatestHistory(sessionId)
             if (isStale()) return
@@ -627,7 +761,13 @@ export function AppShell({
         }
       })()
     },
-    [applyHistory, loadLatestHistory, recordRunEvent, recordRunInfo]
+    [
+      applyHistory,
+      loadLatestHistory,
+      queryClient,
+      recordRunEvent,
+      recordRunInfo,
+    ]
   )
 
   const restoreWorkspace = useCallback(async () => {
@@ -986,7 +1126,10 @@ export function AppShell({
     setSidebarCollapsed((collapsed) => !collapsed)
   }
 
-  const completeTurn = async (turn: FailedTurn, optimistic: boolean) => {
+  const completeTurn = async (
+    turn: FailedTurn & { clientRequestId: string },
+    optimistic: boolean
+  ) => {
     runConnectionControllerRef.current?.abort()
     const connection = new AbortController()
     runConnectionControllerRef.current = connection
@@ -1041,11 +1184,21 @@ export function AppShell({
       if (!isCurrent()) return true
       applyHistory(newest, turn.turnId)
       if (optimistic) setMessages(recoveryTranscript(newest.messages, turn))
+      const userId = getAuthController().getSnapshot().user?.id
+      if (userId)
+        savePendingRun({
+          userId,
+          sessionId: turn.sessionId,
+          turnId: turn.turnId,
+          clientRequestId: turn.clientRequestId,
+          runId: null,
+          lastSequence: 0,
+        })
       await streamRun(
         {
           sessionId: turn.sessionId,
           turnId: turn.turnId,
-          clientRequestId: crypto.randomUUID(),
+          clientRequestId: turn.clientRequestId,
           content: turn.content,
           ...(turn.modelId ? { modelId: turn.modelId } : {}),
           ...(turn.budgetPreset ? { budgetPreset: turn.budgetPreset } : {}),
@@ -1055,6 +1208,11 @@ export function AppShell({
           onRunId: (runId) => {
             if (!isCurrent()) return
             activeRunRef.current = { runId, lastSequence: 0 }
+            if (userId) {
+              const saved = readPendingRun(userId, turn.sessionId)
+              if (saved?.clientRequestId === turn.clientRequestId)
+                savePendingRun({ ...saved, runId })
+            }
             setActiveRunId(runId)
           },
           onRunInfo: (runInfo) => {
@@ -1100,7 +1258,8 @@ export function AppShell({
         turnError instanceof ApiError || turnError instanceof RuntimeError
           ? turnError.code
           : undefined,
-        lifecycle.terminal
+        lifecycle.terminal,
+        activeRunRef.current !== null
       )
       if (
         failureAction === "reconnect" &&
@@ -1114,7 +1273,7 @@ export function AppShell({
         try {
           const detail = await loadLatestHistory(turn.sessionId)
           if (!isCurrent()) return true
-          transcript = detail.messages
+          transcript = recoveryTranscript(detail.messages, turn)
           applyHistory(detail)
         } catch {
           if (!isCurrent()) return true
@@ -1128,6 +1287,8 @@ export function AppShell({
         )
         return true
       }
+      const userId = getAuthController().getSnapshot().user?.id
+      if (userId) clearPendingRun(userId, turn.sessionId, turn.clientRequestId)
       setStreamingText(null)
       setActiveRunId(null)
       setCancellingRun(false)
@@ -1382,6 +1543,7 @@ export function AppShell({
         {
           sessionId: session.id,
           turnId: crypto.randomUUID(),
+          clientRequestId: crypto.randomUUID(),
           content,
           modelId: model.id,
           budgetPreset: selectedBudgetPreset,
@@ -1428,7 +1590,11 @@ export function AppShell({
     setPending(true)
     let preservePending = false
     const completion = completeTurn(
-      { ...failedTurn, modelId: selectedModelId },
+      {
+        ...failedTurn,
+        clientRequestId: crypto.randomUUID(),
+        modelId: selectedModelId,
+      },
       false
     )
     const owner = {
@@ -1742,6 +1908,17 @@ export function AppShell({
                 sessionLoading ||
                 modelSaving ||
                 (route.kind === "chat" && activeSession?.id !== route.chatId)
+              }
+              runStatus={
+                sessionLoading
+                  ? "Checking current run…"
+                  : pending
+                    ? cancellingRun
+                      ? "Stopping…"
+                      : reconnectAvailable || error?.includes("Reconnecting")
+                        ? "Reconnecting. This chat stays locked until its run is checked."
+                        : "Running. You can close this page and return to this chat."
+                    : undefined
               }
               budgetPreset={selectedBudgetPreset}
               onBudgetChange={setRunBudgetChoice}

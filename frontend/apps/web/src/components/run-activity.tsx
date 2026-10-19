@@ -120,7 +120,8 @@ export function RunActivity({
     pending,
     now,
     undefined,
-    summary ?? undefined
+    summary ?? undefined,
+    runInfo?.status
   )
   useEffect(() => {
     if (status.terminal) return

@@ -41,3 +41,40 @@ jobs:
 
       - name: Run aggregate quality check
         run: make check
+
+  database:
+    name: Reliable run database contracts
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: fixture
+          POSTGRES_DB: trellis_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: fixture
+      PGDATABASE: trellis_test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Apply migrations to a disposable database
+        run: |
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/bootstrap.sql
+          for migration in supabase/migrations/*.sql; do
+            psql -X -v ON_ERROR_STOP=1 -f "$migration"
+          done
+      - name: Verify acceptance, ownership, cancellation, and concurrency
+        run: |
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/reliable_runs.sql
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/run_stopping.sql
+          bash supabase/tests/reliable_runs_concurrency.sh

@@ -20,15 +20,28 @@ export function isReconciledRunOutcome(
 
 export function turnFailureAction(
   code: string | undefined,
-  terminalOutcome: TerminalRunOutcome | null
+  terminalOutcome: TerminalRunOutcome | null,
+  hasAcceptedRun = false
 ): "reconnect" | "reload" | "retry" {
   if (terminalOutcome === "completed") return "reload"
-  if (
-    terminalOutcome === null &&
-    ["connection_lost", "runtime_timeout"].includes(code ?? "")
-  )
-    return "reconnect"
-  return "retry"
+  if (terminalOutcome !== null) return "retry"
+  if (hasAcceptedRun) return "reconnect"
+  return [
+    "message_empty",
+    "message_too_large",
+    "run_invalid",
+    "invalid_budget_preset",
+    "model_not_available",
+    "model_not_streaming",
+    "provider_not_available",
+    "provider_not_configured",
+    "run_capacity",
+    "run_token_too_short",
+    "session_not_found",
+    "rpc_invalid_params",
+  ].includes(code ?? "")
+    ? "retry"
+    : "reconnect"
 }
 
 export function recoveryTranscript(

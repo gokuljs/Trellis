@@ -23,6 +23,7 @@ export type RuntimeRunEvent = {
 export type RuntimeRunInfo = {
   runId: string
   modelId?: string
+  status?: string
   budgetPreset?: string
   limits?: {
     maxModelCalls: number
@@ -260,6 +261,7 @@ function credentialWasRejected(error: RuntimeError): boolean {
 function parseRunInfo(result: Record<string, unknown>): RuntimeRunInfo {
   const runId = result.runId as string
   const info: RuntimeRunInfo = { runId }
+  if (typeof result.status === "string") info.status = result.status
   if (typeof result.modelId === "string") info.modelId = result.modelId
   if (typeof result.budgetPreset === "string") {
     info.budgetPreset = result.budgetPreset
@@ -309,6 +311,7 @@ function followRun(
     let nextRpcId = 0
     let settled = false
     let subscriptionRequestPending = false
+    let credentialRefreshed = false
     let bufferedEventOverflowed = false
     let replayRequiredForRun: string | null = null
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -441,6 +444,31 @@ function followRun(
       })
     }
 
+    const refreshStartCredential = async (activeSocket: WebSocket) => {
+      credentialRefreshed = true
+      socket = null
+      socketCredential = null
+      subscriptionReady = false
+      replayRequiredForRun = null
+      bufferedEvents.length = 0
+      activeSocket.close()
+      try {
+        const credential = await auth.refreshAccessToken()
+        if (settled) return
+        if (!stillCurrent() || !auth.isCredentialCurrent(credential)) {
+          finish(authenticationError())
+          return
+        }
+        await connect()
+      } catch (error) {
+        finish(
+          error instanceof AuthAccessError
+            ? credentialError(error)
+            : unavailableAuthenticationError()
+        )
+      }
+    }
+
     const beginRequest = (activeSocket: WebSocket) => {
       if (settled || socket !== activeSocket) return
       if (!stillCurrent()) {
@@ -506,6 +534,15 @@ function followRun(
                   "runtime_request_failed",
                   "Trellis could not start that run."
                 )
+          if (
+            method === "run.start" &&
+            !runId &&
+            runtimeError.code === "run_token_too_short" &&
+            !credentialRefreshed
+          ) {
+            void refreshStartCredential(activeSocket)
+            return
+          }
           failRequest(runtimeError)
         })
     }
@@ -749,11 +786,11 @@ export function resumeRun(
 }
 
 async function requestRunAction<TResult>(
-  method: "run.cancel" | "run.respond",
+  method: "run.cancel" | "run.respond" | "run.lookup",
   params: Record<string, unknown>,
   requestId: string,
   failureMessage: string,
-  parseResult: (result: Record<string, unknown>) => TResult
+  parseResult: (result: unknown) => TResult
 ): Promise<TResult> {
   const auth = getAuthController()
   const initialUser = auth.getSnapshot().user?.id
@@ -811,7 +848,7 @@ async function requestRunAction<TResult>(
         reject(error)
         if (credentialWasRejected(error) && socketCredential)
           expireRejectedCredential(auth, socketCredential)
-      } else if (result) resolve(result)
+      } else if (result !== undefined) resolve(result)
       else
         reject(
           new RuntimeError(
@@ -938,13 +975,8 @@ async function requestRunAction<TResult>(
         )
         return
       }
-      const result = asRecord(envelope.result)
-      if (!result) {
-        finish()
-        return
-      }
       try {
-        finish(parseResult(result))
+        finish(parseResult(envelope.result))
       } catch (error) {
         finish(
           undefined,
@@ -994,8 +1026,9 @@ export async function cancelRun(
     { runId, afterSequence },
     "runtime-cancel",
     "Trellis could not cancel that run.",
-    (result) => {
-      if (result.runId !== runId || typeof result.status !== "string") {
+    (value) => {
+      const result = asRecord(value)
+      if (result?.runId !== runId || typeof result.status !== "string") {
         throw new RuntimeError(
           "runtime_protocol_error",
           "The Trellis service returned an invalid run."
@@ -1021,9 +1054,10 @@ export async function respondToToolApproval(
     { runId, toolCallId, decision, afterSequence },
     "runtime-respond",
     "Trellis could not answer that approval request.",
-    (result) => {
+    (value) => {
+      const result = asRecord(value)
       if (
-        result.runId !== runId ||
+        result?.runId !== runId ||
         result.toolCallId !== toolCallId ||
         result.decision !== decision
       ) {
@@ -1033,6 +1067,32 @@ export async function respondToToolApproval(
         )
       }
       return { runId, toolCallId, decision }
+    }
+  )
+}
+
+export function lookupRun(
+  sessionId: string,
+  clientRequestId: string
+): Promise<RuntimeRunInfo | null> {
+  return requestRunAction(
+    "run.lookup",
+    { sessionId, clientRequestId },
+    "runtime-lookup",
+    "Trellis could not check that request.",
+    (value) => {
+      if (value === null) return null
+      const result = asRecord(value)
+      if (
+        !result ||
+        typeof result.runId !== "string" ||
+        typeof result.status !== "string"
+      )
+        throw new RuntimeError(
+          "runtime_protocol_error",
+          "The Trellis service returned an invalid run."
+        )
+      return parseRunInfo(result)
     }
   )
 }

@@ -18,6 +18,6 @@ typecheck:
 	$(UV) run --locked ty check
 
 test:
-	COVERAGE_FILE=.coverage.stage3 $(UV) run --locked pytest
+	$(UV) run --locked pytest
 
 check: format-check lint typecheck test

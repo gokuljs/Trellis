@@ -1,5 +1,7 @@
 import type { Session, SupabaseClient, User } from "@supabase/supabase-js"
 
+import { clearUserPendingRuns } from "@/lib/pending-run"
+
 import {
   AuthConfigurationError,
   getSupabaseClient,
@@ -40,6 +42,7 @@ export interface AuthController {
   getSnapshot: () => AuthState
   getSessionEpoch: () => number
   getAccessToken: () => Promise<AuthCredential>
+  refreshAccessToken: () => Promise<AuthCredential>
   isCredentialCurrent: (credential: AuthCredential) => boolean
   expireSession: (credential: AuthCredential) => Promise<void>
   subscribe: (listener: () => void) => () => void
@@ -211,6 +214,12 @@ export function createAuthController(
   let validatedAccessToken: string | null = null
   let expiryCleanup: Promise<void> | null = null
   let expiryRecoveryRequired = false
+  let pendingUserId: string | null = null
+
+  const forgetPendingRuns = () => {
+    if (pendingUserId) clearUserPendingRuns(pendingUserId)
+    pendingUserId = null
+  }
 
   const publish = (next: AuthState) => {
     if (
@@ -253,6 +262,7 @@ export function createAuthController(
   }
 
   const expireCurrentSession = (): Promise<void> => {
+    forgetPendingRuns()
     version += 1
     rejectLateAuthEvents = true
     signOutRecoveryRequired = false
@@ -281,6 +291,8 @@ export function createAuthController(
     if (!data.user || data.user.id !== session.user.id)
       throw new AuthAccessError("reauth_required", expiredMessage)
     if (version !== expectedVersion) return
+    if (pendingUserId && pendingUserId !== data.user.id) forgetPendingRuns()
+    pendingUserId = data.user.id
     currentAccessToken = session.access_token
     validatedAccessToken = session.access_token
     publish({ ...emptyState, status: "signed-in", user: data.user })
@@ -341,6 +353,7 @@ export function createAuthController(
     const { data } = client.auth.onAuthStateChange((event, session) => {
       if (event === "INITIAL_SESSION") return
       if (event === "SIGNED_OUT" || !session) {
+        forgetPendingRuns()
         if (state.status === "signed-out" && state.error === expiredMessage)
           return
         if (state.status === "signed-in" && !signingOut) {
@@ -377,6 +390,51 @@ export function createAuthController(
     window.addEventListener("pageshow", recoverFromBrowserBack)
   }
 
+  const getCredential = async (refresh = false): Promise<AuthCredential> => {
+    const user = state.status === "signed-in" ? state.user : null
+    if (!user) throw new AuthAccessError("reauth_required", expiredMessage)
+    const expectedGeneration = accessGeneration
+    const expectedVersion = version
+    const current = () =>
+      state.status === "signed-in" &&
+      state.user?.id === user.id &&
+      accessGeneration === expectedGeneration
+    let result: { data: { session: Session | null }; error: unknown }
+    try {
+      result = await withDeadline<typeof result>(() =>
+        refresh ? client.auth.refreshSession() : client.auth.getSession()
+      )
+    } catch (error) {
+      if (!current())
+        throw new AuthAccessError("reauth_required", expiredMessage)
+      if (isInvalidSession(error) && version === expectedVersion) {
+        void expireCurrentSession()
+        throw new AuthAccessError("reauth_required", expiredMessage)
+      }
+      throw new AuthAccessError("auth_unavailable", unavailableMessage)
+    }
+    if (!current()) throw new AuthAccessError("reauth_required", expiredMessage)
+    const { data, error } = result
+    if (error) {
+      if (isInvalidSession(error) && version === expectedVersion) {
+        void expireCurrentSession()
+        throw new AuthAccessError("reauth_required", expiredMessage)
+      }
+      throw new AuthAccessError("auth_unavailable", unavailableMessage)
+    }
+    if (!data.session?.access_token || data.session.user.id !== user.id) {
+      if (version === expectedVersion) void expireCurrentSession()
+      throw new AuthAccessError("reauth_required", expiredMessage)
+    }
+    if (version === expectedVersion)
+      currentAccessToken = data.session.access_token
+    return {
+      token: data.session.access_token,
+      userId: user.id,
+      sessionEpoch: expectedGeneration,
+    }
+  }
+
   const controller: AuthController = {
     getSnapshot: () => state,
     getSessionEpoch: () => accessGeneration,
@@ -389,49 +447,8 @@ export function createAuthController(
         return Promise.resolve()
       return expireCurrentSession()
     },
-    getAccessToken: async () => {
-      const user = state.status === "signed-in" ? state.user : null
-      if (!user) throw new AuthAccessError("reauth_required", expiredMessage)
-      const expectedGeneration = accessGeneration
-      const expectedVersion = version
-      const current = () =>
-        state.status === "signed-in" &&
-        state.user?.id === user.id &&
-        accessGeneration === expectedGeneration
-      let result: Awaited<ReturnType<typeof client.auth.getSession>>
-      try {
-        result = await withDeadline(() => client.auth.getSession())
-      } catch (error) {
-        if (!current())
-          throw new AuthAccessError("reauth_required", expiredMessage)
-        if (isInvalidSession(error) && version === expectedVersion) {
-          void expireCurrentSession()
-          throw new AuthAccessError("reauth_required", expiredMessage)
-        }
-        throw new AuthAccessError("auth_unavailable", unavailableMessage)
-      }
-      if (!current())
-        throw new AuthAccessError("reauth_required", expiredMessage)
-      const { data, error } = result
-      if (error) {
-        if (isInvalidSession(error) && version === expectedVersion) {
-          void expireCurrentSession()
-          throw new AuthAccessError("reauth_required", expiredMessage)
-        }
-        throw new AuthAccessError("auth_unavailable", unavailableMessage)
-      }
-      if (!data.session?.access_token || data.session.user.id !== user.id) {
-        if (version === expectedVersion) void expireCurrentSession()
-        throw new AuthAccessError("reauth_required", expiredMessage)
-      }
-      if (version === expectedVersion)
-        currentAccessToken = data.session.access_token
-      return {
-        token: data.session.access_token,
-        userId: user.id,
-        sessionEpoch: expectedGeneration,
-      }
-    },
+    getAccessToken: () => getCredential(),
+    refreshAccessToken: () => getCredential(true),
     subscribe: (listener) => {
       const subscriptionListener = () => listener()
       listeners.add(subscriptionListener)
@@ -508,6 +525,7 @@ export function createAuthController(
         .then(() => {
           if (version !== expectedVersion) return
           signOutRecoveryRequired = false
+          forgetPendingRuns()
           publish({ ...emptyState, status: "signed-out" })
         })
         .catch((error: unknown) => {
@@ -570,6 +588,12 @@ export function getAuthController(): AuthController {
       getSnapshot: () => state,
       getSessionEpoch: () => 0,
       getAccessToken: async () => {
+        throw new AuthAccessError(
+          "auth_unavailable",
+          state.error ?? unavailableMessage
+        )
+      },
+      refreshAccessToken: async () => {
         throw new AuthAccessError(
           "auth_unavailable",
           state.error ?? unavailableMessage

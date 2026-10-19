@@ -147,6 +147,23 @@ test("newer live progress suppresses stale saved failure text", () => {
   assert.ok(!html.includes("The model provider is temporarily unavailable."))
 })
 
+test("confirmed interruption replaces an old live phase when saved totals cannot load", () => {
+  const state = describeActivity(
+    [{ ...event("run.phase"), data: { phase: "answering" } }],
+    false,
+    Date.parse("2026-10-16T00:00:20Z"),
+    undefined,
+    summary({ status: "running", last_sequence: 900 }),
+    "interrupted"
+  )
+  assert.deepEqual(state, {
+    label: "Interrupted",
+    orb: "shaping",
+    duration: null,
+    terminal: true,
+  })
+})
+
 test("failed summary loading preserves paged events and offers retry without invented model steps", () => {
   const html = renderToStaticMarkup(
     createElement(RunActivity, {

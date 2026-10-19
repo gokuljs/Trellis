@@ -68,7 +68,8 @@ export function RunActivityDisclosure({
     pending,
     now,
     activity.latestEvent,
-    summary
+    summary,
+    activity.runInfo?.status
   )
   const available = Boolean(
     (sessionId && turnId) ||
@@ -121,6 +122,7 @@ export function RunActivityDisclosure({
             <span>
               {!pending &&
               !activity.summary &&
+              !activity.runInfo?.status &&
               !activity.latestEvent &&
               !activity.events.length
                 ? "View activity"

@@ -2,15 +2,23 @@ import assert from "node:assert/strict"
 import { afterEach, test, mock, spyOn } from "bun:test"
 
 import * as authModule from "../src/lib/auth-controller"
-import type { AuthController } from "../src/lib/auth-controller"
+import {
+  AuthAccessError,
+  type AuthController,
+} from "../src/lib/auth-controller"
 import {
   cancelRun,
+  lookupRun,
   respondToToolApproval,
   resumeRun,
   streamRun,
 } from "../src/lib/runtime-client"
 import { logFailure } from "../src/lib/logging"
-import { isReconciledRunOutcome, ownsRun } from "../src/lib/run-recovery"
+import {
+  isReconciledRunOutcome,
+  ownsRun,
+  turnFailureAction,
+} from "../src/lib/run-recovery"
 
 const secret = "private-runtime-token-prompt-session-tool"
 const originalSocket = globalThis.WebSocket
@@ -68,13 +76,19 @@ async function until(predicate: () => boolean) {
 function setup() {
   let epoch = 1
   const listeners = new Set<() => void>()
-  const credential = { token: secret, userId: secret, sessionEpoch: epoch }
+  let credential = { token: secret, userId: secret, sessionEpoch: epoch }
+  const refreshAccessToken = mock(async () => {
+    credential = { ...credential, token: "refreshed-token" }
+    return credential
+  })
+  const expireSession = mock(async () => undefined)
   const auth = {
     getSnapshot: () => ({ status: "signed-in", user: { id: secret } }),
     getSessionEpoch: () => epoch,
     getAccessToken: async () => credential,
+    refreshAccessToken,
     isCredentialCurrent: () => epoch === credential.sessionEpoch,
-    expireSession: async () => undefined,
+    expireSession,
     subscribe: (listener: () => void) => {
       listeners.add(listener)
       return () => {
@@ -122,6 +136,8 @@ function setup() {
     nativeClearTimeout(timer)
   }) as typeof clearTimeout)
   return {
+    refreshAccessToken,
+    expireSession,
     changeAccount() {
       epoch++
       for (const listener of listeners) listener()
@@ -315,6 +331,35 @@ test("reconciliation accepts terminal outcomes and suppresses stale owners", asy
   assert.deepEqual(recorded(), [])
 })
 
+test("unconfirmed acceptance failures require discovery before unlocking", () => {
+  for (const code of [
+    "auth_unavailable",
+    "database_unavailable",
+    "runtime_protocol_error",
+    "run_in_progress",
+    "session_run_busy",
+    undefined,
+  ]) {
+    assert.equal(turnFailureAction(code, null), "reconnect", code)
+  }
+  assert.equal(turnFailureAction("run_capacity", null, true), "reconnect")
+})
+
+test("definite rejection and terminal events allow a new explicit attempt", () => {
+  for (const code of [
+    "run_capacity",
+    "run_token_too_short",
+    "message_empty",
+    "message_too_large",
+    "invalid_budget_preset",
+    "provider_not_configured",
+  ]) {
+    assert.equal(turnFailureAction(code, null), "retry", code)
+  }
+  assert.equal(turnFailureAction("database_unavailable", "failed"), "retry")
+  assert.equal(turnFailureAction("database_unavailable", "completed"), "reload")
+})
+
 test("leaving a running chat closes its browser subscription without cancelling the run", async () => {
   setup()
   const connection = new AbortController()
@@ -343,4 +388,141 @@ test("leaving a running chat closes its browser subscription without cancelling 
     ["auth.authenticate", "run.start"]
   )
   assert.deepEqual(events, [])
+})
+
+test("request lookup accepts an absent request without creating a run", async () => {
+  setup()
+  const missing = lookupRun("chat", "request")
+  const first = await authenticate()
+  assert.equal(first.sent[1]?.method, "run.lookup")
+  assert.deepEqual(first.sent[1]?.params, {
+    sessionId: "chat",
+    clientRequestId: "request",
+  })
+  acknowledge(first, null)
+  assert.equal(await missing, null)
+  const found = lookupRun("chat", "request")
+  const second = await authenticate(1)
+  acknowledge(second, { runId: secret, status: "running", modelId: "model" })
+  assert.deepEqual(await found, {
+    runId: secret,
+    status: "running",
+    modelId: "model",
+  })
+  assert.equal(
+    sockets
+      .flatMap((socket) => socket.sent)
+      .some((frame) => frame.method === "run.start"),
+    false
+  )
+})
+
+test("a lost acceptance reply reconnects with the original request ID", async () => {
+  setup()
+  const input = {
+    sessionId: "chat",
+    turnId: "turn",
+    clientRequestId: "request",
+    content: "Hello",
+  }
+  const started = streamRun(input, {
+    reconnectAttempts: 1,
+    reconnectDelayMs: 0,
+  })
+  const first = await authenticate()
+  first.disconnect()
+  const second = await authenticate(1)
+  assert.deepEqual(first.sent[1]?.params, input)
+  assert.deepEqual(second.sent[1]?.params, input)
+  acknowledge(second, { runId: secret })
+  complete(second)
+  assert.deepEqual(await started, { runId: secret })
+})
+
+function rejectShortToken(socket: FakeSocket) {
+  const request = socket.sent.find(
+    (frame) => frame.method !== "auth.authenticate"
+  )!
+  socket.receive({
+    jsonrpc: "2.0",
+    id: request.id,
+    error: {
+      code: -32010,
+      message: "Your sign-in expires too soon for this run.",
+      data: { code: "run_token_too_short" },
+    },
+  })
+}
+
+test("a short execution credential refreshes once and retries the unchanged submission", async () => {
+  const { refreshAccessToken, expireSession } = setup()
+  const input = {
+    sessionId: "chat",
+    turnId: "turn",
+    clientRequestId: "request",
+    content: "Hello",
+    modelId: "openai:model",
+    budgetPreset: "longer" as const,
+  }
+  const started = streamRun(input)
+  const first = await authenticate()
+  rejectShortToken(first)
+  const second = await authenticate(1)
+  assert.equal(first.closed, true)
+  assert.equal(second.sent[0]?.params.accessToken, "refreshed-token")
+  assert.deepEqual(first.sent[1]?.params, input)
+  assert.deepEqual(second.sent[1]?.params, input)
+  acknowledge(second, { runId: secret })
+  complete(second)
+  await started
+  assert.equal(refreshAccessToken.mock.calls.length, 1)
+  assert.equal(expireSession.mock.calls.length, 0)
+})
+
+test("a refreshed credential that is still short rejects without refreshing again or signing out", async () => {
+  const { refreshAccessToken, expireSession } = setup()
+  const started = streamRun({
+    sessionId: "chat",
+    turnId: "turn",
+    clientRequestId: "request",
+    content: "Hello",
+  })
+  const failed = assert.rejects(
+    started,
+    (error: unknown) =>
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "run_token_too_short"
+  )
+  rejectShortToken(await authenticate())
+  rejectShortToken(await authenticate(1))
+  await failed
+  assert.equal(refreshAccessToken.mock.calls.length, 1)
+  assert.equal(expireSession.mock.calls.length, 0)
+  assert.equal(sockets.length, 2)
+})
+
+test("temporary refresh failure preserves sign-in and does not resubmit", async () => {
+  const { refreshAccessToken, expireSession } = setup()
+  refreshAccessToken.mockImplementation(async () => {
+    throw new AuthAccessError("auth_unavailable", "Try again.")
+  })
+  const started = streamRun({
+    sessionId: "chat",
+    turnId: "turn",
+    clientRequestId: "request",
+    content: "Hello",
+  })
+  const failed = assert.rejects(
+    started,
+    (error: unknown) =>
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "auth_unavailable"
+  )
+  rejectShortToken(await authenticate())
+  await failed
+  assert.equal(refreshAccessToken.mock.calls.length, 1)
+  assert.equal(expireSession.mock.calls.length, 0)
+  assert.equal(sockets.length, 1)
 })

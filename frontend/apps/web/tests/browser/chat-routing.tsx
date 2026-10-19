@@ -7,13 +7,17 @@ import { AuthGate } from "../../src/components/auth-gate"
 import { ThemeProvider } from "../../src/components/theme-provider"
 import { ApiError, api } from "../../src/lib/api"
 import {
+  AuthAccessError,
   getAuthController,
   type AuthState,
 } from "../../src/lib/auth-controller"
+import { readPendingRun } from "../../src/lib/pending-run"
 import { chatPath, navigate } from "../../src/lib/app-routes"
 import type {
+  AssistantOutput,
   LatestRun,
   Message,
+  RunSummary,
   Session,
   SessionHistoryPage,
 } from "../../src/lib/app-types"
@@ -41,9 +45,12 @@ const sessions = new Map(
   ])
 )
 const transcripts = new Map<string, Message[]>()
+const savedOutputs = new Map<string, AssistantOutput[]>()
 const latest = new Map<string, LatestRun>()
 const requests: string[] = []
 const rpc: string[] = []
+const startRequests: { clientRequestId: string; sessionId: string }[] = []
+const acceptedRequests = new Map<string, string>()
 const checks: string[] = []
 const browserLogs: unknown[] = []
 const blockedRequests: string[] = []
@@ -67,6 +74,14 @@ const sockets: FixtureSocket[] = []
 let transientFailed = true
 let releaseHistory: (() => void) | null = null
 let delayMissing = false
+let delayDiscovery = false
+let failDiscovery = false
+let releaseDiscovery: (() => void) | null = null
+let loseAcceptanceReply = false
+let accessTokenUnavailable = false
+let acceptanceFailure: string | null = null
+let busyFailure: string | null = null
+let rejectBeforeAcceptance = false
 const user = { id: "fixture-user", email: "fixture@example.test" } as User
 const credential = { token: "fixture-token", userId: user.id, sessionEpoch: 1 }
 let authState: AuthState = {
@@ -92,7 +107,11 @@ function publishAuth(
 Object.assign(getAuthController(), {
   getSnapshot: () => authState,
   getSessionEpoch: () => 1,
-  getAccessToken: async () => credential,
+  getAccessToken: async () => {
+    if (accessTokenUnavailable)
+      throw new AuthAccessError("auth_unavailable", "Synthetic auth outage")
+    return credential
+  },
   isCredentialCurrent: () => true,
   expireSession: async () => publishAuth("signed-out"),
   subscribe(listener: () => void) {
@@ -131,8 +150,39 @@ function history(sessionId: string): SessionHistoryPage {
   return {
     session: sessions.get(sessionId)!,
     messages: savedMessages(sessionId),
+    assistant_outputs: savedOutputs.get(sessionId) ?? [],
     timeline_order: [],
     next_before_cursor: null,
+  }
+}
+function runSummary(run: LatestRun): RunSummary {
+  return {
+    ...run,
+    retry_of: null,
+    budget_preset: "conservative",
+    max_model_calls: 8,
+    max_tool_calls: 16,
+    max_total_tokens: 100000,
+    max_cost_usd: 2,
+    deadline_at: "2026-10-18T00:10:00Z",
+    created_at: now,
+    started_at: now,
+    finished_at: ["completed", "cancelled", "failed", "interrupted"].includes(
+      run.status
+    )
+      ? "2026-10-18T00:00:10Z"
+      : null,
+    provider_id: "fixture",
+    model_id: "fixture-model",
+    model_call_count: 1,
+    tool_call_count: 0,
+    total_tokens: null,
+    usage_complete: false,
+    estimated_cost_usd: null,
+    cost_complete: false,
+    stop_reason: null,
+    error_code: null,
+    error_message: null,
   }
 }
 Object.assign(api, {
@@ -189,8 +239,23 @@ Object.assign(api, {
       )
     return history(sessionId)
   },
-  listRunSummaries: async () => ({ items: [], next_offset: null }),
-  getLatestRun: async (sessionId: string) => latest.get(sessionId) ?? null,
+  listRunSummaries: async (sessionId: string) => {
+    const run = latest.get(sessionId)
+    return { items: run ? [runSummary(run)] : [], next_offset: null }
+  },
+  getLatestRun: async (sessionId: string) => {
+    if (sessionId === ids.a && delayDiscovery)
+      await new Promise<void>((resolve) => {
+        releaseDiscovery = resolve
+      })
+    if (sessionId === ids.a && failDiscovery)
+      throw new ApiError(
+        "service_unavailable",
+        "Synthetic discovery outage",
+        503
+      )
+    return latest.get(sessionId) ?? null
+  },
   createSession: async () => {
     requests.push("create")
     transcripts.set(ids.created, [])
@@ -231,8 +296,47 @@ class FixtureSocket {
         sessionId: string
         turnId: string
         content: string
+        clientRequestId: string
       }
-      this.runId = `run-${input.sessionId}`
+      startRequests.push({
+        clientRequestId: input.clientRequestId,
+        sessionId: input.sessionId,
+      })
+      if (rejectBeforeAcceptance) {
+        rejectBeforeAcceptance = false
+        this.reject(frame.id, "database_unavailable")
+        return
+      }
+      if (busyFailure) {
+        const code = busyFailure
+        busyFailure = null
+        const otherInput: Message = {
+          id: "other-tab-input",
+          turn_id: `other-${input.turnId}`,
+          role: "user",
+          content: "Work accepted in another tab",
+          provider: null,
+          model: null,
+          created_at: now,
+        }
+        transcripts.set(input.sessionId, [
+          ...savedMessages(input.sessionId),
+          otherInput,
+        ])
+        latest.set(input.sessionId, {
+          run_id: `other-${input.clientRequestId}`,
+          turn_id: otherInput.turn_id,
+          status: "running",
+          last_sequence: 0,
+          input_message: otherInput,
+        })
+        this.reject(frame.id, code)
+        return
+      }
+      this.runId =
+        acceptedRequests.get(input.clientRequestId) ?? `run-${input.sessionId}`
+      const existing = acceptedRequests.has(input.clientRequestId)
+      acceptedRequests.set(input.clientRequestId, this.runId)
       const inputMessage: Message = {
         id: "fixture-input",
         turn_id: input.turnId,
@@ -242,10 +346,11 @@ class FixtureSocket {
         model: null,
         created_at: now,
       }
-      transcripts.set(input.sessionId, [
-        ...savedMessages(input.sessionId),
-        inputMessage,
-      ])
+      if (!existing)
+        transcripts.set(input.sessionId, [
+          ...savedMessages(input.sessionId),
+          inputMessage,
+        ])
       latest.set(input.sessionId, {
         run_id: this.runId,
         turn_id: input.turnId,
@@ -253,7 +358,42 @@ class FixtureSocket {
         last_sequence: 0,
         input_message: inputMessage,
       })
-      result = { runId: this.runId, modelId: "fixture-model" }
+      result = {
+        runId: this.runId,
+        status: "running",
+        modelId: "fixture-model",
+      }
+      if (acceptanceFailure) {
+        const code = acceptanceFailure
+        acceptanceFailure = null
+        this.reject(frame.id, code)
+        return
+      }
+      if (loseAcceptanceReply) {
+        loseAcceptanceReply = false
+        queueMicrotask(() => {
+          this.closed = true
+          this.onclose?.({ code: 1006 })
+        })
+        return
+      }
+    } else if (frame.method === "run.lookup") {
+      const runId = acceptedRequests.get(frame.params.clientRequestId)
+      const saved = latest.get(frame.params.sessionId)
+      result =
+        runId && saved?.run_id === runId
+          ? { runId, status: saved.status }
+          : null
+    } else if (frame.method === "run.cancel") {
+      const saved = [...latest.values()].find(
+        (run) => run.run_id === frame.params.runId
+      )!
+      saved.status = "cancelled"
+      result = { runId: saved.run_id, status: "cancelled" }
+      for (const socket of sockets) {
+        if (!socket.closed && socket.runId === saved.run_id)
+          socket.event("run.cancelled", {})
+      }
     } else if (frame.method === "run.resume") {
       this.runId = frame.params.runId
       result = { runId: this.runId, modelId: "fixture-model" }
@@ -267,6 +407,36 @@ class FixtureSocket {
   close() {
     this.closed = true
     this.onclose?.({ code: 1000 })
+  }
+  reject(id: string, code: string) {
+    queueMicrotask(() =>
+      this.onmessage?.({
+        data: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -32000,
+            message: "Synthetic request failure",
+            data: { code, status: 503 },
+          },
+        }),
+      })
+    )
+  }
+  event(eventType: string, data: Record<string, unknown>, sequence = 1) {
+    this.onmessage?.({
+      data: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "run.event",
+        params: {
+          runId: this.runId,
+          sequence,
+          eventType,
+          eventVersion: 1,
+          data,
+        },
+      }),
+    })
   }
   staleEvent() {
     this.onmessage?.({
@@ -293,6 +463,7 @@ function evidence() {
       checks,
       requests,
       rpc,
+      startRequests,
       historyLength: window.history.length,
       privacy: Object.values(ids).some((id) =>
         JSON.stringify(browserLogs).includes(id)
@@ -349,7 +520,7 @@ function pass(message: string) {
   checks.push(`PASS ${message}`)
   evidence()
 }
-async function submit(content: string) {
+async function submit(content: string, accepted = true) {
   const textarea = document.querySelector("textarea")!
   const setter = Object.getOwnPropertyDescriptor(
     HTMLTextAreaElement.prototype,
@@ -362,8 +533,15 @@ async function submit(content: string) {
     new KeyboardEvent("keydown", { key: "Enter", bubbles: true })
   )
   await until(
-    () => !!document.querySelector(".cancel-run-button"),
-    "Run did not start"
+    () =>
+      accepted
+        ? !!document.querySelector(".cancel-run-button")
+        : document
+            .querySelector(".chat-error")
+            ?.textContent?.includes("Your request was not accepted.") ===
+            true &&
+          !document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
+    "Submission did not reach its expected state"
   )
 }
 async function runChecks() {
@@ -471,6 +649,25 @@ async function runChecks() {
   await open(ids.a)
   await submit("Keep running while I switch")
   const firstSocket = sockets.at(-1)!
+  assert(
+    document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
+    "Running chat allowed input"
+  )
+  assert(button("Send").disabled, "Running chat allowed Send")
+  assert(
+    document.querySelector<HTMLSelectElement>('[aria-label="Run budget"]')!
+      .disabled,
+    "Running chat allowed budget changes"
+  )
+  assert(
+    document.querySelector<HTMLSelectElement>('[aria-label="Chat model"]')!
+      .disabled,
+    "Running chat allowed model changes"
+  )
+  assert(!button("Stop generating").disabled, "Composer lock blocked Stop")
+  pass(
+    "A running chat locks message, Send, model, and budget while Stop remains usable"
+  )
   button("Fixture chat b").click()
   await until(
     () =>
@@ -511,6 +708,246 @@ async function runChecks() {
   pass(
     "Pending sidebar and history switches preserve the run, ignore stale events, and resume on return"
   )
+  delayDiscovery = true
+  navigate(chatPath(ids.a))
+  await until(() => releaseDiscovery !== null, "Run discovery did not pause")
+  assert(
+    document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
+    "Delayed discovery briefly enabled input"
+  )
+  assert(
+    document.querySelector(".composer-footnote")?.textContent ===
+      "Checking current run…",
+    "Discovery status is unclear"
+  )
+  delayDiscovery = false
+  releaseDiscovery!()
+  await until(
+    () => !!document.querySelector(".cancel-run-button"),
+    "Delayed discovery did not restore the run"
+  )
+  assert(
+    rpc.includes("run.lookup"),
+    "Returning did not look up the exact request"
+  )
+  assert(
+    rpc.filter((method) => method === "run.start").length === 1,
+    "Returning submitted again"
+  )
+  pass(
+    "Exact request lookup and delayed discovery keep the chat locked without another submission"
+  )
+  await open(ids.b)
+  failDiscovery = true
+  navigate(chatPath(ids.a))
+  await until(
+    () =>
+      !![...document.querySelectorAll("button")].find(
+        (item) => item.textContent?.trim() === "Reconnect"
+      ),
+    "Discovery failure did not offer Reconnect"
+  )
+  assert(
+    document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
+    "Discovery failure unlocked input"
+  )
+  failDiscovery = false
+  button("Reconnect").click()
+  await until(
+    () =>
+      !!document.querySelector(".cancel-run-button") &&
+      !document.querySelector(".chat-error"),
+    "Reconnect did not restore the run"
+  )
+  button("Stop generating").click()
+  await until(
+    () => !document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
+    "Cancellation did not unlock input"
+  )
+  assert(
+    rpc.filter((method) => method === "run.start").length === 1,
+    "Reconnect or Stop submitted again"
+  )
+  pass(
+    "Discovery failure keeps the lock and Stop works after reconnect until terminal cancellation"
+  )
+  await open(ids.b)
+  const finished = latest.get(ids.a)!
+  finished.status = "completed"
+  transcripts.set(ids.a, [
+    ...savedMessages(ids.a),
+    {
+      id: "saved-completion",
+      turn_id: finished.turn_id,
+      role: "assistant",
+      content: "Saved final answer",
+      provider: "fixture",
+      model: "fixture-model",
+      created_at: now,
+    },
+  ])
+  const resumesBeforeCompletion = rpc.filter(
+    (method) => method === "run.resume"
+  ).length
+  await open(ids.a)
+  assert(
+    document
+      .querySelector("#root")!
+      .textContent!.includes("Saved final answer"),
+    "Completed answer was not restored"
+  )
+  assert(
+    rpc.filter((method) => method === "run.resume").length ===
+      resumesBeforeCompletion,
+    "Completed history opened another live run"
+  )
+  pass(
+    "Returning after completion shows the saved answer and unlocks controls without execution"
+  )
+  await open(ids.b)
+  const racingInput: Message = {
+    id: "racing-input",
+    turn_id: "racing-turn",
+    role: "user",
+    content: "Complete while the browser discovers my run",
+    provider: null,
+    model: null,
+    created_at: now,
+  }
+  transcripts.set(ids.a, [...savedMessages(ids.a), racingInput])
+  latest.set(ids.a, {
+    run_id: "racing-run",
+    turn_id: racingInput.turn_id,
+    status: "running",
+    last_sequence: 0,
+    input_message: racingInput,
+  })
+  delayDiscovery = true
+  releaseDiscovery = null
+  navigate(chatPath(ids.a))
+  await until(() => releaseDiscovery !== null, "Racing discovery did not pause")
+  latest.get(ids.a)!.status = "completed"
+  transcripts.set(ids.a, [
+    ...savedMessages(ids.a),
+    {
+      ...racingInput,
+      id: "racing-answer",
+      role: "assistant",
+      content: "Final answer saved during run discovery",
+      provider: "fixture",
+      model: "fixture-model",
+    },
+  ])
+  delayDiscovery = false
+  releaseDiscovery!()
+  await until(
+    () =>
+      document
+        .querySelector("#root")!
+        .textContent!.includes("Final answer saved during run discovery") &&
+      !document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
+    "Completion during discovery did not reload its saved answer"
+  )
+  pass(
+    "Completion between history and run discovery reloads the saved final answer"
+  )
+  await open(ids.b)
+  delayDiscovery = true
+  releaseDiscovery = null
+  navigate(chatPath(ids.a))
+  await until(
+    () => releaseDiscovery !== null,
+    "Acceptance discovery did not pause"
+  )
+  const acceptedDuringDiscovery: Message = {
+    ...racingInput,
+    id: "late-accepted-input",
+    turn_id: "late-accepted-turn",
+    content: "Accepted input saved after the browser read history",
+  }
+  transcripts.set(ids.a, [...savedMessages(ids.a), acceptedDuringDiscovery])
+  latest.set(ids.a, {
+    run_id: "late-accepted-run",
+    turn_id: acceptedDuringDiscovery.turn_id,
+    status: "running",
+    last_sequence: 0,
+    input_message: acceptedDuringDiscovery,
+  })
+  delayDiscovery = false
+  releaseDiscovery!()
+  await until(
+    () =>
+      document
+        .querySelector("#root")!
+        .textContent!.includes(acceptedDuringDiscovery.content) &&
+      !!document.querySelector(".cancel-run-button"),
+    "Run discovery omitted the input accepted after history was read"
+  )
+  assert(
+    document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
+    "Late accepted input did not lock its chat"
+  )
+  pass(
+    "Run discovery shows newly accepted input even when history was read earlier"
+  )
+  await until(
+    () => sockets.at(-1)?.runId === "late-accepted-run",
+    "Restored subscription did not start"
+  )
+  const interruptedSocket = sockets.at(-1)!
+  interruptedSocket.event("run.phase", { phase: "answering" })
+  await until(
+    () =>
+      [...document.querySelectorAll(".run-activity-trigger")].some((item) =>
+        item.textContent?.includes("Answering")
+      ),
+    "Running activity did not show its model phase"
+  )
+  interruptedSocket.closed = true
+  interruptedSocket.onclose?.({ code: 1013 })
+  await until(
+    () =>
+      !![...document.querySelectorAll("button")].find(
+        (item) => item.textContent?.trim() === "Reconnect"
+      ),
+    "Lost restored connection did not offer Reconnect"
+  )
+  latest.get(ids.a)!.status = "interrupted"
+  latest.get(ids.a)!.last_sequence = 2
+  savedOutputs.set(ids.a, [
+    {
+      id: "saved-partial",
+      turn_id: acceptedDuringDiscovery.turn_id,
+      run_id: "late-accepted-run",
+      model_call_id: "interrupted-call",
+      step_index: 1,
+      content: "Saved partial answer before interruption",
+      status: "partial",
+      stop_reason: "runtime_shutdown",
+      promoted_message_id: null,
+      created_at: now,
+    },
+  ])
+  const startsBeforeInterruption = startRequests.length
+  button("Reconnect").click()
+  await until(
+    () =>
+      !document.querySelector<HTMLTextAreaElement>("textarea")!.disabled &&
+      [...document.querySelectorAll(".run-activity-trigger")].some((item) =>
+        item.textContent?.includes("Interrupted")
+      ) &&
+      document
+        .querySelector("#root")!
+        .textContent!.includes("Saved partial answer before interruption"),
+    "Interruption discovery left running activity or lost saved partial output"
+  )
+  assert(
+    startRequests.length === startsBeforeInterruption,
+    "Interruption discovery restarted execution"
+  )
+  pass(
+    "Interruption discovered after reconnect replaces the running phase, preserves partial output, and unlocks without execution"
+  )
   button("New session").click()
   await until(
     () => window.location.pathname === "/",
@@ -532,6 +969,122 @@ async function runChecks() {
   )
   pass(
     "Creating a chat replaces the draft URL before its first run without resetting submission"
+  )
+  await open(ids.b)
+  loseAcceptanceReply = true
+  await submit("Save this request even when the reply is lost")
+  const retried = startRequests.filter((request) => request.sessionId === ids.b)
+  assert(
+    retried.length === 2 &&
+      new Set(retried.map((request) => request.clientRequestId)).size === 1,
+    "Lost response changed the logical request ID"
+  )
+  assert(
+    savedMessages(ids.b).filter((message) => message.role === "user").length ===
+      1,
+    "Lost response duplicated the saved input"
+  )
+  pass(
+    "A lost acceptance reply retries the same request ID and saves one logical submission"
+  )
+  const accepted = readPendingRun(user.id, ids.b)
+  assert(accepted?.runId, "Accepted request metadata is missing")
+  const startsBeforeAuthFailure = startRequests.length
+  accessTokenUnavailable = true
+  const acceptedSocket = sockets.at(-1)!
+  acceptedSocket.closed = true
+  acceptedSocket.onclose?.({ code: 1013 })
+  await until(
+    () =>
+      !![...document.querySelectorAll("button")].find(
+        (item) => item.textContent?.trim() === "Reconnect"
+      ),
+    "Authentication outage did not offer Reconnect"
+  )
+  assert(
+    document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
+    "Authentication outage unlocked accepted work"
+  )
+  assert(
+    readPendingRun(user.id, ids.b)?.runId === accepted.runId,
+    "Authentication outage discarded the accepted request"
+  )
+  accessTokenUnavailable = false
+  button("Reconnect").click()
+  await until(
+    () => !document.querySelector(".chat-error"),
+    "Authentication recovery did not resume the run"
+  )
+  assert(
+    startRequests.length === startsBeforeAuthFailure,
+    "Authentication recovery resubmitted accepted work"
+  )
+  button("Stop generating").click()
+  await until(
+    () => !document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
+    "Recovered run did not cancel"
+  )
+  pass(
+    "Authentication loss preserves accepted work and its lock until reconnect and cancellation"
+  )
+  const startsBeforeDatabaseFailure = startRequests.length
+  acceptanceFailure = "database_unavailable"
+  await submit("Keep the committed request after an uncertain database reply")
+  assert(
+    document.querySelector<HTMLTextAreaElement>("textarea")!.disabled &&
+      !!readPendingRun(user.id, ids.b)?.runId,
+    "Uncertain acceptance did not restore and lock its saved run"
+  )
+  assert(
+    startRequests.length === startsBeforeDatabaseFailure + 1,
+    "Uncertain acceptance resubmitted instead of looking up the request"
+  )
+  button("Stop generating").click()
+  await until(
+    () => !document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
+    "Uncertain accepted run did not cancel"
+  )
+  pass(
+    "An uncertain database acceptance is looked up and followed without another submission"
+  )
+  for (const code of ["run_in_progress", "session_run_busy"]) {
+    const startsBeforeBusy = startRequests.length
+    busyFailure = code
+    await submit("Another tab may already be working")
+    assert(
+      document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
+      "Another tab's active run did not lock this chat"
+    )
+    assert(
+      startRequests.length === startsBeforeBusy + 1,
+      "Busy chat recovery resubmitted"
+    )
+    button("Stop generating").click()
+    await until(
+      () => !document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
+      "Another tab's restored run did not cancel"
+    )
+  }
+  pass(
+    "Busy chat rejections discover and follow the work accepted in another tab"
+  )
+  const startsBeforeMissing = startRequests.length
+  rejectBeforeAcceptance = true
+  await submit(
+    "Keep my unaccepted message available for an explicit retry",
+    false
+  )
+  assert(
+    !document.querySelector<HTMLTextAreaElement>("textarea")!.disabled &&
+      !readPendingRun(user.id, ids.b),
+    "Confirmed absence did not unlock the chat and clear its pending hint"
+  )
+  assert(
+    startRequests.length === startsBeforeMissing + 1,
+    "Confirmed absence automatically resubmitted the message"
+  )
+  pass(
+    "Confirmed absence preserves an explicit retry instead of silently losing the input"
   )
   await open(ids.offPage)
   publishAuth("signed-out")

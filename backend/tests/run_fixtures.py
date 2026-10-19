@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, Mock
 
 from app.application.errors import ProviderError
+from app.application.run_capacity import RunCapacity
 from app.application.runs import RunService
 from app.domain.context import ContextPreflight
 from app.domain.models import ModelDescriptor, Session, UserProfile
@@ -112,6 +113,12 @@ class Repository:
     async def create_run(self, *args, **kwargs) -> RunSnapshot:
         return self.run
 
+    async def match_run_request(self, *args, **kwargs) -> RunSnapshot | None:
+        return None
+
+    async def lookup_run(self, *args, **kwargs) -> RunSnapshot | None:
+        return self.run
+
     async def get_run(self, _run_id: str) -> RunSnapshot:
         return self.run
 
@@ -158,7 +165,9 @@ class Repository:
         return None, (event,)
 
 
-def service(repository, provider) -> RunService:
+def service(
+    repository, provider, *, capacity: RunCapacity | None = None, owner_id="local"
+) -> RunService:
     sessions = Mock()
     sessions.get_session = AsyncMock(
         return_value=Session(
@@ -174,7 +183,14 @@ def service(repository, provider) -> RunService:
     secrets = Mock()
     secrets.get = AsyncMock(return_value=CANARY)
     return RunService(
-        repository, sessions, settings, profiles, secrets, {MODEL.adapter_kind: provider}
+        repository,
+        sessions,
+        settings,
+        profiles,
+        secrets,
+        {MODEL.adapter_kind: provider},
+        capacity=capacity,
+        owner_id=owner_id,
     )
 
 

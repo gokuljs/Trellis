@@ -1,7 +1,9 @@
 .venv/
 .env
 __pycache__/
+.pytest_cache/
 .ruff_cache/
 .ty_cache/
-.pytest_cache/
+.coverage
+htmlcov/
 .coverage.stage3
