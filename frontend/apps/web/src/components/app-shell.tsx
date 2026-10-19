@@ -439,6 +439,7 @@ export function AppShell({
       }
       let turn = retryFromTranscript(sessionId, transcript)
       let latest: LatestRun | null
+      let submissionMissing: boolean
       const userId = getAuthController().getSnapshot().user?.id
       const saved = userId ? readPendingRun(userId, sessionId) : null
       try {
@@ -453,6 +454,8 @@ export function AppShell({
           )
         latest = await api.getLatestRun(sessionId)
         if (isStale()) return
+        submissionMissing =
+          !!saved && !exact && latest?.turn_id !== saved.turnId
         if (exact && !latest)
           throw new RuntimeError(
             "runtime_protocol_error",
@@ -472,7 +475,10 @@ export function AppShell({
         return
       }
       if (isStale()) return
-      if (latest) {
+      if (
+        latest &&
+        (!submissionMissing || activeRunStatuses.has(latest.status))
+      ) {
         turn = retryInputForRun(sessionId, transcript, latest)
         if (!turn && activeRunStatuses.has(latest.status)) {
           logFailure(
@@ -489,6 +495,7 @@ export function AppShell({
         }
       }
       if (!latest) {
+        if (submissionMissing) setMessages(transcript)
         setPending(false)
         setStreamingText(null)
         setActiveRunId(null)
@@ -505,6 +512,67 @@ export function AppShell({
       }
 
       if (!activeRunStatuses.has(latest.status)) {
+        let historyReloadFailed = false
+        let summary: RunSummary | undefined
+        if (submissionMissing) setMessages(transcript)
+        else {
+          try {
+            const detail = await loadLatestHistory(sessionId)
+            if (isStale()) return
+            applyHistory(detail)
+          } catch (historyError) {
+            if (isStale()) return
+            historyReloadFailed = true
+            logFailure(historyError, "history.load")
+          }
+        }
+        try {
+          const summaries = await queryClient.fetchInfiniteQuery({
+            ...runSummariesQueryOptions(sessionId, undefined, latest.turn_id),
+            staleTime: 0,
+          })
+          if (isStale()) return
+          summary = summaries.pages
+            .flatMap((page) => page.items)
+            .find(
+              (item) =>
+                item.run_id === latest.run_id &&
+                item.status === latest.status &&
+                item.last_sequence >= latest.last_sequence
+            )
+          if (!summary)
+            throw new RuntimeError(
+              "runtime_protocol_error",
+              "The finished run's saved activity could not be loaded."
+            )
+        } catch (summaryError) {
+          if (isStale()) return
+          historyReloadFailed = true
+          logFailure(summaryError, "activity.summaries")
+        }
+        setRunActivities((current) => {
+          if (isStale()) return current
+          const previous = current[latest.turn_id]
+          const previousRunId =
+            previous?.runInfo?.runId ?? previous?.summary?.run_id
+          const aligned =
+            previousRunId && previousRunId !== latest.run_id
+              ? startNextAttempt(previous)
+              : previous
+          return {
+            ...current,
+            [latest.turn_id]: {
+              ...aligned,
+              events: aligned?.events ?? [],
+              runInfo: {
+                ...aligned?.runInfo,
+                runId: latest.run_id,
+                status: latest.status,
+              },
+              ...(summary ? { summary } : {}),
+            },
+          }
+        })
         if (userId && saved)
           clearPendingRun(userId, sessionId, saved.clientRequestId)
         setPending(false)
@@ -512,11 +580,23 @@ export function AppShell({
         setActiveRunId(null)
         setActiveRunTurnId(null)
         activeRunRef.current = null
-        setReconnectAvailable(false)
+        setReconnectAvailable(historyReloadFailed)
         setCancellingRun(false)
-        if (turn && latest.status !== "completed") {
+        if (historyReloadFailed) {
+          setFailedTurn(null)
+          setError(
+            "The run has finished, but some saved details could not be loaded. Reconnect to try again."
+          )
+        } else if (
+          turn &&
+          (submissionMissing || latest.status !== "completed")
+        ) {
           setFailedTurn(turn)
-          setError("The previous assistant response did not complete.")
+          setError(
+            submissionMissing
+              ? "Your request was not accepted. Retry when you are ready."
+              : "The previous assistant response did not complete."
+          )
         } else {
           setFailedTurn(null)
           setError(null)
@@ -526,6 +606,7 @@ export function AppShell({
 
       setFailedTurn(null)
       setError(null)
+      if (turn) setMessages(recoveryTranscript(transcript, turn))
       setPending(true)
       setCancellingRun(latest.status === "cancelling")
       setStreamingText(null)
@@ -680,7 +761,13 @@ export function AppShell({
         }
       })()
     },
-    [applyHistory, loadLatestHistory, recordRunEvent, recordRunInfo]
+    [
+      applyHistory,
+      loadLatestHistory,
+      queryClient,
+      recordRunEvent,
+      recordRunInfo,
+    ]
   )
 
   const restoreWorkspace = useCallback(async () => {
@@ -1171,7 +1258,8 @@ export function AppShell({
         turnError instanceof ApiError || turnError instanceof RuntimeError
           ? turnError.code
           : undefined,
-        lifecycle.terminal
+        lifecycle.terminal,
+        activeRunRef.current !== null
       )
       if (
         failureAction === "reconnect" &&
@@ -1185,7 +1273,7 @@ export function AppShell({
         try {
           const detail = await loadLatestHistory(turn.sessionId)
           if (!isCurrent()) return true
-          transcript = detail.messages
+          transcript = recoveryTranscript(detail.messages, turn)
           applyHistory(detail)
         } catch {
           if (!isCurrent()) return true

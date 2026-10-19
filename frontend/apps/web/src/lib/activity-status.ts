@@ -20,6 +20,13 @@ const phaseStates = new Map<string, StatusCopy>([
   ["compacting", { label: "Compacting conversation", orb: "shaping" }],
 ])
 
+const terminalStates = new Map<string, StatusCopy>([
+  ["completed", { label: "Completed", orb: "breathing" }],
+  ["failed", { label: "Failed", orb: "shaping" }],
+  ["cancelled", { label: "Cancelled", orb: "shaping" }],
+  ["interrupted", { label: "Interrupted", orb: "shaping" }],
+])
+
 const summaryEvents: Record<string, string> = {
   queued: "run.queued",
   waiting_for_approval: "tool.approval_requested",
@@ -81,13 +88,10 @@ function currentState(event: RuntimeRunEvent): StatusCopy | null {
     case "run.cancellation_requested":
       return { label: "Stopping", orb: "shaping" }
     case "run.completed":
-      return { label: "Completed", orb: "breathing" }
     case "run.failed":
-      return { label: "Failed", orb: "shaping" }
     case "run.cancelled":
-      return { label: "Cancelled", orb: "shaping" }
     case "run.interrupted":
-      return { label: "Interrupted", orb: "shaping" }
+      return terminalStates.get(event.eventType.slice(4)) ?? null
     default:
       return null
   }
@@ -98,8 +102,28 @@ export function describeActivity(
   pending: boolean,
   now: number,
   latestEvent?: RuntimeRunEvent,
-  summary?: RunSummary
+  summary?: RunSummary,
+  confirmedStatus?: string
 ): ActivityStatus {
+  const confirmedTerminal = terminalStates.get(confirmedStatus ?? "")
+  const newestSequence = Math.max(
+    0,
+    latestEvent?.sequence ?? 0,
+    ...events.map((event) => event.sequence)
+  )
+  if (
+    confirmedTerminal &&
+    !(
+      summary &&
+      summary.status === confirmedStatus &&
+      summary.last_sequence >= newestSequence
+    ) &&
+    ![...events, ...(latestEvent ? [latestEvent] : [])].some(
+      (event) => event.eventType === `run.${confirmedStatus}`
+    )
+  ) {
+    return { ...confirmedTerminal, duration: null, terminal: true }
+  }
   if (events.length === 0 && !latestEvent) {
     if (summary) {
       const eventType = summaryEvents[summary.status] ?? "run.started"

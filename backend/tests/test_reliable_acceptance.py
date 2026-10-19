@@ -8,6 +8,7 @@ from run_fixtures import Provider, Repository, service
 
 from app.application.budgets import BudgetPreset
 from app.application.errors import ApplicationError
+from app.domain.runtime import RunSnapshot
 
 
 class AcceptedRepository(Repository):
@@ -76,6 +77,39 @@ def test_secret_change_and_explicit_option_change_conflict(monkeypatch) -> None:
                 await runtime.create_run("session", "request", content, budget_preset=budget)
             assert error.value.code == "run_conflict"
         await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_admission_overload_still_matches_saved_requests(monkeypatch) -> None:
+    async def exercise() -> None:
+        repository = AcceptedRepository()
+        runtime = service(repository, Provider())
+        monkeypatch.setattr(runtime, "_schedule", lambda run_id: None)
+        original = await runtime.create_run("session", "request", "hello")
+
+        async def paused_admission() -> RunSnapshot:
+            await asyncio.Event().wait()
+            return original
+
+        pending = [asyncio.create_task(paused_admission()) for _ in range(32)]
+        runtime._admissions.update(pending)
+        try:
+            assert await runtime.create_run("session", "request", "hello") == original
+            with pytest.raises(ApplicationError) as conflict:
+                await runtime.create_run("session", "request", "different")
+            assert conflict.value.code == "run_conflict"
+            repository.fingerprint = None
+            with pytest.raises(ApplicationError) as full:
+                await runtime.create_run("session", "new", "hello")
+            assert full.value.code == "run_capacity"
+            assert repository.created == 1
+        finally:
+            runtime._admissions.clear()
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            await runtime.close()
 
     asyncio.run(exercise())
 

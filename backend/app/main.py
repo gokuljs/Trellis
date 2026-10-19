@@ -72,6 +72,7 @@ ERROR_STATUS = {
     "provider_timeout": 504,
     "provider_upstream_failed": 502,
     "turn_conflict": 409,
+    "turn_endpoint_retired": 410,
     "turn_in_progress": 409,
     "turn_not_owned": 409,
     "account_in_use": 409,

@@ -1,16 +1,15 @@
 from typing import Annotated
-from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import (
-    ChatServiceDep,
     RunServiceDep,
     SessionServiceDep,
     log_owned_chat,
 )
 from app.api.request_logging import owned_chat_logging
+from app.application.errors import ApplicationError
 from app.domain.models import Message, Session
 from app.domain.runtime import RunSummary
 
@@ -117,17 +116,6 @@ class RunEventResponse(BaseModel):
 class RunEventsResponse(BaseModel):
     items: list[RunEventResponse]
     next_after_sequence: int | None
-
-
-class TurnRequest(BaseModel):
-    turn_id: UUID
-    content: str = Field(min_length=1, max_length=100_000)
-
-
-class TurnResponse(BaseModel):
-    session: SessionResponse
-    user_message: MessageResponse
-    assistant_message: MessageResponse
 
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -308,18 +296,13 @@ async def list_session_run_events(
 
 @router.post(
     "/{session_id}/turns",
-    status_code=status.HTTP_201_CREATED,
+    status_code=status.HTTP_410_GONE,
     dependencies=[Depends(log_owned_chat)],
 )
-async def complete_turn(
+async def retired_turn_endpoint(
     session_id: str,
-    payload: TurnRequest,
-    chat_service: ChatServiceDep,
     session_service: SessionServiceDep,
-) -> TurnResponse:
-    result = await chat_service.complete_turn(session_id, str(payload.turn_id), payload.content)
-    return TurnResponse(
-        session=await serialize_session(result.session, session_service),
-        user_message=serialize_message(result.user_message),
-        assistant_message=serialize_message(result.assistant_message),
-    )
+) -> None:
+    if await session_service.get(session_id) is None:
+        raise ApplicationError("session_not_found", "Session not found.")
+    raise ApplicationError("turn_endpoint_retired", "Use WebSocket run.start to submit a request.")

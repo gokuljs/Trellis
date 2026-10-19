@@ -76,7 +76,9 @@ _TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
             RunStatus.INTERRUPTED,
         }
     ),
-    RunStatus.WAITING_FOR_APPROVAL: frozenset({RunStatus.RUNNING, RunStatus.CANCELLING}),
+    RunStatus.WAITING_FOR_APPROVAL: frozenset(
+        {RunStatus.RUNNING, RunStatus.CANCELLING, RunStatus.FAILED, RunStatus.INTERRUPTED}
+    ),
     RunStatus.CANCELLING: frozenset({RunStatus.CANCELLED, RunStatus.FAILED, RunStatus.INTERRUPTED}),
     RunStatus.COMPLETED: frozenset(),
     RunStatus.FAILED: frozenset(),
@@ -93,6 +95,8 @@ _TRANSITION_EVENTS: dict[tuple[RunStatus, RunStatus], RunEventType] = {
     (RunStatus.RUNNING, RunStatus.WAITING_FOR_APPROVAL): RunEventType.TOOL_APPROVAL_REQUESTED,
     (RunStatus.WAITING_FOR_APPROVAL, RunStatus.RUNNING): RunEventType.RESUMED,
     (RunStatus.WAITING_FOR_APPROVAL, RunStatus.CANCELLING): RunEventType.CANCELLATION_REQUESTED,
+    (RunStatus.WAITING_FOR_APPROVAL, RunStatus.FAILED): RunEventType.FAILED,
+    (RunStatus.WAITING_FOR_APPROVAL, RunStatus.INTERRUPTED): RunEventType.INTERRUPTED,
     (RunStatus.RUNNING, RunStatus.COMPLETED): RunEventType.COMPLETED,
     (RunStatus.RUNNING, RunStatus.FAILED): RunEventType.FAILED,
     (RunStatus.RUNNING, RunStatus.CANCELLED): RunEventType.CANCELLED,

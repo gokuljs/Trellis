@@ -14,7 +14,11 @@ import {
   streamRun,
 } from "../src/lib/runtime-client"
 import { logFailure } from "../src/lib/logging"
-import { isReconciledRunOutcome, ownsRun } from "../src/lib/run-recovery"
+import {
+  isReconciledRunOutcome,
+  ownsRun,
+  turnFailureAction,
+} from "../src/lib/run-recovery"
 
 const secret = "private-runtime-token-prompt-session-tool"
 const originalSocket = globalThis.WebSocket
@@ -325,6 +329,35 @@ test("reconciliation accepts terminal outcomes and suppresses stale owners", asy
   const current = { sessionId: "new-session", generation: 2 }
   if (ownsRun(owner, current)) logFailure(new Error(secret), "run.restore")
   assert.deepEqual(recorded(), [])
+})
+
+test("unconfirmed acceptance failures require discovery before unlocking", () => {
+  for (const code of [
+    "auth_unavailable",
+    "database_unavailable",
+    "runtime_protocol_error",
+    "run_in_progress",
+    "session_run_busy",
+    undefined,
+  ]) {
+    assert.equal(turnFailureAction(code, null), "reconnect", code)
+  }
+  assert.equal(turnFailureAction("run_capacity", null, true), "reconnect")
+})
+
+test("definite rejection and terminal events allow a new explicit attempt", () => {
+  for (const code of [
+    "run_capacity",
+    "run_token_too_short",
+    "message_empty",
+    "message_too_large",
+    "invalid_budget_preset",
+    "provider_not_configured",
+  ]) {
+    assert.equal(turnFailureAction(code, null), "retry", code)
+  }
+  assert.equal(turnFailureAction("database_unavailable", "failed"), "retry")
+  assert.equal(turnFailureAction("database_unavailable", "completed"), "reload")
 })
 
 test("leaving a running chat closes its browser subscription without cancelling the run", async () => {

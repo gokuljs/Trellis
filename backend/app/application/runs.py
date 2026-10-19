@@ -210,6 +210,7 @@ class RunService:
         self._admissions: set[asyncio.Task[RunSnapshot]] = set()
         self._cancel_finalizers: dict[str, asyncio.Task[None]] = {}
         self._lease_monitors: dict[str, asyncio.Task[None]] = {}
+        self._owned_runs: set[str] = set()
         self._lease_lost: set[str] = set()
         self._reschedule_pending: set[str] = set()
         self._closing = False
@@ -227,8 +228,14 @@ class RunService:
         if self._closing:
             raise ApplicationError("runtime_shutting_down", "The runtime is shutting down.")
         if len(self._admissions) >= 32:
-            raise ApplicationError(
-                "run_capacity", "Too many requests are being accepted. Try again."
+            return await self._admit_run(
+                session_id,
+                client_request_id,
+                content,
+                turn_id=turn_id,
+                budget_preset=budget_preset,
+                model_id=model_id,
+                allow_new=False,
             )
         task = asyncio.create_task(
             self._admit_run(
@@ -286,6 +293,7 @@ class RunService:
         turn_id: str | None = None,
         budget_preset: BudgetPreset | None = None,
         model_id: str | None = None,
+        allow_new: bool = True,
     ) -> RunSnapshot:
         session = await self._sessions.get_session(session_id)
         if session is None:
@@ -329,6 +337,10 @@ class RunService:
                 ) from None
             if existing is not None:
                 return cast(RunSnapshot, await self._recover_if_expired(existing))
+            if not allow_new:
+                raise ApplicationError(
+                    "run_capacity", "Too many requests are being accepted. Try again."
+                )
 
             models = await self._settings.list_models()
             selected_model_id = (
@@ -430,6 +442,7 @@ class RunService:
 
     async def _recover_if_expired(self, run: RunSnapshot | None) -> RunSnapshot | None:
         if run is not None and is_terminal_run_status(run.status):
+            self._owned_runs.discard(run.id)
             self._capacity.release_run(self._owner_id, run.id)
         if self._lease_repository is None or run is None or is_terminal_run_status(run.status):
             return run
@@ -445,6 +458,7 @@ class RunService:
             return run
         recovered = await self._lease_repository.recover_expired_run(run.id)
         if is_terminal_run_status(recovered.status):
+            self._owned_runs.discard(run.id)
             self._capacity.release_run(self._owner_id, run.id)
         return recovered
 
@@ -524,15 +538,14 @@ class RunService:
             self._capacity.release_run(self._owner_id, run_id)
         task = self._tasks.get(run_id)
         if (
-            event is not None
-            and run.status in {RunStatus.CANCELLING, RunStatus.CANCELLED}
+            run.status in {RunStatus.CANCELLING, RunStatus.CANCELLED}
             and task is not None
             and not task.done()
         ):
             task.cancel()
         if event is not None:
             await self._publish(event)
-        if event is not None and run.status is RunStatus.CANCELLING:
+        if run.status is RunStatus.CANCELLING:
             current = await self._runs.get_run(run_id)
             if (
                 current is not None
@@ -640,33 +653,54 @@ class RunService:
 
     async def close(self) -> None:
         self._closing = True
-        admissions = tuple(self._admissions)
-        if admissions:
-            await asyncio.gather(*admissions, return_exceptions=True)
-        async with self._admission_lock:
-            pending = tuple(self._tasks.items())
-        tasks = tuple(task for _run_id, task in pending)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        finalizers = tuple(self._cancel_finalizers.values())
-        if finalizers:
-            await asyncio.gather(*finalizers, return_exceptions=True)
-        for run_id, _task in pending:
-            if self._can_execute(run_id):
-                run = await self._runs.get_run(run_id)
-                if run is not None and run.status is RunStatus.QUEUED:
-                    await self._interrupt_queued_run(run_id)
-        monitors = tuple(self._lease_monitors.values())
-        for monitor in monitors:
-            monitor.cancel()
-        if monitors:
-            await asyncio.gather(*monitors, return_exceptions=True)
-        self._capacity.release_owner(self._owner_id)
+        try:
+            admissions = tuple(self._admissions)
+            if admissions:
+                await asyncio.gather(*admissions, return_exceptions=True)
+            async with self._admission_lock:
+                tasks = tuple(self._tasks.values())
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finalizers = tuple(self._cancel_finalizers.values())
+            if finalizers:
+                await asyncio.gather(*finalizers, return_exceptions=True)
+            for run_id in tuple(self._owned_runs):
+                try:
+                    if not self._can_execute(run_id):
+                        continue
+                    run = await self._runs.get_run(run_id)
+                    if run is None or is_terminal_run_status(run.status):
+                        continue
+                    if run.status is RunStatus.CANCELLING:
+                        await self._mark_cancelled(run_id, None)
+                    else:
+                        await self._mark_interrupted(run_id, None)
+                except Exception:
+                    logger.error(
+                        "run.shutdown.persistence_failed",
+                        extra={
+                            "event": "run.shutdown.persistence_failed",
+                            "outcome": "interrupted",
+                            "error_code": "shutdown_persistence_failed",
+                            "run_id": run_id,
+                        },
+                    )
+        finally:
+            monitors = tuple(self._lease_monitors.values())
+            for monitor in monitors:
+                monitor.cancel()
+            if monitors:
+                await asyncio.gather(*monitors, return_exceptions=True)
+            self._owned_runs.clear()
+            self._capacity.release_owner(self._owner_id)
 
     def _schedule(self, run_id: str) -> None:
         if not self._can_execute(run_id):
+            return
+        self._owned_runs.add(run_id)
+        if self._closing:
             return
         self._start_lease_monitor(run_id)
         existing = self._tasks.get(run_id)
@@ -701,13 +735,43 @@ class RunService:
 
     async def _monitor_lease(self, run_id: str) -> None:
         assert self._lease_repository is not None
+        delay = self._lease_renew_interval_seconds
         while True:
-            await asyncio.sleep(self._lease_renew_interval_seconds)
+            await asyncio.sleep(delay)
             try:
+                current = await self._runs.get_run(run_id)
+                if current is None or is_terminal_run_status(current.status):
+                    self._owned_runs.discard(run_id)
+                    self._capacity.release_run(self._owner_id, run_id)
+                    return
+                if current.status is RunStatus.CANCELLING:
+                    await self._cancel_requested_run(current, None)
+                    current = await self._runs.get_run(run_id)
+                    if current is None or is_terminal_run_status(current.status):
+                        self._owned_runs.discard(run_id)
+                        self._capacity.release_run(self._owner_id, run_id)
+                        return
                 run = await self._lease_repository.renew_run_lease(run_id)
+                remaining = self._remaining_seconds(run)
+                if run.status is RunStatus.WAITING_FOR_APPROVAL and remaining <= 0:
+                    await self._fail(
+                        run_id, None, "provider_timeout", "The run deadline was reached."
+                    )
+                    return
+                delay = self._lease_renew_interval_seconds
+                if remaining > 0:
+                    delay = min(delay, remaining)
             except asyncio.CancelledError:
                 raise
             except Exception:
+                try:
+                    current = await self._runs.get_run(run_id)
+                except Exception:
+                    current = None
+                if current is not None and is_terminal_run_status(current.status):
+                    self._owned_runs.discard(run_id)
+                    self._capacity.release_run(self._owner_id, run_id)
+                    return
                 logger.warning(
                     "run.lease.lost",
                     extra={
@@ -724,6 +788,7 @@ class RunService:
                 await self._reconcile_lost_lease(run_id)
                 return
             if is_terminal_run_status(run.status):
+                self._owned_runs.discard(run_id)
                 self._capacity.release_run(self._owner_id, run_id)
                 return
 
@@ -1714,6 +1779,7 @@ class RunService:
             RunEventType.CANCELLED,
             RunEventType.INTERRUPTED,
         }:
+            self._owned_runs.discard(event.run_id)
             self._capacity.release_run(self._owner_id, event.run_id)
         lifecycle = {
             RunEventType.STARTED,
@@ -1841,6 +1907,9 @@ class RunService:
     async def _finish_pending_tools(
         self, run_id: str, status: ToolCallStatus, content: str
     ) -> None:
+        run = await self._runs.get_run(run_id)
+        if run is not None and run.status is RunStatus.WAITING_FOR_APPROVAL:
+            return
         for tool in await self._runs.list_tool_calls(run_id):
             if tool.status not in {ToolCallStatus.PENDING, ToolCallStatus.RUNNING}:
                 continue
