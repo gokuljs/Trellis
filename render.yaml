@@ -27,6 +27,10 @@ services:
         value: "false"
       - key: TRELLIS_ENABLED_CAPABILITIES
         value: "[]"
+      - key: TRELLIS_MAX_ACTIVE_RUNS
+        value: "16"
+      - key: TRELLIS_MAX_ACTIVE_RUNS_PER_USER
+        value: "4"
       - key: TRELLIS_DATA_DIR
         value: /tmp/trellis
       - key: TRELLIS_WEB_ORIGIN

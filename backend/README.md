@@ -7,6 +7,10 @@ Users sign in, choose an available model, and chat.
 See [Stage 2](../docs/stage-2.md) for setup, migrations, streaming and replay
 limits, context compaction, frontend behavior, and verification.
 
+See [Reliable runs](../docs/reliable-runs.md) for request identity, chat locking,
+reconnect, capacity limits, stopping, and local verification. Execution stays in
+one backend process. A backend restart interrupts unfinished work.
+
 From this directory:
 
 ```bash
