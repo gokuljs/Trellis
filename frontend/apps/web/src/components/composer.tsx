@@ -29,6 +29,7 @@ type ComposerProps = {
   modelSaving: boolean
   onModelChange: (modelId: string) => void
   contextGauge?: ReactNode
+  runStatus?: string
 }
 
 function usePrefersReducedMotion() {
@@ -63,6 +64,7 @@ export function Composer({
   modelSaving,
   onModelChange,
   contextGauge,
+  runStatus,
 }: ComposerProps) {
   const { resolvedTheme } = useTheme()
   const prefersReducedMotion = usePrefersReducedMotion()
@@ -145,8 +147,11 @@ export function Composer({
           </div>
         </div>
       </div>
-      <div className="composer-footnote">
-        Trellis can make mistakes. Check important info.
+      <div
+        className="composer-footnote"
+        role={runStatus ? "status" : undefined}
+      >
+        {runStatus ?? "Trellis can make mistakes. Check important info."}
       </div>
     </div>
   )

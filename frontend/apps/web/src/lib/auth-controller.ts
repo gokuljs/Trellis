@@ -1,5 +1,7 @@
 import type { Session, SupabaseClient, User } from "@supabase/supabase-js"
 
+import { clearUserPendingRuns } from "@/lib/pending-run"
+
 import {
   AuthConfigurationError,
   getSupabaseClient,
@@ -211,6 +213,12 @@ export function createAuthController(
   let validatedAccessToken: string | null = null
   let expiryCleanup: Promise<void> | null = null
   let expiryRecoveryRequired = false
+  let pendingUserId: string | null = null
+
+  const forgetPendingRuns = () => {
+    if (pendingUserId) clearUserPendingRuns(pendingUserId)
+    pendingUserId = null
+  }
 
   const publish = (next: AuthState) => {
     if (
@@ -253,6 +261,7 @@ export function createAuthController(
   }
 
   const expireCurrentSession = (): Promise<void> => {
+    forgetPendingRuns()
     version += 1
     rejectLateAuthEvents = true
     signOutRecoveryRequired = false
@@ -281,6 +290,8 @@ export function createAuthController(
     if (!data.user || data.user.id !== session.user.id)
       throw new AuthAccessError("reauth_required", expiredMessage)
     if (version !== expectedVersion) return
+    if (pendingUserId && pendingUserId !== data.user.id) forgetPendingRuns()
+    pendingUserId = data.user.id
     currentAccessToken = session.access_token
     validatedAccessToken = session.access_token
     publish({ ...emptyState, status: "signed-in", user: data.user })
@@ -341,6 +352,7 @@ export function createAuthController(
     const { data } = client.auth.onAuthStateChange((event, session) => {
       if (event === "INITIAL_SESSION") return
       if (event === "SIGNED_OUT" || !session) {
+        forgetPendingRuns()
         if (state.status === "signed-out" && state.error === expiredMessage)
           return
         if (state.status === "signed-in" && !signingOut) {
@@ -508,6 +520,7 @@ export function createAuthController(
         .then(() => {
           if (version !== expectedVersion) return
           signOutRecoveryRequired = false
+          forgetPendingRuns()
           publish({ ...emptyState, status: "signed-out" })
         })
         .catch((error: unknown) => {

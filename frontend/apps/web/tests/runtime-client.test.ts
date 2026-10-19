@@ -5,6 +5,7 @@ import * as authModule from "../src/lib/auth-controller"
 import type { AuthController } from "../src/lib/auth-controller"
 import {
   cancelRun,
+  lookupRun,
   respondToToolApproval,
   resumeRun,
   streamRun,
@@ -343,4 +344,53 @@ test("leaving a running chat closes its browser subscription without cancelling 
     ["auth.authenticate", "run.start"]
   )
   assert.deepEqual(events, [])
+})
+
+test("request lookup accepts an absent request without creating a run", async () => {
+  setup()
+  const missing = lookupRun("chat", "request")
+  const first = await authenticate()
+  assert.equal(first.sent[1]?.method, "run.lookup")
+  assert.deepEqual(first.sent[1]?.params, {
+    sessionId: "chat",
+    clientRequestId: "request",
+  })
+  acknowledge(first, null)
+  assert.equal(await missing, null)
+  const found = lookupRun("chat", "request")
+  const second = await authenticate(1)
+  acknowledge(second, { runId: secret, status: "running", modelId: "model" })
+  assert.deepEqual(await found, {
+    runId: secret,
+    status: "running",
+    modelId: "model",
+  })
+  assert.equal(
+    sockets
+      .flatMap((socket) => socket.sent)
+      .some((frame) => frame.method === "run.start"),
+    false
+  )
+})
+
+test("a lost acceptance reply reconnects with the original request ID", async () => {
+  setup()
+  const input = {
+    sessionId: "chat",
+    turnId: "turn",
+    clientRequestId: "request",
+    content: "Hello",
+  }
+  const started = streamRun(input, {
+    reconnectAttempts: 1,
+    reconnectDelayMs: 0,
+  })
+  const first = await authenticate()
+  first.disconnect()
+  const second = await authenticate(1)
+  assert.deepEqual(first.sent[1]?.params, input)
+  assert.deepEqual(second.sent[1]?.params, input)
+  acknowledge(second, { runId: secret })
+  complete(second)
+  assert.deepEqual(await started, { runId: secret })
 })

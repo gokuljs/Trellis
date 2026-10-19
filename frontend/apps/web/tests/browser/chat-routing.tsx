@@ -44,6 +44,8 @@ const transcripts = new Map<string, Message[]>()
 const latest = new Map<string, LatestRun>()
 const requests: string[] = []
 const rpc: string[] = []
+const startRequests: { clientRequestId: string; sessionId: string }[] = []
+const acceptedRequests = new Map<string, string>()
 const checks: string[] = []
 const browserLogs: unknown[] = []
 const blockedRequests: string[] = []
@@ -67,6 +69,10 @@ const sockets: FixtureSocket[] = []
 let transientFailed = true
 let releaseHistory: (() => void) | null = null
 let delayMissing = false
+let delayDiscovery = false
+let failDiscovery = false
+let releaseDiscovery: (() => void) | null = null
+let loseAcceptanceReply = false
 const user = { id: "fixture-user", email: "fixture@example.test" } as User
 const credential = { token: "fixture-token", userId: user.id, sessionEpoch: 1 }
 let authState: AuthState = {
@@ -190,7 +196,19 @@ Object.assign(api, {
     return history(sessionId)
   },
   listRunSummaries: async () => ({ items: [], next_offset: null }),
-  getLatestRun: async (sessionId: string) => latest.get(sessionId) ?? null,
+  getLatestRun: async (sessionId: string) => {
+    if (sessionId === ids.a && delayDiscovery)
+      await new Promise<void>((resolve) => {
+        releaseDiscovery = resolve
+      })
+    if (sessionId === ids.a && failDiscovery)
+      throw new ApiError(
+        "service_unavailable",
+        "Synthetic discovery outage",
+        503
+      )
+    return latest.get(sessionId) ?? null
+  },
   createSession: async () => {
     requests.push("create")
     transcripts.set(ids.created, [])
@@ -231,8 +249,16 @@ class FixtureSocket {
         sessionId: string
         turnId: string
         content: string
+        clientRequestId: string
       }
-      this.runId = `run-${input.sessionId}`
+      startRequests.push({
+        clientRequestId: input.clientRequestId,
+        sessionId: input.sessionId,
+      })
+      this.runId =
+        acceptedRequests.get(input.clientRequestId) ?? `run-${input.sessionId}`
+      const existing = acceptedRequests.has(input.clientRequestId)
+      acceptedRequests.set(input.clientRequestId, this.runId)
       const inputMessage: Message = {
         id: "fixture-input",
         turn_id: input.turnId,
@@ -242,10 +268,11 @@ class FixtureSocket {
         model: null,
         created_at: now,
       }
-      transcripts.set(input.sessionId, [
-        ...savedMessages(input.sessionId),
-        inputMessage,
-      ])
+      if (!existing)
+        transcripts.set(input.sessionId, [
+          ...savedMessages(input.sessionId),
+          inputMessage,
+        ])
       latest.set(input.sessionId, {
         run_id: this.runId,
         turn_id: input.turnId,
@@ -253,7 +280,36 @@ class FixtureSocket {
         last_sequence: 0,
         input_message: inputMessage,
       })
-      result = { runId: this.runId, modelId: "fixture-model" }
+      result = {
+        runId: this.runId,
+        status: "running",
+        modelId: "fixture-model",
+      }
+      if (loseAcceptanceReply) {
+        loseAcceptanceReply = false
+        queueMicrotask(() => {
+          this.closed = true
+          this.onclose?.({ code: 1006 })
+        })
+        return
+      }
+    } else if (frame.method === "run.lookup") {
+      const runId = acceptedRequests.get(frame.params.clientRequestId)
+      const saved = latest.get(frame.params.sessionId)
+      result =
+        runId && saved?.run_id === runId
+          ? { runId, status: saved.status }
+          : null
+    } else if (frame.method === "run.cancel") {
+      const saved = [...latest.values()].find(
+        (run) => run.run_id === frame.params.runId
+      )!
+      saved.status = "cancelled"
+      result = { runId: saved.run_id, status: "cancelled" }
+      for (const socket of sockets) {
+        if (!socket.closed && socket.runId === saved.run_id)
+          socket.event("run.cancelled", {})
+      }
     } else if (frame.method === "run.resume") {
       this.runId = frame.params.runId
       result = { runId: this.runId, modelId: "fixture-model" }
@@ -267,6 +323,21 @@ class FixtureSocket {
   close() {
     this.closed = true
     this.onclose?.({ code: 1000 })
+  }
+  event(eventType: string, data: Record<string, unknown>, sequence = 1) {
+    this.onmessage?.({
+      data: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "run.event",
+        params: {
+          runId: this.runId,
+          sequence,
+          eventType,
+          eventVersion: 1,
+          data,
+        },
+      }),
+    })
   }
   staleEvent() {
     this.onmessage?.({
@@ -293,6 +364,7 @@ function evidence() {
       checks,
       requests,
       rpc,
+      startRequests,
       historyLength: window.history.length,
       privacy: Object.values(ids).some((id) =>
         JSON.stringify(browserLogs).includes(id)
@@ -471,6 +543,25 @@ async function runChecks() {
   await open(ids.a)
   await submit("Keep running while I switch")
   const firstSocket = sockets.at(-1)!
+  assert(
+    document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
+    "Running chat allowed input"
+  )
+  assert(button("Send").disabled, "Running chat allowed Send")
+  assert(
+    document.querySelector<HTMLSelectElement>('[aria-label="Run budget"]')!
+      .disabled,
+    "Running chat allowed budget changes"
+  )
+  assert(
+    document.querySelector<HTMLSelectElement>('[aria-label="Chat model"]')!
+      .disabled,
+    "Running chat allowed model changes"
+  )
+  assert(!button("Stop generating").disabled, "Composer lock blocked Stop")
+  pass(
+    "A running chat locks message, Send, model, and budget while Stop remains usable"
+  )
   button("Fixture chat b").click()
   await until(
     () =>
@@ -511,6 +602,102 @@ async function runChecks() {
   pass(
     "Pending sidebar and history switches preserve the run, ignore stale events, and resume on return"
   )
+  delayDiscovery = true
+  navigate(chatPath(ids.a))
+  await until(() => releaseDiscovery !== null, "Run discovery did not pause")
+  assert(
+    document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
+    "Delayed discovery briefly enabled input"
+  )
+  assert(
+    document.querySelector(".composer-footnote")?.textContent ===
+      "Checking current run…",
+    "Discovery status is unclear"
+  )
+  delayDiscovery = false
+  releaseDiscovery!()
+  await until(
+    () => !!document.querySelector(".cancel-run-button"),
+    "Delayed discovery did not restore the run"
+  )
+  assert(
+    rpc.includes("run.lookup"),
+    "Returning did not look up the exact request"
+  )
+  assert(
+    rpc.filter((method) => method === "run.start").length === 1,
+    "Returning submitted again"
+  )
+  pass(
+    "Exact request lookup and delayed discovery keep the chat locked without another submission"
+  )
+  await open(ids.b)
+  failDiscovery = true
+  navigate(chatPath(ids.a))
+  await until(
+    () =>
+      !![...document.querySelectorAll("button")].find(
+        (item) => item.textContent?.trim() === "Reconnect"
+      ),
+    "Discovery failure did not offer Reconnect"
+  )
+  assert(
+    document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
+    "Discovery failure unlocked input"
+  )
+  failDiscovery = false
+  button("Reconnect").click()
+  await until(
+    () =>
+      !!document.querySelector(".cancel-run-button") &&
+      !document.querySelector(".chat-error"),
+    "Reconnect did not restore the run"
+  )
+  button("Stop generating").click()
+  await until(
+    () => !document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
+    "Cancellation did not unlock input"
+  )
+  assert(
+    rpc.filter((method) => method === "run.start").length === 1,
+    "Reconnect or Stop submitted again"
+  )
+  pass(
+    "Discovery failure keeps the lock and Stop works after reconnect until terminal cancellation"
+  )
+  await open(ids.b)
+  const finished = latest.get(ids.a)!
+  finished.status = "completed"
+  transcripts.set(ids.a, [
+    ...savedMessages(ids.a),
+    {
+      id: "saved-completion",
+      turn_id: finished.turn_id,
+      role: "assistant",
+      content: "Saved final answer",
+      provider: "fixture",
+      model: "fixture-model",
+      created_at: now,
+    },
+  ])
+  const resumesBeforeCompletion = rpc.filter(
+    (method) => method === "run.resume"
+  ).length
+  await open(ids.a)
+  assert(
+    document
+      .querySelector("#root")!
+      .textContent!.includes("Saved final answer"),
+    "Completed answer was not restored"
+  )
+  assert(
+    rpc.filter((method) => method === "run.resume").length ===
+      resumesBeforeCompletion,
+    "Completed history opened another live run"
+  )
+  pass(
+    "Returning after completion shows the saved answer and unlocks controls without execution"
+  )
   button("New session").click()
   await until(
     () => window.location.pathname === "/",
@@ -532,6 +719,23 @@ async function runChecks() {
   )
   pass(
     "Creating a chat replaces the draft URL before its first run without resetting submission"
+  )
+  await open(ids.b)
+  loseAcceptanceReply = true
+  await submit("Save this request even when the reply is lost")
+  const retried = startRequests.filter((request) => request.sessionId === ids.b)
+  assert(
+    retried.length === 2 &&
+      new Set(retried.map((request) => request.clientRequestId)).size === 1,
+    "Lost response changed the logical request ID"
+  )
+  assert(
+    savedMessages(ids.b).filter((message) => message.role === "user").length ===
+      1,
+    "Lost response duplicated the saved input"
+  )
+  pass(
+    "A lost acceptance reply retries the same request ID and saves one logical submission"
   )
   await open(ids.offPage)
   publishAuth("signed-out")
