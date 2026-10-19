@@ -311,6 +311,7 @@ function followRun(
     let nextRpcId = 0
     let settled = false
     let subscriptionRequestPending = false
+    let credentialRefreshed = false
     let bufferedEventOverflowed = false
     let replayRequiredForRun: string | null = null
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -443,6 +444,31 @@ function followRun(
       })
     }
 
+    const refreshStartCredential = async (activeSocket: WebSocket) => {
+      credentialRefreshed = true
+      socket = null
+      socketCredential = null
+      subscriptionReady = false
+      replayRequiredForRun = null
+      bufferedEvents.length = 0
+      activeSocket.close()
+      try {
+        const credential = await auth.refreshAccessToken()
+        if (settled) return
+        if (!stillCurrent() || !auth.isCredentialCurrent(credential)) {
+          finish(authenticationError())
+          return
+        }
+        await connect()
+      } catch (error) {
+        finish(
+          error instanceof AuthAccessError
+            ? credentialError(error)
+            : unavailableAuthenticationError()
+        )
+      }
+    }
+
     const beginRequest = (activeSocket: WebSocket) => {
       if (settled || socket !== activeSocket) return
       if (!stillCurrent()) {
@@ -508,6 +534,15 @@ function followRun(
                   "runtime_request_failed",
                   "Trellis could not start that run."
                 )
+          if (
+            method === "run.start" &&
+            !runId &&
+            runtimeError.code === "run_token_too_short" &&
+            !credentialRefreshed
+          ) {
+            void refreshStartCredential(activeSocket)
+            return
+          }
           failRequest(runtimeError)
         })
     }

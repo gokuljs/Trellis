@@ -47,6 +47,7 @@ ERROR_STATUS = {
     "run_not_owned": 409,
     "run_lease_lost": 409,
     "reauth_required": 401,
+    "run_token_too_short": 409,
     "cloud_access_denied": 401,
     "database_unavailable": 503,
     "database_not_configured": 503,

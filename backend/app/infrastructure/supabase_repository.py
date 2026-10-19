@@ -1217,7 +1217,10 @@ class SupabaseRepository:
         if not client_request_id or len(client_request_id) > 200:
             raise ValueError("client request ID must contain 1 to 200 characters")
         if not self._token_source.valid_for(limits_for_preset(budget_preset).max_seconds + 30):
-            raise ApplicationError("reauth_required", "Refresh your sign-in before starting a run.")
+            raise ApplicationError(
+                "run_token_too_short",
+                "Your sign-in expires too soon for this run. Refresh your sign-in and try again.",
+            )
         capability = secrets.token_urlsafe(32)
         payload: dict[str, object] = {
             "session_id": session_id,
