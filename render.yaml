@@ -1,7 +1,7 @@
 # Demo configuration only. Free services can sleep and lose local filesystem changes.
 # Durable history stays in Supabase. One process owns the in-memory execution runtime.
 # Preview services must use TRELLIS_ENVIRONMENT=preview and separate origins, users,
-# Supabase credentials, and Logfire tokens. Automatic previews and deploys stay off.
+# Supabase credentials. Automatic previews and deploys stay off.
 previews:
   generation: "off"
 
