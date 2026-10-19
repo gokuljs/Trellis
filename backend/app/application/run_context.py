@@ -72,8 +72,6 @@ def _hash(value: object) -> str:
 
 
 def _remaining(run: RunSnapshot) -> float:
-    if run.deadline_at is None:
-        raise ProviderError("run_not_started", "The run has not begun execution.")
     seconds = (
         datetime.fromisoformat(run.deadline_at.replace("Z", "+00:00")) - datetime.now(UTC)
     ).total_seconds()

@@ -82,7 +82,7 @@ class RunSummaryResponse(BaseModel):
     max_tool_calls: int
     max_total_tokens: int
     max_cost_usd: float
-    deadline_at: str | None
+    deadline_at: str
     last_sequence: int
     created_at: str
     started_at: str | None

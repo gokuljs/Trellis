@@ -305,7 +305,7 @@ class RunSnapshot:
     budget_preset: str
     max_total_tokens: int
     max_cost_usd: float
-    deadline_at: str | None
+    deadline_at: str
     cancel_requested_at: str | None
     lease_expires_at: str | None
     recovery_count: int
