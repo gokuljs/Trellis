@@ -1207,6 +1207,9 @@ class SupabaseRepository:
         model: ModelDescriptor,
         *,
         budget_preset: BudgetPreset = "conservative",
+        request_fingerprint: str | None = None,
+        submitted_model_id: str | None = None,
+        submitted_budget_preset: BudgetPreset | None = None,
     ) -> RunSnapshot:
         normalized_content = content.strip()
         if not normalized_content:
@@ -1216,24 +1219,70 @@ class SupabaseRepository:
         if not self._token_source.valid_for(limits_for_preset(budget_preset).max_seconds + 30):
             raise ApplicationError("reauth_required", "Refresh your sign-in before starting a run.")
         capability = secrets.token_urlsafe(32)
-        result = _object(
-            await self._rpc(
-                "create_run",
-                {
-                    "session_id": session_id,
-                    "turn_id": turn_id,
-                    "client_request_id": client_request_id,
-                    "content": normalized_content,
-                    "model_id": model.id,
-                    "budget_preset": budget_preset,
-                },
-                capability=capability,
-            )
-        )
+        payload: dict[str, object] = {
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "client_request_id": client_request_id,
+            "content": normalized_content,
+            "model_id": model.id,
+            "budget_preset": budget_preset,
+            "request_fingerprint": request_fingerprint,
+            "submitted_model_id": submitted_model_id,
+            "submitted_budget_preset": submitted_budget_preset,
+        }
+        for attempt in range(2):
+            try:
+                result = _object(await self._rpc("create_run", payload, capability=capability))
+                break
+            except (ApplicationError, RuntimeError) as error:
+                if (
+                    isinstance(error, ApplicationError) and error.code != "database_unavailable"
+                ) or (
+                    isinstance(error, RuntimeError)
+                    and str(error) != "Supabase returned invalid JSON"
+                ):
+                    raise
+                accepted = await self._rpc("match_run_request", payload, capability=capability)
+                if accepted is not None:
+                    result = _object(accepted)
+                    break
+                if attempt:
+                    raise
         run = self._run(_object(result.get("run")))
         if result.get("lease_acquired") is True:
             self._record_lease(run, capability)
         return run
+
+    async def match_run_request(
+        self,
+        session_id: str,
+        client_request_id: str,
+        *,
+        turn_id: str,
+        content: str,
+        request_fingerprint: str,
+        submitted_model_id: str | None,
+        submitted_budget_preset: BudgetPreset | None,
+    ) -> RunSnapshot | None:
+        result = await self._rpc(
+            "match_run_request",
+            {
+                "session_id": session_id,
+                "client_request_id": client_request_id,
+                "turn_id": turn_id,
+                "content": content,
+                "request_fingerprint": request_fingerprint,
+                "submitted_model_id": submitted_model_id,
+                "submitted_budget_preset": submitted_budget_preset,
+            },
+        )
+        return self._run(_object(_object(result).get("run"))) if result is not None else None
+
+    async def lookup_run(self, session_id: str, client_request_id: str) -> RunSnapshot | None:
+        result = await self._rpc(
+            "lookup_run", {"session_id": session_id, "client_request_id": client_request_id}
+        )
+        return self._run(_object(result)) if result is not None else None
 
     async def append_run_event(
         self,

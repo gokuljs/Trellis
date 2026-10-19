@@ -1,5 +1,6 @@
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -206,6 +207,7 @@ class RunService:
         self._slots = asyncio.Semaphore(max_concurrent_runs)
         self._admission_lock = asyncio.Lock()
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._admissions: set[asyncio.Task[RunSnapshot]] = set()
         self._cancel_finalizers: dict[str, asyncio.Task[None]] = {}
         self._lease_monitors: dict[str, asyncio.Task[None]] = {}
         self._lease_lost: set[str] = set()
@@ -222,15 +224,28 @@ class RunService:
         budget_preset: BudgetPreset | None = None,
         model_id: str | None = None,
     ) -> RunSnapshot:
-        try:
-            run = await self._admit_run(
+        if self._closing:
+            raise ApplicationError("runtime_shutting_down", "The runtime is shutting down.")
+        if len(self._admissions) >= 32:
+            raise ApplicationError(
+                "run_capacity", "Too many requests are being accepted. Try again."
+            )
+        task = asyncio.create_task(
+            self._admit_run(
                 session_id,
                 client_request_id,
                 content,
                 turn_id=turn_id,
                 budget_preset=budget_preset,
                 model_id=model_id,
-            )
+            ),
+            name="trellis-run-admission",
+            context=contextvars.Context(),
+        )
+        self._admissions.add(task)
+        task.add_done_callback(self._discard_admission)
+        try:
+            run = await asyncio.shield(task)
         except ApplicationError as error:
             logger.warning(
                 "run.admission.rejected",
@@ -253,6 +268,15 @@ class RunService:
         )
         return run
 
+    def _discard_admission(self, task: asyncio.Task[RunSnapshot]) -> None:
+        self._admissions.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    async def lookup_run(self, session_id: str, client_request_id: str) -> RunSnapshot | None:
+        run = await self._runs.lookup_run(session_id, client_request_id)
+        return await self._recover_if_expired(run)
+
     async def _admit_run(
         self,
         session_id: str,
@@ -266,9 +290,41 @@ class RunService:
         session = await self._sessions.get_session(session_id)
         if session is None:
             raise ApplicationError("session_not_found", "Session not found.")
-        normalized_content = self._redactor.redact_text(content.strip())
-        if not normalized_content:
+        original_content = content.strip()
+        if not original_content:
             raise ApplicationError("message_empty", "Message content cannot be empty.")
+        if len(original_content) > 100_000:
+            raise ApplicationError("message_too_large", "The message is too large.")
+        if not client_request_id or len(client_request_id) > 200:
+            raise ApplicationError("run_invalid", "Choose a request ID of 1 to 200 characters.")
+        normalized_content = self._redactor.redact_text(original_content)
+        resolved_turn_id = turn_id or client_request_id
+        try:
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    [1, resolved_turn_id, original_content, model_id, budget_preset],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        except UnicodeEncodeError:
+            raise ApplicationError("run_invalid", "The message contains invalid text.") from None
+        try:
+            existing = await self._runs.match_run_request(
+                session.id,
+                client_request_id,
+                turn_id=resolved_turn_id,
+                content=normalized_content,
+                request_fingerprint=fingerprint,
+                submitted_model_id=model_id,
+                submitted_budget_preset=budget_preset,
+            )
+        except ValueError:
+            raise ApplicationError(
+                "run_conflict", "This request ID is already associated with different run input."
+            ) from None
+        if existing is not None:
+            return cast(RunSnapshot, await self._recover_if_expired(existing))
 
         models = await self._settings.list_models()
         selected_model_id = (
@@ -300,11 +356,14 @@ class RunService:
             try:
                 run = await self._runs.create_run(
                     session.id,
-                    turn_id or client_request_id,
+                    resolved_turn_id,
                     client_request_id,
                     normalized_content,
                     model,
                     budget_preset=selected_budget,
+                    request_fingerprint=fingerprint,
+                    submitted_model_id=model_id,
+                    submitted_budget_preset=budget_preset,
                 )
             except ValueError as error:
                 message = str(error)
@@ -557,8 +616,11 @@ class RunService:
             self._schedule(run_id)
 
     async def close(self) -> None:
+        self._closing = True
+        admissions = tuple(self._admissions)
+        if admissions:
+            await asyncio.gather(*admissions, return_exceptions=True)
         async with self._admission_lock:
-            self._closing = True
             pending = tuple(self._tasks.items())
         tasks = tuple(task for _run_id, task in pending)
         for task in tasks:

@@ -131,7 +131,24 @@ class RunRepository(Protocol):
         model: ModelDescriptor,
         *,
         budget_preset: BudgetPreset = "conservative",
+        request_fingerprint: str | None = None,
+        submitted_model_id: str | None = None,
+        submitted_budget_preset: BudgetPreset | None = None,
     ) -> RunSnapshot: ...
+
+    async def match_run_request(
+        self,
+        session_id: str,
+        client_request_id: str,
+        *,
+        turn_id: str,
+        content: str,
+        request_fingerprint: str,
+        submitted_model_id: str | None,
+        submitted_budget_preset: BudgetPreset | None,
+    ) -> RunSnapshot | None: ...
+
+    async def lookup_run(self, session_id: str, client_request_id: str) -> RunSnapshot | None: ...
 
     async def get_run(self, run_id: str) -> RunSnapshot | None: ...
 

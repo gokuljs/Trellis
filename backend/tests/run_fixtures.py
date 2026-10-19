@@ -112,6 +112,12 @@ class Repository:
     async def create_run(self, *args, **kwargs) -> RunSnapshot:
         return self.run
 
+    async def match_run_request(self, *args, **kwargs) -> RunSnapshot | None:
+        return None
+
+    async def lookup_run(self, *args, **kwargs) -> RunSnapshot | None:
+        return self.run
+
     async def get_run(self, _run_id: str) -> RunSnapshot:
         return self.run
 

@@ -570,9 +570,17 @@ async def runtime_websocket(websocket: WebSocket) -> None:
 
     async def dispatch(
         method: str, params: dict[str, object], command: CommandObservation
-    ) -> dict[str, object]:
+    ) -> dict[str, object] | None:
         result: dict[str, object]
-        if method == "run.start":
+        if method == "run.lookup":
+            run = await service.lookup_run(
+                _required_string(params, "sessionId", maximum=200),
+                _required_string(params, "clientRequestId", maximum=200),
+            )
+            if run is not None:
+                command.correlate(run)
+            return _run_result(run) if run is not None else None
+        elif method == "run.start":
             session_id = _required_string(params, "sessionId", maximum=200)
             client_request_id = _required_string(params, "clientRequestId", maximum=200)
             content = _required_string(params, "content", maximum=100_000)
@@ -698,7 +706,8 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                     try:
                         method, params, request_id, has_id = _parse_request(request)
                         result = await dispatch(method, params, command)
-                        command.identify_run(result.get("runId"))
+                        if result is not None:
+                            command.identify_run(result.get("runId"))
                         if has_id:
                             responses.append({"jsonrpc": "2.0", "id": request_id, "result": result})
                     except RpcFault as error:
