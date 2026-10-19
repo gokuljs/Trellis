@@ -17,6 +17,21 @@ uvx --from uv==0.12.5 uv run fastapi dev
 The `uvx` form keeps the repository reproducible without changing an older
 global uv installation. CI installs the same pinned uv version.
 
+## Logs
+
+The API writes newline-delimited JSON records to stdout. Run `make dev` from
+the repository root to view backend records in the terminal. Each record has a
+UTC timestamp, level, logger name, and event name. It may also include an
+allowlisted route template, HTTP status, duration, outcome, safe error code, or
+a chat, turn, or run ID after the API verifies ownership.
+
+The API logs startup and shutdown, HTTP request completion, WebSocket command
+outcomes, and run lifecycle changes. It uses `info` for normal outcomes,
+`warning` for rejections, fallbacks, interruptions, and lease loss, and `error`
+for failed operations. Health probes, streaming tokens, successful model and
+tool calls, and routine database activity are not logged. Records omit request
+content, credentials, URLs, workspace paths, exception messages, and stacks.
+
 Copy `.env.example` to `.env` and set `TRELLIS_SUPABASE_URL` and
 `TRELLIS_SUPABASE_PUBLISHABLE_KEY` for the same project used by the web app.
 Apply the SQL migrations in `../supabase/migrations/` and expose `trellis` in

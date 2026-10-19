@@ -8,9 +8,9 @@ from app.api.dependencies import (
     ChatServiceDep,
     RunServiceDep,
     SessionServiceDep,
-    correlate_owned_chat,
+    log_owned_chat,
 )
-from app.api.telemetry import owned_chat_telemetry
+from app.api.request_logging import owned_chat_logging
 from app.domain.models import Message, Session
 from app.domain.runtime import RunSummary
 
@@ -205,11 +205,11 @@ async def create_session(
     request: Request, service: SessionServiceDep, payload: SessionWorkspaceRequest | None = None
 ) -> SessionResponse:
     session = await service.create(payload.workspace_path if payload else None)
-    with owned_chat_telemetry(request.scope, session):
+    with owned_chat_logging(request.scope, session):
         return await serialize_session(session, service)
 
 
-@router.put("/{session_id}/workspace", dependencies=[Depends(correlate_owned_chat)])
+@router.put("/{session_id}/workspace", dependencies=[Depends(log_owned_chat)])
 async def set_session_workspace(
     session_id: str, payload: SessionWorkspaceRequest, service: SessionServiceDep
 ) -> SessionResponse:
@@ -218,7 +218,7 @@ async def set_session_workspace(
     )
 
 
-@router.get("/{session_id}", dependencies=[Depends(correlate_owned_chat)])
+@router.get("/{session_id}", dependencies=[Depends(log_owned_chat)])
 async def get_session(session_id: str, service: SessionServiceDep) -> SessionDetailResponse:
     detail = await service.get(session_id)
     if detail is None:
@@ -233,7 +233,7 @@ async def get_session(session_id: str, service: SessionServiceDep) -> SessionDet
     )
 
 
-@router.put("/{session_id}/model", dependencies=[Depends(correlate_owned_chat)])
+@router.put("/{session_id}/model", dependencies=[Depends(log_owned_chat)])
 async def select_session_model(
     session_id: str, payload: SessionModelRequest, service: SessionServiceDep
 ) -> SessionResponse:
@@ -242,7 +242,7 @@ async def select_session_model(
     )
 
 
-@router.get("/{session_id}/runs/latest", dependencies=[Depends(correlate_owned_chat)])
+@router.get("/{session_id}/runs/latest", dependencies=[Depends(log_owned_chat)])
 async def get_latest_run(
     session_id: str, service: RunServiceDep, sessions: SessionServiceDep
 ) -> LatestRunResponse | None:
@@ -261,7 +261,7 @@ async def get_latest_run(
     )
 
 
-@router.get("/{session_id}/runs", dependencies=[Depends(correlate_owned_chat)])
+@router.get("/{session_id}/runs", dependencies=[Depends(log_owned_chat)])
 async def list_session_runs(
     session_id: str,
     service: RunServiceDep,
@@ -279,7 +279,7 @@ async def list_session_runs(
     )
 
 
-@router.get("/{session_id}/runs/{run_id}/events", dependencies=[Depends(correlate_owned_chat)])
+@router.get("/{session_id}/runs/{run_id}/events", dependencies=[Depends(log_owned_chat)])
 async def list_session_run_events(
     session_id: str,
     run_id: str,
@@ -309,7 +309,7 @@ async def list_session_run_events(
 @router.post(
     "/{session_id}/turns",
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(correlate_owned_chat)],
+    dependencies=[Depends(log_owned_chat)],
 )
 async def complete_turn(
     session_id: str,

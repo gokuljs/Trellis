@@ -1,7 +1,7 @@
 import { MutationCache, QueryCache, QueryClient } from "@tanstack/react-query"
 
 import { ApiError } from "@/lib/api"
-import { reportFailure } from "@/lib/telemetry"
+import { logFailure } from "@/lib/logging"
 
 const disposedClients = new WeakSet<QueryClient>()
 
@@ -20,24 +20,24 @@ export function createSessionQueryClient(): QueryClient {
   const client = new QueryClient({
     queryCache: new QueryCache({
       onError(error, query) {
-        const operation = query.meta?.telemetryOperation
+        const operation = query.meta?.logOperation
         if (
           operation &&
-          query.meta?.telemetryOwner !== "caller" &&
+          query.meta?.logOwner !== "caller" &&
           !disposedClients.has(client)
         )
-          reportFailure(error, operation)
+          logFailure(error, operation)
       },
     }),
     mutationCache: new MutationCache({
       onError(error, _variables, _context, mutation) {
-        const operation = mutation.meta?.telemetryOperation
+        const operation = mutation.meta?.logOperation
         if (
           operation &&
-          mutation.meta?.telemetryOwner !== "caller" &&
+          mutation.meta?.logOwner !== "caller" &&
           !disposedClients.has(client)
         )
-          reportFailure(error, operation)
+          logFailure(error, operation)
       },
     }),
     defaultOptions: {

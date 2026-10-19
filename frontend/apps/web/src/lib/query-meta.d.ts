@@ -1,13 +1,13 @@
-import type { TelemetryOperation } from "./telemetry-policy"
+import type { LogOperation } from "./logger"
 
-interface TelemetryMeta extends Record<string, unknown> {
-  telemetryOperation?: TelemetryOperation
-  telemetryOwner?: "cache" | "caller"
+interface LoggingMeta extends Record<string, unknown> {
+  logOperation?: LogOperation
+  logOwner?: "cache" | "caller"
 }
 
 declare module "@tanstack/react-query" {
   interface Register {
-    queryMeta: TelemetryMeta
-    mutationMeta: TelemetryMeta
+    queryMeta: LoggingMeta
+    mutationMeta: LoggingMeta
   }
 }

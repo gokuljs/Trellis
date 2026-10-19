@@ -91,7 +91,7 @@ def test_http_cors_uses_the_same_exact_origin_policy_as_websockets() -> None:
                 headers={
                     "Origin": origin,
                     "Access-Control-Request-Method": "PUT",
-                    "Access-Control-Request-Headers": "authorization,content-type,traceparent",
+                    "Access-Control-Request-Headers": "authorization,content-type",
                 },
             )
             assert response.status_code == status
@@ -102,6 +102,7 @@ def test_http_cors_uses_the_same_exact_origin_policy_as_websockets() -> None:
         for headers in [
             {"Access-Control-Request-Method": "PATCH"},
             {"Access-Control-Request-Headers": "x-private-header"},
+            {"Access-Control-Request-Headers": "traceparent"},
         ]:
             assert (
                 client.options(

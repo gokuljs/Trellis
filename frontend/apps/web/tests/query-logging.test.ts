@@ -1,6 +1,5 @@
 import assert from "node:assert/strict"
-import { afterEach, test } from "bun:test"
-import * as Sentry from "@sentry/react"
+import { afterEach, test, mock, spyOn } from "bun:test"
 import {
   InfiniteQueryObserver,
   MutationObserver,
@@ -19,53 +18,34 @@ import {
   sessionHistoryQueryOptions,
   runSummariesQueryOptions,
 } from "../src/lib/server-queries"
-import { createTelemetryOptions, reportFailure } from "../src/lib/telemetry"
-import { parseTelemetryConfig } from "../src/lib/telemetry-policy"
-
-type Envelope = Parameters<
-  ReturnType<NonNullable<Sentry.BrowserOptions["transport"]>>["send"]
->[0]
+import { logFailure } from "../src/lib/logging"
 const cleanups: (() => void)[] = []
 const secret = "private-query-draft-session-model-token"
+const records: Record<string, unknown>[] = []
 
-afterEach(async () => {
+afterEach(() => {
   for (const cleanup of cleanups.splice(0).reverse()) cleanup()
-  await Sentry.close(1000)
-  Sentry.setCurrentClient(undefined)
+  records.length = 0
+  mock.restore()
 })
 
 function setup() {
-  const envelopes: Envelope[] = []
-  const telemetry = Sentry.init({
-    ...createTelemetryOptions(
-      parseTelemetryConfig({
-        VITE_SENTRY_ENABLED: "true",
-        VITE_SENTRY_DSN: "https://public@o123.ingest.sentry.io/456",
-      })
-    ),
-    transport: () => ({
-      send(envelope) {
-        envelopes.push(envelope)
-        return Promise.resolve({ statusCode: 200 })
-      },
-      flush: () => Promise.resolve(true),
-    }),
-  })!
+  spyOn(console, "error").mockImplementation((record: unknown) => {
+    records.push(record as Record<string, unknown>)
+  })
+  spyOn(console, "warn").mockImplementation((record: unknown) => {
+    records.push(record as Record<string, unknown>)
+  })
   const client = createSessionQueryClient()
   cleanups.push(() => disposeSessionQueryClient(client))
-  const events = async () => {
-    await telemetry.flush(1000)
-    assert.equal(JSON.stringify(envelopes).includes(secret), false)
-    return envelopes.flatMap((envelope) =>
-      envelope[1].flatMap(([header, payload]) =>
-        header.type === "event" ? [payload as Sentry.ErrorEvent] : []
-      )
-    )
+  const events = () => {
+    assert.equal(JSON.stringify(records).includes(secret), false)
+    return records
   }
   return { client, events }
 }
 
-test("a successful retry emits no issue and preserves the existing retry policy", async () => {
+test("a successful retry emits no log and preserves the existing retry policy", async () => {
   const { client, events } = setup()
   let attempts = 0
   const settings = { selected_provider: "openai", providers: [] }
@@ -81,7 +61,7 @@ test("a successful retry emits no issue and preserves the existing retry policy"
   })
   assert.equal(attempts, 2)
   assert.equal(result, settings)
-  assert.deepEqual(await events(), [])
+  assert.deepEqual(events(), [])
 })
 
 test("exhausted retries emit once even when the final error reaches an outer handler", async () => {
@@ -100,17 +80,24 @@ test("exhausted retries emit once even when the final error reaches an outer han
     }),
     (error) => {
       assert.equal(error, failure)
-      reportFailure(error, "workspace.bootstrap")
+      logFailure(error, "workspace.bootstrap")
       return true
     }
   )
   assert.equal(attempts, 2)
-  const captured = await events()
+  const captured = events()
   assert.equal(captured.length, 1)
-  assert.equal(captured[0]?.tags?.["telemetry.operation"], "settings.load")
+  assert.deepEqual(captured[0], {
+    timestamp: captured[0]?.timestamp,
+    level: "error",
+    event: "operation.failed",
+    operation: "settings.load",
+    failure: "service_unavailable",
+    status: 503,
+  })
 })
 
-test("two observers sharing a failed query emit one terminal issue", async () => {
+test("two observers sharing a failed query emit one terminal log", async () => {
   const { client, events } = setup()
   const options = {
     ...settingsQueryOptions({
@@ -133,10 +120,10 @@ test("two observers sharing a failed query emit one terminal issue", async () =>
   )
   cleanups.push(second.subscribe(() => undefined))
   await terminal
-  assert.equal((await events()).length, 1)
+  assert.equal(events().length, 1)
 })
 
-test("draft query keys and mutation variables never enter SDK envelopes", async () => {
+test("draft query keys and mutation variables never enter browser logs", async () => {
   const { client, events } = setup()
   await assert.rejects(
     client.fetchQuery(
@@ -157,17 +144,17 @@ test("draft query keys and mutation variables never enter SDK envelopes", async 
     )
   )
   const mutation = new MutationObserver(client, {
-    meta: { telemetryOperation: "settings.save", telemetryOwner: "cache" },
+    meta: { logOperation: "settings.save", logOwner: "cache" },
     mutationFn: async (variables: { sessionId: string; modelId: string }) => {
       assert.equal(variables.modelId, secret)
       throw new ApiError("service_unavailable", secret, 503)
     },
   })
   await assert.rejects(mutation.mutate({ sessionId: secret, modelId: secret }))
-  const captured = await events()
+  const captured = events()
   assert.equal(captured.length, 2)
   assert.deepEqual(
-    captured.map((event) => event.tags?.["telemetry.operation"]),
+    captured.map((event) => event.operation),
     ["context.preview", "settings.save"]
   )
 })
@@ -177,7 +164,7 @@ test("cancellation and client disposal suppress pending queries and mutations", 
   const query = client
     .fetchQuery({
       queryKey: ["cancelled", secret],
-      meta: { telemetryOperation: "history.load" },
+      meta: { logOperation: "history.load" },
       queryFn: () => new Promise<never>(() => undefined),
     })
     .catch((error: unknown) => error)
@@ -188,7 +175,7 @@ test("cancellation and client disposal suppress pending queries and mutations", 
   const disposedQuery = client
     .fetchQuery({
       queryKey: ["disposed", secret],
-      meta: { telemetryOperation: "history.load" },
+      meta: { logOperation: "history.load" },
       queryFn: () =>
         new Promise<never>((_resolve, reject) => {
           rejectQuery = reject
@@ -203,7 +190,7 @@ test("cancellation and client disposal suppress pending queries and mutations", 
     started = resolve
   })
   const mutation = new MutationObserver(client, {
-    meta: { telemetryOperation: "settings.save", telemetryOwner: "cache" },
+    meta: { logOperation: "settings.save", logOwner: "cache" },
     mutationFn: (variables: { sessionId: string; modelId: string }) => {
       assert.equal(variables.modelId, secret)
       return new Promise<never>((_resolve, reject) => {
@@ -221,7 +208,7 @@ test("cancellation and client disposal suppress pending queries and mutations", 
   rejectMutation(new ApiError("service_unavailable", secret, 503))
   await disposedQuery
   await pending
-  assert.deepEqual(await events(), [])
+  assert.deepEqual(events(), [])
 })
 
 test("history recovery stays quiet after exhausted retries followed by success with an observer", async () => {
@@ -264,10 +251,10 @@ test("history recovery stays quiet after exhausted retries followed by success w
   })
   await assert.rejects(pending)
   assert.equal(attempts, 2)
-  assert.deepEqual(await events(), [])
+  assert.deepEqual(events(), [])
   recovering = true
   await client.fetchInfiniteQuery({ ...options, staleTime: 0 })
-  assert.deepEqual(await events(), [])
+  assert.deepEqual(events(), [])
 })
 
 test("stale session summary reads stay quiet while visible turn activity stays cache-owned", async () => {
@@ -287,12 +274,12 @@ test("stale session summary reads stay quiet while visible turn activity stays c
     })
     .catch((error: unknown) => {
       if (selection === currentSelection)
-        reportFailure(error, "activity.summaries")
+        logFailure(error, "activity.summaries")
     })
   currentSelection = 2
   rejectRead(new ApiError("service_unavailable", secret, 503))
   await pending
-  assert.deepEqual(await events(), [])
+  assert.deepEqual(events(), [])
 
   await assert.rejects(
     client.fetchInfiniteQuery({
@@ -308,9 +295,9 @@ test("stale session summary reads stay quiet while visible turn activity stays c
       retry: false,
     })
   )
-  const captured = await events()
+  const captured = events()
   assert.equal(captured.length, 1)
-  assert.equal(captured[0]?.tags?.["telemetry.operation"], "activity.summaries")
+  assert.equal(captured[0]?.operation, "activity.summaries")
 })
 
 test("caller-owned final history failures report once under their final operation", async () => {
@@ -326,14 +313,14 @@ test("caller-owned final history failures report once under their final operatio
       retry: false,
     }),
     (error) => {
-      reportFailure(error, "sessions.open")
-      reportFailure(error, "sessions.open")
+      logFailure(error, "sessions.open")
+      logFailure(error, "sessions.open")
       return true
     }
   )
-  const captured = await events()
+  const captured = events()
   assert.equal(captured.length, 1)
-  assert.equal(captured[0]?.tags?.["telemetry.operation"], "sessions.open")
+  assert.equal(captured[0]?.operation, "sessions.open")
 })
 
 test("session model saves report only after the caller confirms current ownership", async () => {
@@ -358,14 +345,13 @@ test("session model saves report only after the caller confirms current ownershi
   const pending = stale
     .mutate({ sessionId: secret, modelId: secret })
     .catch((error: unknown) => {
-      if (currentSession === originalSession)
-        reportFailure(error, "settings.save")
+      if (currentSession === originalSession) logFailure(error, "settings.save")
     })
   await started
   currentSession = "new-session"
   rejectSave(new ApiError("service_unavailable", secret, 503))
   await pending
-  assert.deepEqual(await events(), [])
+  assert.deepEqual(events(), [])
 
   const current = new MutationObserver(
     client,
@@ -378,10 +364,10 @@ test("session model saves report only after the caller confirms current ownershi
   await assert.rejects(
     current.mutate({ sessionId: currentSession, modelId: secret }),
     (error) => {
-      reportFailure(error, "settings.save")
-      reportFailure(error, "settings.save")
+      logFailure(error, "settings.save")
+      logFailure(error, "settings.save")
       return true
     }
   )
-  assert.equal((await events()).length, 1)
+  assert.equal(events().length, 1)
 })
