@@ -31,6 +31,7 @@ from app.application.ports import (
     StreamingProviderAdapter,
 )
 from app.application.profile import ProfileService
+from app.application.run_capacity import RunCapacity
 from app.application.runs import RunService
 from app.application.secret_redaction import SecretRedactor
 from app.application.sessions import SessionService
@@ -153,6 +154,10 @@ class AccountRegistry:
         repository_factory: RepositoryFactory | None = None,
     ) -> None:
         self._settings = settings
+        self._run_capacity = RunCapacity(
+            max_active_runs=settings.max_active_runs,
+            max_active_runs_per_user=settings.max_active_runs_per_user,
+        )
         self._capabilities = RuntimeCapabilities(settings.enabled_capabilities)
         self._credentials = ServerCredentialStore(settings)
         self._redactor = SecretRedactor(
@@ -272,6 +277,8 @@ class AccountRegistry:
                         else None,
                         workspace_bindings=workspace_bindings,
                         lease_repository=database,
+                        capacity=self._run_capacity,
+                        owner_id=str(user_id),
                     )
                     try:
                         await run_service.resume_decided_approvals()

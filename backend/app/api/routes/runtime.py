@@ -735,12 +735,19 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                             await close_for_access(_account_fault(error))
                             return
                         if has_id:
+                            error_data: dict[str, object] = {"code": error.code}
+                            error_status = {
+                                "run_capacity": 429,
+                                "run_token_too_short": 409,
+                            }.get(error.code)
+                            if error_status is not None:
+                                error_data["status"] = error_status
                             responses.append(
                                 _error_response(
                                     request_id,
                                     -32000,
                                     error.message,
-                                    {"code": error.code},
+                                    error_data,
                                 )
                             )
                     except Exception:
