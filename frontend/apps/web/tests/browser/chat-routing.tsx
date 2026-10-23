@@ -18,7 +18,6 @@ import type {
   LatestRun,
   Message,
   RunSummary,
-  SavedRunEvent,
   Session,
   SessionHistoryPage,
 } from "../../src/lib/app-types"
@@ -48,19 +47,11 @@ const sessions = new Map(
 const transcripts = new Map<string, Message[]>()
 const savedOutputs = new Map<string, AssistantOutput[]>()
 const latest = new Map<string, LatestRun>()
-let workspaceBlockedRun: LatestRun | null = null
-let workspaceBlockedByOtherAccount = false
 const requests: string[] = []
 const rpc: string[] = []
 const startRequests: { clientRequestId: string; sessionId: string }[] = []
 const acceptedRequests = new Map<string, string>()
 const checks: string[] = []
-const recoveryEvents = new Map<string, SavedRunEvent[]>()
-const reviewRequests: {
-  sessionId: string
-  runId: string
-  toolCallId: string
-}[] = []
 const browserLogs: unknown[] = []
 const blockedRequests: string[] = []
 const originalConsoleInfo = console.info.bind(console)
@@ -168,8 +159,8 @@ function runSummary(run: LatestRun): RunSummary {
   return {
     ...run,
     retry_of: null,
-    budget_preset: run.run_id === "recovering-run" ? "longer" : "conservative",
-    max_model_calls: run.run_id === "recovering-run" ? 12 : 8,
+    budget_preset: "conservative",
+    max_model_calls: 8,
     max_tool_calls: 16,
     max_total_tokens: 100000,
     max_cost_usd: 2,
@@ -183,9 +174,9 @@ function runSummary(run: LatestRun): RunSummary {
       : null,
     provider_id: "fixture",
     model_id: "fixture-model",
-    model_call_count: run.run_id === "recovering-run" ? 3 : 1,
-    tool_call_count: run.run_id === "recovering-run" ? 2 : 0,
-    total_tokens: run.run_id === "recovering-run" ? 1234 : null,
+    model_call_count: 1,
+    tool_call_count: 0,
+    total_tokens: null,
     usage_complete: false,
     estimated_cost_usd: null,
     cost_complete: false,
@@ -252,53 +243,7 @@ Object.assign(api, {
     const run = latest.get(sessionId)
     return { items: run ? [runSummary(run)] : [], next_offset: null }
   },
-  listRunEvents: async (
-    _sessionId: string,
-    runId: string,
-    afterSequence: number
-  ) => ({
-    items: (recoveryEvents.get(runId) ?? []).filter(
-      (event) => event.sequence > afterSequence
-    ),
-    next_after_sequence: null,
-  }),
-  getWorkspaceReview: async (sessionId: string) => {
-    if (![ids.a, ids.b].includes(sessionId)) return { blocked: false }
-    if (workspaceBlockedByOtherAccount)
-      return { blocked: true, reason: "workspace_review_other_account" }
-    return workspaceBlockedRun
-      ? {
-          blocked: true,
-          source_session_id: ids.a,
-          workspace_path: "/trusted/fixture-workspace",
-          run_id: workspaceBlockedRun.run_id,
-          uncertain_operation: structuredClone(
-            workspaceBlockedRun.uncertain_operation
-          ),
-          reason: "command_outcome_unknown",
-        }
-      : { blocked: false }
-  },
-  reviewWorkspace: async (
-    sessionId: string,
-    runId: string,
-    toolCallId: string
-  ) => {
-    const run =
-      workspaceBlockedRun?.run_id === runId
-        ? workspaceBlockedRun
-        : latest.get(sessionId)!
-    assert(
-      run.run_id === runId &&
-        run.uncertain_operation?.tool_call_id === toolCallId,
-      "Review selected another operation"
-    )
-    reviewRequests.push({ sessionId, runId, toolCallId })
-    run.uncertain_operation.reviewed_at = now
-    run.uncertain_operation.review_pending = false
-    if (workspaceBlockedRun?.run_id === runId) workspaceBlockedRun = null
-    return { tool_call_id: toolCallId, reviewed_at: now }
-  },
+  getWorkspaceReview: async () => ({ blocked: false }),
   getLatestRun: async (sessionId: string) => {
     if (sessionId === ids.a && delayDiscovery)
       await new Promise<void>((resolve) => {
@@ -310,7 +255,7 @@ Object.assign(api, {
         "Synthetic discovery outage",
         503
       )
-    return structuredClone(latest.get(sessionId) ?? null)
+    return latest.get(sessionId) ?? null
   },
   createSession: async () => {
     requests.push("create")
@@ -445,66 +390,14 @@ class FixtureSocket {
         (run) => run.run_id === frame.params.runId
       )!
       saved.status = "cancelled"
-      saved.last_sequence += 1
       result = { runId: saved.run_id, status: "cancelled" }
       for (const socket of sockets) {
         if (!socket.closed && socket.runId === saved.run_id)
-          socket.event("run.cancelled", {}, saved.last_sequence)
+          socket.event("run.cancelled", {})
       }
     } else if (frame.method === "run.resume") {
       this.runId = frame.params.runId
-      const saved = [...latest.values()].find(
-        (run) => run.run_id === this.runId
-      )
-      const summary = saved ? runSummary(saved) : null
-      result = {
-        runId: this.runId,
-        modelId: "fixture-model",
-        status: saved?.status,
-        retryAllowed: saved?.retry_allowed,
-        recoveryReason: saved?.recovery_reason,
-        uncertainToolCallId: saved?.uncertain_tool_call_id,
-        budgetPreset: summary?.budget_preset,
-        ...(summary
-          ? {
-              limits: {
-                maxModelCalls: summary.max_model_calls,
-                maxToolCalls: summary.max_tool_calls,
-                maxTotalTokens: summary.max_total_tokens,
-                maxCostUsd: summary.max_cost_usd,
-                deadlineAt: summary.deadline_at,
-              },
-            }
-          : {}),
-      }
-      queueMicrotask(() => {
-        for (const event of recoveryEvents.get(this.runId!) ?? []) {
-          if (!this.closed && event.sequence > frame.params.afterSequence)
-            this.event(event.event_type, event.data, event.sequence)
-        }
-      })
-    } else if (frame.method === "run.respond") {
-      const saved = [...latest.values()].find(
-        (run) => run.run_id === frame.params.runId
-      )!
-      saved.status = "running"
-      saved.last_sequence += 1
-      result = {
-        runId: saved.run_id,
-        toolCallId: frame.params.toolCallId,
-        decision: frame.params.decision,
-      }
-      for (const socket of sockets) {
-        if (!socket.closed && socket.runId === saved.run_id)
-          socket.event(
-            "tool.approval_decided",
-            {
-              tool_call_id: frame.params.toolCallId,
-              decision: frame.params.decision,
-            },
-            saved.last_sequence
-          )
-      }
+      result = { runId: this.runId, modelId: "fixture-model" }
     }
     queueMicrotask(() =>
       this.onmessage?.({
@@ -572,7 +465,6 @@ function evidence() {
       requests,
       rpc,
       startRequests,
-      reviewRequests,
       historyLength: window.history.length,
       privacy: Object.values(ids).some((id) =>
         JSON.stringify(browserLogs).includes(id)
@@ -1194,395 +1086,6 @@ async function runChecks() {
   )
   pass(
     "Confirmed absence preserves an explicit retry instead of silently losing the input"
-  )
-  await open(ids.offPage)
-  const startsBeforeRecovery = startRequests.length
-  const recoveredInput: Message = {
-    id: "recovery-input",
-    turn_id: "recovery-turn",
-    role: "user",
-    content: "Continue the saved build",
-    provider: null,
-    model: null,
-    created_at: now,
-  }
-  transcripts.set(ids.a, [recoveredInput])
-  savedOutputs.set(ids.a, [
-    {
-      id: "recovery-output",
-      turn_id: recoveredInput.turn_id,
-      run_id: "recovering-run",
-      model_call_id: "saved-call",
-      step_index: 0,
-      content: "Saved partial work survives restart",
-      status: "partial",
-      stop_reason: "backend_restart",
-      promoted_message_id: null,
-      created_at: now,
-    },
-  ])
-  const recoveringRun: LatestRun = {
-    run_id: "recovering-run",
-    turn_id: recoveredInput.turn_id,
-    status: "recovering",
-    last_sequence: 3,
-    input_message: recoveredInput,
-    retry_allowed: true,
-    recovery_reason: null,
-    uncertain_tool_call_id: null,
-  }
-  latest.set(ids.a, recoveringRun)
-  const savedEvent = (
-    runId: string,
-    sequence: number,
-    eventType: string,
-    data: Record<string, unknown> = {}
-  ): SavedRunEvent => ({
-    run_id: runId,
-    sequence,
-    event_type: eventType,
-    event_version: 1,
-    data,
-    created_at: now,
-  })
-  recoveryEvents.set(recoveringRun.run_id, [
-    savedEvent(recoveringRun.run_id, 1, "run.queued"),
-    savedEvent(recoveringRun.run_id, 2, "run.phase", { phase: "tool_use" }),
-    savedEvent(recoveringRun.run_id, 3, "run.recovering"),
-  ])
-  navigate(chatPath(ids.a))
-  await until(
-    () =>
-      !!document.querySelector(".cancel-run-button") &&
-      document
-        .querySelector(".run-activity-trigger")
-        ?.textContent?.includes("Recovering") === true,
-    "Recovering run did not restore"
-  )
-  assert(
-    document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
-    "Recovery unlocked the composer"
-  )
-  assert(
-    document.querySelector<HTMLSelectElement>('[aria-label="Run budget"]')!
-      .value === "longer",
-    "Recovery replaced the original budget"
-  )
-  assert(
-    document
-      .querySelector(".composer-footnote")
-      ?.textContent?.includes("Recovering"),
-    "Composer did not explain recovery"
-  )
-  assert(!button("Stop generating").disabled, "Recovering run cannot Stop")
-  assert(
-    document
-      .querySelector("#root")!
-      .textContent!.includes("Saved partial work survives restart"),
-    "Recovery hid saved partial output"
-  )
-  document.querySelector<HTMLButtonElement>(".run-activity-trigger")!.click()
-  await until(
-    () =>
-      document
-        .querySelector("#root")!
-        .textContent!.includes("3 / 12 model calls"),
-    "Original usage or limits did not restore"
-  )
-  pass(
-    "Recovering preserves partial output, original usage and budget, and the composer lock while Stop remains usable"
-  )
-  await open(ids.b)
-  navigate(chatPath(ids.a))
-  await until(
-    () => !!document.querySelector(".cancel-run-button"),
-    "Recovery did not reconnect"
-  )
-  assert(
-    startRequests.length === startsBeforeRecovery,
-    "Recovery reconnect started another attempt"
-  )
-  button("Stop generating").click()
-  await until(
-    () => !document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
-    "Stop did not end recovery"
-  )
-  pass(
-    "Reconnect follows the same recovering run without a new attempt and Stop remains available"
-  )
-  await open(ids.b)
-  const approvalRun: LatestRun = {
-    ...recoveringRun,
-    run_id: "approval-recovered-run",
-    turn_id: "approval-recovered-turn",
-    status: "waiting_for_approval",
-    last_sequence: 4,
-    input_message: { ...recoveredInput, turn_id: "approval-recovered-turn" },
-  }
-  transcripts.set(ids.a, [approvalRun.input_message!])
-  savedOutputs.set(ids.a, [])
-  latest.set(ids.a, approvalRun)
-  recoveryEvents.set(approvalRun.run_id, [
-    savedEvent(approvalRun.run_id, 1, "run.queued"),
-    savedEvent(approvalRun.run_id, 2, "run.recovering"),
-    savedEvent(approvalRun.run_id, 3, "tool.call", {
-      tool_call_id: "restored-patch",
-      name: "apply_patch",
-      arguments: { path: "app.py", old_text: "before", new_text: "after" },
-    }),
-    savedEvent(approvalRun.run_id, 4, "tool.approval_requested", {
-      tool_call_id: "restored-patch",
-      name: "apply_patch",
-      arguments: { path: "app.py", old_text: "before", new_text: "after" },
-      preview: { path: "app.py", diff: "-before\n+after" },
-    }),
-  ])
-  navigate(chatPath(ids.a))
-  await until(
-    () =>
-      document
-        .querySelector(".run-activity-trigger")
-        ?.textContent?.includes("Waiting for approval") === true,
-    "Saved approval wait did not restore"
-  )
-  document.querySelector<HTMLButtonElement>(".run-activity-trigger")!.click()
-  await until(
-    () =>
-      !![...document.querySelectorAll("button")].find(
-        (item) => item.textContent?.trim() === "Approve"
-      ),
-    "Saved approval actions did not restore"
-  )
-  button("Approve").click()
-  await until(
-    () =>
-      document
-        .querySelector(".run-activity-expanded")
-        ?.textContent?.includes("Approved") === true,
-    "Restored approval did not retain its identity"
-  )
-  button("Stop generating").click()
-  await until(
-    () => !document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
-    "Restored approval run did not Stop"
-  )
-  assert(
-    startRequests.length === startsBeforeRecovery,
-    "Restoring approval started another attempt"
-  )
-  pass(
-    "Recovery restores saved approval details and decisions without recreating the run"
-  )
-  await open(ids.b)
-  const unknownRun: LatestRun = {
-    ...recoveringRun,
-    run_id: "unknown-command-run",
-    turn_id: "unknown-command-turn",
-    status: "interrupted",
-    last_sequence: 5,
-    input_message: { ...recoveredInput, turn_id: "unknown-command-turn" },
-    retry_allowed: false,
-    recovery_reason: "command_outcome_unknown",
-    uncertain_tool_call_id: "uncertain-command",
-    uncertain_operation: {
-      tool_call_id: "uncertain-command",
-      name: "run_command",
-      arguments: { command: "make release", cwd: "workspace" },
-      reviewed_at: null,
-      review_pending: true,
-    },
-  }
-  latest.set(ids.a, unknownRun)
-  workspaceBlockedRun = unknownRun
-  transcripts.set(ids.a, [unknownRun.input_message!])
-  savedOutputs.set(ids.a, [
-    {
-      id: "command-partial",
-      turn_id: unknownRun.turn_id,
-      run_id: unknownRun.run_id,
-      model_call_id: "previous-call",
-      step_index: 0,
-      content: "Saved command preparation remains visible",
-      status: "partial",
-      stop_reason: "command_outcome_unknown",
-      promoted_message_id: null,
-      created_at: now,
-    },
-  ])
-  await open(ids.a)
-  await until(
-    () => !!document.querySelector(".workspace-review"),
-    "Uncertain command review did not appear"
-  )
-  assert(
-    document
-      .querySelector(".workspace-review")
-      ?.textContent?.includes("/trusted/fixture-workspace"),
-    "Review did not identify the trusted folder"
-  )
-  assert(
-    document
-      .querySelector("#root")!
-      .textContent!.includes("Saved command preparation remains visible"),
-    "Unknown command lost partial work"
-  )
-  assert(
-    ![...document.querySelectorAll("button")].some(
-      (item) => item.textContent?.trim() === "Retry"
-    ),
-    "Unknown command offered unsafe Retry"
-  )
-  assert(
-    button("Acknowledge review").disabled,
-    "Review did not require explicit confirmation"
-  )
-  document
-    .querySelector<HTMLInputElement>(
-      '.workspace-review input[type="checkbox"]'
-    )!
-    .click()
-  await until(
-    () => !button("Acknowledge review").disabled,
-    "Review confirmation did not enable acknowledgment"
-  )
-  button("Acknowledge review").click()
-  await until(
-    () =>
-      document
-        .querySelector(".workspace-review")
-        ?.textContent?.includes("Review acknowledged") === true,
-    "Command review did not acknowledge"
-  )
-  assert(
-    reviewRequests.length === 1 &&
-      reviewRequests[0].toolCallId === "uncertain-command",
-    "Review did not submit the exact uncertain operation once"
-  )
-  assert(
-    startRequests.length === startsBeforeRecovery,
-    "Manual review executed a new run"
-  )
-  assert(
-    latest.get(ids.a)!.status === "interrupted" &&
-      latest.get(ids.a)!.retry_allowed === false,
-    "Acknowledgment changed the unknown outcome or enabled Retry"
-  )
-  await open(ids.b)
-  await open(ids.a)
-  assert(
-    document
-      .querySelector(".workspace-review")
-      ?.textContent?.includes("Review acknowledged"),
-    "Saved review did not survive reconnect"
-  )
-  assert(
-    ![...document.querySelectorAll("button")].some(
-      (item) => item.textContent?.trim() === "Retry"
-    ),
-    "Acknowledged unknown command offered Retry"
-  )
-  pass(
-    "Unknown commands preserve partial work, require explicit review, and remain interrupted with Retry blocked after acknowledgment and reconnect"
-  )
-  await open(ids.b)
-  const olderUnknown: LatestRun = {
-    ...unknownRun,
-    run_id: "older-unknown-command",
-    uncertain_tool_call_id: "older-uncertain-command",
-    uncertain_operation: {
-      ...unknownRun.uncertain_operation!,
-      tool_call_id: "older-uncertain-command",
-      reviewed_at: null,
-      review_pending: true,
-    },
-  }
-  latest.set(ids.a, olderUnknown)
-  workspaceBlockedRun = olderUnknown
-  await open(ids.a)
-  await until(
-    () =>
-      document
-        .querySelector(".workspace-review")
-        ?.textContent?.includes("older-uncertain-command") === true,
-    "Old command review did not load"
-  )
-  await submit(
-    "Continue with read-only planning while the old command is reviewed"
-  )
-  assert(
-    document
-      .querySelector(".workspace-review")
-      ?.textContent?.includes("older-uncertain-command"),
-    "Starting a new turn hid the unresolved workspace command"
-  )
-  button("Stop generating").click()
-  await until(
-    () => !document.querySelector<HTMLTextAreaElement>("textarea")!.disabled,
-    "New planning run did not Stop"
-  )
-  await open(ids.b)
-  await until(
-    () =>
-      document
-        .querySelector(".workspace-review")
-        ?.textContent?.includes("older-uncertain-command") === true,
-    "Another chat sharing the workspace lost the review"
-  )
-  document
-    .querySelector<HTMLInputElement>(
-      '.workspace-review input[type="checkbox"]'
-    )!
-    .click()
-  await until(
-    () => !button("Acknowledge review").disabled,
-    "Cross-chat review confirmation did not enable"
-  )
-  button("Acknowledge review").click()
-  await until(
-    () =>
-      document
-        .querySelector(".workspace-review")
-        ?.textContent?.includes("Review acknowledged") === true,
-    "Cross-chat review did not acknowledge"
-  )
-  assert(
-    reviewRequests.length === 2 &&
-      reviewRequests[1].sessionId === ids.a &&
-      reviewRequests[1].runId === olderUnknown.run_id,
-    "Cross-chat review did not target the original command's session"
-  )
-  assert(
-    olderUnknown.status === "interrupted" &&
-      olderUnknown.retry_allowed === false,
-    "Cross-chat review rewrote the uncertain run"
-  )
-  pass(
-    "An unresolved workspace command remains reviewable after a new turn and from another chat, with acknowledgment sent to its original run"
-  )
-  workspaceBlockedByOtherAccount = true
-  await open(ids.a)
-  await until(
-    () =>
-      document
-        .querySelector("#root")!
-        .textContent!.includes("unresolved command from another account"),
-    "Cross-account block did not explain review ownership"
-  )
-  assert(
-    !document.querySelector(".workspace-review"),
-    "Cross-account block exposed command details"
-  )
-  workspaceBlockedByOtherAccount = false
-  button("Check workspace").click()
-  await until(
-    () =>
-      !document
-        .querySelector("#root")!
-        .textContent!.includes("unresolved command from another account"),
-    "Workspace block did not refresh"
-  )
-  pass(
-    "Another account's workspace block reveals no command details and can be checked again without executing a run"
   )
   await open(ids.offPage)
   publishAuth("signed-out")

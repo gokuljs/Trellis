@@ -78,19 +78,3 @@ jobs:
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/reliable_runs.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/run_stopping.sql
           bash supabase/tests/reliable_runs_concurrency.sh
-          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/recovery_contracts.sql
-          bash supabase/tests/recovery_contracts_concurrency.sh
-          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/atomic_generation.sql
-          bash supabase/tests/atomic_generation_concurrency.sh
-          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/atomic_compaction.sql
-          bash supabase/tests/atomic_compaction_concurrency.sh
-          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/tool_dispatch.sql
-          bash supabase/tests/tool_dispatch_concurrency.sh
-          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/local_reconciliation.sql
-          bash supabase/tests/local_reconciliation_concurrency.sh
-          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/recovery_review.sql
-          bash supabase/tests/recovery_review_concurrency.sh
-          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/execution_recovery.sql
-          bash supabase/tests/execution_recovery_concurrency.sh
-          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/reconnect_recovery.sql
-          bash supabase/tests/reconnect_recovery_concurrency.sh

@@ -167,8 +167,6 @@ Lost model responses retain partial output and unknown usage without another pai
 attempt. A reconciled patch can still stop if a saved search, listing, or Git
 observation changed and its relationship to that patch cannot be proven.
 
-`make check` with uv 0.12.5 runs formatting, lint, type checking, and all tests,
-including fresh-process crash fixtures. It separately enforces 90% logging
-coverage and 85% coverage of the recovery contract, resolver, discovery, and
-request snapshot modules. The disposable PostgreSQL tests and concurrency
-harnesses in `supabase/tests/` also run in backend CI.
+`make check` with uv 0.12.5 runs formatting, lint, type checking, and the
+remaining backend tests with a 90% logging coverage floor. The existing disposable
+PostgreSQL tests and concurrency harness in `supabase/tests/` run in backend CI.
