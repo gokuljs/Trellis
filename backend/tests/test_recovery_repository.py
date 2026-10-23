@@ -1,6 +1,6 @@
 import asyncio
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -28,6 +28,19 @@ def repository() -> SupabaseRepository:
         VerifiedTokenSource(user),
         httpx.AsyncClient(),
     )
+
+
+def test_authentication_revision_only_advances_for_the_current_verified_credential() -> None:
+    user = UUID("19000000-0000-0000-0000-000000000001")
+    source = VerifiedTokenSource(user)
+    expiry = datetime.now(UTC) + timedelta(hours=1)
+    source.record_verified("current", user, expiry)
+    assert source.revision == 1
+    source.record_verified("current", user, expiry)
+    source.record_verified("older-tab", user, expiry - timedelta(minutes=5))
+    assert source.revision == 1 and source.get_token() == "current"
+    source.record_verified("refreshed", user, expiry + timedelta(minutes=5))
+    assert source.revision == 2 and source.get_token() == "refreshed"
 
 
 def test_recovery_metadata_is_not_dropped_when_reading_a_run() -> None:
@@ -125,6 +138,72 @@ def test_model_allocation_retries_the_same_saved_request_after_lost_acknowledgme
             )
             assert saved.id == call.id
             assert repo._rpc.await_args_list[0] == repo._rpc.await_args_list[1]
+        finally:
+            await repo._client.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("missing_contract", [False, True])
+def test_new_run_persists_the_exact_immutable_contract(missing_contract) -> None:
+    async def scenario():
+        from test_recovery_contracts import CONTRACT
+
+        repo, run = repository(), run_record()
+        contract = replace(CONTRACT, workspace=None)
+        row = asdict(run)
+        row.update(
+            user_id=str(repo._user_id),
+            chat_id=row.pop("session_id"),
+            lease_expires_at=(datetime.now(UTC) + timedelta(minutes=1)).isoformat(),
+            recovery_contract=None if missing_contract else contract.to_dict(),
+        )
+        repo._token_source.record_verified(
+            "verified", repo._user_id, datetime.now(UTC) + timedelta(hours=1)
+        )
+        repo._rpc = AsyncMock(return_value={"run": row, "lease_acquired": True})
+        try:
+            operation = repo.create_run(
+                run.session_id,
+                run.turn_id,
+                run.client_request_id,
+                "hello",
+                MODEL,
+                recovery_contract=contract,
+            )
+            if missing_contract:
+                with pytest.raises(RuntimeError, match="recovery contract"):
+                    await operation
+                assert not repo.owns_run_lease(run.id)
+            else:
+                accepted = await operation
+                assert accepted.recovery_contract == contract
+            assert repo._rpc.await_args is not None
+            assert repo._rpc.await_args.args[1]["recovery_contract"] == contract.to_dict()
+        finally:
+            await repo._client.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_user_stop_retries_the_same_authenticated_intent_without_execution_capability() -> None:
+    async def scenario():
+        repo, run = repository(), run_record()
+        row = asdict(run)
+        row.update(user_id=str(repo._user_id), chat_id=row.pop("session_id"), status="cancelling")
+        repo._rpc = AsyncMock(
+            side_effect=[
+                ApplicationError("database_unavailable", "Lost cancellation acknowledgment"),
+                {"run": row, "event": None},
+            ]
+        )
+        try:
+            requested, event = await repo.request_recovery_cancellation(run.id)
+            assert requested.status.value == "cancelling" and event is None
+            assert not repo.owns_run_lease(run.id)
+            assert repo._rpc.await_args_list[0] == repo._rpc.await_args_list[1]
+            assert repo._rpc.await_args is not None
+            assert repo._rpc.await_args.kwargs["capability"] is None
         finally:
             await repo._client.aclose()
 

@@ -71,6 +71,11 @@ class VerifiedTokenSource:
         self._user_id = user_id
         self._token: str | None = None
         self._expires_at: datetime | None = None
+        self._revision = 0
+
+    @property
+    def revision(self) -> int:
+        return self._revision
 
     def record_verified(self, token: str, verified_user_id: UUID, expires_at: datetime) -> None:
         if verified_user_id != self._user_id:
@@ -89,6 +94,8 @@ class VerifiedTokenSource:
         # Multiple tabs can present different still-valid JWTs for this account.
         # A shorter-lived session must not downgrade the token renewing an active run.
         if self._expires_at is None or expires_at >= self._expires_at:
+            if self._token != token or self._expires_at != expires_at:
+                self._revision += 1
             self._token = token
             self._expires_at = expires_at
 
@@ -1291,6 +1298,7 @@ class SupabaseRepository:
         request_fingerprint: str | None = None,
         submitted_model_id: str | None = None,
         submitted_budget_preset: BudgetPreset | None = None,
+        recovery_contract: RecoveryContract | None = None,
     ) -> RunSnapshot:
         normalized_content = content.strip()
         if not normalized_content:
@@ -1314,6 +1322,10 @@ class SupabaseRepository:
             "submitted_model_id": submitted_model_id,
             "submitted_budget_preset": submitted_budget_preset,
         }
+        if recovery_contract is not None:
+            if recovery_contract.request_identity != client_request_id:
+                raise ValueError("Recovery contract belongs to another request")
+            payload["recovery_contract"] = recovery_contract.to_dict()
         for attempt in range(2):
             try:
                 result = _object(await self._rpc("create_run", payload, capability=capability))
@@ -1334,6 +1346,8 @@ class SupabaseRepository:
                     raise
         run = self._run(_object(result.get("run")))
         if result.get("lease_acquired") is True:
+            if recovery_contract is not None and run.recovery_contract != recovery_contract:
+                raise RuntimeError("Supabase did not preserve the new run's recovery contract")
             self._record_lease(run, capability)
         return run
 
@@ -2108,6 +2122,28 @@ class SupabaseRepository:
             ),
             context_revision=_integer(result, "context_revision"),
         )
+
+    async def request_recovery_cancellation(
+        self, run_id: str
+    ) -> tuple[RunSnapshot, RunEvent | None]:
+        result = _object(
+            await self._idempotent_rpc(
+                "request_recovery_cancellation", {"run_id": run_id}, capability=None
+            )
+        )
+        run = self._run(_object(result.get("run")))
+        event = self._event(_object(result["event"])) if result.get("event") is not None else None
+        if run.id != run_id or (event is not None and event.run_id != run_id):
+            raise RuntimeError("Supabase returned another cancellation request")
+        if run.status not in {
+            RunStatus.CANCELLING,
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.INTERRUPTED,
+        }:
+            raise RuntimeError("Supabase did not save the cancellation request")
+        return run, event
 
     async def ensure_account(self) -> None:
         await self._request("POST", "rpc/ensure_account", payload={})

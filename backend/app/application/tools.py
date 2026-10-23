@@ -156,6 +156,7 @@ class ToolRegistration:
     required_capabilities: frozenset[RuntimeCapability] = frozenset()
     requires_workspace: bool = False
     recovery_policy: ToolRecoveryPolicy = ToolRecoveryPolicy.NEVER
+    recovery_version: str = "v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +216,7 @@ class ToolRegistry:
         self._patch_executor = patch_executor
         self._command_executor = command_executor
         self._generic_executors: dict[str, ToolExecutor] = {}
+        self._recovery_versions = {name: "v1" for name in _LOCAL_CAPABILITIES}
         self._recovery_policies = {
             **{name: ToolRecoveryPolicy.READ_ONLY for name, _description, _model in _DEFINITIONS},
             "apply_patch": ToolRecoveryPolicy.PATCH,
@@ -227,6 +229,9 @@ class ToolRegistry:
         for tool in additional_tools:
             if not tool.name or tool.name in self._requirements:
                 raise ValueError("Tool names must be nonempty and unique")
+            if not tool.recovery_version or len(tool.recovery_version) > 100:
+                raise ValueError("Tools require a bounded recovery version")
+            self._recovery_versions[tool.name] = tool.recovery_version
             self._generic_executors[tool.name] = tool.executor
             self._recovery_policies[tool.name] = tool.recovery_policy
             self._requirements[tool.name] = _ToolRequirements(
@@ -253,6 +258,15 @@ class ToolRegistry:
 
     def recovery_policy(self, name: str) -> ToolRecoveryPolicy:
         return self._recovery_policies.get(name, ToolRecoveryPolicy.NEVER)
+
+    def recovery_versions(self) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            sorted(
+                (name, self._recovery_versions[name])
+                for name in self._definitions
+                if self._capabilities.allows_all(self._requirements[name].required_capabilities)
+            )
+        )
 
     def validate_execution(
         self,

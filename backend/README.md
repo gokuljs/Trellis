@@ -149,3 +149,26 @@ finite reserve. A storage-limit failure stops generation, preserves saved text
 as partial, and leaves earlier event sequences available for reconnect. If tool
 cleanup events cannot fit, the terminal transition closes remaining tool records
 without adding one event per tool. No old events are evicted to make room.
+
+## Restart recovery
+
+After the repository migrations are installed, new runs save a versioned recovery
+contract alongside their existing execution records. Verified account activation
+checks unfinished runs immediately, then checks batches of 20 every five seconds
+while its credential remains valid. Recovery keeps the run ID, original budget
+and deadline, rotates ownership, and permits at most three takeovers. Legacy runs
+without contracts retain their previous interruption behavior.
+
+Explicit folder selections persist under the private account directory, bound to
+the installation and directory identity. Unknown command outcomes block automatic
+writes in that folder until the user acknowledges the original command through
+workspace review. Acknowledgment preserves the unknown outcome and disabled Retry.
+Lost model responses retain partial output and unknown usage without another paid
+attempt. A reconciled patch can still stop if a saved search, listing, or Git
+observation changed and its relationship to that patch cannot be proven.
+
+`make check` with uv 0.12.5 runs formatting, lint, type checking, and all tests,
+including fresh-process crash fixtures. It separately enforces 90% logging
+coverage and 85% coverage of the recovery contract, resolver, discovery, and
+request snapshot modules. The disposable PostgreSQL tests and concurrency
+harnesses in `supabase/tests/` also run in backend CI.

@@ -22,7 +22,12 @@ from app.domain.models import (
     UserProfile,
 )
 from app.domain.outputs import AssistantOutput
-from app.domain.recovery import RecoveryResolution, RecoverySnapshot, WorkspaceRecoveryReference
+from app.domain.recovery import (
+    RecoveryContract,
+    RecoveryResolution,
+    RecoverySnapshot,
+    WorkspaceRecoveryReference,
+)
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -192,6 +197,10 @@ class RecoveryRepository(Protocol):
         self, run_id: str, resolution: RecoveryResolution
     ) -> tuple[RunSnapshot, tuple[RunEvent, ...]]: ...
 
+    async def request_recovery_cancellation(
+        self, run_id: str
+    ) -> tuple[RunSnapshot, RunEvent | None]: ...
+
 
 class RunRepository(Protocol):
     async def create_run(
@@ -206,6 +215,7 @@ class RunRepository(Protocol):
         request_fingerprint: str | None = None,
         submitted_model_id: str | None = None,
         submitted_budget_preset: BudgetPreset | None = None,
+        recovery_contract: RecoveryContract | None = None,
     ) -> RunSnapshot: ...
 
     async def match_run_request(

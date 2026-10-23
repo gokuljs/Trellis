@@ -41,10 +41,11 @@ BEGIN
         RAISE EXCEPTION 'relinquished owner wrote an event';
     EXCEPTION WHEN insufficient_privilege THEN NULL; END;
     ASSERT jsonb_array_length(trellis.mutate('list_recovery_candidates',jsonb_build_object('installation_id',contract->>'installation_id'),NULL))=1;
-    ASSERT trellis.mutate('list_recovery_candidates','{"installation_id":"different"}',NULL)='[]'::jsonb;
+    ASSERT jsonb_array_length(trellis.mutate('list_recovery_candidates','{"installation_id":"different"}',NULL))=1,
+        'expired foreign installations must be discovered for policy rejection';
     again:=trellis.mutate('claim_recovery',jsonb_build_object('run_id',r#>>'{run,id}',
-        'installation_id','different','expected_generation',0),repeat('b',32));
-    ASSERT again->>'rejection_reason'='installation_mismatch';
+        'installation_id','different','expected_generation',1),repeat('b',32));
+    ASSERT again->>'rejection_reason'='generation_changed';
     BEGIN
         PERFORM trellis.mutate('claim_recovery',jsonb_build_object('run_id',r#>>'{run,id}',
             'installation_id',contract->>'installation_id','expected_generation',0),NULL);

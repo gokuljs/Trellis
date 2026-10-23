@@ -8,7 +8,7 @@ from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, NotRequired, TypedDict, cast
 from uuid import uuid4
 
 from app.application.budgets import (
@@ -50,10 +50,11 @@ from app.application.tools import (
     ToolRegistry,
 )
 from app.domain.capabilities import DEFAULT_RUNTIME_CAPABILITIES, RuntimeCapabilities
-from app.domain.models import ModelDescriptor
+from app.domain.models import ModelDescriptor, Session
 from app.domain.recovery import (
     RecoveryAction,
     RecoveryCompatibility,
+    RecoveryContract,
     RecoveryResolution,
     RecoverySnapshot,
     ToolRecoveryPolicy,
@@ -88,6 +89,14 @@ MAX_OUTPUT_TOKENS = 4096
 DEFAULT_LEASE_RENEW_INTERVAL_SECONDS = 30.0
 MAX_MODEL_RESPONSE_BYTES = 256_000
 MAX_CONTINUATION_BYTES = 256_000
+
+
+class _RunCreationOptions(TypedDict):
+    budget_preset: BudgetPreset
+    request_fingerprint: str
+    submitted_model_id: str | None
+    submitted_budget_preset: BudgetPreset | None
+    recovery_contract: NotRequired[RecoveryContract]
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +226,10 @@ class RunService:
         recovery_repository: RecoveryRepository | None = None,
         recovery_compatibility: Callable[[RunSnapshot], Awaitable[RecoveryCompatibility]]
         | None = None,
+        recovery_contract_factory: Callable[
+            [Session, str, ModelDescriptor], Awaitable[RecoveryContract]
+        ]
+        | None = None,
     ) -> None:
         if lease_renew_interval_seconds <= 0:
             raise ValueError("lease renewal interval must be positive")
@@ -224,6 +237,7 @@ class RunService:
             raise ValueError("recovery repository and compatibility must be configured together")
         self._recovery_repository = recovery_repository
         self._recovery_compatibility = recovery_compatibility
+        self._recovery_contract_factory = recovery_contract_factory
         self._recovery_pending: set[str] = set()
         self._runs = runs
         self._sessions = sessions
@@ -405,16 +419,23 @@ class RunService:
 
             reservation = self._capacity.reserve(self._owner_id, session.id, client_request_id)
             try:
+                options: _RunCreationOptions = {
+                    "budget_preset": selected_budget,
+                    "request_fingerprint": fingerprint,
+                    "submitted_model_id": model_id,
+                    "submitted_budget_preset": budget_preset,
+                }
+                if self._recovery_contract_factory is not None:
+                    options["recovery_contract"] = await self._recovery_contract_factory(
+                        session, client_request_id, model
+                    )
                 run = await self._runs.create_run(
                     session.id,
                     resolved_turn_id,
                     client_request_id,
                     normalized_content,
                     model,
-                    budget_preset=selected_budget,
-                    request_fingerprint=fingerprint,
-                    submitted_model_id=model_id,
-                    submitted_budget_preset=budget_preset,
+                    **options,
                 )
             except ValueError as error:
                 self._capacity.release(reservation)
@@ -1079,6 +1100,17 @@ class RunService:
         return await self._runs.list_run_events(run_id, after_sequence, limit=limit)
 
     async def cancel_run(self, run_id: str) -> RunSnapshot:
+        if self._recovery_repository is not None and not self._can_execute(run_id):
+            existing = await self._runs.get_run(run_id)
+            if existing is None:
+                raise ApplicationError("run_not_found", "Run not found.")
+            if is_terminal_run_status(existing.status):
+                return existing
+            if existing.recovery_contract is not None:
+                run, event = await self._recovery_repository.request_recovery_cancellation(run_id)
+                if event is not None:
+                    await self._publish(event)
+                return run
         await self._require_local_control(run_id)
         try:
             run, event = await self._runs.request_run_cancellation(run_id)

@@ -92,3 +92,5 @@ jobs:
           bash supabase/tests/recovery_review_concurrency.sh
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/execution_recovery.sql
           bash supabase/tests/execution_recovery_concurrency.sh
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/reconnect_recovery.sql
+          bash supabase/tests/reconnect_recovery_concurrency.sh

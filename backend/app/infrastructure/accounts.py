@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import errno
 import os
 import stat
@@ -25,12 +26,15 @@ from app.application.ports import (
     ContextCheckpointRepository,
     OnboardingRepository,
     ProviderAdapter,
+    RecoveryRepository,
     RunLeasePort,
     RunRepository,
     SecretStorePort,
     StreamingProviderAdapter,
 )
 from app.application.profile import ProfileService
+from app.application.recovery_contracts import RecoveryContracts
+from app.application.recovery_discovery import RecoveryDiscovery
 from app.application.run_capacity import RunCapacity
 from app.application.runs import RunService
 from app.application.secret_redaction import SecretRedactor
@@ -58,6 +62,7 @@ class AccountRepository(
     ChatRepository,
     ContextCheckpointRepository,
     OnboardingRepository,
+    RecoveryRepository,
     RunRepository,
     RunLeasePort,
     Protocol,
@@ -84,6 +89,7 @@ class AccountContext:
     event_hub: RuntimeEventHub
     workspace_bindings: LocalWorkspaceBindings | None = None
     workspace_execution: LocalWorkspaceExecution | None = None
+    recovery_discovery: RecoveryDiscovery | None = None
 
 
 def _prepare_account_directory(data_dir: Path, user_id: UUID) -> Path:
@@ -156,8 +162,8 @@ def _installation_identity(data_dir: Path) -> InstallationIdentity:
         return InstallationIdentity.load(directory)
     except OSError, RuntimeError, ValueError:
         raise ApplicationError(
-            "workspace_grant_unavailable",
-            "Trellis could not securely load folder permissions. "
+            "installation_identity_unavailable",
+            "Trellis could not securely load its local recovery identity. "
             "Check local storage and try again.",
         ) from None
 
@@ -204,8 +210,32 @@ class AccountRegistry:
         self._active_gets: dict[UUID, int] = {}
         self._gets_idle = asyncio.Event()
         self._gets_idle.set()
+        self._installation: InstallationIdentity | None = None
+        self._installation_lock = asyncio.Lock()
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
+
+    async def _get_installation(self) -> InstallationIdentity:
+        async with self._installation_lock:
+            if self._installation is None:
+                task = asyncio.create_task(
+                    asyncio.to_thread(_installation_identity, self._settings.data_dir),
+                    context=contextvars.Context(),
+                )
+                try:
+                    self._installation = await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    while not task.done():
+                        try:
+                            await asyncio.shield(task)
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:
+                            break
+                    if not task.cancelled():
+                        task.exception()
+                    raise
+            return self._installation
 
     async def get(
         self,
@@ -228,6 +258,10 @@ class AccountRegistry:
             token_source.record_verified(access_token, user_id, expires_at)
             existing = self._contexts.get(user_id)
             if existing is not None:
+                if existing.recovery_discovery is not None:
+                    existing.recovery_discovery.activate(
+                        authentication_revision=token_source.revision
+                    )
                 return existing
             account_lock = self._account_locks.setdefault(user_id, asyncio.Lock())
             self._active_gets[user_id] = self._active_gets.get(user_id, 0) + 1
@@ -239,6 +273,10 @@ class AccountRegistry:
                     raise RuntimeError("Account registry is closed")
                 existing = self._contexts.get(user_id)
                 if existing is not None:
+                    if existing.recovery_discovery is not None:
+                        existing.recovery_discovery.activate(
+                            authentication_revision=token_source.revision
+                        )
                     return existing
 
                 account_dir = await asyncio.to_thread(
@@ -261,12 +299,10 @@ class AccountRegistry:
                     await database.ensure_account()
                     secret_store = self._credentials
                     event_hub = RuntimeEventHub()
+                    installation = await self._get_installation()
                     workspace_bindings = None
                     workspace_execution = None
                     if self._capabilities.workspace_enabled:
-                        installation = await asyncio.to_thread(
-                            _installation_identity, self._settings.data_dir
-                        )
                         workspace_bindings = LocalWorkspaceBindings(
                             WorkspaceGrantStore(account_dir, str(user_id), installation)
                         )
@@ -295,6 +331,14 @@ class AccountRegistry:
                             redactor=self._redactor,
                         )
                     )
+                    recovery_contracts = RecoveryContracts(
+                        installation_id=installation.installation_id,
+                        sessions=database,
+                        tools=tools,
+                        bindings=workspace_bindings,
+                        capabilities=self._capabilities,
+                        adapter_kinds=frozenset(self._runtime_providers),
+                    )
                     run_service = RunService(
                         database,
                         database,
@@ -314,9 +358,17 @@ class AccountRegistry:
                         lease_repository=database,
                         capacity=self._run_capacity,
                         owner_id=str(user_id),
+                        recovery_repository=database,
+                        recovery_compatibility=recovery_contracts.compatibility,
+                        recovery_contract_factory=recovery_contracts.create,
                     )
                     try:
-                        await run_service.resume_decided_approvals()
+                        recovery_discovery = RecoveryDiscovery(
+                            database,
+                            run_service,
+                            installation.installation_id,
+                            lambda: token_source.valid_for(10),
+                        )
                         context = AccountContext(
                             database=database,
                             secret_store=secret_store,
@@ -352,6 +404,7 @@ class AccountRegistry:
                             event_hub=event_hub,
                             workspace_bindings=workspace_bindings,
                             workspace_execution=workspace_execution,
+                            recovery_discovery=recovery_discovery,
                         )
                     except BaseException:
                         await run_service.close()
@@ -363,6 +416,7 @@ class AccountRegistry:
                 self._locks[user_id] = lock_descriptor
                 if self._closed:
                     raise RuntimeError("Account registry is closed")
+                recovery_discovery.activate(authentication_revision=token_source.revision)
                 return context
         finally:
             remaining = self._active_gets[user_id] - 1
@@ -385,6 +439,13 @@ class AccountRegistry:
         await asyncio.shield(close_task)
 
     async def _finish_close(self) -> None:
+        await asyncio.gather(
+            *(
+                context.recovery_discovery.close()
+                for context in tuple(self._contexts.values())
+                if context.recovery_discovery is not None
+            )
+        )
         await self._gets_idle.wait()
         async with self._lock:
             contexts = tuple(self._contexts.values())
@@ -393,6 +454,13 @@ class AccountRegistry:
             locks = tuple(self._locks.values())
             self._locks.clear()
         try:
+            await asyncio.gather(
+                *(
+                    context.recovery_discovery.close()
+                    for context in contexts
+                    if context.recovery_discovery is not None
+                )
+            )
             results = await asyncio.gather(
                 *(context.run_service.close() for context in contexts), return_exceptions=True
             )
