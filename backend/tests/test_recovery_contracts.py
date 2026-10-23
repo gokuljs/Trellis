@@ -203,6 +203,13 @@ def tool_snapshot(
         None,
         dispatch_attempt=1 if status is ToolCallStatus.RUNNING else 0,
         dispatched_at="now" if status is ToolCallStatus.RUNNING else None,
+        dispatch_id=str(uuid4()) if status is ToolCallStatus.RUNNING else None,
+        dispatch_generation=0 if status is ToolCallStatus.RUNNING else None,
+        input_snapshot=(
+            {"arguments": {"path": "file.txt"}, "approval_preview": None}
+            if status is ToolCallStatus.RUNNING
+            else None
+        ),
         recovery_policy=policy,
     )
     return snapshot(model_calls=(call,), run_messages=(assistant,), tool_calls=(tool,))
@@ -243,10 +250,56 @@ def test_dispatched_reads_have_only_one_bounded_retry() -> None:
     assert decision.reason == "read_retry_exhausted"
 
 
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"dispatch_id": None},
+        {"dispatch_generation": None},
+        {"dispatch_generation": 1},
+        {"dispatched_at": None},
+        {"input_snapshot": None},
+        {"input_snapshot": {"arguments": {"path": "another.txt"}, "approval_preview": None}},
+    ],
+)
+def test_dispatched_tool_evidence_must_match_the_canonical_operation(changed) -> None:
+    state = tool_snapshot(status=ToolCallStatus.RUNNING)
+    damaged = replace(state.tool_calls[0], **changed)
+    resolution = resolve_recovery(replace(state, tool_calls=(damaged,)), COMPATIBILITY, NOW)
+    assert resolution.reason == "inconsistent_execution_records"
+
+
 def test_dispatched_patch_requires_reconciliation_before_execution() -> None:
     decision = resolve_recovery(tool_snapshot("patch", ToolCallStatus.RUNNING), COMPATIBILITY, NOW)
     assert decision.action is RecoveryAction.RECONCILE_PATCH
     assert decision.tool_call_id == "tool"
+
+
+@pytest.mark.parametrize(
+    ("policy", "action"),
+    [
+        ("read_only", RecoveryAction.RETRY_READ_TOOL),
+        ("patch", RecoveryAction.RECONCILE_PATCH),
+    ],
+)
+def test_authorized_retry_requires_fresh_validation_after_another_restart(
+    policy: str, action: RecoveryAction
+) -> None:
+    state = tool_snapshot(policy, ToolCallStatus.RUNNING)
+    pending = replace(state.tool_calls[0], status=ToolCallStatus.PENDING)
+    decision = resolve_recovery(replace(state, tool_calls=(pending,)), COMPATIBILITY, NOW)
+    assert decision.action is action
+
+
+@pytest.mark.parametrize("status", [ToolCallStatus.RUNNING, ToolCallStatus.PENDING])
+def test_workspace_loss_with_dispatched_patch_preserves_uncertainty(status: ToolCallStatus) -> None:
+    state = tool_snapshot("patch", ToolCallStatus.RUNNING)
+    patch = replace(state.tool_calls[0], status=status)
+    decision = resolve_recovery(
+        replace(state, tool_calls=(patch,)), replace(COMPATIBILITY, workspace=None), NOW
+    )
+    assert decision.reason == "workspace_unavailable"
+    assert decision.tool_call_id == patch.id
+    assert decision.retry_allowed is False
 
 
 @pytest.mark.parametrize("policy", ["command", "never", "unknown_new_tool"])
@@ -374,6 +427,9 @@ def test_later_command_cannot_be_dispatched_before_an_earlier_pending_tool() -> 
         status=ToolCallStatus.RUNNING,
         dispatch_attempt=1,
         dispatched_at="now",
+        dispatch_id=str(uuid4()),
+        dispatch_generation=0,
+        input_snapshot={"arguments": state.tool_calls[0].arguments, "approval_preview": None},
         recovery_policy="command",
     )
     declarations = (

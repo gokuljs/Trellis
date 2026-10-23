@@ -42,7 +42,7 @@ from app.domain.models import (
     UserProfile,
 )
 from app.domain.outputs import AssistantOutput, validate_assistant_batch
-from app.domain.recovery import RecoveryContract, RecoverySnapshot
+from app.domain.recovery import RecoveryContract, RecoveryResolution, RecoverySnapshot
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -1448,7 +1448,7 @@ class SupabaseRepository:
     ) -> ModelCallRecord:
         if step_index < 1:
             raise ValueError("model call step index must be positive")
-        result = await self._rpc(
+        result = await self._idempotent_rpc(
             "create_model_call",
             {
                 "run_id": run_id,
@@ -1459,7 +1459,12 @@ class SupabaseRepository:
             capability=self._run_capability(run_id),
         )
         call = self._model_call(_object(result))
-        if call.run_id != run_id:
+        if (
+            call.run_id != run_id
+            or call.step_index != step_index
+            or call.model_id != model.id
+            or call.request_snapshot != request_snapshot
+        ):
             raise RuntimeError("Supabase returned a model call from another run")
         self._model_call_runs[call.id] = run_id
         return call
@@ -2000,9 +2005,21 @@ class SupabaseRepository:
         claimed = self._run(_object(result.get("run")))
         if claimed.id != run.id:
             raise RuntimeError("Supabase returned another recovery candidate")
+        reason = _nullable_text(result, "rejection_reason")
         if result.get("lease_acquired") is True:
+            if claimed.generation != run.generation + 1 or claimed.status not in {
+                RunStatus.RECOVERING,
+                RunStatus.CANCELLING,
+            }:
+                raise RuntimeError("Supabase returned an inconsistent recovery takeover")
             self._record_lease(claimed, capability)
-        return claimed, _nullable_text(result, "rejection_reason")
+            if not self.owns_run_lease(claimed.id):
+                raise ApplicationError(
+                    "run_lease_lost", "The recovery ownership expired in transit."
+                )
+        elif reason is None:
+            raise RuntimeError("Supabase did not confirm recovery ownership")
+        return claimed, reason
 
     async def relinquish_run(self, run_id: str) -> RunSnapshot:
         result = await self._rpc(
@@ -2014,11 +2031,51 @@ class SupabaseRepository:
 
     async def finish_recovery(self, run_id: str) -> tuple[RunSnapshot, RunEvent]:
         result = _object(
-            await self._rpc(
+            await self._idempotent_rpc(
                 "finish_recovery", {"run_id": run_id}, capability=self._run_capability(run_id)
             )
         )
-        return self._run(_object(result.get("run"))), self._event(_object(result.get("event")))
+        run, event = (
+            self._run(_object(result.get("run"))),
+            self._event(_object(result.get("event"))),
+        )
+        if run.id != run_id or event.run_id != run_id:
+            raise RuntimeError("Supabase returned another recovery completion")
+        return run, event
+
+    async def stop_recovery(
+        self, run_id: str, resolution: RecoveryResolution
+    ) -> tuple[RunSnapshot, tuple[RunEvent, ...]]:
+        result = _object(
+            await self._idempotent_rpc(
+                "stop_recovery",
+                {
+                    "run_id": run_id,
+                    "reason": resolution.reason,
+                    "retry_allowed": resolution.retry_allowed,
+                    "usage_unknown": resolution.usage_unknown,
+                    "model_call_id": resolution.model_call_id,
+                    "tool_call_id": resolution.tool_call_id,
+                },
+                capability=self._run_capability(run_id),
+            )
+        )
+        run = self._run(_object(result.get("run")))
+        events = tuple(self._event(row) for row in _array(result.get("events")))
+        if (
+            run.id != run_id
+            or run.status
+            not in {
+                RunStatus.COMPLETED,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+                RunStatus.INTERRUPTED,
+            }
+            or any(event.run_id != run_id for event in events)
+        ):
+            raise RuntimeError("Supabase returned another recovery stop")
+        self._drop_lease(run_id)
+        return run, events
 
     async def read_recovery_snapshot(self, run_id: str) -> RecoverySnapshot:
         result = _object(

@@ -324,6 +324,28 @@ def _consistent(snapshot: RecoverySnapshot) -> bool:
             tool.dispatch_attempt < 1 or tool.dispatched_at is None
         ):
             return False
+        if tool.dispatch_attempt > 0 and (
+            tool.dispatch_id is None
+            or tool.dispatch_generation is None
+            or not 0 <= tool.dispatch_generation <= run.generation
+            or tool.dispatched_at is None
+            or tool.input_snapshot is None
+            or tool.input_snapshot.get("arguments") != tool.arguments
+            or tool.input_snapshot.get("approval_preview") != tool.approval_preview
+        ):
+            return False
+        if (
+            tool.dispatch_attempt > 0
+            and tool.status
+            not in {
+                ToolCallStatus.PENDING,
+                ToolCallStatus.RUNNING,
+                ToolCallStatus.OUTCOME_UNKNOWN,
+            }
+            and tool.recovery_policy in {"read_only", "patch", "command"}
+            and tool.result_snapshot is None
+        ):
+            return False
     if any(tool_id not in tools for tool_id in tool_results):
         return False
     unfinished = False
@@ -380,7 +402,7 @@ def _tool_resolution(tool: ToolCallRecord) -> RecoveryResolution:
         return RecoveryResolution(
             RecoveryAction.STOP, "tool_outcome_unknown", tool_call_id=tool.id, retry_allowed=False
         )
-    if tool.status is ToolCallStatus.RUNNING:
+    if tool.status is ToolCallStatus.RUNNING or tool.dispatch_attempt > 0:
         if policy is ToolRecoveryPolicy.READ_ONLY and tool.dispatch_attempt == 1:
             return RecoveryResolution(
                 RecoveryAction.RETRY_READ_TOOL, "retry_interrupted_read", tool_call_id=tool.id
@@ -424,8 +446,9 @@ def resolve_recovery(
             for tool in snapshot.tool_calls
             if tool.status is ToolCallStatus.OUTCOME_UNKNOWN
             or (
-                tool.status is ToolCallStatus.RUNNING
-                and tool.recovery_policy not in {"read_only", "patch"}
+                tool.status in {ToolCallStatus.RUNNING, ToolCallStatus.PENDING}
+                and tool.dispatch_attempt > 0
+                and tool.recovery_policy != "read_only"
             )
         ),
         None,

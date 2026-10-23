@@ -7,11 +7,12 @@ from uuid import UUID
 
 import httpx
 import pytest
-from run_fixtures import model_record, run_record
+from run_fixtures import MODEL, model_record, run_record
 
 from app.application.errors import ApplicationError
 from app.core.config import Settings
 from app.domain.context import CheckpointSource, ContextCheckpointDraft
+from app.domain.recovery import RecoveryAction, RecoveryResolution
 from app.infrastructure.supabase_repository import SupabaseRepository, VerifiedTokenSource
 
 
@@ -70,6 +71,66 @@ def test_legacy_run_has_no_implicit_recovery_contract() -> None:
     assert repo._run(row).recovery_contract is None
 
 
+def test_recovery_stop_retries_the_same_unknown_outcome_without_retaining_ownership() -> None:
+    async def scenario():
+        repo, run = repository(), run_record()
+        row = asdict(run)
+        row.update(
+            user_id=str(repo._user_id),
+            chat_id=row.pop("session_id"),
+            status="interrupted",
+            recovery_reason="model_outcome_unknown",
+        )
+        repo._capabilities[run.id] = "same-capability"
+        repo._lease_expires[run.id] = datetime.now(UTC) + timedelta(minutes=1)
+        repo._rpc = AsyncMock(
+            side_effect=[
+                ApplicationError("database_unavailable", "Lost stop acknowledgment"),
+                {"run": row, "events": []},
+            ]
+        )
+        try:
+            stopped, _ = await repo.stop_recovery(
+                run.id,
+                RecoveryResolution(
+                    RecoveryAction.STOP,
+                    "model_outcome_unknown",
+                    model_call_id="dispatched-call",
+                    usage_unknown=True,
+                ),
+            )
+            assert stopped.recovery_reason == "model_outcome_unknown"
+            assert not repo.owns_run_lease(run.id)
+            assert repo._rpc.await_args_list[0] == repo._rpc.await_args_list[1]
+        finally:
+            await repo._client.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_model_allocation_retries_the_same_saved_request_after_lost_acknowledgment() -> None:
+    async def scenario():
+        repo, call = repository(), model_record()
+        row = asdict(call)
+        row.update(user_id=str(repo._user_id))
+        row["cached_read_tokens"] = row.pop("cached_tokens")
+        repo._capabilities[call.run_id] = "same-capability"
+        repo._lease_expires[call.run_id] = datetime.now(UTC) + timedelta(minutes=1)
+        repo._rpc = AsyncMock(
+            side_effect=[ApplicationError("database_unavailable", "Lost allocation reply"), row]
+        )
+        try:
+            saved = await repo.create_model_call(
+                call.run_id, call.step_index, MODEL, call.request_snapshot
+            )
+            assert saved.id == call.id
+            assert repo._rpc.await_args_list[0] == repo._rpc.await_args_list[1]
+        finally:
+            await repo._client.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_lost_claim_acknowledgment_retries_the_identical_ownership_capability() -> None:
     async def exercise() -> None:
         repo = repository()
@@ -91,6 +152,46 @@ def test_lost_claim_acknowledgment_retries_the_identical_ownership_capability() 
         await repo._client.aclose()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "invalid", [None, "cancelling", "confirmation", "generation", "status", "expiry"]
+)
+def test_only_a_confirmed_current_takeover_installs_a_local_owner(invalid) -> None:
+    async def scenario():
+        repo, run = repository(), run_record()
+        row = asdict(run)
+        row.update(
+            user_id=str(repo._user_id),
+            chat_id=row.pop("session_id"),
+            status=(
+                "running"
+                if invalid == "status"
+                else "cancelling"
+                if invalid == "cancelling"
+                else "recovering"
+            ),
+            generation=0 if invalid == "generation" else 1,
+            lease_expires_at=(
+                datetime.now(UTC) + timedelta(minutes=-1 if invalid == "expiry" else 1)
+            ).isoformat(),
+        )
+        repo._rpc = AsyncMock(
+            return_value={"run": row, "lease_acquired": invalid != "confirmation"}
+        )
+        try:
+            if invalid not in {None, "cancelling"}:
+                with pytest.raises((RuntimeError, ApplicationError)):
+                    await repo.claim_recovery(run, "installation")
+                assert not repo.owns_run_lease(run.id)
+            else:
+                claimed, reason = await repo.claim_recovery(run, "installation")
+                assert claimed.generation == 1 and reason is None
+                assert repo.owns_run_lease(run.id)
+        finally:
+            await repo._client.aclose()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("wrong_result", [False, True])

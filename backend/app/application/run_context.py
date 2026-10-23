@@ -30,6 +30,7 @@ from app.application.context_budget import (
 from app.application.errors import ApplicationError, ProviderError
 from app.application.execution_snapshots import (
     bounded_snapshot,
+    generation_snapshot,
     plan_snapshot,
     request_snapshot,
     restore_context_plan,
@@ -62,6 +63,7 @@ from app.domain.context import (
     NativeCompactionResult,
 )
 from app.domain.models import ModelDescriptor
+from app.domain.recovery import RecoverySnapshot
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -76,6 +78,7 @@ from app.domain.runtime import (
 
 Totals = Callable[[str, list[ModelCallRecord]], tuple[int, float | None]]
 Publish = Callable[[RunEvent], Awaitable[None]]
+BeforeDispatch = Callable[[RunSnapshot], Awaitable[None]]
 logger = logging.getLogger(__name__)
 
 
@@ -308,6 +311,8 @@ class RunContext:
         totals: Totals,
         publish: Publish,
         redactor: SecretRedactor,
+        *,
+        before_dispatch: BeforeDispatch | None = None,
     ) -> None:
         self.runs = runs
         self.sessions = sessions
@@ -315,6 +320,7 @@ class RunContext:
         self.totals = totals
         self.publish = publish
         self.redactor = redactor
+        self.before_dispatch = before_dispatch
 
     async def prepare(
         self,
@@ -340,6 +346,262 @@ class RunContext:
             guidance=guidance,
             tools=tools,
         )
+
+    def _restore_generation_plan(self, run: RunSnapshot, call: ModelCallRecord) -> ContextPreflight:
+        try:
+            plan = restore_context_plan(call.request_snapshot.get("generation_plan"), run)
+            request = restore_model_request(call.request_snapshot, run)
+            saved = generation_snapshot(plan, redactor=self.redactor)
+        except (ValueError, TypeError, AttributeError) as error:
+            raise ApplicationError(
+                "inconsistent_execution_records", "The saved generation request is invalid."
+            ) from error
+        if (
+            call.run_id != run.id
+            or call.request_snapshot != saved
+            or request != plan.request
+            or plan.output_reserve_tokens != request.max_output_tokens
+            or not plan.fits
+            or plan.needs_compaction
+        ):
+            raise ApplicationError(
+                "inconsistent_execution_records", "The saved generation request is inconsistent."
+            )
+        return plan
+
+    def validate_recovery_inputs(
+        self,
+        run: RunSnapshot,
+        call: ModelCallRecord,
+        *,
+        workspace_root: Path | None,
+        guidance: str | None,
+        tools: tuple[ModelToolSpec, ...],
+        snapshot: RecoverySnapshot,
+    ) -> None:
+        plan = self._restore_generation_plan(run, call)
+        request = plan.request
+        if (
+            snapshot.run.id != run.id
+            or snapshot.run.generation != run.generation
+            or snapshot.run.recovery_contract != run.recovery_contract
+            or call not in snapshot.model_calls
+        ):
+            raise ApplicationError(
+                "inconsistent_execution_records", "The recovery snapshot belongs to another run."
+            )
+        checkpoint = max(snapshot.context_checkpoints, key=lambda item: item.revision, default=None)
+        if snapshot.context_revision != (checkpoint.revision if checkpoint else 0):
+            raise ApplicationError(
+                "inconsistent_execution_records", "The saved context revision is inconsistent."
+            )
+        visible = list(snapshot.messages)
+        exchange = list(snapshot.run_messages)
+        if call.status is ModelCallStatus.COMPLETED:
+            assistants = [
+                message
+                for message in exchange
+                if message.role == "assistant" and message.model_call_id == call.id
+            ]
+            if len(assistants) != 1:
+                raise ApplicationError(
+                    "inconsistent_execution_records",
+                    "The saved model response has no unique message.",
+                )
+            exchange = [message for message in exchange if message.ordinal < assistants[0].ordinal]
+        elif call.status is not ModelCallStatus.PENDING:
+            raise ApplicationError(
+                "inconsistent_execution_records", "The saved generation is not recoverable."
+            )
+        if (checkpoint.id if checkpoint else None) != plan.checkpoint_id:
+            raise ApplicationError(
+                "context_checkpoint_conflict", "Context changed before recovery could continue."
+            )
+        if (
+            not any(message.id == run.input_message_id for message in visible)
+            or len({message.id for message in visible}) != len(visible)
+            or any(message.session_id != run.session_id for message in visible)
+        ):
+            raise ApplicationError(
+                "inconsistent_execution_records", "The saved generation sources are inconsistent."
+            )
+        if checkpoint is not None and checkpoint.run_id == run.id:
+            exchange = [
+                message
+                for message in exchange
+                if message.ordinal > checkpoint.covered_run_message_ordinal
+            ]
+        context = build_model_context(
+            visible,
+            exchange,
+            workspace_root=workspace_root,
+            workspace_guidance=guidance,
+            run_tool_calls=snapshot.tool_calls,
+            tools=tools,
+            redactor=self.redactor,
+        )
+        rebuilt = ModelRequest(
+            run.provider_id,
+            run.model_id,
+            run.adapter_kind,
+            run.upstream_model_id,
+            context.messages,
+            request.max_output_tokens,
+            context.system_instructions,
+            context.tools,
+        )
+        items = tuple(
+            ContextItem(source.id, source.turn_id, message, source.id == run.input_message_id)
+            for source, message in zip(
+                sorted(visible, key=lambda value: (value.ordinal, value.id)),
+                context.messages[: len(visible)],
+                strict=True,
+            )
+        ) + tuple(
+            ContextItem(source.id, run.turn_id, message, source_kind="run_message")
+            for source, message in zip(
+                sorted(exchange, key=lambda value: (value.ordinal, value.id)),
+                context.messages[len(visible) :],
+                strict=True,
+            )
+        )
+        if checkpoint is not None:
+            replay = replay_checkpoint(
+                checkpoint,
+                rebuilt,
+                instruction_hash=_hash(
+                    {
+                        "system": context.system_instructions,
+                        "tools": [asdict(tool) for tool in context.tools],
+                    }
+                ),
+                workspace_hash=_hash(
+                    {"root": str(workspace_root) if workspace_root else None, "guidance": guidance}
+                ),
+                allow_native=request.native_context_json is not None,
+            )
+            if request.native_context_json is not None:
+                if replay.native_payload_json is None:
+                    raise ApplicationError(
+                        "recovery_inputs_changed", "The saved native context is unavailable."
+                    )
+                rebuilt = replace(rebuilt, native_context_json=replay.native_payload_json)
+            else:
+                assert replay.message is not None
+                items = (
+                    ContextItem(
+                        checkpoint.id,
+                        "checkpoint:" + checkpoint.id,
+                        replay.message,
+                        source_kind="checkpoint",
+                    ),
+                    *items,
+                )
+        items = normalize_context_items(items)
+        rebuilt = replace(rebuilt, messages=tuple(item.message for item in items))
+        if rebuilt != request or items != plan.sources:
+            raise ApplicationError(
+                "recovery_inputs_changed", "The saved generation inputs have changed."
+            )
+
+    async def validate_saved_generation(
+        self,
+        run: RunSnapshot,
+        model: ModelDescriptor,
+        profile: ModelProfile,
+        provider: StreamingProviderAdapter,
+        api_key: str,
+        user_id: str,
+        call: ModelCallRecord,
+        *,
+        workspace_root: Path | None,
+        guidance: str | None,
+        tools: tuple[ModelToolSpec, ...],
+        snapshot: RecoverySnapshot | None = None,
+    ) -> ContextPreflight:
+        plan = self._restore_generation_plan(run, call)
+        request = plan.request
+        if (
+            call.status is not ModelCallStatus.PENDING
+            or (model.id, model.provider_id, model.adapter_kind, model.upstream_model_id)
+            != (run.model_id, run.provider_id, run.adapter_kind, run.upstream_model_id)
+            or (
+                request.native_context_json is not None
+                and profile.supports_native_compaction is not True
+            )
+        ):
+            raise ApplicationError(
+                "inconsistent_execution_records", "The saved generation request is inconsistent."
+            )
+        if snapshot is None:
+            window = await self.checkpoints.load_context_window(run.session_id)
+            visible = list(window.messages)
+            if not any(message.id == run.input_message_id for message in visible):
+                visible.extend(
+                    message
+                    for message in await cast(ChatRepository, self.sessions).get_turn_messages(
+                        run.session_id, run.turn_id
+                    )
+                    if message.id == run.input_message_id
+                )
+            snapshot = RecoverySnapshot(
+                run,
+                model_calls=tuple(await self.runs.list_model_calls(run.id)),
+                tool_calls=tuple(await self.runs.list_tool_calls(run.id)),
+                run_messages=tuple(await self.runs.list_run_messages(run.id)),
+                messages=tuple(visible),
+                context_checkpoints=(window.checkpoint,) if window.checkpoint else (),
+                context_revision=window.checkpoint.revision if window.checkpoint else 0,
+            )
+        self.validate_recovery_inputs(
+            run,
+            call,
+            workspace_root=workspace_root,
+            guidance=guidance,
+            tools=tools,
+            snapshot=snapshot,
+        )
+        calls = list(snapshot.model_calls)
+        if (
+            not calls
+            or max(calls, key=lambda item: item.step_index) != call
+            or len(calls) != call.step_index
+        ):
+            raise ApplicationError(
+                "inconsistent_execution_records", "The saved model-call sequence is inconsistent."
+            )
+        if len(calls) > run.max_model_calls:
+            raise ProviderError("model_call_limit", "The run reached its model-call limit.")
+        tokens, cost = self.totals(run.model_id, [item for item in calls if item.id != call.id])
+        if cost is None:
+            raise ApplicationError(
+                "run_usage_unknown", "The remaining run budget cannot be verified."
+            )
+        refreshed = await self._preflight(
+            run,
+            provider,
+            api_key,
+            user_id,
+            request,
+            items=plan.sources,
+            profile=profile,
+            remaining_run_tokens=run.max_total_tokens - tokens,
+            remaining_run_cost_usd=run.max_cost_usd - cost,
+            checkpoint_id=plan.checkpoint_id,
+            pricing_context_tokens=max(
+                plan.pricing_context_tokens,
+                max(
+                    (item.draft.pricing_context_tokens for item in snapshot.context_checkpoints),
+                    default=0,
+                ),
+                self._pricing_highwater(profile, calls),
+            ),
+        )
+        if refreshed.request != request or not refreshed.fits or refreshed.needs_compaction:
+            raise ApplicationError(
+                "run_budget_exhausted", "The saved request exceeds its original remaining budget."
+            )
+        return refreshed
 
     async def _prepare(
         self,
@@ -1138,6 +1400,8 @@ class RunContext:
             )
             try:
                 async with asyncio.timeout(_remaining(run)):
+                    if self.before_dispatch is not None:
+                        await self.before_dispatch(run)
                     result = await cast(NativeCompactingProvider, provider).compact(
                         plan.request, api_key, user_id
                     )
@@ -1236,6 +1500,8 @@ class RunContext:
             )
             return None
         except BaseException as error:
+            if run.recovery_contract is not None and call.status is ModelCallStatus.STREAMING:
+                raise
             if not committing and call.status in {
                 ModelCallStatus.PENDING,
                 ModelCallStatus.STREAMING,
@@ -1416,6 +1682,8 @@ class RunContext:
                     {"phase": "compacting", "model_call_id": call.id},
                 )
             )
+            if self.before_dispatch is not None:
+                await self.before_dispatch(run)
             result = await summarize_prefix(
                 provider,
                 request,
@@ -1499,6 +1767,8 @@ class RunContext:
                 await self.publish(event)
             return result.text, call, checkpoint
         except BaseException as error:
+            if run.recovery_contract is not None and call.status is ModelCallStatus.STREAMING:
+                raise
             status = (
                 ModelCallStatus.CANCELLED
                 if isinstance(error, asyncio.CancelledError)

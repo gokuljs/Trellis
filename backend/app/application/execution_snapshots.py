@@ -7,6 +7,8 @@ from dataclasses import asdict
 from typing import Literal, cast
 
 from app.application.context_budget import input_fingerprint
+from app.application.errors import ApplicationError
+from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
 from app.domain.context import ContextItem, ContextPreflight
 from app.domain.runtime import (
     ModelContinuationItem,
@@ -144,6 +146,23 @@ def plan_snapshot(plan: ContextPreflight) -> dict[str, object]:
     return result
 
 
+def generation_snapshot(
+    plan: ContextPreflight, *, redactor: SecretRedactor = COMMON_SECRET_REDACTOR
+) -> dict[str, object]:
+    result = {
+        **request_snapshot(plan.request),
+        "purpose": "generation",
+        "context": plan.snapshot(),
+        "generation_plan": plan_snapshot(plan),
+    }
+    bounded_snapshot(result)
+    if redactor.redact_record(result) != result:
+        raise ApplicationError(
+            "recovery_inputs_sensitive", "The prepared request contains unsafe saved credentials."
+        )
+    return result
+
+
 def restore_context_plan(value: object, run: RunSnapshot) -> ContextPreflight:
     bounded_snapshot(value)
     raw = _object(value)
@@ -189,7 +208,7 @@ def restore_context_plan(value: object, run: RunSnapshot) -> ContextPreflight:
     ):
         raise ValueError("invalid execution context cost")
     checkpoint = raw.get("checkpoint_id")
-    return ContextPreflight(
+    plan = ContextPreflight(
         request,
         tuple(items),
         tuple(items[:prefix]),
@@ -207,3 +226,6 @@ def restore_context_plan(value: object, run: RunSnapshot) -> ContextPreflight:
         _text(raw.get("source_hash")),
         _integer(raw.get("pricing_context_tokens")),
     )
+    if dict(raw) != plan_snapshot(plan):
+        raise ValueError("execution context metadata conflicts with its saved sources")
+    return plan

@@ -23,10 +23,12 @@ from app.application.budgets import (
 )
 from app.application.context_preview import preview_from_plan
 from app.application.errors import ApplicationError, ProviderError
+from app.application.execution_snapshots import generation_snapshot
 from app.application.model_catalog import profile_for_model
 from app.application.ports import (
     ContextCheckpointRepository,
     ProfileRepository,
+    RecoveryRepository,
     RunEventPublisher,
     RunLeasePort,
     RunRepository,
@@ -49,7 +51,14 @@ from app.application.tools import (
 )
 from app.domain.capabilities import DEFAULT_RUNTIME_CAPABILITIES, RuntimeCapabilities
 from app.domain.models import ModelDescriptor
-from app.domain.recovery import ToolRecoveryPolicy
+from app.domain.recovery import (
+    RecoveryAction,
+    RecoveryCompatibility,
+    RecoveryResolution,
+    RecoverySnapshot,
+    ToolRecoveryPolicy,
+    resolve_recovery,
+)
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -59,6 +68,7 @@ from app.domain.runtime import (
     ModelRequest,
     ModelStreamEvent,
     ModelToolCall,
+    ModelToolSpec,
     RunEvent,
     RunEventType,
     RunSnapshot,
@@ -90,6 +100,18 @@ class _ModelStep:
     finish_reason: str | None
     finish_kind: ModelFinishKind
     billing_context: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionContext:
+    model: ModelDescriptor
+    provider: StreamingProviderAdapter
+    api_key: str
+    user_id: str
+    workspace_root: Path | None
+    guidance: str | None
+    tools: tuple[ModelToolSpec, ...]
+    runtime: RunContext
 
 
 def _usage_measure(
@@ -192,9 +214,17 @@ class RunService:
         owner_id: str = "local",
         capabilities: RuntimeCapabilities = DEFAULT_RUNTIME_CAPABILITIES,
         redactor: SecretRedactor | None = None,
+        recovery_repository: RecoveryRepository | None = None,
+        recovery_compatibility: Callable[[RunSnapshot], Awaitable[RecoveryCompatibility]]
+        | None = None,
     ) -> None:
         if lease_renew_interval_seconds <= 0:
             raise ValueError("lease renewal interval must be positive")
+        if (recovery_repository is None) != (recovery_compatibility is None):
+            raise ValueError("recovery repository and compatibility must be configured together")
+        self._recovery_repository = recovery_repository
+        self._recovery_compatibility = recovery_compatibility
+        self._recovery_pending: set[str] = set()
         self._runs = runs
         self._sessions = sessions
         self._settings = settings
@@ -432,6 +462,377 @@ class RunService:
         return run_id not in self._lease_lost and (
             self._lease_repository is None or self._lease_repository.owns_run_lease(run_id)
         )
+
+    async def recover_candidate(self, run: RunSnapshot) -> RunSnapshot:
+        if self._closing:
+            raise ApplicationError("runtime_shutting_down", "The runtime is shutting down.")
+        if (
+            self._recovery_repository is None
+            or run.recovery_contract is None
+            or is_terminal_run_status(run.status)
+        ):
+            return run
+        if len(self._admissions) >= 32:
+            raise ApplicationError("run_capacity", "Too many recoveries are being accepted.")
+        task = asyncio.create_task(
+            self._claim_candidate(run),
+            name="trellis-recovery-admission",
+            context=contextvars.Context(),
+        )
+        self._admissions.add(task)
+        task.add_done_callback(self._discard_admission)
+        return await asyncio.shield(task)
+
+    async def _claim_candidate(self, run: RunSnapshot) -> RunSnapshot:
+        repository = self._recovery_repository
+        compatibility = self._recovery_compatibility
+        if repository is None or compatibility is None or run.recovery_contract is None:
+            return run
+        async with self._admission_lock:
+            if self._closing:
+                raise ApplicationError("runtime_shutting_down", "The runtime is shutting down.")
+            active = self._tasks.get(run.id)
+            if (active is not None and not active.done()) or (
+                run.id in self._owned_runs and self._can_execute(run.id)
+            ):
+                return await self._runs.get_run(run.id) or run
+            reservation = self._capacity.reserve(
+                self._owner_id, run.session_id, run.client_request_id
+            )
+            try:
+                current = await compatibility(run)
+                claimed, reason = await repository.claim_recovery(run, current.installation_id)
+            except BaseException:
+                self._capacity.release(reservation)
+                raise
+            if reason is not None or is_terminal_run_status(claimed.status):
+                self._capacity.release(reservation)
+                for event in await self._runs.list_run_events(
+                    run.id, run.last_event_sequence, limit=20
+                ):
+                    await self._publish(event)
+                return claimed
+            self._capacity.bind(reservation, claimed.id)
+            self._lease_lost.discard(claimed.id)
+            self._recovery_pending.add(claimed.id)
+            self._owned_runs.add(claimed.id)
+            self._start_lease_monitor(claimed.id)
+            try:
+                for event in await self._runs.list_run_events(
+                    run.id, run.last_event_sequence, limit=20
+                ):
+                    await self._publish(event)
+            except BaseException:
+                await self._defer_recovery(claimed.id)
+                raise
+            if self._closing:
+                await self._defer_recovery(claimed.id)
+            else:
+                self._schedule(claimed.id)
+            return claimed
+
+    async def _stop_recovery(self, run_id: str, resolution: RecoveryResolution) -> None:
+        assert self._recovery_repository is not None
+        _run, events = await self._recovery_repository.stop_recovery(run_id, resolution)
+        for event in events:
+            await self._publish(event)
+
+    async def _defer_recovery(self, run_id: str) -> None:
+        assert self._recovery_repository is not None
+        monitor = self._lease_monitors.pop(run_id, None)
+        if monitor is not None and monitor is not asyncio.current_task():
+            monitor.cancel()
+            await asyncio.gather(monitor, return_exceptions=True)
+        try:
+            if self._can_execute(run_id):
+                await self._recovery_repository.relinquish_run(run_id)
+        except Exception:
+            logger.warning(
+                "run.recovery.deferred", extra={"event": "run.recovery.deferred", "run_id": run_id}
+            )
+        finally:
+            self._lease_lost.add(run_id)
+            self._owned_runs.discard(run_id)
+            self._capacity.release_run(self._owner_id, run_id)
+
+    async def _finish_recovery(self, run: RunSnapshot) -> RunSnapshot:
+        assert self._recovery_repository is not None
+        if run.status is RunStatus.RECOVERING:
+            run, event = await self._recovery_repository.finish_recovery(run.id)
+            await self._publish(event)
+        return run
+
+    async def _execute_recovery(self, run: RunSnapshot) -> None:
+        assert self._recovery_repository is not None
+        assert self._recovery_compatibility is not None
+        execution: _ExecutionContext | None = None
+        snapshot: RecoverySnapshot | None = None
+        try:
+            for _ in range(2 * run.max_tool_calls + run.max_model_calls + 8):
+                snapshot = await self._recovery_repository.read_recovery_snapshot(run.id)
+                run = snapshot.run
+                resolution = resolve_recovery(
+                    snapshot, await self._recovery_compatibility(run), datetime.now(UTC)
+                )
+                if resolution.action is RecoveryAction.STOP:
+                    if not is_terminal_run_status(run.status):
+                        await self._stop_recovery(run.id, resolution)
+                    return
+                execution = execution or await self._execution_context(run)
+                if execution.workspace_root is not None and self._workspace_execution is not None:
+                    for tool in snapshot.tool_calls:
+                        if tool.name == "run_command" and tool.status not in {
+                            ToolCallStatus.PENDING,
+                            ToolCallStatus.RUNNING,
+                        }:
+                            await self._workspace_execution.reconcile_command_marker(
+                                run, tool, execution.workspace_root
+                            )
+                if resolution.action in {
+                    RecoveryAction.PREPARE_NEXT_MODEL,
+                    RecoveryAction.DISPATCH_MODEL,
+                    RecoveryAction.CONTINUE_COMPACTION,
+                }:
+                    if (
+                        execution.workspace_root is not None
+                        and self._workspace_execution is not None
+                    ):
+                        await self._workspace_execution.validate_observations(
+                            run, snapshot.tool_calls, execution.workspace_root
+                        )
+                    if (
+                        resolution.action is RecoveryAction.PREPARE_NEXT_MODEL
+                        and snapshot.model_calls
+                    ):
+                        anchor = max(snapshot.model_calls, key=lambda item: item.step_index)
+                        if anchor.request_snapshot.get("purpose") == "generation":
+                            execution.runtime.validate_recovery_inputs(
+                                run,
+                                anchor,
+                                workspace_root=execution.workspace_root,
+                                guidance=execution.guidance,
+                                tools=execution.tools,
+                                snapshot=snapshot,
+                            )
+                    run = await self._finish_recovery(run)
+                    if run.status is not RunStatus.RUNNING:
+                        raise ApplicationError(
+                            "inconsistent_execution_records",
+                            "The saved approval state is inconsistent.",
+                        )
+                    call = next(
+                        (
+                            item
+                            for item in snapshot.model_calls
+                            if item.id == resolution.model_call_id
+                        ),
+                        None,
+                    )
+                    if call is not None and call.request_snapshot.get("purpose") != "generation":
+                        profile = profile_for_model(run.model_id)
+                        if profile is None:
+                            raise ApplicationError(
+                                "model_not_available", "The selected model metadata is unavailable."
+                            )
+                        await execution.runtime.resume_saved_compaction(
+                            run,
+                            execution.model,
+                            profile,
+                            execution.provider,
+                            execution.api_key,
+                            execution.user_id,
+                            call,
+                            workspace_root=execution.workspace_root,
+                            guidance=execution.guidance,
+                            tools=execution.tools,
+                        )
+                        execution = None
+                        continue
+                    await self._execute_snapshot(
+                        run,
+                        recovered=True,
+                        prepared_call=call,
+                        prepared_snapshot=snapshot,
+                        execution=execution,
+                    )
+                    return
+                tool = next(
+                    (item for item in snapshot.tool_calls if item.id == resolution.tool_call_id),
+                    None,
+                )
+                if tool is None:
+                    raise ApplicationError(
+                        "inconsistent_execution_records", "The saved tool operation is unavailable."
+                    )
+                assistant = next(
+                    item for item in snapshot.run_messages if item.id == tool.assistant_message_id
+                )
+                anchor = next(
+                    item for item in snapshot.model_calls if item.id == assistant.model_call_id
+                )
+                execution.runtime.validate_recovery_inputs(
+                    run,
+                    anchor,
+                    workspace_root=execution.workspace_root,
+                    guidance=execution.guidance,
+                    tools=execution.tools,
+                    snapshot=snapshot,
+                )
+                run = await self._finish_recovery(run)
+                if (
+                    resolution.action is RecoveryAction.AWAIT_APPROVAL
+                    and run.status is RunStatus.WAITING_FOR_APPROVAL
+                ):
+                    return
+                if run.status is RunStatus.WAITING_FOR_APPROVAL:
+                    run, event = await self._runs.resume_approved_run(run.id)
+                    await self._publish(event)
+                if not await self._recover_tool(run, tool, snapshot, resolution, execution):
+                    return
+                execution = None
+            await self._stop_recovery(
+                run.id, RecoveryResolution(RecoveryAction.STOP, "inconsistent_execution_records")
+            )
+        except asyncio.CancelledError:
+            if run.id not in self._lease_lost:
+                current = await self._runs.get_run(run.id)
+                if current is not None and current.status is RunStatus.CANCELLING:
+                    await self._stop_recovery(
+                        run.id, RecoveryResolution(RecoveryAction.STOP, "cancellation_requested")
+                    )
+                elif self._closing:
+                    await self._defer_recovery(run.id)
+            raise
+        except TimeoutError:
+            if self._can_execute(run.id):
+                await self._stop_recovery(
+                    run.id, RecoveryResolution(RecoveryAction.STOP, "deadline_exceeded")
+                )
+        except ApplicationError as error:
+            if error.code == "database_unavailable":
+                await self._defer_recovery(run.id)
+            elif self._can_execute(run.id):
+                await self._stop_recovery(
+                    run.id,
+                    RecoveryResolution(
+                        RecoveryAction.STOP,
+                        error.code,
+                        retry_allowed=not any(
+                            tool.dispatch_attempt > 0
+                            and tool.status
+                            in {
+                                ToolCallStatus.PENDING,
+                                ToolCallStatus.RUNNING,
+                                ToolCallStatus.OUTCOME_UNKNOWN,
+                            }
+                            and tool.recovery_policy != ToolRecoveryPolicy.READ_ONLY
+                            for tool in snapshot.tool_calls
+                        )
+                        if snapshot is not None
+                        else False,
+                    ),
+                )
+        except Exception:
+            logger.error(
+                "run.recovery.failed",
+                extra={
+                    "event": "run.recovery.failed",
+                    "run_id": run.id,
+                    "error_code": "runtime_internal_error",
+                },
+            )
+            if self._can_execute(run.id):
+                await self._defer_recovery(run.id)
+
+    async def _recover_tool(
+        self,
+        run: RunSnapshot,
+        tool: ToolCallRecord,
+        snapshot: RecoverySnapshot,
+        resolution: RecoveryResolution,
+        execution: _ExecutionContext,
+    ) -> bool:
+        if self._tool_registry is None:
+            raise ApplicationError("tool_execution_unavailable", "Tool execution is unavailable.")
+        calls = list(snapshot.model_calls)
+        tokens, cost = self._budget_totals(run.model_id, calls)
+        self._check_budget(
+            run,
+            kind="tool",
+            model_calls=len(calls),
+            tool_calls=list(snapshot.tool_calls).index(tool),
+            tokens=tokens,
+            cost_usd=cost,
+        )
+        await self._renew_before_local_tool(run.id, expected_generation=run.generation)
+        async with asyncio.timeout(self._remaining_seconds(run)):
+            async with self._workspace_tool_operation(
+                run, tool, execution.workspace_root
+            ) as operation:
+                if resolution.action is RecoveryAction.RECONCILE_PATCH:
+                    if operation is None:
+                        raise ApplicationError(
+                            "workspace_grant_unavailable",
+                            "The trusted folder permission is unavailable.",
+                        )
+                    reconciliation = await operation.reconcile_patch()
+                    if reconciliation.state == "conflict":
+                        await self._stop_recovery(
+                            run.id,
+                            RecoveryResolution(
+                                RecoveryAction.STOP,
+                                "patch_conflict",
+                                tool_call_id=tool.id,
+                                retry_allowed=False,
+                            ),
+                        )
+                        return False
+                    if reconciliation.state == "desired_state_present":
+                        result = ToolResult(
+                            tool.provider_call_id,
+                            tool.name,
+                            f"Updated {tool.arguments.get('path', 'file')}.",
+                        )
+                        result_snapshot = await operation.capture_result(result)
+                        result_snapshot.update(
+                            {
+                                "source": "reconciled_desired_state",
+                                "reconciliation_proof": reconciliation.proof(),
+                            }
+                        )
+                        await self._record_tool_result(
+                            run.id,
+                            tool,
+                            result,
+                            result_snapshot=result_snapshot,
+                            result_source="reconciled_desired_state",
+                        )
+                        await operation.confirm_saved()
+                        return True
+                    await operation.capture_inputs()
+                    tool = await self._runs.authorize_tool_retry(
+                        run.id,
+                        tool.id,
+                        expected_dispatch_id=tool.dispatch_id or "",
+                        expected_attempt=tool.dispatch_attempt,
+                        reconciliation="unchanged_original",
+                        proof=reconciliation.proof(),
+                    )
+                elif resolution.action is RecoveryAction.RETRY_READ_TOOL:
+                    if operation is not None:
+                        await operation.capture_inputs()
+                    tool = await self._runs.authorize_tool_retry(
+                        run.id,
+                        tool.id,
+                        expected_dispatch_id=tool.dispatch_id or "",
+                        expected_attempt=tool.dispatch_attempt,
+                        reconciliation="read_retry",
+                    )
+                elif operation is not None:
+                    await operation.capture_inputs()
+                return await self._execute_stored_tool(
+                    run, tool, execution.workspace_root, self._remaining_seconds(run), operation
+                )
 
     async def wait_for_run(self, run_id: str) -> None:
         task = self._tasks.get(run_id)
@@ -830,6 +1231,10 @@ class RunService:
                         continue
                     if run.status is RunStatus.CANCELLING:
                         await self._mark_cancelled(run_id, None)
+                    elif (
+                        run.recovery_contract is not None and self._recovery_repository is not None
+                    ):
+                        await self._defer_recovery(run_id)
                     else:
                         await self._mark_interrupted(run_id, None)
                 except Exception:
@@ -975,10 +1380,25 @@ class RunService:
             if run_id in self._lease_lost:
                 raise
             run = await self._runs.get_run(run_id)
-            if run is not None and run.status is RunStatus.QUEUED:
+            if (
+                run is not None
+                and run.recovery_contract is not None
+                and self._recovery_repository is not None
+                and self._closing
+                and run.status is not RunStatus.CANCELLING
+            ):
+                await self._defer_recovery(run_id)
+            elif run is not None and run.status is RunStatus.QUEUED:
                 await self._interrupt_queued_run(run_id)
             elif run is not None and run.status is RunStatus.CANCELLING:
                 await self._mark_cancelled(run_id, None)
+            elif (
+                run is not None
+                and run.recovery_contract is not None
+                and self._recovery_repository is not None
+                and self._closing
+            ):
+                await self._defer_recovery(run_id)
             raise
         except Exception:
             logger.error(
@@ -994,6 +1414,14 @@ class RunService:
                 return
             try:
                 run = await self._runs.get_run(run_id)
+                if (
+                    run is not None
+                    and run.recovery_contract is not None
+                    and self._recovery_repository is not None
+                    and not is_terminal_run_status(run.status)
+                ):
+                    await self._defer_recovery(run_id)
+                    return
                 if run is not None and run.status in {RunStatus.QUEUED, RunStatus.RUNNING}:
                     event = await self._runs.transition_run_record(
                         run_id,
@@ -1038,16 +1466,77 @@ class RunService:
         run = await self._runs.get_run(run_id)
         if run is None:
             return
+        if run.id in self._recovery_pending:
+            self._recovery_pending.discard(run.id)
+            await self._execute_recovery(run)
+            return
         if run.status not in {RunStatus.QUEUED, RunStatus.WAITING_FOR_APPROVAL}:
             return
         await self._execute_snapshot(run)
 
-    async def _execute_snapshot(self, run: RunSnapshot) -> None:
+    async def _execution_context(self, run: RunSnapshot) -> _ExecutionContext:
+        model = await self._get_run_model(run)
+        provider = self._require_provider(model)
+        api_key = await self._secret_store.get(run.provider_id)
+        if model.requires_api_key and api_key is None:
+            raise ApplicationError(
+                "provider_not_configured", "The selected provider is not configured on this server."
+            )
+        profile = await self._profiles.get_profile()
+        session = await self._sessions.get_session(run.session_id)
+        if session is None:
+            raise ApplicationError("session_not_found", "Session not found.")
+        workspace_root = None
+        if self._capabilities.workspace_enabled and self._workspace_bindings is not None:
+            workspace_root = await self._workspace_bindings.resolve(
+                session.id, session.workspace_path
+            )
+        guidance = None
+        if (
+            self._capabilities.allows("local_read")
+            and workspace_root is not None
+            and self._workspace_guidance_reader is not None
+        ):
+            async with (
+                self._workspace_execution.guard(session.id, workspace_root)
+                if self._workspace_execution is not None
+                else nullcontext()
+            ):
+                guidance = await self._workspace_guidance_reader(workspace_root)
+        tools = (
+            self._tool_registry.specs(workspace_root, capabilities=self._capabilities)
+            if model.supports_tools and self._tool_registry is not None
+            else ()
+        )
+        runtime = RunContext(
+            self._runs,
+            self._sessions,
+            cast(ContextCheckpointRepository, self._runs),
+            self._budget_totals,
+            self._publish,
+            self._redactor,
+            before_dispatch=self._guard_model_dispatch,
+        )
+        return _ExecutionContext(
+            model, provider, api_key or "", profile.id, workspace_root, guidance, tools, runtime
+        )
+
+    async def _execute_snapshot(
+        self,
+        run: RunSnapshot,
+        *,
+        recovered: bool = False,
+        prepared_call: ModelCallRecord | None = None,
+        prepared_snapshot: RecoverySnapshot | None = None,
+        execution: _ExecutionContext | None = None,
+    ) -> None:
         run_id = run.id
         call: ModelCallRecord | None = None
         started = False
         try:
-            if run.status is RunStatus.QUEUED:
+            if recovered:
+                started = True
+            elif run.status is RunStatus.QUEUED:
                 started_event = await self._runs.transition_run_record(
                     run_id,
                     RunStatus.RUNNING,
@@ -1061,58 +1550,30 @@ class RunService:
                 started = True
                 await self._publish(resumed_event)
 
-            model = await self._get_run_model(run)
-            provider = self._require_provider(model)
-            api_key = await self._secret_store.get(run.provider_id)
-            if model.requires_api_key and api_key is None:
-                raise ApplicationError(
-                    "provider_not_configured",
-                    "The selected provider is not configured on this server.",
-                )
-            profile = await self._profiles.get_profile()
-            session = await self._sessions.get_session(run.session_id)
-            if session is None:
-                raise ApplicationError("session_not_found", "Session not found.")
-            workspace_root = None
-            if self._capabilities.workspace_enabled and self._workspace_bindings is not None:
-                workspace_root = await self._workspace_bindings.resolve(
-                    session.id, session.workspace_path
-                )
-            guidance = None
-            if (
-                self._capabilities.allows("local_read")
-                and workspace_root is not None
-                and self._workspace_guidance_reader is not None
-            ):
-                async with (
-                    self._workspace_execution.guard(session.id, workspace_root)
-                    if self._workspace_execution is not None
-                    else nullcontext()
-                ):
-                    guidance = await self._workspace_guidance_reader(workspace_root)
-            offered_tools = (
-                self._tool_registry.specs(workspace_root, capabilities=self._capabilities)
-                if model.supports_tools and self._tool_registry is not None
-                else ()
-            )
-            context_runtime = RunContext(
-                self._runs,
-                self._sessions,
-                cast(ContextCheckpointRepository, self._runs),
-                self._budget_totals,
-                self._publish,
-                self._redactor,
-            )
+            execution = execution or await self._execution_context(run)
+            model = execution.model
+            provider = execution.provider
+            api_key = execution.api_key
+            workspace_root = execution.workspace_root
+            guidance = execution.guidance
+            offered_tools = execution.tools
+            context_runtime = execution.runtime
 
             prior_model_steps = await self._runs.list_model_calls(run.id)
-            if prior_model_steps:
+            if prior_model_steps and prepared_call is None:
                 call = prior_model_steps[-1]
                 if not await self._execute_pending_tools(run, workspace_root):
                     return
 
             while True:
+                saved_call = prepared_call
+                prepared_call = None
                 prior_tool_calls = await self._runs.list_tool_calls(run.id)
-                prior_model_calls = await self._runs.list_model_calls(run.id)
+                prior_model_calls = [
+                    item
+                    for item in await self._runs.list_model_calls(run.id)
+                    if saved_call is None or item.id != saved_call.id
+                ]
                 prior_tokens, prior_cost = self._budget_totals(run.model_id, prior_model_calls)
                 self._check_budget(
                     run,
@@ -1127,28 +1588,44 @@ class RunService:
                     raise ApplicationError(
                         "model_not_available", "The selected model metadata is unavailable."
                     )
-                plan = await context_runtime.prepare(
-                    run,
-                    model,
-                    model_profile,
-                    provider,
-                    api_key or "",
-                    profile.id,
-                    workspace_root=workspace_root,
-                    guidance=guidance,
-                    tools=offered_tools,
-                )
-                prior_model_calls = await self._runs.list_model_calls(run.id)
-                prior_tokens, prior_cost = self._budget_totals(run.model_id, prior_model_calls)
-                step_index = len(prior_model_calls) + 1
-                self._check_budget(
-                    run,
-                    kind="model",
-                    model_calls=len(prior_model_calls),
-                    tool_calls=len(prior_tool_calls),
-                    tokens=prior_tokens,
-                    cost_usd=prior_cost,
-                )
+                if saved_call is not None:
+                    plan = await context_runtime.validate_saved_generation(
+                        run,
+                        model,
+                        model_profile,
+                        provider,
+                        api_key,
+                        execution.user_id,
+                        saved_call,
+                        workspace_root=workspace_root,
+                        guidance=guidance,
+                        tools=offered_tools,
+                        snapshot=prepared_snapshot,
+                    )
+                    step_index = saved_call.step_index
+                else:
+                    plan = await context_runtime.prepare(
+                        run,
+                        model,
+                        model_profile,
+                        provider,
+                        api_key,
+                        execution.user_id,
+                        workspace_root=workspace_root,
+                        guidance=guidance,
+                        tools=offered_tools,
+                    )
+                    prior_model_calls = await self._runs.list_model_calls(run.id)
+                    prior_tokens, prior_cost = self._budget_totals(run.model_id, prior_model_calls)
+                    step_index = len(prior_model_calls) + 1
+                    self._check_budget(
+                        run,
+                        kind="model",
+                        model_calls=len(prior_model_calls),
+                        tool_calls=len(prior_tool_calls),
+                        tokens=prior_tokens,
+                        cost_usd=prior_cost,
+                    )
                 request = plan.request
                 assert model_profile.context_window_tokens is not None
                 await self._append_and_publish(
@@ -1158,16 +1635,10 @@ class RunService:
                         plan, context_window_tokens=model_profile.context_window_tokens
                     ).snapshot(),
                 )
-                call = await self._runs.create_model_call(
-                    run.id,
-                    step_index,
-                    model,
-                    {
-                        **self._request_snapshot(request),
-                        "purpose": "generation",
-                        "context": plan.snapshot(),
-                    },
+                call = saved_call or await self._runs.create_model_call(
+                    run.id, step_index, model, generation_snapshot(plan, redactor=self._redactor)
                 )
+                await self._renew_before_local_tool(run.id, expected_generation=run.generation)
                 call = await self._runs.update_model_call(call.id, ModelCallStatus.STREAMING)
                 await self._append_and_publish(
                     run.id, RunEventType.PHASE, {"phase": "answering", "model_call_id": call.id}
@@ -1178,7 +1649,7 @@ class RunService:
                     request,
                     provider,
                     api_key or "",
-                    profile.id,
+                    execution.user_id,
                     prior_tokens,
                     prior_cost,
                     pricing_context_tokens=plan.pricing_context_tokens,
@@ -1273,13 +1744,22 @@ class RunService:
             if current is not None and current.status is RunStatus.CANCELLING:
                 await self._mark_cancelled(run_id, call)
             elif started and current is not None and current.status is RunStatus.RUNNING:
-                await self._mark_interrupted(run_id, call)
+                if run.recovery_contract is not None and self._recovery_repository is not None:
+                    await self._defer_recovery(run_id)
+                else:
+                    await self._mark_interrupted(run_id, call)
             raise
         except ProviderError as error:
             if started and self._can_execute(run_id):
                 await self._fail_or_cancel(run_id, call, error.code, error.message)
         except ApplicationError as error:
-            if started and self._can_execute(run_id):
+            if (
+                run.recovery_contract is not None
+                and self._recovery_repository is not None
+                and error.code == "database_unavailable"
+            ):
+                await self._defer_recovery(run_id)
+            elif started and self._can_execute(run_id):
                 await self._fail_or_cancel(run_id, call, error.code, error.message)
         except Exception:
             logger.error(
@@ -1291,13 +1771,18 @@ class RunService:
                     "run_id": run_id,
                 },
             )
-            if started and self._can_execute(run_id):
+            if run.recovery_contract is not None and self._recovery_repository is not None:
+                await self._defer_recovery(run_id)
+            elif started and self._can_execute(run_id):
                 await self._fail_or_cancel(
                     run_id,
                     call,
                     "runtime_internal_error",
                     "Trellis could not complete this run.",
                 )
+
+    async def _guard_model_dispatch(self, run: RunSnapshot) -> None:
+        await self._renew_before_local_tool(run.id, expected_generation=run.generation)
 
     async def _renew_before_local_tool(
         self, run_id: str, *, expected_generation: int | None = None
@@ -1557,6 +2042,7 @@ class RunService:
         *,
         status: ToolCallStatus | None = None,
         result_snapshot: dict[str, object] | None = None,
+        result_source: str = "executor",
     ) -> None:
         result_content = (
             f"{result.error_code}: {result.content}"
@@ -1568,12 +2054,20 @@ class RunService:
         result_status = status or (
             ToolCallStatus.FAILED if result.is_error else ToolCallStatus.COMPLETED
         )
-        if result_snapshot is None:
+        if result_snapshot is None and result_source == "executor":
             _message, _call, event = await self._runs.record_tool_result(
                 run_id,
                 stored_call.id,
                 self._redactor.redact_text(result_content),
                 status=result_status,
+            )
+        elif result_source == "executor":
+            _message, _call, event = await self._runs.record_tool_result(
+                run_id,
+                stored_call.id,
+                self._redactor.redact_text(result_content),
+                status=result_status,
+                result_snapshot=result_snapshot,
             )
         else:
             _message, _call, event = await self._runs.record_tool_result(
@@ -1582,56 +2076,9 @@ class RunService:
                 self._redactor.redact_text(result_content),
                 status=result_status,
                 result_snapshot=result_snapshot,
+                result_source=result_source,
             )
         await self._publish(event)
-
-    def _request_snapshot(self, request: ModelRequest) -> dict[str, object]:
-        snapshot: dict[str, object] = {
-            "provider_id": request.provider_id,
-            "model_id": request.model_id,
-            "adapter_kind": request.adapter_kind,
-            "upstream_model_id": request.upstream_model_id,
-            "system_instructions": request.system_instructions,
-            "messages": [
-                {
-                    "role": message.role,
-                    "content": self._redactor.redact_text(message.content),
-                    **(
-                        {"tool_call_id": message.tool_call_id}
-                        if message.tool_call_id is not None
-                        else {}
-                    ),
-                    "tool_calls": [
-                        {"id": tool.id, "name": tool.name, "arguments": tool.arguments}
-                        for tool in message.tool_calls
-                    ],
-                    "continuation_items": [
-                        {
-                            "provider_id": item.provider_id,
-                            "model_id": item.model_id,
-                            "payload_json": item.payload_json,
-                        }
-                        for item in message.continuation_items
-                    ],
-                }
-                for message in request.messages
-            ],
-            "tools": [
-                {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "input_schema": tool.input_schema,
-                }
-                for tool in request.tools
-            ],
-            "max_output_tokens": request.max_output_tokens,
-            **(
-                {"native_context_json": request.native_context_json}
-                if request.native_context_json is not None
-                else {}
-            ),
-        }
-        return cast(dict[str, object], self._redactor.redact_record(snapshot))
 
     def _validate_generation_response(
         self,
@@ -1927,6 +2374,10 @@ class RunService:
                 finish_reason = self._safe_provider_metadata(event.finish_reason)
                 finish_kind = event.finish_kind
 
+        await self._guard_model_dispatch(run)
+        timeout_seconds = self._remaining_seconds(run)
+        if timeout_seconds <= 0:
+            raise ProviderError("provider_timeout", "The run deadline was reached.")
         try:
             async with (
                 asyncio.timeout(timeout_seconds),
@@ -2004,6 +2455,11 @@ class RunService:
         cost = 0.0
         missing_price = False
         for call in calls:
+            if call.error_code == "model_outcome_unknown":
+                raise ProviderError(
+                    "provider_usage_unavailable",
+                    "The provider response was lost, so its final usage is unknown.",
+                )
             billing = cast(
                 Mapping[str, object], (call.response_snapshot or {}).get("usage_context", {})
             )
@@ -2204,6 +2660,33 @@ class RunService:
         current = await self._runs.get_run(run_id)
         if (
             current is not None
+            and current.recovery_contract is not None
+            and self._recovery_repository is not None
+            and not is_terminal_run_status(current.status)
+        ):
+            snapshot = await self._recovery_repository.read_recovery_snapshot(run_id)
+            unknown_call = next(
+                (
+                    item
+                    for item in reversed(snapshot.model_calls)
+                    if item.status is ModelCallStatus.STREAMING
+                ),
+                None,
+            )
+            if unknown_call is not None:
+                await self._stop_recovery(
+                    run_id,
+                    RecoveryResolution(
+                        RecoveryAction.STOP,
+                        "model_outcome_unknown",
+                        model_call_id=unknown_call.id,
+                        usage_unknown=True,
+                    ),
+                )
+                saved = await self._runs.get_run(run_id)
+                return saved.status if saved is not None else None
+        if (
+            current is not None
             and not is_terminal_run_status(current.status)
             and (current.status is RunStatus.CANCELLING or current.cancel_requested_at is not None)
         ):
@@ -2232,6 +2715,16 @@ class RunService:
         await self._publish(event)
 
     async def _mark_cancelled(self, run_id: str, call: ModelCallRecord | None) -> None:
+        current = await self._runs.get_run(run_id)
+        if (
+            current is not None
+            and current.recovery_contract is not None
+            and self._recovery_repository is not None
+        ):
+            await self._stop_recovery(
+                run_id, RecoveryResolution(RecoveryAction.STOP, "cancellation_requested")
+            )
+            return
         if call is not None and call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
             await self._runs.update_model_call(call.id, ModelCallStatus.CANCELLED)
         await self._finish_pending_tools(

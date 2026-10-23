@@ -22,7 +22,7 @@ from app.domain.models import (
     UserProfile,
 )
 from app.domain.outputs import AssistantOutput
-from app.domain.recovery import RecoverySnapshot, WorkspaceRecoveryReference
+from app.domain.recovery import RecoveryResolution, RecoverySnapshot, WorkspaceRecoveryReference
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -187,6 +187,10 @@ class RecoveryRepository(Protocol):
     async def relinquish_run(self, run_id: str) -> RunSnapshot: ...
 
     async def finish_recovery(self, run_id: str) -> tuple[RunSnapshot, RunEvent]: ...
+
+    async def stop_recovery(
+        self, run_id: str, resolution: RecoveryResolution
+    ) -> tuple[RunSnapshot, tuple[RunEvent, ...]]: ...
 
 
 class RunRepository(Protocol):

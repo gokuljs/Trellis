@@ -280,6 +280,7 @@ class _WorkspaceOperation:
         self._observations = _observations(prior_tools)
         self._marker: CommandMarker | None = None
         self._dispatch_id: str | None = None
+        self._reconciled_patch = False
 
     async def reconcile_patch(self) -> PatchReconciliation:
         if self._tool.name != "apply_patch":
@@ -287,6 +288,7 @@ class _WorkspaceOperation:
         await self.verify()
         preview = self._tool.approval_preview or {}
         state = await reconcile_patch(self._tool.arguments, preview, self._pinned.path)
+        self._reconciled_patch = state == "desired_state_present"
         before = preview.get("target_sha256")
         after = preview.get("desired_sha256")
         return PatchReconciliation(
@@ -348,9 +350,19 @@ class _WorkspaceOperation:
                 raise _failure("workspace_inputs_changed")
             self._observations.append(observation)
         elif self._tool.name in {"apply_patch", "run_command"}:
-            self._observations = [
-                await _observe(self._pinned.path, entry) for entry in self._observations
-            ]
+            refreshed = []
+            for entry in self._observations:
+                observed = await _observe(self._pinned.path, entry)
+                arguments = entry.get("arguments")
+                own_target = (
+                    entry.get("name") in {"read_file", "patch_target"}
+                    and isinstance(arguments, dict)
+                    and arguments.get("path") == self._tool.arguments.get("path")
+                )
+                if self._reconciled_patch and not own_target and observed != entry:
+                    raise _failure("workspace_inputs_changed")
+                refreshed.append(observed)
+            self._observations = refreshed
             if self._tool.name == "apply_patch" and not result.is_error:
                 path = self._tool.arguments.get("path")
                 observation = await _observe(
