@@ -21,6 +21,7 @@ from app.domain.models import (
     UserProfile,
 )
 from app.domain.outputs import AssistantOutput
+from app.domain.recovery import RecoverySnapshot
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -119,6 +120,20 @@ class RunLeasePort(Protocol):
     async def renew_run_lease(self, run_id: str) -> RunSnapshot: ...
 
     async def recover_expired_run(self, run_id: str) -> RunSnapshot: ...
+
+
+class RecoveryRepository(Protocol):
+    async def list_recovery_candidates(self, installation_id: str) -> list[RunSnapshot]: ...
+
+    async def claim_recovery(
+        self, run: RunSnapshot, installation_id: str
+    ) -> tuple[RunSnapshot, str | None]: ...
+
+    async def read_recovery_snapshot(self, run_id: str) -> RecoverySnapshot: ...
+
+    async def relinquish_run(self, run_id: str) -> RunSnapshot: ...
+
+    async def finish_recovery(self, run_id: str) -> tuple[RunSnapshot, RunEvent]: ...
 
 
 class RunRepository(Protocol):

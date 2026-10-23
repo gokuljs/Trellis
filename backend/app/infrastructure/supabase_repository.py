@@ -42,6 +42,7 @@ from app.domain.models import (
     UserProfile,
 )
 from app.domain.outputs import AssistantOutput, validate_assistant_batch
+from app.domain.recovery import RecoveryContract, RecoverySnapshot
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -452,6 +453,17 @@ class SupabaseRepository:
             "rpc/mutate",
             payload={"p_action": action, "p_payload": payload, "p_capability": capability},
         )
+
+    async def _idempotent_rpc(
+        self, action: str, payload: dict[str, object], *, capability: str
+    ) -> object:
+        for attempt in range(2):
+            try:
+                return await self._rpc(action, payload, capability=capability)
+            except ApplicationError as error:
+                if attempt or error.code != "database_unavailable":
+                    raise
+        raise AssertionError("bounded commit retry exhausted")
 
     def _owned(self, row: dict[str, object], key: str = "user_id") -> dict[str, object]:
         if _text(row, key) != str(self._user_id):
@@ -899,6 +911,15 @@ class SupabaseRepository:
             created_at=_text(row, "created_at"),
             started_at=_nullable_text(row, "started_at"),
             finished_at=_nullable_text(row, "finished_at"),
+            recovery_contract=(
+                RecoveryContract.from_dict(_object(row["recovery_contract"]))
+                if row.get("recovery_contract") is not None
+                else None
+            ),
+            generation=_integer(row, "generation") if "generation" in row else 0,
+            retry_allowed=_boolean(row, "retry_allowed") if "retry_allowed" in row else True,
+            recovery_reason=_nullable_text(row, "recovery_reason"),
+            uncertain_tool_call_id=_nullable_text(row, "uncertain_tool_call_id"),
         )
 
     def _event(self, row: dict[str, object]) -> RunEvent:
@@ -954,7 +975,8 @@ class SupabaseRepository:
                 "max_model_calls,max_tool_calls,budget_preset,max_total_tokens,max_cost_usd,"
                 "deadline_at,cancel_requested_at,lease_expires_at,recovery_count,stop_reason,"
                 "last_event_sequence,error_code,error_message,created_at,started_at,finished_at,"
-                "waiting_tool_call_id"
+                "waiting_tool_call_id,recovery_contract,generation,retry_allowed,"
+                "recovery_reason,uncertain_tool_call_id"
             ),
             filters={"user_id": f"eq.{self._user_id}", **filters},
         )
@@ -1096,6 +1118,11 @@ class SupabaseRepository:
             approval_preview=None if preview is None else _object(preview),
             created_at=_text(row, "created_at"),
             finished_at=_nullable_text(row, "finished_at"),
+            dispatch_attempt=_integer(row, "dispatch_attempt") if "dispatch_attempt" in row else 0,
+            dispatch_generation=_nullable_integer(row, "dispatch_generation"),
+            dispatched_at=_nullable_text(row, "dispatched_at"),
+            recovery_policy=_nullable_text(row, "recovery_policy"),
+            result_source=_nullable_text(row, "result_source"),
         )
 
     async def _tool_call_rows(self, run_id: str) -> list[dict[str, object]]:
@@ -1104,7 +1131,8 @@ class SupabaseRepository:
             select=(
                 "id,user_id,run_id,assistant_message_id,call_index,provider_call_id,name,"
                 "arguments,status,approval_decision,approval_decided_at,approval_preview,"
-                "created_at,finished_at"
+                "created_at,finished_at,dispatch_attempt,dispatch_generation,dispatched_at,"
+                "recovery_policy,result_source"
             ),
             filters={
                 "user_id": f"eq.{self._user_id}",
@@ -1682,6 +1710,86 @@ class SupabaseRepository:
         if run.status is RunStatus.INTERRUPTED:
             self._drop_lease(run_id)
         return run
+
+    async def list_recovery_candidates(self, installation_id: str) -> list[RunSnapshot]:
+        rows = _array(
+            await self._rpc(
+                "list_recovery_candidates", {"installation_id": installation_id, "limit": 20}
+            )
+        )
+        if len(rows) > 20:
+            raise RuntimeError("Supabase returned too many recovery candidates")
+        return [self._run(row) for row in rows]
+
+    async def claim_recovery(
+        self, run: RunSnapshot, installation_id: str
+    ) -> tuple[RunSnapshot, str | None]:
+        capability = secrets.token_urlsafe(32)
+        result = _object(
+            await self._idempotent_rpc(
+                "claim_recovery",
+                {
+                    "run_id": run.id,
+                    "installation_id": installation_id,
+                    "expected_generation": run.generation,
+                },
+                capability=capability,
+            )
+        )
+        claimed = self._run(_object(result.get("run")))
+        if claimed.id != run.id:
+            raise RuntimeError("Supabase returned another recovery candidate")
+        if result.get("lease_acquired") is True:
+            self._record_lease(claimed, capability)
+        return claimed, _nullable_text(result, "rejection_reason")
+
+    async def relinquish_run(self, run_id: str) -> RunSnapshot:
+        result = await self._rpc(
+            "relinquish_run", {"run_id": run_id}, capability=self._run_capability(run_id)
+        )
+        run = self._run(_object(result))
+        self._drop_lease(run_id)
+        return run
+
+    async def finish_recovery(self, run_id: str) -> tuple[RunSnapshot, RunEvent]:
+        result = _object(
+            await self._rpc(
+                "finish_recovery", {"run_id": run_id}, capability=self._run_capability(run_id)
+            )
+        )
+        return self._run(_object(result.get("run"))), self._event(_object(result.get("event")))
+
+    async def read_recovery_snapshot(self, run_id: str) -> RecoverySnapshot:
+        result = _object(
+            await self._request("POST", "rpc/read_recovery_snapshot", payload={"p_run_id": run_id})
+        )
+        run = self._run(_object(result.get("run")))
+        if run.id != run_id:
+            raise RuntimeError("Supabase returned another recovery snapshot")
+        calls = tuple(self._model_call(row) for row in _array(result.get("model_calls")))
+        tools = tuple(self._tool_call(row) for row in _array(result.get("tool_calls")))
+        by_message: dict[str, list[ModelToolCall]] = {}
+        for call in sorted(tools, key=lambda item: item.call_index):
+            by_message.setdefault(call.assistant_message_id, []).append(
+                ModelToolCall(call.provider_call_id, call.name, call.arguments)
+            )
+        exchanges = tuple(
+            self._run_message(row, tuple(by_message.get(_text(row, "id"), ())))
+            for row in _array(result.get("run_messages"))
+        )
+        self._model_call_runs.update({call.id: call.run_id for call in calls})
+        return RecoverySnapshot(
+            run=run,
+            model_calls=calls,
+            tool_calls=tools,
+            run_messages=exchanges,
+            messages=tuple(self._message(row) for row in _array(result.get("messages"))),
+            outputs=tuple(self._assistant_output(row) for row in _array(result.get("outputs"))),
+            context_checkpoints=tuple(
+                self._checkpoint(row) for row in _array(result.get("context_checkpoints"))
+            ),
+            context_revision=_integer(result, "context_revision"),
+        )
 
     async def ensure_account(self) -> None:
         await self._request("POST", "rpc/ensure_account", payload={})

@@ -1,6 +1,11 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from app.domain.recovery import RecoveryContract
 
 ModelFinishKind = Literal["final", "tool", "incomplete"]
 
@@ -8,6 +13,7 @@ ModelFinishKind = Literal["final", "tool", "incomplete"]
 class RunStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
+    RECOVERING = "recovering"
     WAITING_FOR_APPROVAL = "waiting_for_approval"
     CANCELLING = "cancelling"
     COMPLETED = "completed"
@@ -19,6 +25,7 @@ class RunStatus(StrEnum):
 class RunEventType(StrEnum):
     QUEUED = "run.queued"
     STARTED = "run.started"
+    RECOVERING = "run.recovering"
     CANCELLATION_REQUESTED = "run.cancellation_requested"
     ASSISTANT_DELTA = "assistant.delta"
     ASSISTANT_MESSAGE = "assistant.message"
@@ -55,6 +62,7 @@ class ToolCallStatus(StrEnum):
     DENIED = "denied"
     CANCELLED = "cancelled"
     TIMED_OUT = "timed_out"
+    OUTCOME_UNKNOWN = "outcome_unknown"
 
 
 class ToolApprovalDecision(StrEnum):
@@ -64,11 +72,18 @@ class ToolApprovalDecision(StrEnum):
 
 _TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.QUEUED: frozenset(
-        {RunStatus.RUNNING, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.INTERRUPTED}
+        {
+            RunStatus.RUNNING,
+            RunStatus.RECOVERING,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.INTERRUPTED,
+        }
     ),
     RunStatus.RUNNING: frozenset(
         {
             RunStatus.WAITING_FOR_APPROVAL,
+            RunStatus.RECOVERING,
             RunStatus.CANCELLING,
             RunStatus.COMPLETED,
             RunStatus.FAILED,
@@ -77,7 +92,24 @@ _TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
         }
     ),
     RunStatus.WAITING_FOR_APPROVAL: frozenset(
-        {RunStatus.RUNNING, RunStatus.CANCELLING, RunStatus.FAILED, RunStatus.INTERRUPTED}
+        {
+            RunStatus.RUNNING,
+            RunStatus.RECOVERING,
+            RunStatus.CANCELLING,
+            RunStatus.FAILED,
+            RunStatus.INTERRUPTED,
+        }
+    ),
+    RunStatus.RECOVERING: frozenset(
+        {
+            RunStatus.RUNNING,
+            RunStatus.WAITING_FOR_APPROVAL,
+            RunStatus.CANCELLING,
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.INTERRUPTED,
+        }
     ),
     RunStatus.CANCELLING: frozenset({RunStatus.CANCELLED, RunStatus.FAILED, RunStatus.INTERRUPTED}),
     RunStatus.COMPLETED: frozenset(),
@@ -88,6 +120,16 @@ _TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
 
 _TRANSITION_EVENTS: dict[tuple[RunStatus, RunStatus], RunEventType] = {
     (RunStatus.QUEUED, RunStatus.RUNNING): RunEventType.STARTED,
+    (RunStatus.QUEUED, RunStatus.RECOVERING): RunEventType.RECOVERING,
+    (RunStatus.RUNNING, RunStatus.RECOVERING): RunEventType.RECOVERING,
+    (RunStatus.WAITING_FOR_APPROVAL, RunStatus.RECOVERING): RunEventType.RECOVERING,
+    (RunStatus.RECOVERING, RunStatus.RUNNING): RunEventType.RESUMED,
+    (RunStatus.RECOVERING, RunStatus.WAITING_FOR_APPROVAL): RunEventType.TOOL_APPROVAL_REQUESTED,
+    (RunStatus.RECOVERING, RunStatus.CANCELLING): RunEventType.CANCELLATION_REQUESTED,
+    (RunStatus.RECOVERING, RunStatus.COMPLETED): RunEventType.COMPLETED,
+    (RunStatus.RECOVERING, RunStatus.FAILED): RunEventType.FAILED,
+    (RunStatus.RECOVERING, RunStatus.CANCELLED): RunEventType.CANCELLED,
+    (RunStatus.RECOVERING, RunStatus.INTERRUPTED): RunEventType.INTERRUPTED,
     (RunStatus.QUEUED, RunStatus.FAILED): RunEventType.FAILED,
     (RunStatus.QUEUED, RunStatus.CANCELLED): RunEventType.CANCELLED,
     (RunStatus.QUEUED, RunStatus.INTERRUPTED): RunEventType.INTERRUPTED,
@@ -109,6 +151,7 @@ _LIFECYCLE_EVENT_TYPES = frozenset(
     {
         RunEventType.QUEUED,
         RunEventType.STARTED,
+        RunEventType.RECOVERING,
         RunEventType.CANCELLATION_REQUESTED,
         RunEventType.TOOL_APPROVAL_REQUESTED,
         RunEventType.RESUMED,
@@ -320,6 +363,11 @@ class RunSnapshot:
     created_at: str
     started_at: str | None
     finished_at: str | None
+    recovery_contract: RecoveryContract | None = None
+    generation: int = 0
+    retry_allowed: bool = True
+    recovery_reason: str | None = None
+    uncertain_tool_call_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,3 +436,8 @@ class ToolCallRecord:
     created_at: str
     finished_at: str | None
     approval_preview: dict[str, object] | None = None
+    dispatch_attempt: int = 0
+    dispatch_generation: int | None = None
+    dispatched_at: str | None = None
+    recovery_policy: str | None = None
+    result_source: str | None = None
