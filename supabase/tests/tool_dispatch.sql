@@ -184,6 +184,8 @@ BEGIN
             'content','stale output','status','completed'),repeat('a',32));
         RAISE EXCEPTION 'stale owner saved a tool result';
     EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+    PERFORM trellis.mutate('authorize_tool_retry',jsonb_build_object('run_id',f.run_id,'tool_call_id',f.tool_id,
+        'expected_dispatch_id',p->>'dispatch_id','expected_attempt',1,'reconciliation','read_retry','proof',NULL),repeat('b',32));
     p:=p||'{"expected_attempt":1,"dispatch_id":"23400000-0000-0000-0000-000000000432"}';
     started:=trellis.mutate('begin_tool_execution',p,repeat('b',32));
     ASSERT started#>>'{tool_call,dispatch_attempt}'='2' AND started#>>'{tool_call,dispatch_generation}'='1';

@@ -93,6 +93,61 @@ def test_lost_claim_acknowledgment_retries_the_identical_ownership_capability() 
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("wrong_result", [False, True])
+def test_tool_result_acknowledgment_includes_matching_persisted_evidence(wrong_result) -> None:
+    async def exercise() -> None:
+        repo, run = repository(), run_record()
+        metadata: dict[str, object] = {"source": "executor", "workspace_observations": []}
+        tool = {
+            "id": "tool",
+            "user_id": str(repo._user_id),
+            "run_id": run.id,
+            "assistant_message_id": "assistant",
+            "call_index": 0,
+            "provider_call_id": "call",
+            "name": "run_command",
+            "arguments": {},
+            "status": "completed",
+            "created_at": "now",
+            "result_snapshot": None if wrong_result else metadata,
+        }
+        message = {
+            "id": "result",
+            "user_id": str(repo._user_id),
+            "run_id": run.id,
+            "ordinal": 2,
+            "role": "tool",
+            "content": "Done",
+            "tool_call_id": "tool",
+            "continuation": [],
+            "created_at": "now",
+        }
+        event = {
+            "user_id": str(repo._user_id),
+            "run_id": run.id,
+            "sequence": 3,
+            "event_type": "tool.result",
+            "event_version": 1,
+            "data": {},
+            "created_at": "now",
+        }
+        repo._capabilities[run.id] = "same-capability"
+        repo._lease_expires[run.id] = datetime.now(UTC) + timedelta(minutes=1)
+        repo._rpc = AsyncMock(return_value={"tool_call": tool, "message": message, "event": event})
+        try:
+            operation = repo.record_tool_result(run.id, "tool", "Done", result_snapshot=metadata)
+            if wrong_result:
+                with pytest.raises(RuntimeError, match="another tool's result"):
+                    await operation
+            else:
+                _, saved, _ = await operation
+                assert saved.result_snapshot == metadata
+        finally:
+            await repo._client.aclose()
+
+    asyncio.run(exercise())
+
+
 def test_generation_commit_retries_lost_ack_without_republishing_or_changing_identity() -> None:
     async def exercise() -> None:
         repo = repository()
@@ -261,6 +316,59 @@ def test_lost_tool_dispatch_ack_reuses_the_attempt_identity(different_attempt) -
                 saved, _ = await pending
                 assert saved.dispatch_id == dispatch_id
             assert requests[0] == requests[1]
+        finally:
+            await repo._client.aclose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("different_attempt", [False, True])
+def test_retry_authorization_preserves_reconciliation_proof_and_attempt(different_attempt) -> None:
+    async def exercise() -> None:
+        repo, run = repository(), run_record()
+        tool = {
+            "id": "tool",
+            "user_id": str(repo._user_id),
+            "run_id": run.id,
+            "assistant_message_id": "assistant",
+            "call_index": 0,
+            "provider_call_id": "call",
+            "name": "apply_patch",
+            "arguments": {},
+            "status": "pending",
+            "created_at": "now",
+            "dispatch_attempt": 2 if different_attempt else 1,
+            "dispatch_id": "dispatch",
+            "result_snapshot": {"workspace_observations": []},
+        }
+        proof: dict[str, object] = {
+            "before_sha256": "a" * 64,
+            "after_sha256": "b" * 64,
+            "observed_sha256": "a" * 64,
+        }
+        repo._capabilities[run.id] = "same-capability"
+        repo._lease_expires[run.id] = datetime.now(UTC) + timedelta(minutes=1)
+        repo._rpc = AsyncMock(
+            side_effect=[ApplicationError("database_unavailable", "Lost acknowledgment"), tool]
+        )
+        try:
+            pending = repo.authorize_tool_retry(
+                run.id,
+                "tool",
+                expected_dispatch_id="dispatch",
+                expected_attempt=1,
+                reconciliation="unchanged_original",
+                proof=proof,
+            )
+            if different_attempt:
+                with pytest.raises(RuntimeError, match="another tool retry"):
+                    await pending
+            else:
+                saved = await pending
+                assert saved.result_snapshot == {"workspace_observations": []}
+            assert repo._rpc.await_args_list[0] == repo._rpc.await_args_list[1]
+            assert repo._rpc.await_args is not None
+            assert repo._rpc.await_args.args[1]["proof"] == proof
         finally:
             await repo._client.aclose()
 

@@ -3,8 +3,8 @@ import contextvars
 import hashlib
 import json
 import logging
-from collections.abc import Awaitable, Callable, Iterable, Mapping
-from contextlib import aclosing, suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,6 +35,8 @@ from app.application.ports import (
     SettingsRepository,
     StreamingProviderAdapter,
     WorkspaceBindingPort,
+    WorkspaceExecutionPort,
+    WorkspaceOperationPort,
 )
 from app.application.run_capacity import RunCapacity
 from app.application.run_context import RunContext, billing_tier, usage_cost
@@ -182,6 +184,7 @@ class RunService:
         tool_registry: ToolRegistry | None = None,
         workspace_guidance_reader: Callable[[Path], Awaitable[str | None]] | None = None,
         workspace_bindings: WorkspaceBindingPort | None = None,
+        workspace_execution: WorkspaceExecutionPort | None = None,
         lease_repository: RunLeasePort | None = None,
         lease_renew_interval_seconds: float = DEFAULT_LEASE_RENEW_INTERVAL_SECONDS,
         capacity: RunCapacity | None = None,
@@ -203,6 +206,7 @@ class RunService:
         self._redactor = redactor or COMMON_SECRET_REDACTOR
         self._workspace_guidance_reader = workspace_guidance_reader
         self._workspace_bindings = workspace_bindings
+        self._workspace_execution = workspace_execution
         self._lease_repository = lease_repository
         self._lease_renew_interval_seconds = lease_renew_interval_seconds
         self._capacity = capacity or RunCapacity()
@@ -925,13 +929,18 @@ class RunService:
                 workspace_root = await self._workspace_bindings.resolve(
                     session.id, session.workspace_path
                 )
-            guidance = (
-                await self._workspace_guidance_reader(workspace_root)
-                if self._capabilities.allows("local_read")
+            guidance = None
+            if (
+                self._capabilities.allows("local_read")
                 and workspace_root is not None
                 and self._workspace_guidance_reader is not None
-                else None
-            )
+            ):
+                async with (
+                    self._workspace_execution.guard(session.id, workspace_root)
+                    if self._workspace_execution is not None
+                    else nullcontext()
+                ):
+                    guidance = await self._workspace_guidance_reader(workspace_root)
             offered_tools = (
                 self._tool_registry.specs(workspace_root, capabilities=self._capabilities)
                 if model.supports_tools and self._tool_registry is not None
@@ -1198,127 +1207,179 @@ class RunService:
             remaining_seconds = self._remaining_seconds(run)
             if remaining_seconds <= 0:
                 raise ProviderError("provider_timeout", "The run deadline was reached.")
-            tool_request = ModelToolCall(
-                stored_call.provider_call_id, stored_call.name, stored_call.arguments
+            try:
+                async with asyncio.timeout(remaining_seconds):
+                    async with self._workspace_tool_operation(
+                        run, stored_call, workspace_root
+                    ) as operation:
+                        if not await self._execute_stored_tool(
+                            run, stored_call, workspace_root, remaining_seconds, operation
+                        ):
+                            return False
+            except TimeoutError:
+                raise ProviderError("provider_timeout", "The run deadline was reached.") from None
+        return True
+
+    @asynccontextmanager
+    async def _workspace_tool_operation(
+        self, run: RunSnapshot, tool: ToolCallRecord, root: Path | None
+    ) -> AsyncIterator[WorkspaceOperationPort | None]:
+        assert self._tool_registry is not None
+        if (
+            self._workspace_execution is not None
+            and root is not None
+            and self._tool_registry.recovery_policy(tool.name)
+            in {ToolRecoveryPolicy.READ_ONLY, ToolRecoveryPolicy.PATCH, ToolRecoveryPolicy.COMMAND}
+        ):
+            prior = await self._runs.list_tool_calls(run.id)
+            async with self._workspace_execution.operation(run, tool, root, prior) as operation:
+                yield operation
+        else:
+            yield None
+
+    async def _execute_stored_tool(
+        self,
+        run: RunSnapshot,
+        stored_call: ToolCallRecord,
+        workspace_root: Path | None,
+        remaining_seconds: float,
+        operation: WorkspaceOperationPort | None,
+    ) -> bool:
+        assert self._tool_registry is not None
+        tool_request = ModelToolCall(
+            stored_call.provider_call_id, stored_call.name, stored_call.arguments
+        )
+        try:
+            self._tool_registry.check_call(
+                tool_request, workspace_root, capabilities=self._capabilities
             )
+        except ToolExecutionError as error:
+            raise ProviderError(error.code, error.message) from None
+        approval_required = self._tool_registry.requires_approval(tool_request, workspace_root)
+        if approval_required and stored_call.approval_decision is None:
             try:
-                self._tool_registry.check_call(
-                    tool_request, workspace_root, capabilities=self._capabilities
-                )
-            except ToolExecutionError as error:
-                raise ProviderError(error.code, error.message) from None
-            approval_required = self._tool_registry.requires_approval(tool_request, workspace_root)
-            if approval_required and stored_call.approval_decision is None:
-                try:
-                    async with asyncio.timeout(remaining_seconds):
-                        preview = await self._tool_registry.approval_preview(
-                            tool_request, workspace_root, capabilities=self._capabilities
-                        )
-                except ToolExecutionError as error:
-                    await self._record_tool_result(
-                        run.id,
-                        stored_call,
-                        ToolResult(
-                            tool_request.id, tool_request.name, error.message, True, error.code
-                        ),
+                async with asyncio.timeout(remaining_seconds):
+                    preview = await self._tool_registry.approval_preview(
+                        tool_request, workspace_root, capabilities=self._capabilities
                     )
-                    continue
-                except TimeoutError:
-                    raise ProviderError(
-                        "provider_timeout", "The run deadline was reached."
-                    ) from None
-                safe_preview = cast(dict[str, object] | None, self._redactor.redact_record(preview))
-                if safe_preview != preview:
-                    await self._record_tool_result(
-                        run.id,
-                        stored_call,
-                        ToolResult(
-                            tool_request.id,
-                            tool_request.name,
-                            "The tool preview contained a secret.",
-                            True,
-                            "sensitive_approval_preview",
-                        ),
-                    )
-                    continue
-                _waiting, event = await self._runs.request_tool_approval(
-                    run.id, stored_call.id, safe_preview
-                )
-                await self._publish(event)
-                return False
-            if stored_call.approval_decision is ToolApprovalDecision.DENIED:
-                result = ToolResult(
-                    stored_call.provider_call_id,
-                    stored_call.name,
-                    "The user denied this tool call.",
-                    True,
-                    "approval_denied",
-                )
-                await self._record_tool_result(
-                    run.id, stored_call, result, status=ToolCallStatus.DENIED
-                )
-                continue
-            try:
-                self._tool_registry.validate_execution(
-                    tool_request,
-                    workspace_root,
-                    approved=stored_call.approval_decision is ToolApprovalDecision.APPROVED,
-                    approval_preview=stored_call.approval_preview,
-                    capabilities=self._capabilities,
-                )
             except ToolExecutionError as error:
                 await self._record_tool_result(
                     run.id,
                     stored_call,
                     ToolResult(tool_request.id, tool_request.name, error.message, True, error.code),
                 )
-                continue
-            try:
-                await self._renew_before_local_tool(run.id)
-                dispatch_id = str(uuid4())
-                stored_call, event = await self._runs.begin_tool_execution(
-                    run.id,
-                    stored_call.id,
-                    dispatch_id=dispatch_id,
-                    expected_attempt=stored_call.dispatch_attempt,
-                    recovery_policy=self._tool_registry.recovery_policy(stored_call.name).value,
-                    input_snapshot={
-                        "arguments": stored_call.arguments,
-                        "approval_preview": stored_call.approval_preview,
-                    },
-                )
-                await self._publish(event)
-                if stored_call.status is ToolCallStatus.OUTCOME_UNKNOWN:
-                    raise ProviderError(
-                        "tool_outcome_unknown", "This tool's outcome requires review."
-                    )
-                if stored_call.status in {
-                    ToolCallStatus.COMPLETED,
-                    ToolCallStatus.FAILED,
-                    ToolCallStatus.DENIED,
-                    ToolCallStatus.CANCELLED,
-                    ToolCallStatus.TIMED_OUT,
-                }:
-                    continue
-                if stored_call.status is not ToolCallStatus.RUNNING:
-                    raise ApplicationError(
-                        "tool_dispatch_invalid", "The saved tool dispatch is inconsistent."
-                    )
-                if (
-                    stored_call.dispatch_id != dispatch_id
-                    or stored_call.dispatch_generation != run.generation
-                ):
-                    raise ApplicationError("run_lease_lost", "This run is no longer active here.")
-                await self._renew_before_local_tool(run.id, expected_generation=run.generation)
-                remaining_seconds = self._remaining_seconds(run)
-                if remaining_seconds <= 0:
-                    raise TimeoutError
-                result = await self._execute_tool(
-                    run, stored_call, tool_request, workspace_root, remaining_seconds
-                )
+                return True
             except TimeoutError:
                 raise ProviderError("provider_timeout", "The run deadline was reached.") from None
-            await self._record_tool_result(run.id, stored_call, result)
+            safe_preview = cast(dict[str, object] | None, self._redactor.redact_record(preview))
+            if safe_preview != preview:
+                await self._record_tool_result(
+                    run.id,
+                    stored_call,
+                    ToolResult(
+                        tool_request.id,
+                        tool_request.name,
+                        "The tool preview contained a secret.",
+                        True,
+                        "sensitive_approval_preview",
+                    ),
+                )
+                return True
+            _waiting, event = await self._runs.request_tool_approval(
+                run.id, stored_call.id, safe_preview
+            )
+            await self._publish(event)
+            return False
+        if stored_call.approval_decision is ToolApprovalDecision.DENIED:
+            result = ToolResult(
+                stored_call.provider_call_id,
+                stored_call.name,
+                "The user denied this tool call.",
+                True,
+                "approval_denied",
+            )
+            await self._record_tool_result(
+                run.id, stored_call, result, status=ToolCallStatus.DENIED
+            )
+            return True
+        try:
+            self._tool_registry.validate_execution(
+                tool_request,
+                workspace_root,
+                approved=stored_call.approval_decision is ToolApprovalDecision.APPROVED,
+                approval_preview=stored_call.approval_preview,
+                capabilities=self._capabilities,
+            )
+        except ToolExecutionError as error:
+            await self._record_tool_result(
+                run.id,
+                stored_call,
+                ToolResult(tool_request.id, tool_request.name, error.message, True, error.code),
+            )
+            return True
+        try:
+            await self._renew_before_local_tool(run.id)
+            input_snapshot: dict[str, object] = {
+                "arguments": stored_call.arguments,
+                "approval_preview": stored_call.approval_preview,
+            }
+            if operation is not None:
+                input_snapshot.update(await operation.capture_inputs())
+            dispatch_id = str(uuid4())
+            if operation is not None:
+                dispatch_id = await operation.mark_dispatch(dispatch_id)
+            stored_call, event = await self._runs.begin_tool_execution(
+                run.id,
+                stored_call.id,
+                dispatch_id=dispatch_id,
+                expected_attempt=stored_call.dispatch_attempt,
+                recovery_policy=self._tool_registry.recovery_policy(stored_call.name).value,
+                input_snapshot=input_snapshot,
+            )
+            await self._publish(event)
+            if stored_call.status is ToolCallStatus.OUTCOME_UNKNOWN:
+                raise ProviderError("tool_outcome_unknown", "This tool's outcome requires review.")
+            if stored_call.status in {
+                ToolCallStatus.COMPLETED,
+                ToolCallStatus.FAILED,
+                ToolCallStatus.DENIED,
+                ToolCallStatus.CANCELLED,
+                ToolCallStatus.TIMED_OUT,
+            }:
+                if (
+                    operation is not None
+                    and stored_call.dispatch_id == dispatch_id
+                    and stored_call.result_snapshot is not None
+                    and stored_call.result_snapshot.get("dispatch_id") == dispatch_id
+                ):
+                    await operation.confirm_saved()
+                return True
+            if stored_call.status is not ToolCallStatus.RUNNING:
+                raise ApplicationError(
+                    "tool_dispatch_invalid", "The saved tool dispatch is inconsistent."
+                )
+            if (
+                stored_call.dispatch_id != dispatch_id
+                or stored_call.dispatch_generation != run.generation
+            ):
+                raise ApplicationError("run_lease_lost", "This run is no longer active here.")
+            await self._renew_before_local_tool(run.id, expected_generation=run.generation)
+            if operation is not None:
+                await operation.verify()
+            remaining_seconds = self._remaining_seconds(run)
+            if remaining_seconds <= 0:
+                raise TimeoutError
+            result = await self._execute_tool(
+                run, stored_call, tool_request, workspace_root, remaining_seconds
+            )
+        except TimeoutError:
+            raise ProviderError("provider_timeout", "The run deadline was reached.") from None
+        if result.error_code == "command_outcome_unknown":
+            raise ProviderError("tool_outcome_unknown", result.content)
+        result_snapshot = await operation.capture_result(result) if operation is not None else None
+        await self._record_tool_result(run.id, stored_call, result, result_snapshot=result_snapshot)
+        if operation is not None:
+            await operation.confirm_saved()
         return True
 
     async def _execute_tool(
@@ -1346,6 +1407,7 @@ class RunService:
         result: ToolResult,
         *,
         status: ToolCallStatus | None = None,
+        result_snapshot: dict[str, object] | None = None,
     ) -> None:
         result_content = (
             f"{result.error_code}: {result.content}"
@@ -1354,13 +1416,24 @@ class RunService:
         )
         if result.truncated:
             result_content += "\n[Output truncated by Trellis.]"
-        _message, _call, event = await self._runs.record_tool_result(
-            run_id,
-            stored_call.id,
-            self._redactor.redact_text(result_content),
-            status=status
-            or (ToolCallStatus.FAILED if result.is_error else ToolCallStatus.COMPLETED),
+        result_status = status or (
+            ToolCallStatus.FAILED if result.is_error else ToolCallStatus.COMPLETED
         )
+        if result_snapshot is None:
+            _message, _call, event = await self._runs.record_tool_result(
+                run_id,
+                stored_call.id,
+                self._redactor.redact_text(result_content),
+                status=result_status,
+            )
+        else:
+            _message, _call, event = await self._runs.record_tool_result(
+                run_id,
+                stored_call.id,
+                self._redactor.redact_text(result_content),
+                status=result_status,
+                result_snapshot=result_snapshot,
+            )
         await self._publish(event)
 
     def _request_snapshot(self, request: ModelRequest) -> dict[str, object]:
@@ -2033,9 +2106,9 @@ class RunService:
         for tool in await self._runs.list_tool_calls(run_id):
             if tool.status not in {ToolCallStatus.PENDING, ToolCallStatus.RUNNING}:
                 continue
-            if tool.status is ToolCallStatus.RUNNING and (
-                tool.recovery_policy != ToolRecoveryPolicy.READ_ONLY
-            ):
+            if (
+                tool.status is ToolCallStatus.RUNNING or tool.dispatch_attempt > 0
+            ) and tool.recovery_policy != ToolRecoveryPolicy.READ_ONLY:
                 await self._runs.mark_tool_outcome_unknown(
                     run_id, tool.id, "Execution stopped before a confirmed tool result was saved."
                 )

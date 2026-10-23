@@ -444,3 +444,4 @@ class ToolCallRecord:
     dispatch_id: str | None = None
     input_snapshot: dict[str, object] | None = None
     reviewed_at: str | None = None
+    result_snapshot: dict[str, object] | None = None

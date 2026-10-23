@@ -86,3 +86,5 @@ jobs:
           bash supabase/tests/atomic_compaction_concurrency.sh
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/tool_dispatch.sql
           bash supabase/tests/tool_dispatch_concurrency.sh
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/local_reconciliation.sql
+          bash supabase/tests/local_reconciliation_concurrency.sh

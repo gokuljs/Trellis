@@ -1173,6 +1173,9 @@ class SupabaseRepository:
             dispatch_id=_nullable_text(row, "dispatch_id"),
             input_snapshot=None if input_snapshot is None else _object(input_snapshot),
             reviewed_at=_nullable_text(row, "reviewed_at"),
+            result_snapshot=(
+                None if row.get("result_snapshot") is None else _object(row["result_snapshot"])
+            ),
         )
 
     async def _tool_call_rows(self, run_id: str) -> list[dict[str, object]]:
@@ -1182,7 +1185,7 @@ class SupabaseRepository:
                 "id,user_id,run_id,assistant_message_id,call_index,provider_call_id,name,"
                 "arguments,status,approval_decision,approval_decided_at,approval_preview,"
                 "created_at,finished_at,dispatch_attempt,dispatch_generation,dispatched_at,"
-                "recovery_policy,result_source,dispatch_id,input_snapshot,reviewed_at"
+                "recovery_policy,result_source,dispatch_id,input_snapshot,reviewed_at,result_snapshot"
             ),
             filters={
                 "user_id": f"eq.{self._user_id}",
@@ -1656,6 +1659,7 @@ class SupabaseRepository:
         *,
         status: ToolCallStatus = ToolCallStatus.COMPLETED,
         result_source: str = "executor",
+        result_snapshot: dict[str, object] | None = None,
     ) -> tuple[RunMessageRecord, ToolCallRecord, RunEvent]:
         if status not in {
             ToolCallStatus.COMPLETED,
@@ -1674,15 +1678,27 @@ class SupabaseRepository:
                     "content": content,
                     "status": status.value,
                     "result_source": result_source,
+                    "result_snapshot": result_snapshot,
                 },
                 capability=self._run_capability(run_id),
             )
         )
-        return (
-            self._run_message(_object(result.get("message"))),
-            self._tool_call(_object(result.get("tool_call"))),
-            self._event(_object(result.get("event"))),
-        )
+        message = self._run_message(_object(result.get("message")))
+        tool = self._tool_call(_object(result.get("tool_call")))
+        event = self._event(_object(result.get("event")))
+        if (
+            message.run_id != run_id
+            or message.tool_call_id != tool_call_id
+            or message.role != "tool"
+            or message.content != content
+            or tool.run_id != run_id
+            or tool.id != tool_call_id
+            or tool.status is not status
+            or tool.result_snapshot != result_snapshot
+            or event.run_id != run_id
+        ):
+            raise RuntimeError("Supabase returned another tool's result")
+        return message, tool, event
 
     async def begin_tool_execution(
         self,
@@ -1734,6 +1750,39 @@ class SupabaseRepository:
             or tool.status is not ToolCallStatus.OUTCOME_UNKNOWN
         ):
             raise RuntimeError("Supabase returned another uncertain tool")
+        return tool
+
+    async def authorize_tool_retry(
+        self,
+        run_id: str,
+        tool_call_id: str,
+        *,
+        expected_dispatch_id: str,
+        expected_attempt: int,
+        reconciliation: str,
+        proof: dict[str, object] | None = None,
+    ) -> ToolCallRecord:
+        result = await self._idempotent_rpc(
+            "authorize_tool_retry",
+            {
+                "run_id": run_id,
+                "tool_call_id": tool_call_id,
+                "expected_dispatch_id": expected_dispatch_id,
+                "expected_attempt": expected_attempt,
+                "reconciliation": reconciliation,
+                "proof": proof,
+            },
+            capability=self._run_capability(run_id),
+        )
+        tool = self._tool_call(_object(result))
+        if (
+            tool.id != tool_call_id
+            or tool.run_id != run_id
+            or tool.dispatch_id != expected_dispatch_id
+            or tool.dispatch_attempt != expected_attempt
+            or tool.status is not ToolCallStatus.PENDING
+        ):
+            raise RuntimeError("Supabase returned another tool retry authorization")
         return tool
 
     async def record_tool_approval_decision(

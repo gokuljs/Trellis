@@ -4,9 +4,11 @@ import asyncio
 import os
 import signal
 import stat
+import sys
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import suppress
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import cast
@@ -47,6 +49,50 @@ _PROTECTED_NAMES = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _PinnedWorkspace:
+    root: Path
+    descriptor: int
+    verify: Callable[[], bool]
+
+
+_PINNED_WORKSPACE: ContextVar[_PinnedWorkspace | None] = ContextVar(
+    "trellis_pinned_workspace", default=None
+)
+
+
+def validate_pinned_workspace(root: Path) -> None:
+    pinned = _PINNED_WORKSPACE.get()
+    if pinned is None:
+        return
+    try:
+        current = os.stat(root, follow_symlinks=False)
+        original = os.fstat(pinned.descriptor)
+        valid = (
+            root == pinned.root
+            and root.resolve(strict=True) == root
+            and stat.S_ISDIR(current.st_mode)
+            and stat.S_ISDIR(original.st_mode)
+            and (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino)
+            and pinned.verify()
+        )
+    except OSError, ValueError:
+        valid = False
+    if not valid:
+        raise ToolExecutionError(
+            "workspace_grant_unavailable", "The trusted workspace changed or was revoked."
+        )
+
+
+@contextmanager
+def pinned_workspace(root: Path, descriptor: int, verify: Callable[[], bool]) -> Iterator[None]:
+    token = _PINNED_WORKSPACE.set(_PinnedWorkspace(root, descriptor, verify))
+    try:
+        yield
+    finally:
+        _PINNED_WORKSPACE.reset(token)
+
+
 def _protected(name: str) -> bool:
     lower = name.casefold()
     return (
@@ -74,6 +120,7 @@ def _parts(relative_path: str, *, allow_root: bool) -> tuple[str, ...]:
 
 
 def _root(workspace_root: Path) -> Path:
+    validate_pinned_workspace(workspace_root)
     try:
         if (
             not workspace_root.is_absolute()
@@ -87,8 +134,12 @@ def _root(workspace_root: Path) -> Path:
 
 
 def _open_directory(root: Path, parts: tuple[str, ...]) -> int:
+    validate_pinned_workspace(root)
     try:
-        descriptor = os.open(root, _DIRECTORY_FLAGS)
+        pinned = _PINNED_WORKSPACE.get()
+        descriptor = (
+            os.dup(pinned.descriptor) if pinned is not None else os.open(root, _DIRECTORY_FLAGS)
+        )
         for part in parts:
             try:
                 next_descriptor = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptor)
@@ -303,15 +354,33 @@ async def _run_bounded_file_operation[T](
     arguments: dict[str, object],
 ) -> T:
     stopped = threading.Event()
+    worker = asyncio.create_task(asyncio.to_thread(operation, root, arguments, stopped))
     try:
         async with asyncio.timeout(TOOL_TIMEOUT_SECONDS):
-            return await asyncio.to_thread(operation, root, arguments, stopped)
+            return await asyncio.shield(worker)
     except TimeoutError:
         stopped.set()
+        if await _drain_task(worker):
+            raise asyncio.CancelledError from None
         raise ToolExecutionError("tool_timeout", "The tool reached its time limit.") from None
     except asyncio.CancelledError:
         stopped.set()
+        await _drain_task(worker)
         raise
+
+
+async def _drain_task[T](task: asyncio.Future[T]) -> bool:
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    if not task.cancelled():
+        task.exception()
+    return cancelled
 
 
 class _OutputLimit(Exception):
@@ -333,16 +402,76 @@ async def _stop_process(
     process: asyncio.subprocess.Process,
     tasks: tuple[asyncio.Task[bytes] | asyncio.Task[int], ...],
 ) -> None:
+    async def finish() -> None:
+        try:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except PermissionError, ProcessLookupError:
+                with suppress(ProcessLookupError):
+                    process.kill()
+            async with asyncio.timeout(5):
+                await process.wait()
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    cleanup = asyncio.create_task(finish())
+    await _drain_task(cleanup)
+    cleanup.result()
+
+
+async def _spawn_git(
+    root: Path, arguments: tuple[str, ...], environment: dict[str, str]
+) -> asyncio.subprocess.Process:
+    opening = asyncio.create_task(asyncio.to_thread(_open_directory, root, ()))
     try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except PermissionError, ProcessLookupError:
-        # Some local sandboxes permit terminating a direct child but not its process group.
-        with suppress(ProcessLookupError):
-            process.kill()
-    await process.wait()
-    for task in tasks:
-        task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
+        descriptor = await asyncio.shield(opening)
+    except asyncio.CancelledError:
+        await _drain_task(opening)
+        if not opening.cancelled() and opening.exception() is None:
+            os.close(opening.result())
+        raise
+    try:
+        await asyncio.to_thread(validate_pinned_workspace, root)
+        spawning = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                "import os,sys; fd=int(sys.argv[1]); os.fchdir(fd); os.close(fd); "
+                "os.execvpe(sys.argv[2], sys.argv[2:], os.environ)",
+                str(descriptor),
+                "git",
+                "--literal-pathspecs",
+                "--no-optional-locks",
+                "--no-pager",
+                "-c",
+                "core.fsmonitor=false",
+                *arguments,
+                pass_fds=(descriptor,),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=environment,
+                start_new_session=True,
+            )
+        )
+        try:
+            return await asyncio.shield(spawning)
+        except asyncio.CancelledError:
+            await _drain_task(spawning)
+            if not spawning.cancelled() and spawning.exception() is None:
+                child = spawning.result()
+                readers = tuple(
+                    asyncio.create_task(stream.read())
+                    for stream in (child.stdout, child.stderr)
+                    if stream is not None
+                )
+                await _stop_process(child, readers)
+            raise
+    finally:
+        os.close(descriptor)
 
 
 async def _git_command(
@@ -357,30 +486,17 @@ async def _git_command(
         "LC_ALL": "C",
     }
     try:
-        process = await asyncio.create_subprocess_exec(
-            "git",
-            "--literal-pathspecs",
-            "--no-optional-locks",
-            "--no-pager",
-            "-c",
-            "core.fsmonitor=false",
-            "-C",
-            str(root),
-            *arguments,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=environment,
-            start_new_session=True,
-        )
+        process = await _spawn_git(root, arguments, environment)
     except OSError:
         raise ToolExecutionError("git_unavailable", "Git inspection is unavailable.") from None
     assert process.stdout is not None and process.stderr is not None
     stdout_task = asyncio.create_task(_read_stream(process.stdout, limit, "stdout"))
     stderr_task = asyncio.create_task(_read_stream(process.stderr, 4096, "stderr"))
     wait_task = asyncio.create_task(process.wait())
+    result = asyncio.gather(stdout_task, stderr_task, wait_task)
     try:
         async with asyncio.timeout(TOOL_TIMEOUT_SECONDS):
-            stdout, _stderr, exit_code = await asyncio.gather(stdout_task, stderr_task, wait_task)
+            stdout, _stderr, exit_code = await asyncio.shield(result)
     except _OutputLimit as error:
         await _stop_process(process, (stdout_task, stderr_task, wait_task))
         if error.stream_name == "stderr":
@@ -391,6 +507,8 @@ async def _git_command(
     except TimeoutError, asyncio.CancelledError:
         await _stop_process(process, (stdout_task, stderr_task, wait_task))
         raise
+    finally:
+        await _drain_task(result)
     if exit_code:
         raise ToolExecutionError("git_failed", "Git inspection could not complete.")
     return stdout, False

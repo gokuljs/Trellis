@@ -47,6 +47,7 @@ from app.infrastructure.runtime_events import RuntimeEventHub
 from app.infrastructure.server_credentials import ServerCredentialStore
 from app.infrastructure.supabase_repository import SupabaseRepository, VerifiedTokenSource
 from app.infrastructure.workspace_bindings import LocalWorkspaceBindings
+from app.infrastructure.workspace_execution import CommandMarkerStore, LocalWorkspaceExecution
 from app.infrastructure.workspace_grants import (
     InstallationIdentity,
     WorkspaceGrantStore,
@@ -82,6 +83,7 @@ class AccountContext:
     run_service: RunService
     event_hub: RuntimeEventHub
     workspace_bindings: LocalWorkspaceBindings | None = None
+    workspace_execution: LocalWorkspaceExecution | None = None
 
 
 def _prepare_account_directory(data_dir: Path, user_id: UUID) -> Path:
@@ -260,12 +262,21 @@ class AccountRegistry:
                     secret_store = self._credentials
                     event_hub = RuntimeEventHub()
                     workspace_bindings = None
+                    workspace_execution = None
                     if self._capabilities.workspace_enabled:
                         installation = await asyncio.to_thread(
                             _installation_identity, self._settings.data_dir
                         )
                         workspace_bindings = LocalWorkspaceBindings(
                             WorkspaceGrantStore(account_dir, str(user_id), installation)
+                        )
+                        workspace_execution = LocalWorkspaceExecution(
+                            workspace_bindings,
+                            CommandMarkerStore(
+                                self._settings.data_dir.resolve(strict=True) / "installation",
+                                installation,
+                            ),
+                            str(user_id),
                         )
                     tools = (
                         self._tool_registry_factory(database)
@@ -299,6 +310,7 @@ class AccountRegistry:
                         if self._capabilities.allows("local_read")
                         else None,
                         workspace_bindings=workspace_bindings,
+                        workspace_execution=workspace_execution,
                         lease_repository=database,
                         capacity=self._run_capacity,
                         owner_id=str(user_id),
@@ -334,10 +346,12 @@ class AccountRegistry:
                                 if self._capabilities.allows("local_read")
                                 else None,
                                 workspace_bindings=workspace_bindings,
+                                workspace_execution=workspace_execution,
                             ),
                             run_service=run_service,
                             event_hub=event_hub,
                             workspace_bindings=workspace_bindings,
+                            workspace_execution=workspace_execution,
                         )
                     except BaseException:
                         await run_service.close()

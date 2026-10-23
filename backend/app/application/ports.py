@@ -1,4 +1,5 @@
 from collections.abc import AsyncGenerator, Sequence
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from typing import Protocol
 
@@ -37,7 +38,9 @@ from app.domain.runtime import (
     ToolApprovalDecision,
     ToolCallRecord,
     ToolCallStatus,
+    ToolResult,
 )
+from app.domain.workspaces import PatchReconciliation
 
 
 class ProfileRepository(Protocol):
@@ -116,6 +119,44 @@ class WorkspaceBindingPort(Protocol):
     async def reference(
         self, session_id: str, workspace_path: str | None
     ) -> WorkspaceRecoveryReference | None: ...
+
+
+class WorkspaceOperationPort(Protocol):
+    async def reconcile_patch(self) -> PatchReconciliation: ...
+
+    async def capture_inputs(self) -> dict[str, object]: ...
+
+    async def mark_dispatch(self, dispatch_id: str) -> str: ...
+
+    async def capture_result(self, result: ToolResult) -> dict[str, object]: ...
+
+    async def confirm_saved(self) -> None: ...
+
+    async def verify(self) -> None: ...
+
+
+class WorkspaceExecutionPort(Protocol):
+    def guard(
+        self, session_id: str, root: Path, *, exclusive: bool = False
+    ) -> AbstractAsyncContextManager[None]: ...
+
+    def operation(
+        self,
+        run: RunSnapshot,
+        tool: ToolCallRecord,
+        root: Path,
+        prior_tools: Sequence[ToolCallRecord] = (),
+    ) -> AbstractAsyncContextManager[WorkspaceOperationPort]: ...
+
+    async def reconcile_patch(
+        self, run: RunSnapshot, tool: ToolCallRecord, root: Path
+    ) -> PatchReconciliation: ...
+
+    async def validate_observations(
+        self, run: RunSnapshot, tools: Sequence[ToolCallRecord], root: Path
+    ) -> None: ...
+
+    async def acknowledge_review(self, session_id: str, root: Path, tool_call_id: str) -> None: ...
 
 
 class RunLeasePort(Protocol):
@@ -296,6 +337,7 @@ class RunRepository(Protocol):
         *,
         status: ToolCallStatus = ToolCallStatus.COMPLETED,
         result_source: str = "executor",
+        result_snapshot: dict[str, object] | None = None,
     ) -> tuple[RunMessageRecord, ToolCallRecord, RunEvent]: ...
 
     async def begin_tool_execution(
@@ -311,6 +353,17 @@ class RunRepository(Protocol):
 
     async def mark_tool_outcome_unknown(
         self, run_id: str, tool_call_id: str, reason: str
+    ) -> ToolCallRecord: ...
+
+    async def authorize_tool_retry(
+        self,
+        run_id: str,
+        tool_call_id: str,
+        *,
+        expected_dispatch_id: str,
+        expected_attempt: int,
+        reconciliation: str,
+        proof: dict[str, object] | None = None,
     ) -> ToolCallRecord: ...
 
     async def record_tool_approval_decision(

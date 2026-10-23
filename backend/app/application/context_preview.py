@@ -5,6 +5,7 @@ is an estimate even when the last generation used provider token counting.
 """
 
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
@@ -20,6 +21,7 @@ from app.application.ports import (
     SessionRepository,
     SettingsRepository,
     WorkspaceBindingPort,
+    WorkspaceExecutionPort,
 )
 from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
 from app.application.settings import is_selectable
@@ -91,6 +93,7 @@ class ContextPreviewService:
         redactor: SecretRedactor = COMMON_SECRET_REDACTOR,
         workspace_bindings: WorkspaceBindingPort | None = None,
         workspace_guidance_reader: Callable[[Path], Awaitable[str | None]] | None = None,
+        workspace_execution: WorkspaceExecutionPort | None = None,
     ) -> None:
         self._sessions = sessions
         self._settings = settings
@@ -102,6 +105,7 @@ class ContextPreviewService:
         self._redactor = redactor
         self._workspace_bindings = workspace_bindings
         self._workspace_guidance_reader = workspace_guidance_reader
+        self._workspace_execution = workspace_execution
 
     async def preview(
         self,
@@ -141,13 +145,19 @@ class ContextPreviewService:
             and self._workspace_bindings is not None
             else None
         )
-        guidance = (
-            await self._workspace_guidance_reader(workspace_root)
-            if self._capabilities.allows("local_read")
+        guidance = None
+        if (
+            self._capabilities.allows("local_read")
             and workspace_root is not None
             and self._workspace_guidance_reader is not None
-            else None
-        )
+            and session is not None
+        ):
+            async with (
+                self._workspace_execution.guard(session.id, workspace_root)
+                if self._workspace_execution is not None
+                else nullcontext()
+            ):
+                guidance = await self._workspace_guidance_reader(workspace_root)
         tools = (
             self._tool_registry.specs(workspace_root, capabilities=self._capabilities)
             if model.supports_tools and self._tool_registry is not None
