@@ -70,6 +70,7 @@ from app.domain.runtime import (
     ToolResult,
     is_terminal_run_status,
 )
+from app.domain.workspaces import WorkspaceReviewState
 
 logger = logging.getLogger(__name__)
 
@@ -400,6 +401,12 @@ class RunService:
                     ) from None
                 if "session not found" in message:
                     raise ApplicationError("session_not_found", "Session not found.") from None
+                if message == "unsafe_retry_requires_review":
+                    raise ApplicationError(
+                        "unsafe_retry",
+                        "This run contains an action with an unknown outcome. "
+                        "Retry cannot safely repeat it.",
+                    ) from None
                 raise ApplicationError(
                     "run_invalid", "The run request could not be accepted."
                 ) from None
@@ -481,6 +488,148 @@ class RunService:
         return await self._recover_if_expired(
             await self._runs.get_latest_run_for_session(session_id)
         )
+
+    async def uncertain_operation(self, run: RunSnapshot) -> ToolCallRecord | None:
+        if run.uncertain_tool_call_id is None:
+            return None
+        return next(
+            (
+                tool
+                for tool in await self._runs.list_tool_calls(run.id)
+                if tool.id == run.uncertain_tool_call_id
+                and tool.run_id == run.id
+                and tool.status is ToolCallStatus.OUTCOME_UNKNOWN
+            ),
+            None,
+        )
+
+    async def get_workspace_review(self, session_id: str) -> WorkspaceReviewState:
+        session = await self._sessions.get_session(session_id)
+        if session is None:
+            raise ApplicationError("session_not_found", "Session not found.")
+        if self._workspace_bindings is None or self._workspace_execution is None:
+            return WorkspaceReviewState(False)
+        root = await self._workspace_bindings.resolve(session.id, session.workspace_path)
+        if root is None:
+            return WorkspaceReviewState(False)
+        block = await self._workspace_execution.pending_review(session.id, root)
+        if block is None:
+            return WorkspaceReviewState(False)
+        if block.run_id is None or block.session_id is None or block.tool_call_id is None:
+            return WorkspaceReviewState(True, "workspace_review_other_account")
+        run = await self._runs.get_run(block.run_id)
+        if run is None or run.id != block.run_id or run.session_id != block.session_id:
+            return WorkspaceReviewState(True, "workspace_review_unavailable")
+        tool = next(
+            (
+                item
+                for item in await self._runs.list_tool_calls(run.id)
+                if item.id == block.tool_call_id and item.run_id == run.id
+            ),
+            None,
+        )
+        if tool is None or tool.name != "run_command":
+            return WorkspaceReviewState(True, "workspace_review_unavailable")
+        if await self._workspace_execution.reconcile_command_marker(
+            run, tool, root, session_id=session.id
+        ):
+            return WorkspaceReviewState(False)
+        if not is_terminal_run_status(run.status):
+            return WorkspaceReviewState(True, "workspace_review_run_active")
+        if tool.status is not ToolCallStatus.OUTCOME_UNKNOWN:
+            return WorkspaceReviewState(True, "workspace_review_unavailable")
+        return WorkspaceReviewState(
+            True, "command_outcome_unknown", run.session_id, run.id, tool, str(root)
+        )
+
+    async def workspace_review_pending(self, run: RunSnapshot, tool: ToolCallRecord) -> bool:
+        if tool.reviewed_at is None:
+            return True
+        if self._workspace_bindings is None or self._workspace_execution is None:
+            return True
+        try:
+            session = await self._sessions.get_session(run.session_id)
+            if session is None:
+                return True
+            root = await self._workspace_bindings.resolve(session.id, session.workspace_path)
+            if root is None:
+                return True
+            expected = (
+                run.recovery_contract.workspace if run.recovery_contract is not None else None
+            )
+            if expected is not None:
+                current = await self._workspace_bindings.reference(
+                    session.id, session.workspace_path
+                )
+                if current is None or (
+                    current.canonical_path,
+                    current.directory_device,
+                    current.directory_inode,
+                ) != (
+                    expected.canonical_path,
+                    expected.directory_device,
+                    expected.directory_inode,
+                ):
+                    return True
+            return await self._workspace_execution.review_pending(session.id, root, tool.id)
+        except ApplicationError, OSError:
+            return True
+
+    async def review_workspace(
+        self,
+        session_id: str,
+        run_id: str,
+        tool_call_id: str,
+        *,
+        confirmed: bool,
+    ) -> ToolCallRecord:
+        if confirmed is not True:
+            raise ApplicationError(
+                "workspace_review_confirmation_required", "Confirm that you reviewed this command."
+            )
+        session = await self._sessions.get_session(session_id)
+        if session is None:
+            raise ApplicationError("session_not_found", "Session not found.")
+        run = await self._runs.get_run(run_id)
+        if run is None or run.session_id != session_id:
+            raise ApplicationError("run_not_found", "Run not found.")
+        tool = await self.uncertain_operation(run)
+        if (
+            not is_terminal_run_status(run.status)
+            or run.uncertain_tool_call_id != tool_call_id
+            or tool is None
+            or tool.name != "run_command"
+        ):
+            raise ApplicationError(
+                "workspace_review_mismatch", "This is not an uncertain command for this chat."
+            )
+        if self._workspace_bindings is None or self._workspace_execution is None:
+            raise ApplicationError(
+                "workspace_grant_unavailable", "Select the command's folder to review its outcome."
+            )
+        root = await self._workspace_bindings.resolve(session_id, session.workspace_path)
+        if root is None:
+            raise ApplicationError(
+                "workspace_grant_unavailable", "Select the command's folder to review its outcome."
+            )
+        expected = run.recovery_contract.workspace if run.recovery_contract is not None else None
+        if expected is not None:
+            current = await self._workspace_bindings.reference(session_id, session.workspace_path)
+            if current is None or (
+                current.canonical_path,
+                current.directory_device,
+                current.directory_inode,
+            ) != (
+                expected.canonical_path,
+                expected.directory_device,
+                expected.directory_inode,
+            ):
+                raise ApplicationError(
+                    "workspace_review_mismatch", "Select the folder used by this command."
+                )
+        saved = await self._runs.acknowledge_workspace_review(session_id, run_id, tool_call_id)
+        await self._workspace_execution.acknowledge_review(session_id, root, tool_call_id)
+        return saved
 
     async def list_session_runs(
         self,

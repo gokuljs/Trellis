@@ -5,10 +5,13 @@ import remarkGfm from "remark-gfm"
 import { ThinkingOrb } from "thinking-orbs"
 
 import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
+import { WorkspaceRecoveryNotice } from "@/components/workspace-review"
 import { HistoryPagination } from "@/components/history-pagination"
 import { RunActivityDisclosure } from "@/components/run-activity-disclosure"
 import type {
   AssistantOutput,
+  LatestRun,
+  WorkspaceReviewStatus,
   Message,
   Session,
   TimelineRow,
@@ -35,6 +38,14 @@ type ChatThreadProps = {
   error: string | null
   activityHistoryError?: string | null
   onRetryActivityHistory?: () => void
+  recovery?: LatestRun | null
+  workspaceReview?: WorkspaceReviewStatus | null
+  onRefreshWorkspaceReview?: () => void
+  onWorkspaceReview?: (
+    runId: string,
+    toolCallId: string,
+    sourceSessionId?: string
+  ) => Promise<void>
   canRetry: boolean
   canReconnect?: boolean
   canCancel: boolean
@@ -116,6 +127,10 @@ export function ChatThread({
   error,
   activityHistoryError = null,
   onRetryActivityHistory = () => undefined,
+  recovery = null,
+  workspaceReview = null,
+  onRefreshWorkspaceReview = () => undefined,
+  onWorkspaceReview = async () => undefined,
   canRetry,
   canReconnect = false,
   canCancel,
@@ -324,6 +339,12 @@ export function ChatThread({
           ) : null}
         </div>
       ) : null}
+      <WorkspaceRecoveryNotice
+        run={recovery}
+        workspace={workspaceReview}
+        onReview={onWorkspaceReview}
+        onRefresh={onRefreshWorkspaceReview}
+      />
       {activityHistoryError ? (
         <div className="chat-error" role="alert">
           <span>{activityHistoryError}</span>

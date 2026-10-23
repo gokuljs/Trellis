@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Literal
 
+from app.domain.runtime import ToolCallRecord
+
 PatchState = Literal["desired_state_present", "unchanged_original", "conflict"]
 
 
@@ -19,3 +21,20 @@ class PatchReconciliation:
             "after_sha256": self.after_sha256,
             "observed_sha256": self.observed_sha256,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceReviewBlock:
+    session_id: str | None = None
+    run_id: str | None = None
+    tool_call_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceReviewState:
+    blocked: bool
+    reason: str | None = None
+    source_session_id: str | None = None
+    run_id: str | None = None
+    tool: ToolCallRecord | None = None
+    workspace_path: str | None = None

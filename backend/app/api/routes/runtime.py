@@ -179,6 +179,9 @@ def _run_result(run) -> dict[str, object]:
         "modelId": run.model_id,
         "status": run.status.value,
         "lastSequence": run.last_event_sequence,
+        "retryAllowed": run.retry_allowed,
+        "recoveryReason": run.recovery_reason,
+        "uncertainToolCallId": run.uncertain_tool_call_id,
         "budgetPreset": run.budget_preset,
         "limits": {
             "maxModelCalls": run.max_model_calls,

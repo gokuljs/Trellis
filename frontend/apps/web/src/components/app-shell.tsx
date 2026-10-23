@@ -67,12 +67,17 @@ import type {
   TimelineRow,
   Settings,
   WorkspaceView,
+  WorkspaceReviewStatus,
 } from "@/lib/app-types"
 import {
   ownsRun,
   isReconciledRunOutcome,
   recoveryTranscript,
   turnFailureAction,
+  recoveryRunInfo,
+  mergeRunInfo,
+  runInfoFromEvent,
+  allowsRunRetry,
   type TerminalRunOutcome,
 } from "@/lib/run-recovery"
 import {
@@ -156,6 +161,7 @@ function retryFromTranscript(
 const activeRunStatuses = new Set([
   "queued",
   "running",
+  "recovering",
   "waiting_for_approval",
   "cancelling",
 ])
@@ -228,6 +234,9 @@ export function AppShell({
   const [pending, setPending] = useState(false)
   const [streamingText, setStreamingText] = useState<string | null>(null)
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
+  const [latestRun, setLatestRun] = useState<LatestRun | null>(null)
+  const [workspaceReview, setWorkspaceReview] =
+    useState<WorkspaceReviewStatus | null>(null)
   const [runActivities, setRunActivities] = useState<
     Record<string, TurnRunActivity>
   >({})
@@ -254,6 +263,7 @@ export function AppShell({
   const runGenerationRef = useRef(0)
   const cancelRequestRef = useRef(false)
   const approvalRequestRef = useRef<string | null>(null)
+  const workspaceReviewRequestRef = useRef(0)
   const bootstrapControllerRef = useRef<AbortController | null>(null)
   const runConnectionControllerRef = useRef<AbortController | null>(null)
   const summaryRefresh = useMemo(
@@ -306,17 +316,59 @@ export function AppShell({
     [queryClient]
   )
 
+  const refreshWorkspaceReview = useCallback(async (sessionId: string) => {
+    const generation = runGenerationRef.current
+    const requestId = ++workspaceReviewRequestRef.current
+    try {
+      const saved = await api.getWorkspaceReview(sessionId)
+      if (
+        activeSessionIdRef.current === sessionId &&
+        runGenerationRef.current === generation &&
+        workspaceReviewRequestRef.current === requestId
+      )
+        setWorkspaceReview(saved)
+    } catch {
+      if (
+        activeSessionIdRef.current === sessionId &&
+        runGenerationRef.current === generation &&
+        workspaceReviewRequestRef.current === requestId
+      )
+        setWorkspaceReview({
+          blocked: true,
+          reason: "workspace_review_unavailable",
+        })
+    }
+  }, [])
+
   const recordRunInfo = useCallback(
-    (turnId: string, runInfo: RuntimeRunInfo) =>
+    (turnId: string, runInfo: RuntimeRunInfo) => {
+      setLatestRun((current) => {
+        const merged = mergeRunInfo(
+          current ? recoveryRunInfo(current) : null,
+          runInfo
+        )
+        return {
+          ...(current?.run_id === runInfo.runId ? current : {}),
+          run_id: merged.runId,
+          turn_id: turnId,
+          status: merged.status ?? "running",
+          last_sequence:
+            current?.run_id === runInfo.runId ? current.last_sequence : 0,
+          retry_allowed: merged.retryAllowed,
+          recovery_reason: merged.recoveryReason,
+          uncertain_tool_call_id: merged.uncertainToolCallId,
+        }
+      })
       setRunActivities((current) => ({
         ...current,
         [turnId]: {
           ...current[turnId],
           events: current[turnId]?.events ?? [],
-          runInfo,
+          runInfo: mergeRunInfo(current[turnId]?.runInfo, runInfo),
           latestEvent: current[turnId]?.latestEvent,
         },
-      })),
+      }))
+    },
     []
   )
 
@@ -345,6 +397,47 @@ export function AppShell({
       setAssistantOutputState((current) =>
         reduceAssistantOutputEvent(current, event, turnId)
       )
+      setLatestRun((current) => {
+        if (current?.run_id !== event.runId) return current
+        const info = runInfoFromEvent(recoveryRunInfo(current), event)
+        return {
+          ...current,
+          status: info.status ?? current.status,
+          last_sequence: Math.max(current.last_sequence, event.sequence),
+          retry_allowed: info.retryAllowed,
+          recovery_reason: info.recoveryReason,
+          uncertain_tool_call_id: info.uncertainToolCallId,
+        }
+      })
+      if (
+        sessionId &&
+        [
+          "run.completed",
+          "run.failed",
+          "run.cancelled",
+          "run.interrupted",
+        ].includes(event.eventType)
+      ) {
+        const generation = runGenerationRef.current
+        void refreshWorkspaceReview(sessionId)
+        void api
+          .getLatestRun(sessionId)
+          .then((saved) => {
+            if (
+              activeSessionIdRef.current !== sessionId ||
+              runGenerationRef.current !== generation ||
+              saved?.run_id !== event.runId
+            )
+              return
+            setLatestRun((current) =>
+              current?.run_id === saved.run_id &&
+              current.last_sequence > saved.last_sequence
+                ? current
+                : saved
+            )
+          })
+          .catch(() => undefined)
+      }
       setRunActivities((current) => {
         const activity = current[turnId] ?? { events: [], runInfo: null }
         if (activity.runInfo && activity.runInfo.runId !== event.runId)
@@ -357,7 +450,12 @@ export function AppShell({
           : activity.events
         return {
           ...current,
-          [turnId]: { ...activity, events, latestEvent: event },
+          [turnId]: {
+            ...activity,
+            events,
+            latestEvent: event,
+            runInfo: runInfoFromEvent(activity.runInfo, event),
+          },
         }
       })
       if (event.eventType === "tool.approval_decided") {
@@ -391,7 +489,7 @@ export function AppShell({
         setStreamingText((current) => (current ?? "") + event.data.text)
       }
     },
-    [summaryRefresh]
+    [summaryRefresh, refreshWorkspaceReview]
   )
 
   const restoreSessionRun = useCallback(
@@ -437,6 +535,7 @@ export function AppShell({
         setError(message)
         setReconnectAvailable(true)
       }
+      void refreshWorkspaceReview(sessionId)
       let turn = retryFromTranscript(sessionId, transcript)
       let latest: LatestRun | null
       let submissionMissing: boolean
@@ -454,6 +553,7 @@ export function AppShell({
           )
         latest = await api.getLatestRun(sessionId)
         if (isStale()) return
+        setLatestRun(latest)
         submissionMissing =
           !!saved && !exact && latest?.turn_id !== saved.turnId
         if (exact && !latest)
@@ -564,11 +664,7 @@ export function AppShell({
             [latest.turn_id]: {
               ...aligned,
               events: aligned?.events ?? [],
-              runInfo: {
-                ...aligned?.runInfo,
-                runId: latest.run_id,
-                status: latest.status,
-              },
+              runInfo: mergeRunInfo(aligned?.runInfo, recoveryRunInfo(latest)),
               ...(summary ? { summary } : {}),
             },
           }
@@ -624,11 +720,7 @@ export function AppShell({
             ...aligned,
             events: [],
             latestEvent: undefined,
-            runInfo: {
-              ...(aligned?.runInfo ?? {}),
-              runId: latest.run_id,
-              status: latest.status,
-            },
+            runInfo: mergeRunInfo(aligned?.runInfo, recoveryRunInfo(latest)),
           },
         }
       })
@@ -724,6 +816,7 @@ export function AppShell({
           try {
             const currentRun = await api.getLatestRun(sessionId)
             if (isStale()) return
+            setLatestRun(currentRun)
             keepActive =
               currentRun?.run_id === latest.run_id &&
               activeRunStatuses.has(currentRun.status)
@@ -767,6 +860,7 @@ export function AppShell({
       queryClient,
       recordRunEvent,
       recordRunInfo,
+      refreshWorkspaceReview,
     ]
   )
 
@@ -910,6 +1004,9 @@ export function AppShell({
     setStreamingText(null)
     setActiveRunId(null)
     setRunActivities({})
+    setLatestRun(null)
+    setWorkspaceReview(null)
+    workspaceReviewRequestRef.current += 1
     setActiveRunTurnId(null)
     setApprovalPendingToolId(null)
     setApprovalError(null)
@@ -1138,6 +1235,7 @@ export function AppShell({
       generation: ++runGenerationRef.current,
     }
     setContextGeneration(owner.generation)
+    setLatestRun(null)
     const isCurrent = () =>
       !connection.signal.aborted &&
       !!bootstrapControllerRef.current &&
@@ -1570,6 +1668,10 @@ export function AppShell({
   const retryFailedTurn = async () => {
     if (
       !failedTurn ||
+      !allowsRunRetry(
+        runActivities[failedTurn.turnId],
+        latestRun?.turn_id === failedTurn.turnId ? latestRun : null
+      ) ||
       pending ||
       sessionLoading ||
       (route.kind === "chat" && activeSession?.id !== route.chatId) ||
@@ -1614,6 +1716,72 @@ export function AppShell({
         if (!preservePending) setPending(false)
       }
     }
+  }
+
+  const acknowledgeWorkspaceReview = async (
+    runId: string,
+    toolCallId: string,
+    sourceSessionId?: string
+  ) => {
+    const sessionId = activeSessionIdRef.current
+    const generation = runGenerationRef.current
+    const matchesWorkspace =
+      workspaceReview?.run_id === runId &&
+      workspaceReview.uncertain_operation?.tool_call_id === toolCallId &&
+      workspaceReview.source_session_id === sourceSessionId
+    const matchesLatest =
+      latestRun?.run_id === runId &&
+      latestRun.uncertain_operation?.tool_call_id === toolCallId &&
+      (!sourceSessionId || sourceSessionId === sessionId)
+    if (!sessionId || (!matchesWorkspace && !matchesLatest))
+      throw new ApiError(
+        "workspace_review_stale",
+        "The workspace review changed. Reconnect and check the current operation.",
+        409
+      )
+    const saved = await api.reviewWorkspace(
+      sourceSessionId ?? sessionId,
+      runId,
+      toolCallId
+    )
+    if (
+      activeSessionIdRef.current !== sessionId ||
+      runGenerationRef.current !== generation
+    )
+      return
+    if (saved.tool_call_id !== toolCallId)
+      throw new RuntimeError(
+        "runtime_protocol_error",
+        "Trellis returned a different workspace review."
+      )
+    workspaceReviewRequestRef.current += 1
+    setWorkspaceReview((current) =>
+      current?.run_id === runId &&
+      current.uncertain_operation?.tool_call_id === toolCallId
+        ? {
+            ...current,
+            blocked: false,
+            uncertain_operation: {
+              ...current.uncertain_operation,
+              reviewed_at: saved.reviewed_at,
+              review_pending: false,
+            },
+          }
+        : current
+    )
+    setLatestRun((current) =>
+      current?.run_id === runId &&
+      current.uncertain_operation?.tool_call_id === toolCallId
+        ? {
+            ...current,
+            uncertain_operation: {
+              ...current.uncertain_operation,
+              reviewed_at: saved.reviewed_at,
+              review_pending: false,
+            },
+          }
+        : current
+    )
   }
 
   const reconnectRestoredRun = () => {
@@ -1664,6 +1832,13 @@ export function AppShell({
   const selectedBudgetPreset =
     runBudgetChoice ?? settings?.default_budget_preset ?? "conservative"
   const activeActivity = activeRunTurnId ? runActivities[activeRunTurnId] : null
+  const recovering = pending && activeActivity?.runInfo?.status === "recovering"
+  const activeBudgetPreset = activeActivity?.runInfo?.budgetPreset
+  const lockedBudgetPreset =
+    pending &&
+    (activeBudgetPreset === "conservative" || activeBudgetPreset === "longer")
+      ? activeBudgetPreset
+      : selectedBudgetPreset
   const lockedModelId = pending
     ? (activeActivity?.runInfo?.modelId ??
       (runContextState.runId === activeRunId
@@ -1849,7 +2024,21 @@ export function AppShell({
               error={error}
               activityHistoryError={activityHistoryError}
               onRetryActivityHistory={() => void loadSession(activeSession.id)}
-              canRetry={failedTurn !== null && !pending && !modelSaving}
+              canRetry={
+                failedTurn !== null &&
+                !pending &&
+                !modelSaving &&
+                allowsRunRetry(
+                  runActivities[failedTurn.turnId],
+                  latestRun?.turn_id === failedTurn.turnId ? latestRun : null
+                )
+              }
+              recovery={latestRun}
+              workspaceReview={workspaceReview}
+              onWorkspaceReview={acknowledgeWorkspaceReview}
+              onRefreshWorkspaceReview={() =>
+                void refreshWorkspaceReview(activeSession.id)
+              }
               canReconnect={reconnectAvailable}
               canCancel={pending && activeRunId !== null}
               cancellationPending={cancellingRun}
@@ -1917,13 +2106,15 @@ export function AppShell({
                       ? "Stopping…"
                       : reconnectAvailable || error?.includes("Reconnecting")
                         ? "Reconnecting. This chat stays locked until its run is checked."
-                        : "Running. You can close this page and return to this chat."
+                        : recovering
+                          ? "Recovering. Checking saved work before continuing."
+                          : "Running. You can close this page and return to this chat."
                     : undefined
               }
-              budgetPreset={selectedBudgetPreset}
+              budgetPreset={lockedBudgetPreset}
               onBudgetChange={setRunBudgetChoice}
               models={settings?.models ?? []}
-              selectedModelId={selectedModelId}
+              selectedModelId={lockedModelId}
               modelSaving={modelSaving}
               onModelChange={(modelId) => void changeChatModel(modelId)}
               contextGauge={

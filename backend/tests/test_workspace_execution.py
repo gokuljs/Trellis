@@ -47,6 +47,37 @@ def command():
     )
 
 
+def test_review_in_another_selected_folder_keeps_the_original_marker(tmp_path):
+    owner, root, _ = execution(tmp_path)
+    run, tool = run_record(), command()
+    metadata = root.stat()
+    marker = CommandMarker(
+        owner.account_id,
+        run.session_id,
+        run.id,
+        tool.id,
+        str(uuid4()),
+        1,
+        metadata.st_dev,
+        metadata.st_ino,
+    )
+    owner.markers.prepare(marker)
+    replacement = tmp_path / "other-folder"
+    replacement.mkdir()
+
+    async def scenario():
+        await owner.bindings.bind(run.session_id, replacement)
+        assert await owner.review_pending(run.session_id, replacement, tool.id)
+        with pytest.raises(ApplicationError, match="does not match"):
+            await owner.acknowledge_review(run.session_id, replacement, tool.id)
+        assert owner.markers.get(metadata.st_dev, metadata.st_ino) == marker
+        await owner.bindings.bind(run.session_id, root)
+        await owner.acknowledge_review(run.session_id, root, tool.id)
+        assert not await owner.review_pending(run.session_id, root, tool.id)
+
+    asyncio.run(scenario())
+
+
 def test_dispatched_command_marker_survives_process_death_and_blocks_another_account(tmp_path):
     owner, root, installation = execution(tmp_path)
     run, tool = run_record(), command()

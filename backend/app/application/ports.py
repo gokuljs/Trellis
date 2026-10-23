@@ -40,7 +40,7 @@ from app.domain.runtime import (
     ToolCallStatus,
     ToolResult,
 )
-from app.domain.workspaces import PatchReconciliation
+from app.domain.workspaces import PatchReconciliation, WorkspaceReviewBlock
 
 
 class ProfileRepository(Protocol):
@@ -157,6 +157,14 @@ class WorkspaceExecutionPort(Protocol):
     ) -> None: ...
 
     async def acknowledge_review(self, session_id: str, root: Path, tool_call_id: str) -> None: ...
+
+    async def review_pending(self, session_id: str, root: Path, tool_call_id: str) -> bool: ...
+
+    async def pending_review(self, session_id: str, root: Path) -> WorkspaceReviewBlock | None: ...
+
+    async def reconcile_command_marker(
+        self, run: RunSnapshot, tool: ToolCallRecord, root: Path, *, session_id: str | None = None
+    ) -> bool: ...
 
 
 class RunLeasePort(Protocol):
@@ -353,6 +361,10 @@ class RunRepository(Protocol):
 
     async def mark_tool_outcome_unknown(
         self, run_id: str, tool_call_id: str, reason: str
+    ) -> ToolCallRecord: ...
+
+    async def acknowledge_workspace_review(
+        self, session_id: str, run_id: str, tool_call_id: str
     ) -> ToolCallRecord: ...
 
     async def authorize_tool_retry(

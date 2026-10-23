@@ -29,6 +29,7 @@ const terminalStates = new Map<string, StatusCopy>([
 
 const summaryEvents: Record<string, string> = {
   queued: "run.queued",
+  recovering: "run.recovering",
   waiting_for_approval: "tool.approval_requested",
   cancelling: "run.cancellation_requested",
   completed: "run.completed",
@@ -62,6 +63,8 @@ function currentState(event: RuntimeRunEvent): StatusCopy | null {
         : null
     case "run.queued":
       return { label: "Waiting", orb: "connecting" }
+    case "run.recovering":
+      return { label: "Recovering", orb: "connecting" }
     case "run.started":
     case "run.resumed":
       return { label: "Thinking", orb: "working" }
@@ -146,6 +149,13 @@ export function describeActivity(
         terminal,
       }
     }
+    if (confirmedStatus === "recovering")
+      return {
+        label: "Recovering",
+        orb: "connecting",
+        duration: null,
+        terminal: false,
+      }
     return pending
       ? { label: "Thinking", orb: "working", duration: null, terminal: false }
       : {
@@ -204,6 +214,15 @@ export function describeActivity(
       continue
     }
     if (stopping) continue
+    if (
+      event.eventType === "run.recovering" ||
+      event.eventType === "run.resumed"
+    ) {
+      awaitingApproval = false
+      hasPhase = false
+      state = currentState(event)!
+      continue
+    }
     if (event.eventType === "tool.approval_requested") {
       awaitingApproval = true
       state = { label: "Waiting for approval", orb: "listening" }
@@ -223,6 +242,8 @@ export function describeActivity(
       }
     } else if (!hasPhase && incoming) state = incoming
   }
+  if (summaryIsCurrent && matchingSummary?.status === "recovering")
+    state = { label: "Recovering", orb: "connecting" }
   if (summaryIsCurrent && matchingSummary?.status === "cancelling")
     state = { label: "Stopping", orb: "shaping" }
   if (

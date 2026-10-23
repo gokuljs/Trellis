@@ -20,8 +20,9 @@ from app.domain.runtime import (
     ToolCallRecord,
     ToolCallStatus,
     ToolResult,
+    is_terminal_run_status,
 )
-from app.domain.workspaces import PatchReconciliation
+from app.domain.workspaces import PatchReconciliation, WorkspaceReviewBlock
 from app.infrastructure.local_patch import _read_target, _target_parts, reconcile_patch
 from app.infrastructure.local_tools import (
     LocalReadToolExecutor,
@@ -156,6 +157,18 @@ class CommandMarkerStore:
     def get(self, device: int, inode: int) -> CommandMarker | None:
         with _private_directory(self._directory) as descriptor:
             return self._load(descriptor).get(f"{device}:{inode}")
+
+    def for_tool(self, account_id: str, session_id: str, tool_call_id: str) -> CommandMarker | None:
+        with _private_directory(self._directory) as descriptor:
+            return next(
+                (
+                    marker
+                    for marker in self._load(descriptor).values()
+                    if (marker.account_id, marker.session_id, marker.tool_call_id)
+                    == (account_id, session_id, tool_call_id)
+                ),
+                None,
+            )
 
     def prepare(self, marker: CommandMarker) -> CommandMarker:
         with (
@@ -469,12 +482,76 @@ class LocalWorkspaceExecution:
             except ToolExecutionError:
                 raise _failure("workspace_inputs_changed") from None
 
+    async def pending_review(self, session_id: str, root: Path) -> WorkspaceReviewBlock | None:
+        async with self._locked(session_id, root, exclusive=False) as pinned:
+            marker = await _off_loop(
+                lambda: self.markers.get(pinned.grant.device, pinned.grant.inode)
+            )
+            if marker is None:
+                return None
+            if marker.account_id != self.account_id:
+                return WorkspaceReviewBlock()
+            return WorkspaceReviewBlock(marker.session_id, marker.run_id, marker.tool_call_id)
+
+    async def reconcile_command_marker(
+        self, run: RunSnapshot, tool: ToolCallRecord, root: Path, *, session_id: str | None = None
+    ) -> bool:
+        async with self._locked(session_id or run.session_id, root, exclusive=True) as pinned:
+            marker = await _off_loop(
+                lambda: self.markers.get(pinned.grant.device, pinned.grant.inode)
+            )
+            if marker is None:
+                return True
+            if (
+                marker.account_id != self.account_id
+                or marker.session_id != run.session_id
+                or marker.run_id != run.id
+                or marker.tool_call_id != tool.id
+                or tool.run_id != run.id
+                or tool.name != "run_command"
+            ):
+                return False
+            saved = (
+                tool.status in _FINISHED_TOOLS
+                and tool.dispatch_id == marker.dispatch_id
+                and tool.result_snapshot is not None
+                and tool.result_snapshot.get("dispatch_id") == marker.dispatch_id
+            )
+            never_dispatched = tool.dispatch_attempt == 0 and is_terminal_run_status(run.status)
+            if not saved and not never_dispatched:
+                return False
+            await _off_loop(lambda: self.markers.clear(marker))
+            return True
+
+    async def review_pending(self, session_id: str, root: Path, tool_call_id: str) -> bool:
+        async with self._locked(session_id, root, exclusive=False) as pinned:
+            marker = await _off_loop(
+                lambda: self.markers.get(pinned.grant.device, pinned.grant.inode)
+            )
+            if marker is not None and (
+                marker.account_id,
+                marker.session_id,
+                marker.tool_call_id,
+            ) == (self.account_id, session_id, tool_call_id):
+                return True
+            return (
+                await _off_loop(
+                    lambda: self.markers.for_tool(self.account_id, session_id, tool_call_id)
+                )
+                is not None
+            )
+
     async def acknowledge_review(self, session_id: str, root: Path, tool_call_id: str) -> None:
         async with self._locked(session_id, root, exclusive=True) as pinned:
             marker = await _off_loop(
                 lambda: self.markers.get(pinned.grant.device, pinned.grant.inode)
             )
             if marker is None:
+                elsewhere = await _off_loop(
+                    lambda: self.markers.for_tool(self.account_id, session_id, tool_call_id)
+                )
+                if elsewhere is not None:
+                    raise _failure("workspace_review_mismatch")
                 return
             if (
                 marker.account_id != self.account_id

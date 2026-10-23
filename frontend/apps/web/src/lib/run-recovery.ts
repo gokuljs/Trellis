@@ -1,4 +1,10 @@
-import type { Message } from "@/lib/app-types"
+import type { LatestRun, Message } from "@/lib/app-types"
+
+import type {
+  RuntimeRunEvent,
+  RuntimeRunInfo,
+  TurnRunActivity,
+} from "@/lib/runtime-client"
 
 export type TerminalRunOutcome =
   "completed" | "failed" | "cancelled" | "interrupted"
@@ -66,4 +72,78 @@ export function recoveryTranscript(
       created_at: new Date().toISOString(),
     },
   ]
+}
+
+export function recoveryRunInfo(run: LatestRun): RuntimeRunInfo {
+  return {
+    runId: run.run_id,
+    status: run.status,
+    retryAllowed: run.retry_allowed,
+    recoveryReason: run.recovery_reason,
+    uncertainToolCallId: run.uncertain_tool_call_id,
+  }
+}
+
+export function mergeRunInfo(
+  previous: RuntimeRunInfo | null | undefined,
+  incoming: RuntimeRunInfo
+): RuntimeRunInfo {
+  if (previous?.runId !== incoming.runId) return incoming
+  return {
+    ...previous,
+    ...incoming,
+    ...(previous.retryAllowed === false ? { retryAllowed: false } : {}),
+  }
+}
+
+export function runInfoFromEvent(
+  previous: RuntimeRunInfo | null,
+  event: RuntimeRunEvent
+): RuntimeRunInfo {
+  const incoming: RuntimeRunInfo = { runId: event.runId }
+  const statuses: Record<string, string> = {
+    "run.queued": "queued",
+    "run.started": "running",
+    "run.recovering": "recovering",
+    "run.resumed": "running",
+    "run.cancellation_requested": "cancelling",
+    "tool.approval_requested": "waiting_for_approval",
+    "tool.approval_decided": "running",
+    "run.completed": "completed",
+    "run.failed": "failed",
+    "run.cancelled": "cancelled",
+    "run.interrupted": "interrupted",
+  }
+  if (statuses[event.eventType]) incoming.status = statuses[event.eventType]
+  if (typeof event.data.retry_allowed === "boolean")
+    incoming.retryAllowed = event.data.retry_allowed
+  if (
+    typeof event.data.recovery_reason === "string" ||
+    event.data.recovery_reason === null
+  )
+    incoming.recoveryReason = event.data.recovery_reason
+  if (
+    typeof event.data.uncertain_tool_call_id === "string" ||
+    event.data.uncertain_tool_call_id === null
+  )
+    incoming.uncertainToolCallId = event.data.uncertain_tool_call_id
+  return mergeRunInfo(previous, incoming)
+}
+
+export function allowsRunRetry(
+  activity?: TurnRunActivity,
+  latest?: LatestRun | null
+): boolean {
+  const runId =
+    activity?.runInfo?.runId ?? activity?.summary?.run_id ?? latest?.run_id
+  if (!runId) return true
+  return !(
+    (latest?.run_id === runId && latest.retry_allowed === false) ||
+    activity?.runInfo?.retryAllowed === false ||
+    (activity?.summary?.run_id === runId &&
+      activity.summary.retry_allowed === false) ||
+    activity?.events.some(
+      (event) => event.runId === runId && event.data.retry_allowed === false
+    )
+  )
 }

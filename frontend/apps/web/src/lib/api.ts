@@ -11,6 +11,7 @@ import type {
   Settings,
   ContextPreview,
   ContextPreviewRequest,
+  WorkspaceReviewStatus,
 } from "@/lib/app-types"
 import {
   AuthAccessError,
@@ -377,6 +378,22 @@ export function createApiClient({
         method: "PUT",
         body: JSON.stringify({ model_id: modelId }),
       }),
+    getWorkspaceReview: (sessionId: string) =>
+      request<WorkspaceReviewStatus>(
+        `/api/sessions/${encodeURIComponent(sessionId)}/workspace/review`
+      ),
+    reviewWorkspace: (sessionId: string, runId: string, toolCallId: string) =>
+      request<{ tool_call_id: string; reviewed_at: string }>(
+        `/api/sessions/${encodeURIComponent(sessionId)}/workspace/review`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            run_id: runId,
+            tool_call_id: toolCallId,
+            confirmed: true,
+          }),
+        }
+      ),
     getLatestRun: (sessionId: string) =>
       request<LatestRun | null>(`/api/sessions/${sessionId}/runs/latest`),
     listRunSummaries: (

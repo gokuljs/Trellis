@@ -526,3 +526,36 @@ test("temporary refresh failure preserves sign-in and does not resubmit", async 
   assert.equal(expireSession.mock.calls.length, 0)
   assert.equal(sockets.length, 1)
 })
+
+test("reconnect exposes recovery policy and original limits without starting another run", async () => {
+  setup()
+  const infos: unknown[] = []
+  const resumed = resumeRun(secret, { onRunInfo: (info) => infos.push(info) })
+  const socket = await authenticate()
+  assert.equal(socket.sent[1]?.method, "run.resume")
+  const saved = {
+    runId: secret,
+    status: "recovering",
+    modelId: "original-model",
+    budgetPreset: "longer",
+    retryAllowed: false,
+    recoveryReason: "command_outcome_unknown",
+    uncertainToolCallId: "tool-original",
+    limits: {
+      maxModelCalls: 12,
+      maxToolCalls: 24,
+      maxTotalTokens: 250000,
+      maxCostUsd: 4,
+      deadlineAt: "2026-10-23T01:00:00Z",
+    },
+  }
+  acknowledge(socket, saved)
+  await until(() => infos.length === 1)
+  assert.deepEqual(infos, [saved])
+  complete(socket)
+  await resumed
+  assert.equal(
+    socket.sent.some((request) => request.method === "run.start"),
+    false
+  )
+})

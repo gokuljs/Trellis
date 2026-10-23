@@ -498,7 +498,7 @@ class SupabaseRepository:
         )
 
     async def _idempotent_rpc(
-        self, action: str, payload: dict[str, object], *, capability: str
+        self, action: str, payload: dict[str, object], *, capability: str | None
     ) -> object:
         for attempt in range(2):
             try:
@@ -1750,6 +1750,25 @@ class SupabaseRepository:
             or tool.status is not ToolCallStatus.OUTCOME_UNKNOWN
         ):
             raise RuntimeError("Supabase returned another uncertain tool")
+        return tool
+
+    async def acknowledge_workspace_review(
+        self, session_id: str, run_id: str, tool_call_id: str
+    ) -> ToolCallRecord:
+        row = await self._idempotent_rpc(
+            "acknowledge_workspace_review",
+            {"session_id": session_id, "run_id": run_id, "tool_call_id": tool_call_id},
+            capability=None,
+        )
+        tool = self._tool_call(_object(row))
+        if (
+            tool.id != tool_call_id
+            or tool.run_id != run_id
+            or tool.name != "run_command"
+            or tool.status is not ToolCallStatus.OUTCOME_UNKNOWN
+            or tool.reviewed_at is None
+        ):
+            raise RuntimeError("Supabase returned another command review acknowledgment")
         return tool
 
     async def authorize_tool_retry(
