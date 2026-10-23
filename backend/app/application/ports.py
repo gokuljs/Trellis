@@ -214,6 +214,16 @@ class RunRepository(Protocol):
         content: str,
     ) -> tuple[Message, tuple[RunEvent, ...]]: ...
 
+    async def commit_generation(
+        self,
+        run_id: str,
+        call_id: str,
+        completion: dict[str, object],
+        *,
+        assistant_message: ModelMessage | None,
+        final_content: str | None,
+    ) -> tuple[ModelCallRecord, tuple[ToolCallRecord, ...], tuple[RunEvent, ...]]: ...
+
     async def append_assistant_batch(
         self, run_id: str, model_call_id: str, batch_index: int, text: str
     ) -> tuple[AssistantOutput, RunEvent]: ...

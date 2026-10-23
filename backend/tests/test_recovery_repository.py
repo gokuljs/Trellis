@@ -1,11 +1,13 @@
 import asyncio
+import json
 from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 from uuid import UUID
 
 import httpx
 import pytest
-from run_fixtures import run_record
+from run_fixtures import model_record, run_record
 
 from app.application.errors import ApplicationError
 from app.core.config import Settings
@@ -85,6 +87,44 @@ def test_lost_claim_acknowledgment_retries_the_identical_ownership_capability() 
         with pytest.raises(ApplicationError):
             await repo._idempotent_rpc("claim_recovery", payload, capability="same-capability")
         assert repo._rpc.await_count == 1
+        await repo._client.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_generation_commit_retries_lost_ack_without_republishing_or_changing_identity() -> None:
+    async def exercise() -> None:
+        repo = repository()
+        call = model_record()
+        row = asdict(call)
+        row["user_id"] = str(repo._user_id)
+        row["cached_read_tokens"] = row.pop("cached_tokens")
+        row["status"] = "completed"
+        payloads: list[dict[str, object]] = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            payloads.append(json.loads(request.content))
+            if len(payloads) == 1:
+                raise httpx.ReadError("Saved commit, lost acknowledgment", request=request)
+            return httpx.Response(200, json={"model_call": row, "tool_calls": [], "events": []})
+
+        repo._client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        repo._token_source.record_verified(
+            "verified", repo._user_id, datetime.now(UTC) + timedelta(hours=1)
+        )
+        repo._capabilities[call.run_id] = "same-capability"
+        repo._lease_expires[call.run_id] = datetime.now(UTC) + timedelta(minutes=1)
+        saved, _, _ = await repo.commit_generation(
+            call.run_id,
+            call.id,
+            {"response_snapshot": {"content": "answer", "tool_calls": []}, "cached_tokens": 0},
+            assistant_message=None,
+            final_content="answer",
+        )
+        assert saved.id == call.id
+        assert payloads[0] == payloads[1]
+        assert payloads[0]["p_action"] == "commit_generation"
+        assert not repo.owns_run_lease(call.run_id)
         await repo._client.aclose()
 
     asyncio.run(exercise())

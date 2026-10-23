@@ -80,3 +80,5 @@ jobs:
           bash supabase/tests/reliable_runs_concurrency.sh
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/recovery_contracts.sql
           bash supabase/tests/recovery_contracts_concurrency.sh
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/atomic_generation.sql
+          bash supabase/tests/atomic_generation_concurrency.sh

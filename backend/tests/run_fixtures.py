@@ -141,8 +141,8 @@ class Repository:
         self.run = replace(self.run, status=RunStatus.RUNNING)
         return self.run, await self.append_run_event(run_id, RunEventType.RESUMED, {})
 
-    async def create_model_call(self, *args, **kwargs) -> ModelCallRecord:
-        call = model_record()
+    async def create_model_call(self, run_id, step_index, model, snapshot) -> ModelCallRecord:
+        call = replace(model_record(), request_snapshot=snapshot)
         self.calls.append(call)
         return call
 
@@ -157,6 +157,22 @@ class Repository:
         return None, await self.append_run_event(
             run_id, RunEventType.ASSISTANT_DELTA, {"text": text}
         )
+
+    async def commit_generation(
+        self, run_id, call_id, completion, *, assistant_message=None, final_content=None
+    ):
+        call = await self.update_model_call(call_id, ModelCallStatus.COMPLETED, **completion)
+        event = await self.append_run_event(
+            run_id, RunEventType.MODEL_COMPLETED, {"model_call_id": call_id}
+        )
+        events = [event]
+        if final_content is not None:
+            events.append(
+                await self.transition_run_record(
+                    run_id, RunStatus.COMPLETED, RunEventType.COMPLETED, {}
+                )
+            )
+        return call, (), tuple(events)
 
     async def complete_run(self, run_id, content):
         event = await self.transition_run_record(

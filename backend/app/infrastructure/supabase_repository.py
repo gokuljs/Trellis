@@ -463,6 +463,9 @@ class SupabaseRepository:
             except ApplicationError as error:
                 if attempt or error.code != "database_unavailable":
                     raise
+            except RuntimeError as error:
+                if attempt or str(error) != "Supabase returned invalid JSON":
+                    raise
         raise AssertionError("bounded commit retry exhausted")
 
     def _owned(self, row: dict[str, object], key: str = "user_id") -> dict[str, object]:
@@ -1508,6 +1511,59 @@ class SupabaseRepository:
         calls = tuple(self._tool_call(row) for row in _array(result.get("tool_calls")))
         events = tuple(self._event(row) for row in _array(result.get("events")))
         return assistant, calls, events
+
+    async def commit_generation(
+        self,
+        run_id: str,
+        call_id: str,
+        completion: dict[str, object],
+        *,
+        assistant_message: ModelMessage | None,
+        final_content: str | None,
+    ) -> tuple[ModelCallRecord, tuple[ToolCallRecord, ...], tuple[RunEvent, ...]]:
+        if (assistant_message is None) == (final_content is None):
+            raise ValueError("generation requires exactly one completion outcome")
+        saved_completion = dict(completion)
+        if "cached_tokens" in saved_completion:
+            saved_completion["cached_read_tokens"] = saved_completion.pop("cached_tokens")
+        message: dict[str, object] | None = None
+        if assistant_message is not None:
+            if assistant_message.role != "assistant" or assistant_message.tool_call_id is not None:
+                raise ValueError("generation requires an assistant message")
+            message = {
+                "role": "assistant",
+                "content": assistant_message.content,
+                "tool_call_id": None,
+                "tool_calls": [asdict(item) for item in assistant_message.tool_calls],
+                "continuation_items": [
+                    asdict(item) for item in assistant_message.continuation_items
+                ],
+            }
+        result = _object(
+            await self._idempotent_rpc(
+                "commit_generation",
+                {
+                    "run_id": run_id,
+                    "call_id": call_id,
+                    "completion": saved_completion,
+                    "assistant_message": message,
+                    "final_content": final_content,
+                },
+                capability=self._run_capability(run_id),
+            )
+        )
+        call = self._model_call(_object(result.get("model_call")))
+        tools = tuple(self._tool_call(row) for row in _array(result.get("tool_calls")))
+        events = tuple(self._event(row) for row in _array(result.get("events")))
+        if (
+            call.id != call_id
+            or call.run_id != run_id
+            or any(item.run_id != run_id for item in (*tools, *events))
+        ):
+            raise RuntimeError("Supabase returned another generation's completion")
+        if final_content is not None:
+            self._drop_lease(run_id)
+        return call, tools, events
 
     async def record_tool_result(
         self,

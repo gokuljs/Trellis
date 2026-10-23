@@ -1002,7 +1002,11 @@ class RunService:
                     run.id,
                     step_index,
                     model,
-                    {**self._request_snapshot(request), "context": plan.snapshot()},
+                    {
+                        **self._request_snapshot(request),
+                        "purpose": "generation",
+                        "context": plan.snapshot(),
+                    },
                 )
                 call = await self._runs.update_model_call(call.id, ModelCallStatus.STREAMING)
                 await self._append_and_publish(
@@ -1019,127 +1023,82 @@ class RunService:
                     prior_cost,
                     pricing_context_tokens=plan.pricing_context_tokens,
                 )
-                safe_calls, preflight_errors = _prepare_tool_calls(step.tool_calls, self._redactor)
-                step = replace(step, tool_calls=safe_calls)
                 step_tokens, step_cost = _usage_measure(
                     run.model_id, step.usage, step.billing_context
                 )
-                call = await self._runs.update_model_call(
-                    call.id,
-                    ModelCallStatus.COMPLETED,
-                    response_snapshot=self._response_snapshot(step),
-                    provider_response_id=step.provider_response_id,
-                    finish_reason=step.finish_reason,
-                    input_tokens=step.usage["input_tokens"],
-                    output_tokens=step.usage["output_tokens"],
-                    reasoning_tokens=step.usage["reasoning_tokens"],
-                    cached_tokens=step.usage["cached_tokens"],
-                    cache_creation_tokens=step.usage["cache_creation_tokens"],
-                    estimated_cost=step_cost,
-                    clear_estimated_cost=step_cost is None,
-                    accounted_total_tokens=step_tokens,
-                    clear_accounted_total_tokens=step_tokens is None,
+                try:
+                    safe_calls, preflight_errors = _prepare_tool_calls(
+                        step.tool_calls, self._redactor
+                    )
+                    step = replace(step, tool_calls=safe_calls)
+                    completed_call = replace(
+                        call,
+                        status=ModelCallStatus.COMPLETED,
+                        response_snapshot=self._response_snapshot(step),
+                        provider_response_id=step.provider_response_id,
+                        finish_reason=step.finish_reason,
+                        input_tokens=step.usage["input_tokens"],
+                        output_tokens=step.usage["output_tokens"],
+                        reasoning_tokens=step.usage["reasoning_tokens"],
+                        cached_tokens=step.usage["cached_tokens"],
+                        cache_creation_tokens=step.usage["cache_creation_tokens"],
+                        estimated_cost=step_cost,
+                        accounted_total_tokens=step_tokens,
+                    )
+                    total_tokens, total_cost = self._budget_totals(
+                        run.model_id, [*prior_model_calls, completed_call]
+                    )
+                    self._validate_generation_response(
+                        run,
+                        step,
+                        request,
+                        workspace_root,
+                        prior_tool_calls,
+                        step_index,
+                        total_tokens,
+                        total_cost,
+                    )
+                except ProviderError:
+                    # Invalid paid responses still retain their usage, but never
+                    # publish an assistant exchange or a final answer.
+                    call = await self._runs.update_model_call(
+                        call.id,
+                        ModelCallStatus.COMPLETED,
+                        response_snapshot=self._response_snapshot(step),
+                        provider_response_id=step.provider_response_id,
+                        finish_reason=step.finish_reason,
+                        input_tokens=step.usage["input_tokens"],
+                        output_tokens=step.usage["output_tokens"],
+                        reasoning_tokens=step.usage["reasoning_tokens"],
+                        cached_tokens=step.usage["cached_tokens"],
+                        cache_creation_tokens=step.usage["cache_creation_tokens"],
+                        estimated_cost=step_cost,
+                        clear_estimated_cost=step_cost is None,
+                        accounted_total_tokens=step_tokens,
+                        clear_accounted_total_tokens=step_tokens is None,
+                    )
+                    raise
+                assistant_message = (
+                    ModelMessage(
+                        role="assistant",
+                        content=step.content,
+                        tool_calls=step.tool_calls,
+                        continuation_items=step.continuation_items,
+                    )
+                    if step.tool_calls
+                    else None
                 )
-                await self._append_and_publish(
+                call, stored_calls, stored_events = await self._runs.commit_generation(
                     run.id,
-                    RunEventType.MODEL_COMPLETED,
-                    {
-                        "model_call_id": call.id,
-                        "provider_response_id": step.provider_response_id,
-                        "finish_reason": step.finish_reason,
-                        "finish_kind": step.finish_kind,
-                    },
-                )
-                total_tokens, total_cost = self._budget_totals(
-                    run.model_id, [*prior_model_calls, call]
-                )
-                self._check_budget(
-                    run,
-                    kind=None,
-                    model_calls=step_index,
-                    tool_calls=len(prior_tool_calls),
-                    tokens=total_tokens,
-                    cost_usd=total_cost,
-                )
-                if step.finish_kind == "incomplete":
-                    raise ProviderError(
-                        "provider_response_incomplete",
-                        "The provider stopped before completing the answer. Try again.",
-                    )
-                if (step.finish_kind == "tool") != bool(step.tool_calls):
-                    raise ProviderError(
-                        "provider_invalid_response",
-                        "The provider returned an inconsistent completion.",
-                    )
-                if not step.tool_calls:
-                    final_content = step.content
-                    if not final_content.strip():
-                        raise ProviderError(
-                            "provider_invalid_response", "The provider returned an empty response."
-                        )
-                    await self._append_and_publish(
-                        run.id, RunEventType.PHASE, {"phase": "finishing", "model_call_id": call.id}
-                    )
-                    _message, completion_events = await self._runs.complete_run(
-                        run.id, final_content
-                    )
-                    for event in completion_events:
-                        await self._publish(event)
-                    return
-
-                if self._tool_registry is None:
-                    raise ProviderError(
-                        "tool_execution_unavailable", "This run cannot execute tool requests yet."
-                    )
-                for tool_request in step.tool_calls:
-                    try:
-                        self._tool_registry.check_call(
-                            tool_request, workspace_root, capabilities=self._capabilities
-                        )
-                    except ToolExecutionError as error:
-                        if error.code == "unknown_tool":
-                            raise ProviderError(
-                                "provider_invalid_response",
-                                "The provider requested an unoffered tool.",
-                            ) from None
-                        raise ProviderError(error.code, error.message) from None
-                offered_names = {tool.name for tool in request.tools}
-                if any(tool.name not in offered_names for tool in step.tool_calls):
-                    raise ProviderError(
-                        "provider_invalid_response", "The provider requested an unoffered tool."
-                    )
-                prior_ids = {tool.provider_call_id for tool in prior_tool_calls}
-                new_ids = [tool.id for tool in step.tool_calls]
-                if len(new_ids) != len(set(new_ids)) or any(
-                    tool_id in prior_ids for tool_id in new_ids
-                ):
-                    raise ProviderError(
-                        "provider_invalid_response", "The provider repeated a tool call ID."
-                    )
-                if len(prior_tool_calls) + len(step.tool_calls) > run.max_tool_calls:
-                    raise ProviderError("tool_call_limit", "The run reached its tool-call limit.")
-                if step_index >= run.max_model_calls:
-                    raise ProviderError("model_call_limit", "The run reached its model-call limit.")
-                self._check_budget(
-                    run,
-                    kind="tool",
-                    model_calls=step_index,
-                    tool_calls=len(prior_tool_calls),
-                    tokens=total_tokens,
-                    cost_usd=total_cost,
-                )
-                assistant_message = ModelMessage(
-                    role="assistant",
-                    content=step.content,
-                    tool_calls=step.tool_calls,
-                    continuation_items=step.continuation_items,
-                )
-                await self._runs.finish_assistant_output(run.id, call.id)
-                _assistant, stored_calls, stored_events = await self._runs.record_assistant_message(
-                    run.id, call.id, assistant_message
+                    call.id,
+                    self._generation_completion(step, step_tokens, step_cost),
+                    assistant_message=assistant_message,
+                    final_content=step.content if assistant_message is None else None,
                 )
                 for event in stored_events:
                     await self._publish(event)
+                if assistant_message is None:
+                    return
                 for stored_call in stored_calls:
                     result = preflight_errors.get(stored_call.provider_call_id)
                     if result is not None:
@@ -1381,6 +1340,93 @@ class RunService:
             ),
         }
         return cast(dict[str, object], self._redactor.redact_record(snapshot))
+
+    def _validate_generation_response(
+        self,
+        run: RunSnapshot,
+        step: _ModelStep,
+        request: ModelRequest,
+        workspace_root: Path | None,
+        prior_tool_calls: list[ToolCallRecord],
+        step_index: int,
+        total_tokens: int,
+        total_cost: float | None,
+    ) -> None:
+        self._check_budget(
+            run,
+            kind=None,
+            model_calls=step_index,
+            tool_calls=len(prior_tool_calls),
+            tokens=total_tokens,
+            cost_usd=total_cost,
+        )
+        if step.finish_kind == "incomplete":
+            raise ProviderError(
+                "provider_response_incomplete",
+                "The provider stopped before completing the answer. Try again.",
+            )
+        if (step.finish_kind == "tool") != bool(step.tool_calls):
+            raise ProviderError(
+                "provider_invalid_response", "The provider returned an inconsistent completion."
+            )
+        if not step.tool_calls:
+            if not step.content.strip():
+                raise ProviderError(
+                    "provider_invalid_response", "The provider returned an empty response."
+                )
+            return
+        if self._tool_registry is None:
+            raise ProviderError(
+                "tool_execution_unavailable", "This run cannot execute tool requests yet."
+            )
+        for tool_request in step.tool_calls:
+            try:
+                self._tool_registry.check_call(
+                    tool_request, workspace_root, capabilities=self._capabilities
+                )
+            except ToolExecutionError as error:
+                if error.code == "unknown_tool":
+                    raise ProviderError(
+                        "provider_invalid_response", "The provider requested an unoffered tool."
+                    ) from None
+                raise ProviderError(error.code, error.message) from None
+        offered_names = {tool.name for tool in request.tools}
+        if any(tool.name not in offered_names for tool in step.tool_calls):
+            raise ProviderError(
+                "provider_invalid_response", "The provider requested an unoffered tool."
+            )
+        prior_ids = {tool.provider_call_id for tool in prior_tool_calls}
+        new_ids = [tool.id for tool in step.tool_calls]
+        if len(new_ids) != len(set(new_ids)) or any(tool_id in prior_ids for tool_id in new_ids):
+            raise ProviderError(
+                "provider_invalid_response", "The provider repeated a tool call ID."
+            )
+        if len(prior_tool_calls) + len(step.tool_calls) > run.max_tool_calls:
+            raise ProviderError("tool_call_limit", "The run reached its tool-call limit.")
+        if step_index >= run.max_model_calls:
+            raise ProviderError("model_call_limit", "The run reached its model-call limit.")
+        self._check_budget(
+            run,
+            kind="tool",
+            model_calls=step_index,
+            tool_calls=len(prior_tool_calls),
+            tokens=total_tokens,
+            cost_usd=total_cost,
+        )
+
+    def _generation_completion(
+        self, step: _ModelStep, tokens: int | None, cost: float | None
+    ) -> dict[str, object]:
+        return {
+            "response_snapshot": self._response_snapshot(step),
+            "provider_response_id": step.provider_response_id,
+            "finish_reason": step.finish_reason,
+            **step.usage,
+            "estimated_cost": cost,
+            "clear_estimated_cost": cost is None,
+            "accounted_total_tokens": tokens,
+            "clear_accounted_total_tokens": tokens is None,
+        }
 
     def _response_snapshot(self, step: _ModelStep) -> dict[str, object]:
         snapshot: dict[str, object] = {
