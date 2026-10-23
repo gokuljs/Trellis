@@ -441,3 +441,6 @@ class ToolCallRecord:
     dispatched_at: str | None = None
     recovery_policy: str | None = None
     result_source: str | None = None
+    dispatch_id: str | None = None
+    input_snapshot: dict[str, object] | None = None
+    reviewed_at: str | None = None

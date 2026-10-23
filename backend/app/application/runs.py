@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
+from uuid import uuid4
 
 from app.application.budgets import (
     BudgetExceeded,
@@ -46,6 +47,7 @@ from app.application.tools import (
 )
 from app.domain.capabilities import DEFAULT_RUNTIME_CAPABILITIES, RuntimeCapabilities
 from app.domain.models import ModelDescriptor
+from app.domain.recovery import ToolRecoveryPolicy
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -1139,14 +1141,22 @@ class RunService:
                     "Trellis could not complete this run.",
                 )
 
-    async def _renew_before_local_tool(self, run_id: str) -> None:
-        if self._lease_repository is None:
-            return
+    async def _renew_before_local_tool(
+        self, run_id: str, *, expected_generation: int | None = None
+    ) -> None:
         if not self._can_execute(run_id):
             raise ApplicationError("run_lease_lost", "This run is no longer active here.")
         try:
-            renewed = await self._lease_repository.renew_run_lease(run_id)
-            if is_terminal_run_status(renewed.status):
+            renewed = (
+                await self._lease_repository.renew_run_lease(run_id)
+                if self._lease_repository is not None
+                else await self._runs.get_run(run_id)
+            )
+            if not self._can_execute(run_id) or (
+                expected_generation is not None
+                and renewed is not None
+                and renewed.generation != expected_generation
+            ):
                 raise ApplicationError("run_lease_lost", "This run is no longer active here.")
         except asyncio.CancelledError:
             raise
@@ -1156,6 +1166,12 @@ class RunService:
             if monitor is not None:
                 monitor.cancel()
             raise ApplicationError("run_lease_lost", "This run is no longer active here.") from None
+        if renewed is not None and (
+            renewed.status is RunStatus.CANCELLING or renewed.cancel_requested_at is not None
+        ):
+            raise ProviderError("run_cancelled", "The run was cancelled before tool execution.")
+        if renewed is None or renewed.status is not RunStatus.RUNNING:
+            raise ApplicationError("run_lease_lost", "This run is no longer active here.")
 
     async def _execute_pending_tools(self, run: RunSnapshot, workspace_root: Path | None) -> bool:
         if self._tool_registry is None:
@@ -1164,12 +1180,13 @@ class RunService:
         all_tool_calls = await self._runs.list_tool_calls(run.id)
         total_tokens, total_cost = self._budget_totals(run.model_id, model_calls)
         for call_index, stored_call in enumerate(all_tool_calls):
+            if stored_call.status in {ToolCallStatus.RUNNING, ToolCallStatus.OUTCOME_UNKNOWN}:
+                raise ProviderError(
+                    "tool_outcome_unknown", "This tool's outcome requires recovery or review."
+                )
             if stored_call.status is not ToolCallStatus.PENDING:
                 continue
             await self._renew_before_local_tool(run.id)
-            await self._append_and_publish(
-                run.id, RunEventType.PHASE, {"phase": "tool_use", "tool_call_id": stored_call.id}
-            )
             self._check_budget(
                 run,
                 kind="tool",
@@ -1242,7 +1259,60 @@ class RunService:
                 )
                 continue
             try:
+                self._tool_registry.validate_execution(
+                    tool_request,
+                    workspace_root,
+                    approved=stored_call.approval_decision is ToolApprovalDecision.APPROVED,
+                    approval_preview=stored_call.approval_preview,
+                    capabilities=self._capabilities,
+                )
+            except ToolExecutionError as error:
+                await self._record_tool_result(
+                    run.id,
+                    stored_call,
+                    ToolResult(tool_request.id, tool_request.name, error.message, True, error.code),
+                )
+                continue
+            try:
                 await self._renew_before_local_tool(run.id)
+                dispatch_id = str(uuid4())
+                stored_call, event = await self._runs.begin_tool_execution(
+                    run.id,
+                    stored_call.id,
+                    dispatch_id=dispatch_id,
+                    expected_attempt=stored_call.dispatch_attempt,
+                    recovery_policy=self._tool_registry.recovery_policy(stored_call.name).value,
+                    input_snapshot={
+                        "arguments": stored_call.arguments,
+                        "approval_preview": stored_call.approval_preview,
+                    },
+                )
+                await self._publish(event)
+                if stored_call.status is ToolCallStatus.OUTCOME_UNKNOWN:
+                    raise ProviderError(
+                        "tool_outcome_unknown", "This tool's outcome requires review."
+                    )
+                if stored_call.status in {
+                    ToolCallStatus.COMPLETED,
+                    ToolCallStatus.FAILED,
+                    ToolCallStatus.DENIED,
+                    ToolCallStatus.CANCELLED,
+                    ToolCallStatus.TIMED_OUT,
+                }:
+                    continue
+                if stored_call.status is not ToolCallStatus.RUNNING:
+                    raise ApplicationError(
+                        "tool_dispatch_invalid", "The saved tool dispatch is inconsistent."
+                    )
+                if (
+                    stored_call.dispatch_id != dispatch_id
+                    or stored_call.dispatch_generation != run.generation
+                ):
+                    raise ApplicationError("run_lease_lost", "This run is no longer active here.")
+                await self._renew_before_local_tool(run.id, expected_generation=run.generation)
+                remaining_seconds = self._remaining_seconds(run)
+                if remaining_seconds <= 0:
+                    raise TimeoutError
                 result = await self._execute_tool(
                     run, stored_call, tool_request, workspace_root, remaining_seconds
                 )
@@ -1910,7 +1980,11 @@ class RunService:
         error_message: str,
     ) -> RunStatus | None:
         current = await self._runs.get_run(run_id)
-        if current is not None and current.status is RunStatus.CANCELLING:
+        if (
+            current is not None
+            and not is_terminal_run_status(current.status)
+            and (current.status is RunStatus.CANCELLING or current.cancel_requested_at is not None)
+        ):
             await self._mark_cancelled(run_id, call)
             return RunStatus.CANCELLED
         if current is not None and current.status is RunStatus.RUNNING:
@@ -1958,6 +2032,13 @@ class RunService:
             return
         for tool in await self._runs.list_tool_calls(run_id):
             if tool.status not in {ToolCallStatus.PENDING, ToolCallStatus.RUNNING}:
+                continue
+            if tool.status is ToolCallStatus.RUNNING and (
+                tool.recovery_policy != ToolRecoveryPolicy.READ_ONLY
+            ):
+                await self._runs.mark_tool_outcome_unknown(
+                    run_id, tool.id, "Execution stopped before a confirmed tool result was saved."
+                )
                 continue
             try:
                 _message, _updated, event = await self._runs.record_tool_result(

@@ -196,3 +196,72 @@ def test_summary_receipt_keeps_the_original_checkpoint_and_ownership(changed_che
             await repo._client.aclose()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("different_attempt", [False, True])
+def test_lost_tool_dispatch_ack_reuses_the_attempt_identity(different_attempt) -> None:
+    async def exercise() -> None:
+        repo = repository()
+        run = run_record()
+        dispatch_id = "19000000-0000-0000-0000-000000000010"
+        tool = {
+            "id": "19000000-0000-0000-0000-000000000011",
+            "user_id": str(repo._user_id),
+            "run_id": run.id,
+            "assistant_message_id": "assistant",
+            "call_index": 0,
+            "provider_call_id": "provider-call",
+            "name": "read_file",
+            "arguments": {},
+            "status": "running",
+            "created_at": "now",
+            "dispatch_attempt": 1,
+            "dispatch_generation": 0,
+            "dispatched_at": "now",
+            "recovery_policy": "read_only",
+            "dispatch_id": "other-attempt" if different_attempt else dispatch_id,
+            "input_snapshot": {"arguments": {}, "approval_preview": None},
+        }
+        event = {
+            "user_id": str(repo._user_id),
+            "run_id": run.id,
+            "sequence": 3,
+            "event_type": "run.phase",
+            "event_version": 1,
+            "data": {"phase": "tool_use"},
+            "created_at": "now",
+        }
+        requests: list[dict[str, object]] = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            requests.append(json.loads(request.content))
+            if len(requests) == 1:
+                raise httpx.ReadError("Dispatch committed, acknowledgment lost", request=request)
+            return httpx.Response(200, json={"tool_call": tool, "event": event})
+
+        repo._client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        repo._token_source.record_verified(
+            "verified", repo._user_id, datetime.now(UTC) + timedelta(hours=1)
+        )
+        repo._capabilities[run.id] = "same-capability"
+        repo._lease_expires[run.id] = datetime.now(UTC) + timedelta(minutes=1)
+        try:
+            pending = repo.begin_tool_execution(
+                run.id,
+                str(tool["id"]),
+                dispatch_id=dispatch_id,
+                expected_attempt=0,
+                recovery_policy="read_only",
+                input_snapshot={"arguments": {}, "approval_preview": None},
+            )
+            if different_attempt:
+                with pytest.raises(RuntimeError, match="another tool"):
+                    await pending
+            else:
+                saved, _ = await pending
+                assert saved.dispatch_id == dispatch_id
+            assert requests[0] == requests[1]
+        finally:
+            await repo._client.aclose()
+
+    asyncio.run(exercise())

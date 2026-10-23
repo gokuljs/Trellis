@@ -84,3 +84,5 @@ jobs:
           bash supabase/tests/atomic_generation_concurrency.sh
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/atomic_compaction.sql
           bash supabase/tests/atomic_compaction_concurrency.sh
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/tool_dispatch.sql
+          bash supabase/tests/tool_dispatch_concurrency.sh

@@ -291,7 +291,23 @@ class RunRepository(Protocol):
         content: str,
         *,
         status: ToolCallStatus = ToolCallStatus.COMPLETED,
+        result_source: str = "executor",
     ) -> tuple[RunMessageRecord, ToolCallRecord, RunEvent]: ...
+
+    async def begin_tool_execution(
+        self,
+        run_id: str,
+        tool_call_id: str,
+        *,
+        dispatch_id: str,
+        expected_attempt: int,
+        recovery_policy: str,
+        input_snapshot: dict[str, object] | None = None,
+    ) -> tuple[ToolCallRecord, RunEvent]: ...
+
+    async def mark_tool_outcome_unknown(
+        self, run_id: str, tool_call_id: str, reason: str
+    ) -> ToolCallRecord: ...
 
     async def record_tool_approval_decision(
         self,
