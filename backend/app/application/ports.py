@@ -1,4 +1,5 @@
 from collections.abc import AsyncGenerator, Sequence
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from typing import Protocol
 
@@ -21,6 +22,12 @@ from app.domain.models import (
     UserProfile,
 )
 from app.domain.outputs import AssistantOutput
+from app.domain.recovery import (
+    RecoveryContract,
+    RecoveryResolution,
+    RecoverySnapshot,
+    WorkspaceRecoveryReference,
+)
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -36,7 +43,9 @@ from app.domain.runtime import (
     ToolApprovalDecision,
     ToolCallRecord,
     ToolCallStatus,
+    ToolResult,
 )
+from app.domain.workspaces import PatchReconciliation, WorkspaceReviewBlock
 
 
 class ProfileRepository(Protocol):
@@ -108,9 +117,59 @@ class WorkspaceDirectoryPicker(Protocol):
 
 
 class WorkspaceBindingPort(Protocol):
-    def bind(self, session_id: str, workspace_root: Path | None) -> None: ...
+    async def bind(self, session_id: str, workspace_root: Path | None) -> None: ...
 
     async def resolve(self, session_id: str, workspace_path: str | None) -> Path | None: ...
+
+    async def reference(
+        self, session_id: str, workspace_path: str | None
+    ) -> WorkspaceRecoveryReference | None: ...
+
+
+class WorkspaceOperationPort(Protocol):
+    async def reconcile_patch(self) -> PatchReconciliation: ...
+
+    async def capture_inputs(self) -> dict[str, object]: ...
+
+    async def mark_dispatch(self, dispatch_id: str) -> str: ...
+
+    async def capture_result(self, result: ToolResult) -> dict[str, object]: ...
+
+    async def confirm_saved(self) -> None: ...
+
+    async def verify(self) -> None: ...
+
+
+class WorkspaceExecutionPort(Protocol):
+    def guard(
+        self, session_id: str, root: Path, *, exclusive: bool = False
+    ) -> AbstractAsyncContextManager[None]: ...
+
+    def operation(
+        self,
+        run: RunSnapshot,
+        tool: ToolCallRecord,
+        root: Path,
+        prior_tools: Sequence[ToolCallRecord] = (),
+    ) -> AbstractAsyncContextManager[WorkspaceOperationPort]: ...
+
+    async def reconcile_patch(
+        self, run: RunSnapshot, tool: ToolCallRecord, root: Path
+    ) -> PatchReconciliation: ...
+
+    async def validate_observations(
+        self, run: RunSnapshot, tools: Sequence[ToolCallRecord], root: Path
+    ) -> None: ...
+
+    async def acknowledge_review(self, session_id: str, root: Path, tool_call_id: str) -> None: ...
+
+    async def review_pending(self, session_id: str, root: Path, tool_call_id: str) -> bool: ...
+
+    async def pending_review(self, session_id: str, root: Path) -> WorkspaceReviewBlock | None: ...
+
+    async def reconcile_command_marker(
+        self, run: RunSnapshot, tool: ToolCallRecord, root: Path, *, session_id: str | None = None
+    ) -> bool: ...
 
 
 class RunLeasePort(Protocol):
@@ -119,6 +178,28 @@ class RunLeasePort(Protocol):
     async def renew_run_lease(self, run_id: str) -> RunSnapshot: ...
 
     async def recover_expired_run(self, run_id: str) -> RunSnapshot: ...
+
+
+class RecoveryRepository(Protocol):
+    async def list_recovery_candidates(self, installation_id: str) -> list[RunSnapshot]: ...
+
+    async def claim_recovery(
+        self, run: RunSnapshot, installation_id: str
+    ) -> tuple[RunSnapshot, str | None]: ...
+
+    async def read_recovery_snapshot(self, run_id: str) -> RecoverySnapshot: ...
+
+    async def relinquish_run(self, run_id: str) -> RunSnapshot: ...
+
+    async def finish_recovery(self, run_id: str) -> tuple[RunSnapshot, RunEvent]: ...
+
+    async def stop_recovery(
+        self, run_id: str, resolution: RecoveryResolution
+    ) -> tuple[RunSnapshot, tuple[RunEvent, ...]]: ...
+
+    async def request_recovery_cancellation(
+        self, run_id: str
+    ) -> tuple[RunSnapshot, RunEvent | None]: ...
 
 
 class RunRepository(Protocol):
@@ -134,6 +215,7 @@ class RunRepository(Protocol):
         request_fingerprint: str | None = None,
         submitted_model_id: str | None = None,
         submitted_budget_preset: BudgetPreset | None = None,
+        recovery_contract: RecoveryContract | None = None,
     ) -> RunSnapshot: ...
 
     async def match_run_request(
@@ -199,6 +281,25 @@ class RunRepository(Protocol):
         content: str,
     ) -> tuple[Message, tuple[RunEvent, ...]]: ...
 
+    async def commit_generation(
+        self,
+        run_id: str,
+        call_id: str,
+        completion: dict[str, object],
+        *,
+        assistant_message: ModelMessage | None,
+        final_content: str | None,
+    ) -> tuple[ModelCallRecord, tuple[ToolCallRecord, ...], tuple[RunEvent, ...]]: ...
+
+    async def commit_native_compaction(
+        self,
+        run_id: str,
+        call_id: str,
+        completion: dict[str, object],
+        *,
+        status: ModelCallStatus,
+    ) -> tuple[ModelCallRecord, tuple[RunEvent, ...]]: ...
+
     async def append_assistant_batch(
         self, run_id: str, model_call_id: str, batch_index: int, text: str
     ) -> tuple[AssistantOutput, RunEvent]: ...
@@ -257,7 +358,39 @@ class RunRepository(Protocol):
         content: str,
         *,
         status: ToolCallStatus = ToolCallStatus.COMPLETED,
+        result_source: str = "executor",
+        result_snapshot: dict[str, object] | None = None,
     ) -> tuple[RunMessageRecord, ToolCallRecord, RunEvent]: ...
+
+    async def begin_tool_execution(
+        self,
+        run_id: str,
+        tool_call_id: str,
+        *,
+        dispatch_id: str,
+        expected_attempt: int,
+        recovery_policy: str,
+        input_snapshot: dict[str, object] | None = None,
+    ) -> tuple[ToolCallRecord, RunEvent]: ...
+
+    async def mark_tool_outcome_unknown(
+        self, run_id: str, tool_call_id: str, reason: str
+    ) -> ToolCallRecord: ...
+
+    async def acknowledge_workspace_review(
+        self, session_id: str, run_id: str, tool_call_id: str
+    ) -> ToolCallRecord: ...
+
+    async def authorize_tool_retry(
+        self,
+        run_id: str,
+        tool_call_id: str,
+        *,
+        expected_dispatch_id: str,
+        expected_attempt: int,
+        reconciliation: str,
+        proof: dict[str, object] | None = None,
+    ) -> ToolCallRecord: ...
 
     async def record_tool_approval_decision(
         self,
@@ -342,6 +475,15 @@ class ContextCheckpointRepository(Protocol):
     async def save_context_checkpoint(
         self, run_id: str, expected_revision: int, draft: ContextCheckpointDraft
     ) -> ContextCheckpoint: ...
+
+    async def commit_summary(
+        self,
+        run_id: str,
+        model_call_id: str,
+        completion: dict[str, object],
+        expected_revision: int,
+        draft: ContextCheckpointDraft,
+    ) -> tuple[ModelCallRecord, ContextCheckpoint, tuple[RunEvent, ...]]: ...
 
     async def list_context_messages(
         self, session_id: str, after_ordinal: int, *, limit: int = 128

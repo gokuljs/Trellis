@@ -243,6 +243,7 @@ Object.assign(api, {
     const run = latest.get(sessionId)
     return { items: run ? [runSummary(run)] : [], next_offset: null }
   },
+  getWorkspaceReview: async () => ({ blocked: false }),
   getLatestRun: async (sessionId: string) => {
     if (sessionId === ids.a && delayDiscovery)
       await new Promise<void>((resolve) => {

@@ -121,15 +121,39 @@ export type AssistantOutput = {
   next_batch_index?: number
 }
 
-export type LatestRun = {
+export type RecoveryMetadata = {
+  retry_allowed?: boolean
+  recovery_reason?: string | null
+  uncertain_tool_call_id?: string | null
+}
+
+export type UncertainOperation = {
+  tool_call_id: string
+  name: string
+  arguments: Record<string, unknown>
+  reviewed_at: string | null
+  review_pending?: boolean
+}
+
+export type WorkspaceReviewStatus = {
+  blocked: boolean
+  workspace_path?: string | null
+  source_session_id?: string
+  run_id?: string
+  uncertain_operation?: UncertainOperation | null
+  reason?: string | null
+}
+
+export type LatestRun = RecoveryMetadata & {
   run_id: string
   turn_id: string
   status: string
   last_sequence: number
   input_message?: Message | null
+  uncertain_operation?: UncertainOperation | null
 }
 
-export type RunSummary = {
+export type RunSummary = RecoveryMetadata & {
   run_id: string
   turn_id: string
   retry_of: string | null

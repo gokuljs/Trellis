@@ -10,6 +10,7 @@ import threading
 from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
+from typing import Literal
 
 from app.application.context import MAX_WORKSPACE_GUIDANCE_BYTES
 from app.application.tools import ToolExecutionError, redact_secrets
@@ -20,6 +21,7 @@ from app.infrastructure.local_tools import (
     _read_bytes,
     _root,
     _run_bounded_file_operation,
+    validate_pinned_workspace,
 )
 
 MAX_PATCH_DIFF_BYTES = 20_000
@@ -205,6 +207,7 @@ def _preview_operation(
             hashlib.sha256(original_bytes).hexdigest() if original_bytes is not None else None
         ),
         "target_identity": original_target[1] if original_target is not None else None,
+        "desired_sha256": hashlib.sha256(replacement.encode("utf-8")).hexdigest(),
         "arguments_sha256": _arguments_digest(path, old_text, new_text),
         "diff": diff,
         "guidance": guidance,
@@ -276,6 +279,10 @@ def _apply_operation(
             assert original_identity is not None
             mode = original_identity["mode"]
         replacement_bytes = replacement.encode("utf-8")
+        if hashlib.sha256(replacement_bytes).hexdigest() != preview.get("desired_sha256"):
+            raise ToolExecutionError(
+                "approval_invalid", "The approved patch does not match this edit."
+            )
         if len(replacement_bytes) > MAX_FILE_BYTES:
             raise ToolExecutionError("file_too_large", "The edited file exceeds the size limit.")
         if preview.get("diff") != _unified_diff(
@@ -321,6 +328,7 @@ def _apply_operation(
             )
         if stopped.is_set():
             raise ToolExecutionError("tool_timeout", "The tool reached its time limit.")
+        validate_pinned_workspace(root)
         if expected_digest is None:
             try:
                 os.link(
@@ -347,6 +355,81 @@ def _apply_operation(
                 os.unlink(temporary_name, dir_fd=parent_fd)
         os.close(parent_fd)
     return f"{'Created' if expected_digest is None else 'Updated'} {path}.", False
+
+
+type PatchReconciliation = Literal["desired_state_present", "unchanged_original", "conflict"]
+
+
+def _reconcile_operation(
+    workspace_root: Path,
+    arguments: dict[str, object],
+    preview: dict[str, object],
+    stopped: threading.Event,
+) -> PatchReconciliation:
+    root = _root(workspace_root)
+    path, old_text, new_text = _arguments(arguments)
+    parts = _target_parts(path)
+    before = preview.get("target_sha256")
+    after = preview.get("desired_sha256")
+    if (
+        preview.get("path") != path
+        or preview.get("arguments_sha256") != _arguments_digest(path, old_text, new_text)
+        or not isinstance(after, str)
+        or len(after) != 64
+        or any(character not in "0123456789abcdef" for character in after)
+        or (
+            before is not None
+            and (
+                not isinstance(before, str)
+                or len(before) != 64
+                or any(character not in "0123456789abcdef" for character in before)
+            )
+        )
+    ):
+        return "conflict"
+    guidance, hashes = _ancestor_guidance(root, parts)
+    if preview.get("guidance_sha256") != hashes or preview.get("guidance") != guidance:
+        return "conflict"
+    parent_fd = _open_directory(root, parts[:-1])
+    try:
+        target = _read_target(parent_fd, parts[-1])
+        digest = hashlib.sha256(target[0]).hexdigest() if target is not None else None
+        if stopped.is_set():
+            raise ToolExecutionError("tool_timeout", "The tool reached its time limit.")
+        validate_pinned_workspace(root)
+        if not _parent_still_attached(root, parts[:-1], parent_fd):
+            return "conflict"
+        if digest == after:
+            return "desired_state_present"
+        identity = target[1] if target is not None else None
+        if digest != before or identity != preview.get("target_identity"):
+            return "conflict"
+        original = target[0].decode("utf-8") if target is not None else ""
+        if (target is None and old_text) or (target is not None and not old_text):
+            return "conflict"
+        try:
+            replacement = _replace_once(original, old_text, new_text) if old_text else new_text
+        except ToolExecutionError:
+            return "conflict"
+        if hashlib.sha256(replacement.encode("utf-8")).hexdigest() != after:
+            return "conflict"
+        if preview.get("diff") != _unified_diff(
+            path, original, replacement, created=target is None
+        ):
+            return "conflict"
+        return "unchanged_original"
+    finally:
+        os.close(parent_fd)
+
+
+async def reconcile_patch(
+    arguments: Mapping[str, object], preview: dict[str, object], root: Path
+) -> PatchReconciliation:
+    return await _run_bounded_file_operation(
+        lambda workspace, args, stopped: _reconcile_operation(workspace, args, preview, stopped),
+        root,
+        dict(arguments),
+    )
 
 
 class LocalPatchToolExecutor:

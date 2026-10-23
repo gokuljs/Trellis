@@ -14,6 +14,7 @@ from app.domain.capabilities import (
     RuntimeCapabilities,
     RuntimeCapability,
 )
+from app.domain.recovery import ToolRecoveryPolicy
 from app.domain.runtime import ModelToolCall, ModelToolSpec, ToolResult
 
 MAX_ARGUMENT_BYTES = 16_384
@@ -154,6 +155,8 @@ class ToolRegistration:
     executor: ToolExecutor
     required_capabilities: frozenset[RuntimeCapability] = frozenset()
     requires_workspace: bool = False
+    recovery_policy: ToolRecoveryPolicy = ToolRecoveryPolicy.NEVER
+    recovery_version: str = "v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +216,12 @@ class ToolRegistry:
         self._patch_executor = patch_executor
         self._command_executor = command_executor
         self._generic_executors: dict[str, ToolExecutor] = {}
+        self._recovery_versions = {name: "v1" for name in _LOCAL_CAPABILITIES}
+        self._recovery_policies = {
+            **{name: ToolRecoveryPolicy.READ_ONLY for name, _description, _model in _DEFINITIONS},
+            "apply_patch": ToolRecoveryPolicy.PATCH,
+            "run_command": ToolRecoveryPolicy.COMMAND,
+        }
         self._requirements = {
             name: _ToolRequirements(frozenset({capability}), True)
             for name, capability in _LOCAL_CAPABILITIES.items()
@@ -220,7 +229,11 @@ class ToolRegistry:
         for tool in additional_tools:
             if not tool.name or tool.name in self._requirements:
                 raise ValueError("Tool names must be nonempty and unique")
+            if not tool.recovery_version or len(tool.recovery_version) > 100:
+                raise ValueError("Tools require a bounded recovery version")
+            self._recovery_versions[tool.name] = tool.recovery_version
             self._generic_executors[tool.name] = tool.executor
+            self._recovery_policies[tool.name] = tool.recovery_policy
             self._requirements[tool.name] = _ToolRequirements(
                 tool.required_capabilities, tool.requires_workspace
             )
@@ -242,6 +255,45 @@ class ToolRegistry:
     def requires_approval(self, call: ModelToolCall, workspace_root: Path | None = None) -> bool:
         del workspace_root
         return call.name in self._approval_required_names
+
+    def recovery_policy(self, name: str) -> ToolRecoveryPolicy:
+        return self._recovery_policies.get(name, ToolRecoveryPolicy.NEVER)
+
+    def recovery_versions(self) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            sorted(
+                (name, self._recovery_versions[name])
+                for name in self._definitions
+                if self._capabilities.allows_all(self._requirements[name].required_capabilities)
+            )
+        )
+
+    def validate_execution(
+        self,
+        call: ModelToolCall,
+        workspace_root: Path | None,
+        *,
+        approved: bool = False,
+        approval_preview: dict[str, object] | None = None,
+        capabilities: RuntimeCapabilities | None = None,
+    ) -> dict[str, object]:
+        self.check_call(call, workspace_root, capabilities=capabilities)
+        if self.requires_approval(call, workspace_root) and not approved:
+            raise ToolExecutionError(
+                "approval_required", "This tool requires approval before it can run."
+            )
+        arguments = self._validated_arguments(call)
+        if call.name == "run_command":
+            parse_command(str(arguments["command"]))
+            if approval_preview != {
+                "command": arguments["command"],
+                "cwd": arguments["cwd"],
+                "timeout_seconds": arguments["timeout_seconds"],
+            }:
+                raise ToolExecutionError(
+                    "approval_changed", "The approved command no longer matches this request."
+                )
+        return arguments
 
     async def approval_preview(
         self,
@@ -350,32 +402,13 @@ class ToolRegistry:
         capabilities: RuntimeCapabilities | None = None,
     ) -> ToolResult:
         try:
-            self.check_call(call, workspace_root, capabilities=capabilities)
-        except ToolExecutionError as error:
-            return self._safe_error(call, error)
-        if workspace_root is None and self._requirements[call.name].requires_workspace:
-            return self._safe_error(
+            arguments = self.validate_execution(
                 call,
-                ToolExecutionError(
-                    "workspace_required", "This tool requires a selected workspace."
-                ),
+                workspace_root,
+                approved=approved,
+                approval_preview=approval_preview,
+                capabilities=capabilities,
             )
-        if self.requires_approval(call, workspace_root) and not approved:
-            return ToolResult(
-                call.id,
-                call.name,
-                "This tool requires approval before it can run.",
-                True,
-                "approval_required",
-            )
-        try:
-            arguments = self._validated_arguments(call)
-            if call.name == "run_command" and approval_preview != await self.approval_preview(
-                call, workspace_root
-            ):
-                raise ToolExecutionError(
-                    "approval_changed", "The approved command no longer matches this request."
-                )
         except ToolExecutionError as error:
             return self._safe_error(call, error)
         try:
@@ -409,6 +442,8 @@ class ToolRegistry:
         except ToolExecutionError as error:
             return self._safe_error(call, error)
         except Exception:
+            if self.recovery_policy(call.name) is not ToolRecoveryPolicy.READ_ONLY:
+                raise
             return ToolResult(
                 call.id, call.name, "The tool could not complete.", True, "tool_failed"
             )

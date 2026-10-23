@@ -24,6 +24,9 @@ export type RuntimeRunInfo = {
   runId: string
   modelId?: string
   status?: string
+  retryAllowed?: boolean
+  recoveryReason?: string | null
+  uncertainToolCallId?: string | null
   budgetPreset?: string
   limits?: {
     maxModelCalls: number
@@ -262,6 +265,18 @@ function parseRunInfo(result: Record<string, unknown>): RuntimeRunInfo {
   const runId = result.runId as string
   const info: RuntimeRunInfo = { runId }
   if (typeof result.status === "string") info.status = result.status
+  if (typeof result.retryAllowed === "boolean")
+    info.retryAllowed = result.retryAllowed
+  if (
+    typeof result.recoveryReason === "string" ||
+    result.recoveryReason === null
+  )
+    info.recoveryReason = result.recoveryReason
+  if (
+    typeof result.uncertainToolCallId === "string" ||
+    result.uncertainToolCallId === null
+  )
+    info.uncertainToolCallId = result.uncertainToolCallId
   if (typeof result.modelId === "string") info.modelId = result.modelId
   if (typeof result.budgetPreset === "string") {
     info.budgetPreset = result.budgetPreset

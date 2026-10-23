@@ -1,4 +1,4 @@
-import { LayoutGrid, MessageSquare, Moon, Settings, Sun } from "lucide-react"
+import { MessageSquare, Moon, Settings, Sun } from "lucide-react"
 import type { MouseEvent, ReactNode } from "react"
 
 import { useTheme } from "@/components/theme-provider"
@@ -79,12 +79,6 @@ export function WorkspaceTopbar({
         </span>
       </nav>
       <div className="topbar-actions">
-        <button className="topbar-icon" aria-label="Layout">
-          <LayoutGrid size={15} aria-hidden="true" />
-        </button>
-        <button className="topbar-icon" aria-label="Messages">
-          <MessageSquare size={15} aria-hidden="true" />
-        </button>
         <button
           className={`topbar-icon ${activeView === "Settings" ? "is-active" : ""}`}
           aria-label="Settings"

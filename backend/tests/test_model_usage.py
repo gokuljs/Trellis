@@ -1,5 +1,6 @@
 import asyncio
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import cast
 from unittest.mock import AsyncMock, Mock
@@ -9,11 +10,12 @@ import httpx
 import pytest
 from run_fixtures import MODEL, Provider, Repository, plan, run_record, service
 
+from app.application.compaction import build_summary_request
 from app.application.ports import RunRepository, StreamingProviderAdapter
-from app.application.run_context import RunContext
+from app.application.run_context import CompactionIntent, RunContext
 from app.application.secret_redaction import SecretRedactor
 from app.core.config import Settings
-from app.domain.context import NativeCompactionResult
+from app.domain.context import ContextItem, NativeCompactionResult
 from app.domain.runtime import ModelCallStatus, ModelStreamEvent
 from app.infrastructure.supabase_repository import SupabaseRepository, VerifiedTokenSource
 
@@ -128,14 +130,39 @@ def test_billable_paths_persist_normalized_usage(purpose, monkeypatch) -> None:
                 )
                 await context._compact(run_record(), MODEL, native, plan(), "key", "user", 1)
             else:
+                source = ContextItem(str(USER_ID), "history", plan().request.messages[0])
+                generation = replace(plan(), sources=(source,), input_hash="a" * 64)
+                summary = replace(
+                    plan(), request=build_summary_request(generation.request, (source,))
+                )
+                intent = CompactionIntent(
+                    str(USER_ID),
+                    str(USER_ID),
+                    0,
+                    None,
+                    generation,
+                    summary,
+                    1,
+                    "b" * 64,
+                    "c" * 64,
+                )
+
+                async def commit(run_id, call_id, completion, revision, draft):
+                    call = await repo.update_model_call(
+                        call_id, ModelCallStatus.COMPLETED, **completion
+                    )
+                    return call, Mock(), ()
+
+                cast(Mock, context.checkpoints).commit_summary = AsyncMock(side_effect=commit)
                 await context._summarize(
                     run_record(),
                     MODEL,
                     cast(StreamingProviderAdapter, provider),
-                    plan(),
+                    summary,
                     "key",
                     "user",
                     1,
+                    intent=intent,
                 )
 
     asyncio.run(exercise())

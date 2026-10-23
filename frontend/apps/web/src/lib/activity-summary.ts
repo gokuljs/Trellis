@@ -5,6 +5,7 @@ const summaryEvents = new Set([
   "run.queued",
   "run.started",
   "run.resumed",
+  "run.recovering",
   "run.cancellation_requested",
   "run.completed",
   "run.failed",

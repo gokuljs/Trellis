@@ -9,7 +9,7 @@ import json
 import secrets
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from typing import Literal, cast
@@ -42,6 +42,7 @@ from app.domain.models import (
     UserProfile,
 )
 from app.domain.outputs import AssistantOutput, validate_assistant_batch
+from app.domain.recovery import RecoveryContract, RecoveryResolution, RecoverySnapshot
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -70,6 +71,11 @@ class VerifiedTokenSource:
         self._user_id = user_id
         self._token: str | None = None
         self._expires_at: datetime | None = None
+        self._revision = 0
+
+    @property
+    def revision(self) -> int:
+        return self._revision
 
     def record_verified(self, token: str, verified_user_id: UUID, expires_at: datetime) -> None:
         if verified_user_id != self._user_id:
@@ -88,6 +94,8 @@ class VerifiedTokenSource:
         # Multiple tabs can present different still-valid JWTs for this account.
         # A shorter-lived session must not downgrade the token renewing an active run.
         if self._expires_at is None or expires_at >= self._expires_at:
+            if self._token != token or self._expires_at != expires_at:
+                self._revision += 1
             self._token = token
             self._expires_at = expires_at
 
@@ -246,6 +254,49 @@ class SupabaseRepository:
         ):
             raise RuntimeError("Supabase returned another checkpoint result")
         return saved
+
+    async def commit_summary(
+        self,
+        run_id: str,
+        model_call_id: str,
+        completion: dict[str, object],
+        expected_revision: int,
+        draft: ContextCheckpointDraft,
+    ) -> tuple[ModelCallRecord, ContextCheckpoint, tuple[RunEvent, ...]]:
+        if draft.model_call_id != model_call_id:
+            raise ValueError("summary checkpoint belongs to another model call")
+        saved_completion = dict(completion)
+        if "cached_tokens" in saved_completion:
+            saved_completion["cached_read_tokens"] = saved_completion.pop("cached_tokens")
+        result = _object(
+            await self._idempotent_rpc(
+                "commit_summary",
+                {
+                    "run_id": run_id,
+                    "call_id": model_call_id,
+                    "completion": saved_completion,
+                    "expected_revision": expected_revision,
+                    "draft": asdict(draft),
+                },
+                capability=self._run_capability(run_id),
+            )
+        )
+        call = self._model_call(_object(result.get("model_call")))
+        checkpoint = self._checkpoint(_object(result.get("checkpoint")))
+        events = tuple(self._event(row) for row in _array(result.get("events")))
+        if (
+            call.id != model_call_id
+            or call.run_id != run_id
+            or checkpoint.run_id != run_id
+            or checkpoint.id != draft.id
+            or checkpoint.revision != expected_revision + 1
+            or replace(checkpoint.draft, pricing_context_tokens=draft.pricing_context_tokens)
+            != draft
+            or checkpoint.draft.pricing_context_tokens < draft.pricing_context_tokens
+            or any(item.run_id != run_id for item in events)
+        ):
+            raise RuntimeError("Supabase returned another summary's completion")
+        return call, checkpoint, events
 
     async def list_context_messages(
         self, session_id: str, after_ordinal: int, *, limit: int = 128
@@ -452,6 +503,20 @@ class SupabaseRepository:
             "rpc/mutate",
             payload={"p_action": action, "p_payload": payload, "p_capability": capability},
         )
+
+    async def _idempotent_rpc(
+        self, action: str, payload: dict[str, object], *, capability: str | None
+    ) -> object:
+        for attempt in range(2):
+            try:
+                return await self._rpc(action, payload, capability=capability)
+            except ApplicationError as error:
+                if attempt or error.code != "database_unavailable":
+                    raise
+            except RuntimeError as error:
+                if attempt or str(error) != "Supabase returned invalid JSON":
+                    raise
+        raise AssertionError("bounded commit retry exhausted")
 
     def _owned(self, row: dict[str, object], key: str = "user_id") -> dict[str, object]:
         if _text(row, key) != str(self._user_id):
@@ -899,6 +964,15 @@ class SupabaseRepository:
             created_at=_text(row, "created_at"),
             started_at=_nullable_text(row, "started_at"),
             finished_at=_nullable_text(row, "finished_at"),
+            recovery_contract=(
+                RecoveryContract.from_dict(_object(row["recovery_contract"]))
+                if row.get("recovery_contract") is not None
+                else None
+            ),
+            generation=_integer(row, "generation") if "generation" in row else 0,
+            retry_allowed=_boolean(row, "retry_allowed") if "retry_allowed" in row else True,
+            recovery_reason=_nullable_text(row, "recovery_reason"),
+            uncertain_tool_call_id=_nullable_text(row, "uncertain_tool_call_id"),
         )
 
     def _event(self, row: dict[str, object]) -> RunEvent:
@@ -954,7 +1028,8 @@ class SupabaseRepository:
                 "max_model_calls,max_tool_calls,budget_preset,max_total_tokens,max_cost_usd,"
                 "deadline_at,cancel_requested_at,lease_expires_at,recovery_count,stop_reason,"
                 "last_event_sequence,error_code,error_message,created_at,started_at,finished_at,"
-                "waiting_tool_call_id"
+                "waiting_tool_call_id,recovery_contract,generation,retry_allowed,"
+                "recovery_reason,uncertain_tool_call_id"
             ),
             filters={"user_id": f"eq.{self._user_id}", **filters},
         )
@@ -1082,6 +1157,7 @@ class SupabaseRepository:
         self._owned(row)
         decision = _nullable_text(row, "approval_decision")
         preview = row.get("approval_preview")
+        input_snapshot = row.get("input_snapshot")
         return ToolCallRecord(
             id=_text(row, "id"),
             run_id=_text(row, "run_id"),
@@ -1096,6 +1172,17 @@ class SupabaseRepository:
             approval_preview=None if preview is None else _object(preview),
             created_at=_text(row, "created_at"),
             finished_at=_nullable_text(row, "finished_at"),
+            dispatch_attempt=_integer(row, "dispatch_attempt") if "dispatch_attempt" in row else 0,
+            dispatch_generation=_nullable_integer(row, "dispatch_generation"),
+            dispatched_at=_nullable_text(row, "dispatched_at"),
+            recovery_policy=_nullable_text(row, "recovery_policy"),
+            result_source=_nullable_text(row, "result_source"),
+            dispatch_id=_nullable_text(row, "dispatch_id"),
+            input_snapshot=None if input_snapshot is None else _object(input_snapshot),
+            reviewed_at=_nullable_text(row, "reviewed_at"),
+            result_snapshot=(
+                None if row.get("result_snapshot") is None else _object(row["result_snapshot"])
+            ),
         )
 
     async def _tool_call_rows(self, run_id: str) -> list[dict[str, object]]:
@@ -1104,7 +1191,8 @@ class SupabaseRepository:
             select=(
                 "id,user_id,run_id,assistant_message_id,call_index,provider_call_id,name,"
                 "arguments,status,approval_decision,approval_decided_at,approval_preview,"
-                "created_at,finished_at"
+                "created_at,finished_at,dispatch_attempt,dispatch_generation,dispatched_at,"
+                "recovery_policy,result_source,dispatch_id,input_snapshot,reviewed_at,result_snapshot"
             ),
             filters={
                 "user_id": f"eq.{self._user_id}",
@@ -1210,6 +1298,7 @@ class SupabaseRepository:
         request_fingerprint: str | None = None,
         submitted_model_id: str | None = None,
         submitted_budget_preset: BudgetPreset | None = None,
+        recovery_contract: RecoveryContract | None = None,
     ) -> RunSnapshot:
         normalized_content = content.strip()
         if not normalized_content:
@@ -1233,6 +1322,10 @@ class SupabaseRepository:
             "submitted_model_id": submitted_model_id,
             "submitted_budget_preset": submitted_budget_preset,
         }
+        if recovery_contract is not None:
+            if recovery_contract.request_identity != client_request_id:
+                raise ValueError("Recovery contract belongs to another request")
+            payload["recovery_contract"] = recovery_contract.to_dict()
         for attempt in range(2):
             try:
                 result = _object(await self._rpc("create_run", payload, capability=capability))
@@ -1253,6 +1346,8 @@ class SupabaseRepository:
                     raise
         run = self._run(_object(result.get("run")))
         if result.get("lease_acquired") is True:
+            if recovery_contract is not None and run.recovery_contract != recovery_contract:
+                raise RuntimeError("Supabase did not preserve the new run's recovery contract")
             self._record_lease(run, capability)
         return run
 
@@ -1367,7 +1462,7 @@ class SupabaseRepository:
     ) -> ModelCallRecord:
         if step_index < 1:
             raise ValueError("model call step index must be positive")
-        result = await self._rpc(
+        result = await self._idempotent_rpc(
             "create_model_call",
             {
                 "run_id": run_id,
@@ -1378,7 +1473,12 @@ class SupabaseRepository:
             capability=self._run_capability(run_id),
         )
         call = self._model_call(_object(result))
-        if call.run_id != run_id:
+        if (
+            call.run_id != run_id
+            or call.step_index != step_index
+            or call.model_id != model.id
+            or call.request_snapshot != request_snapshot
+        ):
             raise RuntimeError("Supabase returned a model call from another run")
         self._model_call_runs[call.id] = run_id
         return call
@@ -1481,6 +1581,95 @@ class SupabaseRepository:
         events = tuple(self._event(row) for row in _array(result.get("events")))
         return assistant, calls, events
 
+    async def commit_generation(
+        self,
+        run_id: str,
+        call_id: str,
+        completion: dict[str, object],
+        *,
+        assistant_message: ModelMessage | None,
+        final_content: str | None,
+    ) -> tuple[ModelCallRecord, tuple[ToolCallRecord, ...], tuple[RunEvent, ...]]:
+        if (assistant_message is None) == (final_content is None):
+            raise ValueError("generation requires exactly one completion outcome")
+        saved_completion = dict(completion)
+        if "cached_tokens" in saved_completion:
+            saved_completion["cached_read_tokens"] = saved_completion.pop("cached_tokens")
+        message: dict[str, object] | None = None
+        if assistant_message is not None:
+            if assistant_message.role != "assistant" or assistant_message.tool_call_id is not None:
+                raise ValueError("generation requires an assistant message")
+            message = {
+                "role": "assistant",
+                "content": assistant_message.content,
+                "tool_call_id": None,
+                "tool_calls": [asdict(item) for item in assistant_message.tool_calls],
+                "continuation_items": [
+                    asdict(item) for item in assistant_message.continuation_items
+                ],
+            }
+        result = _object(
+            await self._idempotent_rpc(
+                "commit_generation",
+                {
+                    "run_id": run_id,
+                    "call_id": call_id,
+                    "completion": saved_completion,
+                    "assistant_message": message,
+                    "final_content": final_content,
+                },
+                capability=self._run_capability(run_id),
+            )
+        )
+        call = self._model_call(_object(result.get("model_call")))
+        tools = tuple(self._tool_call(row) for row in _array(result.get("tool_calls")))
+        events = tuple(self._event(row) for row in _array(result.get("events")))
+        if (
+            call.id != call_id
+            or call.run_id != run_id
+            or any(item.run_id != run_id for item in (*tools, *events))
+        ):
+            raise RuntimeError("Supabase returned another generation's completion")
+        if final_content is not None:
+            self._drop_lease(run_id)
+        return call, tools, events
+
+    async def commit_native_compaction(
+        self,
+        run_id: str,
+        call_id: str,
+        completion: dict[str, object],
+        *,
+        status: ModelCallStatus,
+    ) -> tuple[ModelCallRecord, tuple[RunEvent, ...]]:
+        if status not in {ModelCallStatus.COMPLETED, ModelCallStatus.FAILED}:
+            raise ValueError("native compaction requires a known completion")
+        saved_completion = dict(completion)
+        if "cached_tokens" in saved_completion:
+            saved_completion["cached_read_tokens"] = saved_completion.pop("cached_tokens")
+        result = _object(
+            await self._idempotent_rpc(
+                "commit_native_compaction",
+                {
+                    "run_id": run_id,
+                    "call_id": call_id,
+                    "completion": saved_completion,
+                    "next_status": status.value,
+                },
+                capability=self._run_capability(run_id),
+            )
+        )
+        call = self._model_call(_object(result.get("model_call")))
+        events = tuple(self._event(row) for row in _array(result.get("events")))
+        if (
+            call.id != call_id
+            or call.run_id != run_id
+            or call.status is not status
+            or any(item.run_id != run_id for item in events)
+        ):
+            raise RuntimeError("Supabase returned another native compaction's completion")
+        return call, events
+
     async def record_tool_result(
         self,
         run_id: str,
@@ -1488,6 +1677,8 @@ class SupabaseRepository:
         content: str,
         *,
         status: ToolCallStatus = ToolCallStatus.COMPLETED,
+        result_source: str = "executor",
+        result_snapshot: dict[str, object] | None = None,
     ) -> tuple[RunMessageRecord, ToolCallRecord, RunEvent]:
         if status not in {
             ToolCallStatus.COMPLETED,
@@ -1498,22 +1689,139 @@ class SupabaseRepository:
         }:
             raise ValueError("tool result requires a terminal status")
         result = _object(
-            await self._rpc(
+            await self._idempotent_rpc(
                 "record_tool_result",
                 {
                     "run_id": run_id,
                     "tool_call_id": tool_call_id,
                     "content": content,
                     "status": status.value,
+                    "result_source": result_source,
+                    "result_snapshot": result_snapshot,
                 },
                 capability=self._run_capability(run_id),
             )
         )
-        return (
-            self._run_message(_object(result.get("message"))),
-            self._tool_call(_object(result.get("tool_call"))),
-            self._event(_object(result.get("event"))),
+        message = self._run_message(_object(result.get("message")))
+        tool = self._tool_call(_object(result.get("tool_call")))
+        event = self._event(_object(result.get("event")))
+        if (
+            message.run_id != run_id
+            or message.tool_call_id != tool_call_id
+            or message.role != "tool"
+            or message.content != content
+            or tool.run_id != run_id
+            or tool.id != tool_call_id
+            or tool.status is not status
+            or tool.result_snapshot != result_snapshot
+            or event.run_id != run_id
+        ):
+            raise RuntimeError("Supabase returned another tool's result")
+        return message, tool, event
+
+    async def begin_tool_execution(
+        self,
+        run_id: str,
+        tool_call_id: str,
+        *,
+        dispatch_id: str,
+        expected_attempt: int,
+        recovery_policy: str,
+        input_snapshot: dict[str, object] | None = None,
+    ) -> tuple[ToolCallRecord, RunEvent]:
+        result = _object(
+            await self._idempotent_rpc(
+                "begin_tool_execution",
+                {
+                    "run_id": run_id,
+                    "tool_call_id": tool_call_id,
+                    "dispatch_id": dispatch_id,
+                    "expected_attempt": expected_attempt,
+                    "recovery_policy": recovery_policy,
+                    "input_snapshot": input_snapshot,
+                },
+                capability=self._run_capability(run_id),
+            )
         )
+        tool = self._tool_call(_object(result.get("tool_call")))
+        event = self._event(_object(result.get("event")))
+        if (
+            tool.id != tool_call_id
+            or tool.run_id != run_id
+            or tool.dispatch_id != dispatch_id
+            or event.run_id != run_id
+        ):
+            raise RuntimeError("Supabase returned another tool's dispatch")
+        return tool, event
+
+    async def mark_tool_outcome_unknown(
+        self, run_id: str, tool_call_id: str, reason: str
+    ) -> ToolCallRecord:
+        result = await self._idempotent_rpc(
+            "mark_tool_outcome_unknown",
+            {"run_id": run_id, "tool_call_id": tool_call_id, "reason": reason},
+            capability=self._run_capability(run_id),
+        )
+        tool = self._tool_call(_object(result))
+        if (
+            tool.id != tool_call_id
+            or tool.run_id != run_id
+            or tool.status is not ToolCallStatus.OUTCOME_UNKNOWN
+        ):
+            raise RuntimeError("Supabase returned another uncertain tool")
+        return tool
+
+    async def acknowledge_workspace_review(
+        self, session_id: str, run_id: str, tool_call_id: str
+    ) -> ToolCallRecord:
+        row = await self._idempotent_rpc(
+            "acknowledge_workspace_review",
+            {"session_id": session_id, "run_id": run_id, "tool_call_id": tool_call_id},
+            capability=None,
+        )
+        tool = self._tool_call(_object(row))
+        if (
+            tool.id != tool_call_id
+            or tool.run_id != run_id
+            or tool.name != "run_command"
+            or tool.status is not ToolCallStatus.OUTCOME_UNKNOWN
+            or tool.reviewed_at is None
+        ):
+            raise RuntimeError("Supabase returned another command review acknowledgment")
+        return tool
+
+    async def authorize_tool_retry(
+        self,
+        run_id: str,
+        tool_call_id: str,
+        *,
+        expected_dispatch_id: str,
+        expected_attempt: int,
+        reconciliation: str,
+        proof: dict[str, object] | None = None,
+    ) -> ToolCallRecord:
+        result = await self._idempotent_rpc(
+            "authorize_tool_retry",
+            {
+                "run_id": run_id,
+                "tool_call_id": tool_call_id,
+                "expected_dispatch_id": expected_dispatch_id,
+                "expected_attempt": expected_attempt,
+                "reconciliation": reconciliation,
+                "proof": proof,
+            },
+            capability=self._run_capability(run_id),
+        )
+        tool = self._tool_call(_object(result))
+        if (
+            tool.id != tool_call_id
+            or tool.run_id != run_id
+            or tool.dispatch_id != expected_dispatch_id
+            or tool.dispatch_attempt != expected_attempt
+            or tool.status is not ToolCallStatus.PENDING
+        ):
+            raise RuntimeError("Supabase returned another tool retry authorization")
+        return tool
 
     async def record_tool_approval_decision(
         self,
@@ -1682,6 +1990,160 @@ class SupabaseRepository:
         if run.status is RunStatus.INTERRUPTED:
             self._drop_lease(run_id)
         return run
+
+    async def list_recovery_candidates(self, installation_id: str) -> list[RunSnapshot]:
+        rows = _array(
+            await self._rpc(
+                "list_recovery_candidates", {"installation_id": installation_id, "limit": 20}
+            )
+        )
+        if len(rows) > 20:
+            raise RuntimeError("Supabase returned too many recovery candidates")
+        return [self._run(row) for row in rows]
+
+    async def claim_recovery(
+        self, run: RunSnapshot, installation_id: str
+    ) -> tuple[RunSnapshot, str | None]:
+        capability = secrets.token_urlsafe(32)
+        result = _object(
+            await self._idempotent_rpc(
+                "claim_recovery",
+                {
+                    "run_id": run.id,
+                    "installation_id": installation_id,
+                    "expected_generation": run.generation,
+                },
+                capability=capability,
+            )
+        )
+        claimed = self._run(_object(result.get("run")))
+        if claimed.id != run.id:
+            raise RuntimeError("Supabase returned another recovery candidate")
+        reason = _nullable_text(result, "rejection_reason")
+        if result.get("lease_acquired") is True:
+            if claimed.generation != run.generation + 1 or claimed.status not in {
+                RunStatus.RECOVERING,
+                RunStatus.CANCELLING,
+            }:
+                raise RuntimeError("Supabase returned an inconsistent recovery takeover")
+            self._record_lease(claimed, capability)
+            if not self.owns_run_lease(claimed.id):
+                raise ApplicationError(
+                    "run_lease_lost", "The recovery ownership expired in transit."
+                )
+        elif reason is None:
+            raise RuntimeError("Supabase did not confirm recovery ownership")
+        return claimed, reason
+
+    async def relinquish_run(self, run_id: str) -> RunSnapshot:
+        result = await self._rpc(
+            "relinquish_run", {"run_id": run_id}, capability=self._run_capability(run_id)
+        )
+        run = self._run(_object(result))
+        self._drop_lease(run_id)
+        return run
+
+    async def finish_recovery(self, run_id: str) -> tuple[RunSnapshot, RunEvent]:
+        result = _object(
+            await self._idempotent_rpc(
+                "finish_recovery", {"run_id": run_id}, capability=self._run_capability(run_id)
+            )
+        )
+        run, event = (
+            self._run(_object(result.get("run"))),
+            self._event(_object(result.get("event"))),
+        )
+        if run.id != run_id or event.run_id != run_id:
+            raise RuntimeError("Supabase returned another recovery completion")
+        return run, event
+
+    async def stop_recovery(
+        self, run_id: str, resolution: RecoveryResolution
+    ) -> tuple[RunSnapshot, tuple[RunEvent, ...]]:
+        result = _object(
+            await self._idempotent_rpc(
+                "stop_recovery",
+                {
+                    "run_id": run_id,
+                    "reason": resolution.reason,
+                    "retry_allowed": resolution.retry_allowed,
+                    "usage_unknown": resolution.usage_unknown,
+                    "model_call_id": resolution.model_call_id,
+                    "tool_call_id": resolution.tool_call_id,
+                },
+                capability=self._run_capability(run_id),
+            )
+        )
+        run = self._run(_object(result.get("run")))
+        events = tuple(self._event(row) for row in _array(result.get("events")))
+        if (
+            run.id != run_id
+            or run.status
+            not in {
+                RunStatus.COMPLETED,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+                RunStatus.INTERRUPTED,
+            }
+            or any(event.run_id != run_id for event in events)
+        ):
+            raise RuntimeError("Supabase returned another recovery stop")
+        self._drop_lease(run_id)
+        return run, events
+
+    async def read_recovery_snapshot(self, run_id: str) -> RecoverySnapshot:
+        result = _object(
+            await self._request("POST", "rpc/read_recovery_snapshot", payload={"p_run_id": run_id})
+        )
+        run = self._run(_object(result.get("run")))
+        if run.id != run_id:
+            raise RuntimeError("Supabase returned another recovery snapshot")
+        calls = tuple(self._model_call(row) for row in _array(result.get("model_calls")))
+        tools = tuple(self._tool_call(row) for row in _array(result.get("tool_calls")))
+        by_message: dict[str, list[ModelToolCall]] = {}
+        for call in sorted(tools, key=lambda item: item.call_index):
+            by_message.setdefault(call.assistant_message_id, []).append(
+                ModelToolCall(call.provider_call_id, call.name, call.arguments)
+            )
+        exchanges = tuple(
+            self._run_message(row, tuple(by_message.get(_text(row, "id"), ())))
+            for row in _array(result.get("run_messages"))
+        )
+        self._model_call_runs.update({call.id: call.run_id for call in calls})
+        return RecoverySnapshot(
+            run=run,
+            model_calls=calls,
+            tool_calls=tools,
+            run_messages=exchanges,
+            messages=tuple(self._message(row) for row in _array(result.get("messages"))),
+            outputs=tuple(self._assistant_output(row) for row in _array(result.get("outputs"))),
+            context_checkpoints=tuple(
+                self._checkpoint(row) for row in _array(result.get("context_checkpoints"))
+            ),
+            context_revision=_integer(result, "context_revision"),
+        )
+
+    async def request_recovery_cancellation(
+        self, run_id: str
+    ) -> tuple[RunSnapshot, RunEvent | None]:
+        result = _object(
+            await self._idempotent_rpc(
+                "request_recovery_cancellation", {"run_id": run_id}, capability=None
+            )
+        )
+        run = self._run(_object(result.get("run")))
+        event = self._event(_object(result["event"])) if result.get("event") is not None else None
+        if run.id != run_id or (event is not None and event.run_id != run_id):
+            raise RuntimeError("Supabase returned another cancellation request")
+        if run.status not in {
+            RunStatus.CANCELLING,
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.INTERRUPTED,
+        }:
+            raise RuntimeError("Supabase did not save the cancellation request")
+        return run, event
 
     async def ensure_account(self) -> None:
         await self._request("POST", "rpc/ensure_account", payload={})

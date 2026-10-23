@@ -486,11 +486,13 @@ def test_provider_cancellation_waits_for_stream_cleanup() -> None:
                 cleanup.set()
 
     async def exercise() -> None:
-        runtime = service(Repository(), WaitingProvider())
+        repository = Repository()
+        repository.run = replace(repository.run, status=RunStatus.RUNNING)
+        runtime = service(repository, WaitingProvider())
         provider = WaitingProvider()
         task = asyncio.create_task(
             runtime._stream_model_step(
-                run_record(),
+                repository.run,
                 model_record(),
                 request(),
                 cast(StreamingProviderAdapter, provider),

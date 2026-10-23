@@ -1,0 +1,32 @@
+.workspace-review,
+.workspace-recovery-reason {
+  margin-top: var(--space-4);
+  color: var(--shell-text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.workspace-review h2 {
+  margin: 0;
+  color: var(--shell-text-strong);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.workspace-review p,
+.workspace-recovery-reason p {
+  margin: var(--space-2) 0;
+}
+
+.workspace-review-confirmation {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  color: var(--shell-text-strong);
+}
+
+.workspace-review-confirmation input {
+  flex: none;
+  accent-color: var(--shell-accent);
+}

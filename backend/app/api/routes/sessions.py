@@ -1,4 +1,5 @@
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
@@ -31,6 +32,34 @@ class SessionModelRequest(BaseModel):
 
 class SessionWorkspaceRequest(BaseModel):
     workspace_path: str | None = Field(default=None, max_length=4096)
+
+
+class WorkspaceReviewRequest(BaseModel):
+    run_id: UUID
+    tool_call_id: UUID
+    confirmed: bool = Field(strict=True)
+
+
+class WorkspaceReviewResponse(BaseModel):
+    tool_call_id: str
+    reviewed_at: str
+
+
+class UncertainOperationResponse(BaseModel):
+    tool_call_id: str
+    name: str
+    arguments: dict[str, object]
+    reviewed_at: str | None
+    review_pending: bool
+
+
+class WorkspaceReviewStatusResponse(BaseModel):
+    blocked: bool
+    source_session_id: str | None = None
+    run_id: str | None = None
+    uncertain_operation: UncertainOperationResponse | None = None
+    reason: str | None = None
+    workspace_path: str | None = None
 
 
 class MessageResponse(BaseModel):
@@ -69,6 +98,10 @@ class LatestRunResponse(BaseModel):
     turn_id: str
     status: str
     last_sequence: int
+    retry_allowed: bool = True
+    recovery_reason: str | None = None
+    uncertain_tool_call_id: str | None = None
+    uncertain_operation: UncertainOperationResponse | None = None
 
 
 class RunSummaryResponse(BaseModel):
@@ -97,6 +130,9 @@ class RunSummaryResponse(BaseModel):
     stop_reason: str | None
     error_code: str | None
     error_message: str | None
+    retry_allowed: bool = True
+    recovery_reason: str | None = None
+    uncertain_tool_call_id: str | None = None
 
 
 class RunSummariesResponse(BaseModel):
@@ -174,6 +210,9 @@ def serialize_run_summary(summary: RunSummary) -> RunSummaryResponse:
         cost_complete=summary.cost_complete,
         stop_reason=run.stop_reason,
         error_code=run.error_code or ("lease_expired" if lease_expired else None),
+        retry_allowed=run.retry_allowed,
+        recovery_reason=run.recovery_reason,
+        uncertain_tool_call_id=run.uncertain_tool_call_id,
         error_message=run.error_message
         or (
             "The API stopped before this run finished. Start a new run to continue."
@@ -206,6 +245,46 @@ async def set_session_workspace(
     )
 
 
+@router.get("/{session_id}/workspace/review", dependencies=[Depends(log_owned_chat)])
+async def get_workspace_review(
+    session_id: str, service: RunServiceDep
+) -> WorkspaceReviewStatusResponse:
+    state = await service.get_workspace_review(session_id)
+    return WorkspaceReviewStatusResponse(
+        blocked=state.blocked,
+        reason=state.reason,
+        source_session_id=state.source_session_id,
+        workspace_path=state.workspace_path,
+        run_id=state.run_id,
+        uncertain_operation=(
+            UncertainOperationResponse(
+                tool_call_id=state.tool.id,
+                name=state.tool.name,
+                arguments=state.tool.arguments,
+                reviewed_at=state.tool.reviewed_at,
+                review_pending=True,
+            )
+            if state.tool is not None
+            else None
+        ),
+    )
+
+
+@router.post("/{session_id}/workspace/review", dependencies=[Depends(log_owned_chat)])
+async def review_session_workspace(
+    session_id: str, payload: WorkspaceReviewRequest, service: RunServiceDep
+) -> WorkspaceReviewResponse:
+    tool = await service.review_workspace(
+        session_id,
+        str(payload.run_id),
+        str(payload.tool_call_id),
+        confirmed=payload.confirmed,
+    )
+    if tool.reviewed_at is None:
+        raise RuntimeError("Workspace review was not saved")
+    return WorkspaceReviewResponse(tool_call_id=tool.id, reviewed_at=tool.reviewed_at)
+
+
 @router.get("/{session_id}", dependencies=[Depends(log_owned_chat)])
 async def get_session(session_id: str, service: SessionServiceDep) -> SessionDetailResponse:
     detail = await service.get(session_id)
@@ -236,6 +315,7 @@ async def get_latest_run(
 ) -> LatestRunResponse | None:
     run = await service.get_latest_run_for_session(session_id)
     input_message = await sessions.get_message(session_id, run.input_message_id) if run else None
+    uncertain = await service.uncertain_operation(run) if run is not None else None
     return (
         None
         if run is None
@@ -245,6 +325,20 @@ async def get_latest_run(
             turn_id=run.turn_id,
             status=run.status.value,
             last_sequence=run.last_event_sequence,
+            retry_allowed=run.retry_allowed,
+            recovery_reason=run.recovery_reason,
+            uncertain_tool_call_id=run.uncertain_tool_call_id,
+            uncertain_operation=(
+                UncertainOperationResponse(
+                    tool_call_id=uncertain.id,
+                    name=uncertain.name,
+                    arguments=uncertain.arguments,
+                    reviewed_at=uncertain.reviewed_at,
+                    review_pending=await service.workspace_review_pending(run, uncertain),
+                )
+                if uncertain is not None
+                else None
+            ),
         )
     )
 

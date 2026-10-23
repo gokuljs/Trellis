@@ -267,6 +267,9 @@ export function RunActivity({
                   case "run.started":
                     title = "Run started"
                     break
+                  case "run.recovering":
+                    title = "Run recovering"
+                    break
                   case "run.resumed":
                     title = "Run resumed"
                     break
@@ -379,7 +382,9 @@ export function RunActivity({
                           ? "Tool completed"
                           : status === "cancelled"
                             ? "Tool cancelled"
-                            : "Tool failed"
+                            : status === "outcome_unknown"
+                              ? "Tool outcome unknown"
+                              : "Tool failed"
                     tone = status === "completed" ? "normal" : "warning"
                     const content = textField(event.data, "content")
                     detail = content ? (
