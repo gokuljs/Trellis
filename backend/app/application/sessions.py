@@ -107,10 +107,8 @@ class SessionService:
             else None
         )
         session = await self._repository.create_session(resolved)
-        if self.workspace_enabled and self._workspace_bindings is not None:
-            self._workspace_bindings.bind(
-                session.id, Path(resolved) if resolved is not None else None
-            )
+        if self.workspace_enabled and self._workspace_bindings is not None and resolved is not None:
+            await self._workspace_bindings.bind(session.id, Path(resolved))
         return session
 
     async def set_workspace(self, session_id: str, workspace_path: str | None) -> Session:
@@ -120,6 +118,8 @@ class SessionService:
             if workspace_path is not None
             else None
         )
+        if self._workspace_bindings is not None and resolved is None:
+            await self._workspace_bindings.bind(session_id, None)
         try:
             session = await self._repository.set_session_workspace(session_id, resolved)
         except SessionWorkspaceBusy:
@@ -128,10 +128,8 @@ class SessionService:
             ) from None
         if session is None:
             raise ApplicationError("session_not_found", "Session not found.")
-        if self._workspace_bindings is not None:
-            self._workspace_bindings.bind(
-                session.id, Path(resolved) if resolved is not None else None
-            )
+        if self._workspace_bindings is not None and resolved is not None:
+            await self._workspace_bindings.bind(session.id, Path(resolved))
         return session
 
     async def get(self, session_id: str) -> SessionDetail | None:

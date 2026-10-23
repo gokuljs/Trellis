@@ -47,6 +47,10 @@ from app.infrastructure.runtime_events import RuntimeEventHub
 from app.infrastructure.server_credentials import ServerCredentialStore
 from app.infrastructure.supabase_repository import SupabaseRepository, VerifiedTokenSource
 from app.infrastructure.workspace_bindings import LocalWorkspaceBindings
+from app.infrastructure.workspace_grants import (
+    InstallationIdentity,
+    WorkspaceGrantStore,
+)
 
 
 class AccountRepository(
@@ -77,6 +81,7 @@ class AccountContext:
     chat_service: ChatService
     run_service: RunService
     event_hub: RuntimeEventHub
+    workspace_bindings: LocalWorkspaceBindings | None = None
 
 
 def _prepare_account_directory(data_dir: Path, user_id: UUID) -> Path:
@@ -103,7 +108,7 @@ def _prepare_account_directory(data_dir: Path, user_id: UUID) -> Path:
                 raise RuntimeError("An account data path must be a private directory")
             if metadata.st_uid != os.geteuid():
                 raise RuntimeError("An account data path must be owned by this process")
-    return account_dir
+    return account_dir.resolve(strict=True)
 
 
 def _acquire_account_lock(account_dir: Path) -> int:
@@ -140,6 +145,19 @@ def _release_unclaimed_lock(task: asyncio.Task[int]) -> None:
     except BaseException:
         return
     os.close(descriptor)
+
+
+def _installation_identity(data_dir: Path) -> InstallationIdentity:
+    try:
+        directory = data_dir.resolve(strict=True) / "installation"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        return InstallationIdentity.load(directory)
+    except OSError, RuntimeError, ValueError:
+        raise ApplicationError(
+            "workspace_grant_unavailable",
+            "Trellis could not securely load folder permissions. "
+            "Check local storage and try again.",
+        ) from None
 
 
 class AccountRegistry:
@@ -241,9 +259,14 @@ class AccountRegistry:
                     await database.ensure_account()
                     secret_store = self._credentials
                     event_hub = RuntimeEventHub()
-                    workspace_bindings = (
-                        LocalWorkspaceBindings() if self._capabilities.workspace_enabled else None
-                    )
+                    workspace_bindings = None
+                    if self._capabilities.workspace_enabled:
+                        installation = await asyncio.to_thread(
+                            _installation_identity, self._settings.data_dir
+                        )
+                        workspace_bindings = LocalWorkspaceBindings(
+                            WorkspaceGrantStore(account_dir, str(user_id), installation)
+                        )
                     tools = (
                         self._tool_registry_factory(database)
                         if self._tool_registry_factory is not None
@@ -314,6 +337,7 @@ class AccountRegistry:
                             ),
                             run_service=run_service,
                             event_hub=event_hub,
+                            workspace_bindings=workspace_bindings,
                         )
                     except BaseException:
                         await run_service.close()

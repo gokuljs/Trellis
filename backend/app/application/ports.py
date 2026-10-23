@@ -21,7 +21,7 @@ from app.domain.models import (
     UserProfile,
 )
 from app.domain.outputs import AssistantOutput
-from app.domain.recovery import RecoverySnapshot
+from app.domain.recovery import RecoverySnapshot, WorkspaceRecoveryReference
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -109,9 +109,13 @@ class WorkspaceDirectoryPicker(Protocol):
 
 
 class WorkspaceBindingPort(Protocol):
-    def bind(self, session_id: str, workspace_root: Path | None) -> None: ...
+    async def bind(self, session_id: str, workspace_root: Path | None) -> None: ...
 
     async def resolve(self, session_id: str, workspace_path: str | None) -> Path | None: ...
+
+    async def reference(
+        self, session_id: str, workspace_path: str | None
+    ) -> WorkspaceRecoveryReference | None: ...
 
 
 class RunLeasePort(Protocol):
