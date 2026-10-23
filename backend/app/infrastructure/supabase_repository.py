@@ -9,7 +9,7 @@ import json
 import secrets
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from typing import Literal, cast
@@ -247,6 +247,49 @@ class SupabaseRepository:
         ):
             raise RuntimeError("Supabase returned another checkpoint result")
         return saved
+
+    async def commit_summary(
+        self,
+        run_id: str,
+        model_call_id: str,
+        completion: dict[str, object],
+        expected_revision: int,
+        draft: ContextCheckpointDraft,
+    ) -> tuple[ModelCallRecord, ContextCheckpoint, tuple[RunEvent, ...]]:
+        if draft.model_call_id != model_call_id:
+            raise ValueError("summary checkpoint belongs to another model call")
+        saved_completion = dict(completion)
+        if "cached_tokens" in saved_completion:
+            saved_completion["cached_read_tokens"] = saved_completion.pop("cached_tokens")
+        result = _object(
+            await self._idempotent_rpc(
+                "commit_summary",
+                {
+                    "run_id": run_id,
+                    "call_id": model_call_id,
+                    "completion": saved_completion,
+                    "expected_revision": expected_revision,
+                    "draft": asdict(draft),
+                },
+                capability=self._run_capability(run_id),
+            )
+        )
+        call = self._model_call(_object(result.get("model_call")))
+        checkpoint = self._checkpoint(_object(result.get("checkpoint")))
+        events = tuple(self._event(row) for row in _array(result.get("events")))
+        if (
+            call.id != model_call_id
+            or call.run_id != run_id
+            or checkpoint.run_id != run_id
+            or checkpoint.id != draft.id
+            or checkpoint.revision != expected_revision + 1
+            or replace(checkpoint.draft, pricing_context_tokens=draft.pricing_context_tokens)
+            != draft
+            or checkpoint.draft.pricing_context_tokens < draft.pricing_context_tokens
+            or any(item.run_id != run_id for item in events)
+        ):
+            raise RuntimeError("Supabase returned another summary's completion")
+        return call, checkpoint, events
 
     async def list_context_messages(
         self, session_id: str, after_ordinal: int, *, limit: int = 128
@@ -1564,6 +1607,42 @@ class SupabaseRepository:
         if final_content is not None:
             self._drop_lease(run_id)
         return call, tools, events
+
+    async def commit_native_compaction(
+        self,
+        run_id: str,
+        call_id: str,
+        completion: dict[str, object],
+        *,
+        status: ModelCallStatus,
+    ) -> tuple[ModelCallRecord, tuple[RunEvent, ...]]:
+        if status not in {ModelCallStatus.COMPLETED, ModelCallStatus.FAILED}:
+            raise ValueError("native compaction requires a known completion")
+        saved_completion = dict(completion)
+        if "cached_tokens" in saved_completion:
+            saved_completion["cached_read_tokens"] = saved_completion.pop("cached_tokens")
+        result = _object(
+            await self._idempotent_rpc(
+                "commit_native_compaction",
+                {
+                    "run_id": run_id,
+                    "call_id": call_id,
+                    "completion": saved_completion,
+                    "next_status": status.value,
+                },
+                capability=self._run_capability(run_id),
+            )
+        )
+        call = self._model_call(_object(result.get("model_call")))
+        events = tuple(self._event(row) for row in _array(result.get("events")))
+        if (
+            call.id != call_id
+            or call.run_id != run_id
+            or call.status is not status
+            or any(item.run_id != run_id for item in events)
+        ):
+            raise RuntimeError("Supabase returned another native compaction's completion")
+        return call, events
 
     async def record_tool_result(
         self,

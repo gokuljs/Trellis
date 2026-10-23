@@ -224,6 +224,15 @@ class RunRepository(Protocol):
         final_content: str | None,
     ) -> tuple[ModelCallRecord, tuple[ToolCallRecord, ...], tuple[RunEvent, ...]]: ...
 
+    async def commit_native_compaction(
+        self,
+        run_id: str,
+        call_id: str,
+        completion: dict[str, object],
+        *,
+        status: ModelCallStatus,
+    ) -> tuple[ModelCallRecord, tuple[RunEvent, ...]]: ...
+
     async def append_assistant_batch(
         self, run_id: str, model_call_id: str, batch_index: int, text: str
     ) -> tuple[AssistantOutput, RunEvent]: ...
@@ -367,6 +376,15 @@ class ContextCheckpointRepository(Protocol):
     async def save_context_checkpoint(
         self, run_id: str, expected_revision: int, draft: ContextCheckpointDraft
     ) -> ContextCheckpoint: ...
+
+    async def commit_summary(
+        self,
+        run_id: str,
+        model_call_id: str,
+        completion: dict[str, object],
+        expected_revision: int,
+        draft: ContextCheckpointDraft,
+    ) -> tuple[ModelCallRecord, ContextCheckpoint, tuple[RunEvent, ...]]: ...
 
     async def list_context_messages(
         self, session_id: str, after_ordinal: int, *, limit: int = 128

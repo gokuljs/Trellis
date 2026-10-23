@@ -5,11 +5,12 @@ import hashlib
 import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+from itertools import accumulate
 from pathlib import Path
 from typing import cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from app.application.budgets import PricingUnavailable, count_total_tokens
 from app.application.compaction import build_summary_request, replay_checkpoint, summarize_prefix
@@ -18,11 +19,22 @@ from app.application.context_budget import (
     _cost as reserve_context_cost,
 )
 from app.application.context_budget import (
+    _turn_units as context_turn_units,
+)
+from app.application.context_budget import (
     estimate_input_tokens,
+    input_fingerprint,
     normalize_context_items,
     preflight_context,
 )
 from app.application.errors import ApplicationError, ProviderError
+from app.application.execution_snapshots import (
+    bounded_snapshot,
+    plan_snapshot,
+    request_snapshot,
+    restore_context_plan,
+    restore_model_request,
+)
 from app.application.model_catalog import (
     ModelProfile,
     UsageTokens,
@@ -41,10 +53,12 @@ from app.application.ports import (
 from app.application.secret_redaction import SecretRedactor
 from app.domain.context import (
     CheckpointSource,
+    ContextCheckpoint,
     ContextCheckpointDraft,
     ContextItem,
     ContextPreflight,
     InputTokenCount,
+    NativeCompactionKind,
     NativeCompactionResult,
 )
 from app.domain.models import ModelDescriptor
@@ -78,6 +92,134 @@ def _remaining(run: RunSnapshot) -> float:
     if seconds <= 0:
         raise ProviderError("provider_timeout", "The run deadline was reached.")
     return seconds
+
+
+def _native_payload_valid(
+    run: RunSnapshot, kind: object, payload: object, redactor: SecretRedactor
+) -> bool:
+    if (
+        not isinstance(payload, str)
+        or len(payload.encode()) > 262144
+        or redactor.redact_text(payload) != payload
+        or kind != ("openai_window" if run.provider_id == "openai" else "anthropic_block")
+    ):
+        return False
+    try:
+        value = json.loads(payload)
+        bounded_snapshot(value)
+    except ValueError, RecursionError:
+        return False
+    return (
+        isinstance(value, list) and bool(value)
+        if run.provider_id == "openai"
+        else isinstance(value, dict) and value.get("type") == "compaction"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionIntent:
+    operation_id: str
+    target_checkpoint_id: str
+    expected_revision: int
+    parent_checkpoint_id: str | None
+    generation_plan: ContextPreflight
+    summary_plan: ContextPreflight
+    prefix_length: int
+    instruction_hash: str
+    workspace_hash: str
+    native_model_call_id: str | None = None
+
+    def __post_init__(self) -> None:
+        UUID(self.operation_id)
+        UUID(self.target_checkpoint_id)
+        if self.parent_checkpoint_id is not None:
+            UUID(self.parent_checkpoint_id)
+        if self.native_model_call_id is not None:
+            UUID(self.native_model_call_id)
+        if (
+            isinstance(self.expected_revision, bool)
+            or not isinstance(self.expected_revision, int)
+            or self.expected_revision < 0
+            or (self.expected_revision == 0) != (self.parent_checkpoint_id is None)
+            or isinstance(self.prefix_length, bool)
+            or not isinstance(self.prefix_length, int)
+            or not 1 <= self.prefix_length <= len(self.generation_plan.sources)
+            or any(item.required for item in self.prefix)
+        ):
+            raise ValueError("invalid saved compaction prefix or revision")
+        try:
+            boundaries = set(
+                accumulate(len(unit) for unit in context_turn_units(self.generation_plan.sources))
+            )
+        except ApplicationError as error:
+            raise ValueError("saved compaction contains an incomplete tool exchange") from error
+        if self.prefix_length not in boundaries:
+            raise ValueError("saved compaction cannot split a conversation turn")
+        for digest in (self.instruction_hash, self.workspace_hash):
+            if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                raise ValueError("invalid saved compaction hash")
+        expected = build_summary_request(self.generation_plan.request, self.prefix)
+        if (
+            not 1 <= self.summary_plan.request.max_output_tokens <= expected.max_output_tokens
+            or replace(expected, max_output_tokens=self.summary_plan.request.max_output_tokens)
+            != self.summary_plan.request
+        ):
+            raise ValueError("saved summary request does not match its compaction prefix")
+
+    @property
+    def prefix(self) -> tuple[ContextItem, ...]:
+        return self.generation_plan.sources[: self.prefix_length]
+
+    def snapshot(self) -> dict[str, object]:
+        result = {
+            "version": 1,
+            "operation_id": self.operation_id,
+            "target_checkpoint_id": self.target_checkpoint_id,
+            "expected_revision": self.expected_revision,
+            "parent_checkpoint_id": self.parent_checkpoint_id,
+            "sources": [
+                asdict(CheckpointSource(item.source_id, item.source_kind, item.turn_id))
+                for item in self.prefix
+            ],
+            "source_hash": _hash([asdict(item) for item in self.prefix]),
+            "input_hash": self.generation_plan.input_hash,
+            "instruction_hash": self.instruction_hash,
+            "workspace_hash": self.workspace_hash,
+            "input_tokens_before": self.generation_plan.input_tokens,
+            "pricing_context_tokens": max(
+                self.generation_plan.pricing_context_tokens,
+                self.summary_plan.pricing_context_tokens,
+            ),
+            "native_model_call_id": self.native_model_call_id,
+            "prefix_length": self.prefix_length,
+            "generation_plan": plan_snapshot(self.generation_plan),
+            "summary_plan": plan_snapshot(self.summary_plan),
+        }
+        bounded_snapshot(result)
+        return result
+
+    @classmethod
+    def restore(cls, value: object, run: RunSnapshot) -> CompactionIntent:
+        if not isinstance(value, dict):
+            raise ValueError("saved compaction intent is missing")
+        raw = cast(dict[str, object], value)
+        if raw.get("version") != 1 or isinstance(raw.get("version"), bool):
+            raise ValueError("unsupported saved compaction intent")
+        result = cls(
+            cast(str, raw.get("operation_id")),
+            cast(str, raw.get("target_checkpoint_id")),
+            cast(int, raw.get("expected_revision")),
+            cast(str | None, raw.get("parent_checkpoint_id")),
+            restore_context_plan(raw.get("generation_plan"), run),
+            restore_context_plan(raw.get("summary_plan"), run),
+            cast(int, raw.get("prefix_length")),
+            cast(str, raw.get("instruction_hash")),
+            cast(str, raw.get("workspace_hash")),
+            cast(str | None, raw.get("native_model_call_id")),
+        )
+        if result.snapshot() != raw:
+            raise ValueError("saved compaction intent conflicts with its source plan")
+        return result
 
 
 def billing_tier(value: object) -> str:
@@ -409,7 +551,18 @@ class RunContext:
                             "context_compaction_unavailable",
                             "No affordable complete prefix can be summarized.",
                         ) from None
-            native_result = await self._try_native(
+            intent = CompactionIntent(
+                str(uuid4()),
+                str(uuid4()),
+                checkpoint.revision if checkpoint else 0,
+                checkpoint.id if checkpoint else None,
+                plan,
+                summary_plan,
+                len(prefix),
+                instruction_hash,
+                workspace_hash,
+            )
+            await self._try_native(
                 run,
                 model,
                 profile,
@@ -422,73 +575,391 @@ class RunContext:
                 len(calls),
                 tokens,
                 cost,
+                intent=intent,
             )
+            await self._finish_compaction(run, model, profile, provider, api_key, user_id, intent)
+        raise ProviderError("model_call_limit", "The run reached its model-call limit.")
+
+    async def _validate_compaction_inputs(
+        self,
+        run: RunSnapshot,
+        intent: CompactionIntent,
+        *,
+        workspace_root: Path | None,
+        guidance: str | None,
+        tools: tuple[ModelToolSpec, ...],
+    ) -> None:
+        window = await self.checkpoints.load_context_window(run.session_id)
+        checkpoint = window.checkpoint
+        if (checkpoint.id if checkpoint else None, checkpoint.revision if checkpoint else 0) != (
+            intent.parent_checkpoint_id,
+            intent.expected_revision,
+        ):
+            raise ApplicationError(
+                "context_checkpoint_conflict", "Context changed before recovery could continue."
+            )
+        visible = list(window.messages)
+        if not any(message.id == run.input_message_id for message in visible):
+            visible.extend(
+                message
+                for message in await cast(ChatRepository, self.sessions).get_turn_messages(
+                    run.session_id, run.turn_id
+                )
+                if message.id == run.input_message_id
+            )
+        exchange = await self.runs.list_run_messages(run.id)
+        if checkpoint is not None and checkpoint.run_id == run.id:
+            exchange = [
+                message
+                for message in exchange
+                if message.ordinal > checkpoint.covered_run_message_ordinal
+            ]
+        context = build_model_context(
+            visible,
+            exchange,
+            workspace_root=workspace_root,
+            workspace_guidance=guidance,
+            run_tool_calls=await self.runs.list_tool_calls(run.id),
+            tools=tools,
+            redactor=self.redactor,
+        )
+        instruction_hash = _hash(
+            {
+                "system": context.system_instructions,
+                "tools": [asdict(tool) for tool in context.tools],
+            }
+        )
+        workspace_hash = _hash(
+            {"root": str(workspace_root) if workspace_root else None, "guidance": guidance}
+        )
+        request = ModelRequest(
+            run.provider_id,
+            run.model_id,
+            run.adapter_kind,
+            run.upstream_model_id,
+            context.messages,
+            intent.generation_plan.request.max_output_tokens,
+            context.system_instructions,
+            context.tools,
+        )
+        items = tuple(
+            ContextItem(source.id, source.turn_id, message, source.id == run.input_message_id)
+            for source, message in zip(
+                sorted(visible, key=lambda value: (value.ordinal, value.id)),
+                context.messages[: len(visible)],
+                strict=True,
+            )
+        ) + tuple(
+            ContextItem(source.id, run.turn_id, message, source_kind="run_message")
+            for source, message in zip(
+                sorted(exchange, key=lambda value: (value.ordinal, value.id)),
+                context.messages[len(visible) :],
+                strict=True,
+            )
+        )
+        if checkpoint is not None:
+            replay = replay_checkpoint(
+                checkpoint,
+                request,
+                instruction_hash=instruction_hash,
+                workspace_hash=workspace_hash,
+            )
+            assert replay.message is not None
+            items = (
+                ContextItem(
+                    checkpoint.id,
+                    "checkpoint:" + checkpoint.id,
+                    replay.message,
+                    source_kind="checkpoint",
+                ),
+                *items,
+            )
+            request = replace(request, messages=tuple(item.message for item in items))
+        items = normalize_context_items(items)
+        request = replace(request, messages=tuple(item.message for item in items))
+        if (
+            instruction_hash != intent.instruction_hash
+            or workspace_hash != intent.workspace_hash
+            or items != intent.generation_plan.sources
+            or input_fingerprint(request) != intent.generation_plan.input_hash
+        ):
+            raise ApplicationError(
+                "recovery_inputs_changed", "The saved compaction inputs have changed."
+            )
+
+    @staticmethod
+    def _restore_native_plan(
+        run: RunSnapshot,
+        profile: ModelProfile,
+        call: ModelCallRecord,
+        intent: CompactionIntent,
+    ) -> ContextPreflight:
+        try:
+            request = restore_model_request(call.request_snapshot, run)
+        except ValueError as error:
+            raise ApplicationError(
+                "inconsistent_execution_records", "The saved native request is invalid."
+            ) from error
+        expected_request = replace(
+            intent.generation_plan.request,
+            messages=tuple(item.message for item in intent.prefix),
+            max_output_tokens=request.max_output_tokens,
+            native_context_json=None,
+            tools=() if profile.provider_id == "openai" else intent.generation_plan.request.tools,
+        )
+        if request != expected_request or request.max_output_tokens > (
+            profile.max_output_tokens or 0
+        ):
+            raise ApplicationError(
+                "inconsistent_execution_records",
+                "The saved native request conflicts with its intent.",
+            )
+        raw_context = call.request_snapshot.get("context")
+        if not isinstance(raw_context, dict):
+            raise ApplicationError("inconsistent_execution_records", "Missing compaction plan.")
+        raw_plan = {
+            **raw_context,
+            "request": request_snapshot(request),
+            "items": json.loads(
+                json.dumps([asdict(replace(item, required=True)) for item in intent.prefix])
+            ),
+            "prefix_length": 0,
+        }
+        try:
+            plan = restore_context_plan(raw_plan, run)
+        except ValueError as error:
+            raise ApplicationError(
+                "inconsistent_execution_records", "The saved native request is invalid."
+            ) from error
+        if plan.output_reserve_tokens != request.max_output_tokens:
+            raise ApplicationError(
+                "inconsistent_execution_records",
+                "The saved native reservation is inconsistent.",
+            )
+        return plan
+
+    async def resume_saved_compaction(
+        self,
+        run: RunSnapshot,
+        model: ModelDescriptor,
+        profile: ModelProfile,
+        provider: StreamingProviderAdapter,
+        api_key: str,
+        user_id: str,
+        call: ModelCallRecord,
+        *,
+        workspace_root: Path | None,
+        guidance: str | None,
+        tools: tuple[ModelToolSpec, ...],
+    ) -> ContextCheckpoint:
+        try:
+            intent = CompactionIntent.restore(call.request_snapshot.get("compaction_intent"), run)
+        except (ValueError, TypeError, AttributeError) as error:
+            raise ApplicationError(
+                "inconsistent_execution_records", "The saved compaction intent is invalid."
+            ) from error
+        checkpoint = await self.checkpoints.load_context_checkpoint(run.session_id)
+        if checkpoint is not None and checkpoint.id == intent.target_checkpoint_id:
+            if checkpoint.run_id != run.id or checkpoint.revision != intent.expected_revision + 1:
+                raise ApplicationError(
+                    "inconsistent_execution_records", "The saved compaction result is inconsistent."
+                )
+            return checkpoint
+        _remaining(run)
+        await self._validate_compaction_inputs(
+            run, intent, workspace_root=workspace_root, guidance=guidance, tools=tools
+        )
+        if call.run_id != run.id or call.status is ModelCallStatus.STREAMING:
+            raise ApplicationError(
+                "model_outcome_unknown", "The dispatched compaction response was not saved."
+            )
+        purpose = call.request_snapshot.get("purpose")
+        if purpose == "native_compaction" and call.status is ModelCallStatus.PENDING:
+            plan = self._restore_native_plan(run, profile, call, intent)
+            request = plan.request
             calls = await self.runs.list_model_calls(run.id)
             tokens, cost = self.totals(run.model_id, calls)
-            # Native usage is actual spending. Recheck the private summary
-            # against what remains before dispatching another paid request.
-            summary_plan = await self._preflight(
-                run,
-                provider,
-                api_key,
-                user_id,
-                summary_plan.request,
-                items=summary_plan.sources,
-                profile=profile,
-                remaining_run_tokens=run.max_total_tokens - tokens,
-                remaining_run_cost_usd=run.max_cost_usd - cost if cost is not None else None,
-                pricing_context_tokens=max(
-                    plan.pricing_context_tokens, summary_plan.pricing_context_tokens
-                ),
-            )
-            summary, call = await self._summarize(
-                run, model, provider, summary_plan, api_key, user_id, len(calls) + 1
-            )
-            after_calls = await self.runs.list_model_calls(run.id)
-            spent_tokens, spent_cost = self.totals(run.model_id, after_calls)
-            if (
-                spent_tokens >= run.max_total_tokens
-                or spent_cost is None
-                or spent_cost >= run.max_cost_usd
+            if len(calls) + 2 > run.max_model_calls:
+                raise ProviderError(
+                    "model_call_limit", "Compaction and generation exceed the model-call limit."
+                )
+            if plan.count_method != "provider" or not callable(
+                getattr(provider, "count_input", None)
             ):
                 raise ApplicationError(
-                    "run_budget_exhausted", "Compaction exhausted the remaining run budget."
+                    "inconsistent_execution_records", "The saved native count cannot be verified."
                 )
-            after = replace(
-                request,
-                messages=(
-                    ModelMessage(
-                        "user", "Saved conversation summary (historical context):\n" + summary
-                    ),
-                    *(item.message for item in plan.sources[len(prefix) :]),
-                ),
+            async with asyncio.timeout(min(30.0, _remaining(run))):
+                counted = await cast(TokenCountingProvider, provider).count_input(
+                    request, api_key, user_id
+                )
+            if counted.input_hash != plan.input_hash or counted.tokens != plan.input_tokens:
+                raise ApplicationError(
+                    "recovery_inputs_changed", "The saved native input count has changed."
+                )
+            reservations = (plan, intent.summary_plan, intent.generation_plan)
+            reserved = sum(item.input_tokens + item.output_reserve_tokens for item in reservations)
+            highwater = self._pricing_highwater(profile, calls)
+            costs = [
+                reserve_context_cost(
+                    profile,
+                    item.input_tokens,
+                    item.output_reserve_tokens,
+                    max(item.pricing_context_tokens, highwater),
+                )
+                for item in reservations
+            ]
+            if (
+                cost is None
+                or tokens + reserved > run.max_total_tokens
+                or any(item is None for item in costs)
+                or cost + sum(item or 0 for item in costs) > run.max_cost_usd
+            ):
+                raise ApplicationError("run_budget_exhausted", "Compaction exceeds the run budget.")
+            await self._compact(
+                run,
+                model,
+                provider,
+                plan,
+                api_key,
+                user_id,
+                call.step_index,
+                intent=intent,
+                prepared_call=call,
             )
-            draft = ContextCheckpointDraft(
-                str(uuid4()),
-                call.id,
-                tuple(
-                    CheckpointSource(item.source_id, item.source_kind, item.turn_id)
-                    for item in prefix
-                ),
-                summary,
-                _hash([asdict(item) for item in prefix]),
-                plan.input_hash,
-                instruction_hash,
-                workspace_hash,
-                plan.input_tokens,
-                estimate_input_tokens(after).tokens,
-                native_kind=native_result.native_kind if native_result else None,
-                native_payload_json=native_result.payload_json if native_result else None,
-                pricing_context_tokens=max(
-                    plan.pricing_context_tokens,
-                    summary_plan.pricing_context_tokens,
-                    self._pricing_highwater(profile, after_calls),
-                ),
+        elif purpose not in {"summary", "native_compaction"}:
+            raise ApplicationError("inconsistent_execution_records", "Invalid compaction purpose.")
+        return await self._finish_compaction(
+            run, model, profile, provider, api_key, user_id, intent
+        )
+
+    async def _finish_compaction(
+        self,
+        run: RunSnapshot,
+        model: ModelDescriptor,
+        profile: ModelProfile,
+        provider: StreamingProviderAdapter,
+        api_key: str,
+        user_id: str,
+        intent: CompactionIntent,
+    ) -> ContextCheckpoint:
+        calls = await self.runs.list_model_calls(run.id)
+        group = [
+            call
+            for call in calls
+            if isinstance(call.request_snapshot.get("compaction_intent"), dict)
+            and cast(dict[str, object], call.request_snapshot["compaction_intent"]).get(
+                "operation_id"
             )
-            await self.checkpoints.save_context_checkpoint(
-                run.id, checkpoint.revision if checkpoint else 0, draft
+            == intent.operation_id
+        ]
+        native = [
+            call for call in group if call.request_snapshot.get("purpose") == "native_compaction"
+        ]
+        summaries = [call for call in group if call.request_snapshot.get("purpose") == "summary"]
+        if len(native) > 1 or len(summaries) > 1 or len(group) != len(native) + len(summaries):
+            raise ApplicationError(
+                "inconsistent_execution_records", "Compaction has duplicate calls."
             )
-        raise ProviderError("model_call_limit", "The run reached its model-call limit.")
+        for saved in group:
+            try:
+                saved_intent = CompactionIntent.restore(
+                    saved.request_snapshot.get("compaction_intent"), run
+                )
+            except (ValueError, TypeError, AttributeError) as error:
+                raise ApplicationError(
+                    "inconsistent_execution_records", "A saved compaction operation is invalid."
+                ) from error
+            expected_native = native[0].id if native and saved in summaries else None
+            if (
+                replace(saved_intent, native_model_call_id=None)
+                != replace(intent, native_model_call_id=None)
+                or saved_intent.native_model_call_id != expected_native
+            ):
+                raise ApplicationError(
+                    "inconsistent_execution_records", "Saved compaction operations conflict."
+                )
+            if saved in native:
+                self._restore_native_plan(run, profile, saved, saved_intent)
+        native_result = None
+        if native:
+            saved = native[0]
+            if (
+                saved.status not in {ModelCallStatus.COMPLETED, ModelCallStatus.FAILED}
+                or saved.accounted_total_tokens is None
+                or saved.estimated_cost is None
+                or (
+                    saved.status is ModelCallStatus.FAILED
+                    and saved.error_code != "native_context_invalid"
+                )
+            ):
+                raise ApplicationError(
+                    "model_outcome_unknown", "The native compaction outcome is unknown."
+                )
+            intent = replace(intent, native_model_call_id=saved.id)
+            if saved.status is ModelCallStatus.COMPLETED:
+                response = saved.response_snapshot or {}
+                kind, payload = response.get("native_kind"), response.get("native_payload_json")
+                if not _native_payload_valid(run, kind, payload, self.redactor):
+                    raise ApplicationError(
+                        "inconsistent_execution_records", "Invalid native compaction result."
+                    )
+                native_result = NativeCompactionResult(
+                    cast(NativeCompactionKind, kind),
+                    cast(str, payload),
+                    (),
+                    saved.provider_response_id,
+                )
+        if summaries and summaries[0].status is ModelCallStatus.COMPLETED:
+            checkpoint = await self.checkpoints.load_context_checkpoint(run.session_id)
+            if checkpoint is None or checkpoint.id != intent.target_checkpoint_id:
+                raise ApplicationError(
+                    "inconsistent_execution_records", "The summary checkpoint is missing."
+                )
+            return checkpoint
+        if summaries and summaries[0].status is not ModelCallStatus.PENDING:
+            raise ApplicationError(
+                "model_outcome_unknown", "The dispatched summary response was not saved."
+            )
+        if not summaries and len(calls) + 1 >= run.max_model_calls:
+            raise ProviderError(
+                "model_call_limit", "Compaction and generation exceed the model-call limit."
+            )
+        tokens, cost = self.totals(run.model_id, calls)
+        summary_plan = await self._preflight(
+            run,
+            provider,
+            api_key,
+            user_id,
+            intent.summary_plan.request,
+            items=intent.summary_plan.sources,
+            profile=profile,
+            remaining_run_tokens=run.max_total_tokens - tokens,
+            remaining_run_cost_usd=run.max_cost_usd - cost if cost is not None else None,
+            pricing_context_tokens=max(
+                intent.generation_plan.pricing_context_tokens,
+                intent.summary_plan.pricing_context_tokens,
+                self._pricing_highwater(profile, calls),
+            ),
+        )
+        if cost is None or summary_plan.request != intent.summary_plan.request:
+            raise ApplicationError(
+                "run_budget_exhausted", "The saved summary exceeds the remaining budget."
+            )
+        _, _, checkpoint = await self._summarize(
+            run,
+            model,
+            provider,
+            summary_plan,
+            api_key,
+            user_id,
+            summaries[0].step_index if summaries else len(calls) + 1,
+            intent=intent,
+            native_result=native_result,
+            prepared_call=summaries[0] if summaries else None,
+            pricing_highwater=self._pricing_highwater(profile, calls),
+        )
+        return checkpoint
 
     @staticmethod
     def _pricing_highwater(profile: ModelProfile, calls: list[ModelCallRecord]) -> int:
@@ -537,6 +1008,8 @@ class RunContext:
         call_count: int,
         tokens: int,
         cost: float | None,
+        *,
+        intent: CompactionIntent,
     ) -> NativeCompactionResult | None:
         if (
             profile.supports_native_compaction is not True
@@ -608,7 +1081,7 @@ class RunContext:
             estimated_call_cost_usd=native_cost,
         )
         return await self._compact(
-            run, model, provider, native_plan, api_key, user_id, call_count + 1
+            run, model, provider, native_plan, api_key, user_id, call_count + 1, intent=intent
         )
 
     async def _compact(
@@ -620,19 +1093,22 @@ class RunContext:
         api_key: str,
         user_id: str,
         step_index: int,
+        *,
+        intent: CompactionIntent | None = None,
+        prepared_call: ModelCallRecord | None = None,
     ) -> NativeCompactionResult | None:
-        call = await self.runs.create_model_call(
+        snapshot = {
+            **request_snapshot(plan.request),
+            "purpose": "native_compaction",
+            "context": plan.snapshot(),
+            **({"compaction_intent": intent.snapshot()} if intent is not None else {}),
+        }
+        bounded_snapshot(snapshot)
+        call = prepared_call or await self.runs.create_model_call(
             run.id,
             step_index,
             model,
-            {
-                "purpose": "native_compaction",
-                "context": plan.snapshot(),
-                "messages": [asdict(message) for message in plan.request.messages],
-                "system_instructions": plan.request.system_instructions,
-                "tools": [asdict(tool) for tool in plan.request.tools],
-                "max_output_tokens": plan.request.max_output_tokens,
-            },
+            snapshot,
         )
         usage: dict[str, int | None] = {
             key: None
@@ -650,6 +1126,7 @@ class RunContext:
             "iterations": iterations,
             "usage_complete": False,
         }
+        committing = False
         try:
             call = await self.runs.update_model_call(call.id, ModelCallStatus.STREAMING)
             await self.publish(
@@ -721,42 +1198,32 @@ class RunContext:
                 raise ProviderError(
                     "native_usage_unknown", "Native compaction usage is unavailable."
                 )
-            valid = result.failure_code is None and result.payload_json is not None
-            if valid:
-                assert result.payload_json is not None
-                valid = (
-                    len(result.payload_json.encode()) <= 262144
-                    and self.redactor.redact_text(result.payload_json) == result.payload_json
-                    and result.native_kind
-                    == ("openai_window" if run.provider_id == "openai" else "anthropic_block")
-                )
-                try:
-                    payload = json.loads(result.payload_json)
-                    valid = valid and (
-                        isinstance(payload, list) and bool(payload)
-                        if run.provider_id == "openai"
-                        else isinstance(payload, dict) and payload.get("type") == "compaction"
-                    )
-                except ValueError:
-                    valid = False
-            call = await self.runs.update_model_call(
-                call.id,
-                ModelCallStatus.COMPLETED if valid else ModelCallStatus.FAILED,
-                response_snapshot={
-                    "usage_context": billing,
-                    "native_kind": result.native_kind,
-                    "native_payload_json": result.payload_json if valid else None,
-                },
-                error_code=None if valid else "native_context_invalid",
+            valid = result.failure_code is None and _native_payload_valid(
+                run, result.native_kind, result.payload_json, self.redactor
             )
+            committing = True
+            call, events = await self.runs.commit_native_compaction(
+                run.id,
+                call.id,
+                {
+                    "response_snapshot": {
+                        "usage_context": billing,
+                        "native_kind": result.native_kind,
+                        "native_payload_json": result.payload_json if valid else None,
+                    },
+                    "provider_response_id": self.redactor.redact_text(result.provider_response_id)
+                    if result.provider_response_id
+                    else None,
+                    **usage,
+                    "estimated_cost": cost,
+                    "accounted_total_tokens": total,
+                    "error_code": None if valid else "native_context_invalid",
+                },
+                status=ModelCallStatus.COMPLETED if valid else ModelCallStatus.FAILED,
+            )
+            for event in events:
+                await self.publish(event)
             if valid:
-                await self.publish(
-                    await self.runs.append_run_event(
-                        run.id,
-                        RunEventType.MODEL_COMPLETED,
-                        {"model_call_id": call.id, "purpose": "native_compaction"},
-                    )
-                )
                 return result
             logger.warning(
                 "context.native_compaction.fallback",
@@ -769,7 +1236,10 @@ class RunContext:
             )
             return None
         except BaseException as error:
-            if call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
+            if not committing and call.status in {
+                ModelCallStatus.PENDING,
+                ModelCallStatus.STREAMING,
+            }:
                 await self.runs.update_model_call(
                     call.id,
                     ModelCallStatus.CANCELLED
@@ -847,17 +1317,45 @@ class RunContext:
         api_key: str,
         user_id: str,
         step_index: int,
-    ) -> tuple[str, ModelCallRecord]:
+        *,
+        intent: CompactionIntent,
+        native_result: NativeCompactionResult | None = None,
+        prepared_call: ModelCallRecord | None = None,
+        pricing_highwater: int = 0,
+    ) -> tuple[str, ModelCallRecord, ContextCheckpoint]:
         request = plan.request
         snapshot: dict[str, object] = {
+            **request_snapshot(request),
             "purpose": "summary",
             "context": plan.snapshot(),
-            "messages": [asdict(message) for message in request.messages],
-            "system_instructions": request.system_instructions,
-            "max_output_tokens": request.max_output_tokens,
-            "tools": [],
+            "compaction_intent": intent.snapshot(),
         }
-        call = await self.runs.create_model_call(run.id, step_index, model, snapshot)
+        bounded_snapshot(snapshot)
+        if prepared_call is not None:
+            try:
+                saved_request = restore_model_request(prepared_call.request_snapshot, run)
+                saved_intent = CompactionIntent.restore(
+                    prepared_call.request_snapshot.get("compaction_intent"), run
+                )
+            except (ValueError, TypeError, AttributeError) as error:
+                raise ApplicationError(
+                    "inconsistent_execution_records", "The saved summary request is invalid."
+                ) from error
+            if (
+                prepared_call.run_id != run.id
+                or prepared_call.status is not ModelCallStatus.PENDING
+                or saved_request != request
+                or saved_intent != intent
+                or prepared_call.request_snapshot.get("context") != plan.snapshot()
+            ):
+                raise ApplicationError(
+                    "inconsistent_execution_records",
+                    "The saved summary request conflicts with its intent.",
+                )
+            request = saved_request
+        call = prepared_call or await self.runs.create_model_call(
+            run.id, step_index, model, snapshot
+        )
         usage: dict[str, int | None] = {
             key: None
             for key in (
@@ -908,6 +1406,7 @@ class RunContext:
                 )
             )
 
+        committing = False
         try:
             call = await self.runs.update_model_call(call.id, ModelCallStatus.STREAMING)
             await self.publish(
@@ -931,32 +1430,83 @@ class RunContext:
                 raise ProviderError(
                     "provider_usage_unavailable", "The summary did not report enough usage."
                 )
-            call = await self.runs.update_model_call(
+            after = replace(
+                intent.generation_plan.request,
+                messages=(
+                    ModelMessage(
+                        "user", "Saved conversation summary (historical context):\n" + result.text
+                    ),
+                    *(
+                        item.message
+                        for item in intent.generation_plan.sources[intent.prefix_length :]
+                    ),
+                ),
+            )
+            profile = profile_for_model(run.model_id)
+            assert profile is not None
+            summary_highwater = self._pricing_highwater(
+                profile,
+                [
+                    replace(
+                        call,
+                        input_tokens=usage["input_tokens"],
+                        cached_tokens=usage["cached_tokens"],
+                        cache_creation_tokens=usage["cache_creation_tokens"],
+                        response_snapshot={"usage_context": billing.copy()},
+                    )
+                ],
+            )
+            draft = ContextCheckpointDraft(
+                intent.target_checkpoint_id,
                 call.id,
-                ModelCallStatus.COMPLETED,
-                provider_response_id=self.redactor.redact_text(result.provider_response_id)
-                if result.provider_response_id
-                else None,
-                response_snapshot={"content": result.text, "usage_context": billing.copy()},
-                estimated_cost=cost,
-                clear_estimated_cost=cost is None,
-                accounted_total_tokens=total,
-                clear_accounted_total_tokens=total is None,
+                tuple(
+                    CheckpointSource(item.source_id, item.source_kind, item.turn_id)
+                    for item in intent.prefix
+                ),
+                result.text,
+                _hash([asdict(item) for item in intent.prefix]),
+                intent.generation_plan.input_hash,
+                intent.instruction_hash,
+                intent.workspace_hash,
+                intent.generation_plan.input_tokens,
+                estimate_input_tokens(after).tokens,
+                native_kind=native_result.native_kind if native_result else None,
+                native_payload_json=native_result.payload_json if native_result else None,
+                pricing_context_tokens=max(
+                    intent.generation_plan.pricing_context_tokens,
+                    plan.pricing_context_tokens,
+                    pricing_highwater,
+                    summary_highwater,
+                ),
             )
-            await self.publish(
-                await self.runs.append_run_event(
-                    run.id,
-                    RunEventType.MODEL_COMPLETED,
-                    {"model_call_id": call.id, "purpose": "summary"},
-                )
+            committing = True
+            call, checkpoint, events = await self.checkpoints.commit_summary(
+                run.id,
+                call.id,
+                {
+                    "provider_response_id": self.redactor.redact_text(result.provider_response_id)
+                    if result.provider_response_id
+                    else None,
+                    "response_snapshot": {"content": result.text, "usage_context": billing.copy()},
+                    **usage,
+                    "estimated_cost": cost,
+                    "accounted_total_tokens": total,
+                },
+                intent.expected_revision,
+                draft,
             )
-            return result.text, call
+            for event in events:
+                await self.publish(event)
+            return result.text, call, checkpoint
         except BaseException as error:
             status = (
                 ModelCallStatus.CANCELLED
                 if isinstance(error, asyncio.CancelledError)
                 else ModelCallStatus.FAILED
             )
-            if call.status in {ModelCallStatus.PENDING, ModelCallStatus.STREAMING}:
+            if not committing and call.status in {
+                ModelCallStatus.PENDING,
+                ModelCallStatus.STREAMING,
+            }:
                 await self.runs.update_model_call(call.id, status)
             raise

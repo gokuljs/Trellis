@@ -11,6 +11,7 @@ from run_fixtures import model_record, run_record
 
 from app.application.errors import ApplicationError
 from app.core.config import Settings
+from app.domain.context import CheckpointSource, ContextCheckpointDraft
 from app.infrastructure.supabase_repository import SupabaseRepository, VerifiedTokenSource
 
 
@@ -126,5 +127,72 @@ def test_generation_commit_retries_lost_ack_without_republishing_or_changing_ide
         assert payloads[0]["p_action"] == "commit_generation"
         assert not repo.owns_run_lease(call.run_id)
         await repo._client.aclose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("changed_checkpoint", [False, True])
+def test_summary_receipt_keeps_the_original_checkpoint_and_ownership(changed_checkpoint) -> None:
+    async def exercise() -> None:
+        repo = repository()
+        call, run = model_record(), run_record()
+        draft = ContextCheckpointDraft(
+            "19000000-0000-0000-0000-000000000004",
+            call.id,
+            (CheckpointSource("19000000-0000-0000-0000-000000000005", "message", "previous"),),
+            "Saved summary",
+            "a" * 64,
+            "a" * 64,
+            "a" * 64,
+            "a" * 64,
+            100,
+            50,
+        )
+        checkpoint = {
+            **asdict(draft),
+            "user_id": str(repo._user_id),
+            "run_id": run.id,
+            "chat_id": run.session_id,
+            "revision": 1,
+            "parent_id": None,
+            "provider_id": run.provider_id,
+            "model_id": run.model_id,
+            "adapter_kind": run.adapter_kind,
+            "covered_message_ordinal": 2,
+            "covered_run_message_ordinal": 0,
+            "created_at": "now",
+        }
+        if changed_checkpoint:
+            checkpoint["summary"] = "Different summary"
+        saved_call = asdict(call)
+        saved_call.update(user_id=str(repo._user_id), status="completed")
+        saved_call["cached_read_tokens"] = saved_call.pop("cached_tokens")
+        requests: list[dict[str, object]] = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            requests.append(json.loads(request.content))
+            if len(requests) == 1:
+                return httpx.Response(200, content=b"Lost JSON acknowledgment")
+            return httpx.Response(
+                200, json={"model_call": saved_call, "checkpoint": checkpoint, "events": []}
+            )
+
+        repo._client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        repo._token_source.record_verified(
+            "verified", repo._user_id, datetime.now(UTC) + timedelta(hours=1)
+        )
+        repo._capabilities[call.run_id] = "same-capability"
+        repo._lease_expires[call.run_id] = datetime.now(UTC) + timedelta(minutes=1)
+        try:
+            if changed_checkpoint:
+                with pytest.raises(RuntimeError, match="another summary"):
+                    await repo.commit_summary(run.id, call.id, {}, 0, draft)
+            else:
+                _, saved, _ = await repo.commit_summary(run.id, call.id, {}, 0, draft)
+                assert saved.draft == draft
+            assert requests[0] == requests[1]
+            assert repo.owns_run_lease(run.id)
+        finally:
+            await repo._client.aclose()
 
     asyncio.run(exercise())

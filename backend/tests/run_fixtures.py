@@ -174,6 +174,19 @@ class Repository:
             )
         return call, (), tuple(events)
 
+    async def commit_native_compaction(self, run_id, call_id, completion, *, status):
+        call = await self.update_model_call(call_id, status, **completion)
+        events = ()
+        if status is ModelCallStatus.COMPLETED:
+            events = (
+                await self.append_run_event(
+                    run_id,
+                    RunEventType.MODEL_COMPLETED,
+                    {"model_call_id": call_id, "purpose": "native_compaction"},
+                ),
+            )
+        return call, events
+
     async def complete_run(self, run_id, content):
         event = await self.transition_run_record(
             run_id, RunStatus.COMPLETED, RunEventType.COMPLETED, {}
