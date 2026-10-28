@@ -6,8 +6,11 @@ full commit, Git tree, version, import date, and file count.
 
 `upstream/` is a complete, unchanged copy of that commit's `pstack/` directory,
 including its license, skills, agent prompts, playbooks, scripts, and docs. It
-is reference material outside native skill discovery. The single discoverable
-Trellis skill is [pstack](../skills/pstack/SKILL.md).
+is reference material outside native skill discovery. Trellis's engineering
+workflow entrypoint is [pstack](../skills/pstack/SKILL.md). The
+[grill-me](../skills/grill-me/SKILL.md) and
+[grilling](../skills/grilling/SKILL.md) skills provide complementary design
+interviews.
 
 The original manifests, global rule paths, model names, tools, and automations
 describe Cursor. Their presence does not install or activate Cursor features.
@@ -45,6 +48,6 @@ the immutable source tree.
    an independent reviewer inspect the update. Commit source and adapter changes
    as separate commits only when each commit remains usable.
 
-Keep the repository's discoverable skill list to the single pstack entrypoint.
-Add future Trellis guidance as a focused reference under
+Keep engineering workflow guidance in the pstack entrypoint. Add future
+Trellis engineering guidance as a focused reference under
 `.agents/skills/pstack/references/` and route to it through the pstack adapter.

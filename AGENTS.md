@@ -14,7 +14,10 @@ there.
 
 - Use the project-local [pstack skill](.agents/skills/pstack/SKILL.md) for
   nontrivial engineering work and explicit pstack requests. It is the only
-  repository-local skill entrypoint.
+  engineering workflow entrypoint.
+- Use [grill-me](.agents/skills/grill-me/SKILL.md) or
+  [grilling](.agents/skills/grilling/SKILL.md) for design interviews that
+  challenge plans, assumptions, and tradeoffs. These complement pstack.
 - Read the official workflow and only the relevant playbooks and principle
   files from `.agents/pstack/upstream/`. Follow the mappings in the pstack
   skill for Codex tools and user authorization.

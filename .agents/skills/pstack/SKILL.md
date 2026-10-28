@@ -5,10 +5,10 @@ description: Apply Lauren Tan's pstack workflows in Codex for substantial engine
 
 # Pstack for Trellis
 
-This is Trellis's only repository-local skill entrypoint. It routes to Lauren
-Tan's official source, pinned under `../../pstack/upstream/`. Follow repository
-instructions and the user's task scope. The adapter maps Cursor assumptions to
-supported Codex tools; it does not change the upstream snapshot.
+This is Trellis's repository-local engineering workflow entrypoint. It routes
+to Lauren Tan's official source, pinned under `../../pstack/upstream/`. Follow
+repository instructions and the user's task scope. The adapter maps Cursor
+assumptions to supported Codex tools; it does not change the upstream snapshot.
 
 ## Choose the workflow
 
@@ -41,8 +41,8 @@ Resolve references within an upstream file relative to that file.
 
 Read the root and nearest `AGENTS.md` before editing. They define the product's
 frontend toolchain, shared icon ownership, backend architecture, and required
-checks. Apply those constraints through pstack; do not replace the application
-workflow or introduce another repository-local skill package.
+checks. Apply those constraints through pstack. Complementary design interviews
+use [grill-me](../grill-me/SKILL.md) and [grilling](../grilling/SKILL.md).
 
 Read [frontend guidance](../../../frontend/AGENTS.md) before frontend work.
 Keep Trellis's visual system unless the user asks for a redesign. For future

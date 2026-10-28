@@ -22,7 +22,8 @@ as permission to implement a change.
 
 ## Add frontend guidance to pstack
 
-Keep the repository's discoverable skill list to the single pstack entrypoint.
+Keep frontend engineering workflows in the pstack entrypoint. The shared
+grill-me and grilling skills provide complementary design interviews.
 When a future task needs more frontend guidance, add a focused reference beneath
 `.agents/skills/pstack/references/` and route to it from the pstack entrypoint.
 Do not add a separate frontend skill package or installer lock.
