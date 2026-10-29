@@ -25,6 +25,12 @@
       "skillPath": "skills/apple-design/SKILL.md",
       "computedHash": "0190417d092a0df447b000154e39733ea6d97efad6d3bec8a6ce3845aeb88914"
     },
+    "ask-sonner": {
+      "source": "emilkowalski/skill",
+      "sourceType": "github",
+      "skillPath": "skills/ask-sonner/SKILL.md",
+      "computedHash": "8bd257b845985f4b35b603b510a126604176521094af79c4b7347ffeb8a8f7ab"
+    },
     "emil-design-eng": {
       "source": "emilkowalski/skill",
       "sourceType": "github",
