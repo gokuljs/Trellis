@@ -611,7 +611,9 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "anyio" },
+    { name = "dnspython" },
     { name = "fastapi", extra = ["standard-no-fastapi-cloud-cli"] },
+    { name = "h11" },
     { name = "httpx" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
@@ -629,7 +631,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anyio", specifier = ">=4.14.2,<5" },
+    { name = "dnspython", specifier = "==2.8.0" },
     { name = "fastapi", extras = ["standard-no-fastapi-cloud-cli"], specifier = ">=0.141.1,<1" },
+    { name = "h11", specifier = "==0.16.0" },
     { name = "httpx", specifier = ">=0.28.1,<1" },
     { name = "pydantic-settings", specifier = ">=2.15,<3" },
     { name = "python-dotenv", specifier = ">=1.2,<2" },
