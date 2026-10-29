@@ -44,6 +44,7 @@ from app.application.run_capacity import RunCapacity
 from app.application.run_context import RunContext, billing_tier, usage_cost
 from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
 from app.application.streaming import TextStreamBatcher
+from app.application.tool_context import ToolExecutionContext
 from app.application.tools import (
     MAX_ARGUMENT_BYTES,
     ToolExecutionError,
@@ -852,7 +853,12 @@ class RunService:
                 elif operation is not None:
                     await operation.capture_inputs()
                 return await self._execute_stored_tool(
-                    run, tool, execution.workspace_root, self._remaining_seconds(run), operation
+                    run,
+                    tool,
+                    execution.workspace_root,
+                    self._remaining_seconds(run),
+                    operation,
+                    user_id=execution.user_id,
                 )
 
     async def wait_for_run(self, run_id: str) -> None:
@@ -1594,7 +1600,7 @@ class RunService:
             prior_model_steps = await self._runs.list_model_calls(run.id)
             if prior_model_steps and prepared_call is None:
                 call = prior_model_steps[-1]
-                if not await self._execute_pending_tools(run, workspace_root):
+                if not await self._execute_pending_tools(run, execution):
                     return
 
             while True:
@@ -1766,7 +1772,7 @@ class RunService:
                     result = preflight_errors.get(stored_call.provider_call_id)
                     if result is not None:
                         await self._record_tool_result(run.id, stored_call, result)
-                if not await self._execute_pending_tools(run, workspace_root):
+                if not await self._execute_pending_tools(run, execution):
                     return
             raise ProviderError("model_call_limit", "The run reached its model-call limit.")
         except asyncio.CancelledError:
@@ -1848,9 +1854,10 @@ class RunService:
         if renewed is None or renewed.status is not RunStatus.RUNNING:
             raise ApplicationError("run_lease_lost", "This run is no longer active here.")
 
-    async def _execute_pending_tools(self, run: RunSnapshot, workspace_root: Path | None) -> bool:
+    async def _execute_pending_tools(self, run: RunSnapshot, execution: _ExecutionContext) -> bool:
         if self._tool_registry is None:
             raise ProviderError("tool_execution_unavailable", "Tool execution is unavailable.")
+        workspace_root = execution.workspace_root
         model_calls = await self._runs.list_model_calls(run.id)
         all_tool_calls = await self._runs.list_tool_calls(run.id)
         total_tokens, total_cost = self._budget_totals(run.model_id, model_calls)
@@ -1879,7 +1886,12 @@ class RunService:
                         run, stored_call, workspace_root
                     ) as operation:
                         if not await self._execute_stored_tool(
-                            run, stored_call, workspace_root, remaining_seconds, operation
+                            run,
+                            stored_call,
+                            workspace_root,
+                            remaining_seconds,
+                            operation,
+                            user_id=execution.user_id,
                         ):
                             return False
             except TimeoutError:
@@ -1894,6 +1906,7 @@ class RunService:
         if (
             self._workspace_execution is not None
             and root is not None
+            and self._tool_registry.requires_workspace(tool.name)
             and self._tool_registry.recovery_policy(tool.name)
             in {ToolRecoveryPolicy.READ_ONLY, ToolRecoveryPolicy.PATCH, ToolRecoveryPolicy.COMMAND}
         ):
@@ -1910,6 +1923,8 @@ class RunService:
         workspace_root: Path | None,
         remaining_seconds: float,
         operation: WorkspaceOperationPort | None,
+        *,
+        user_id: str,
     ) -> bool:
         assert self._tool_registry is not None
         tool_request = ModelToolCall(
@@ -2036,7 +2051,12 @@ class RunService:
             if remaining_seconds <= 0:
                 raise TimeoutError
             result = await self._execute_tool(
-                run, stored_call, tool_request, workspace_root, remaining_seconds
+                run,
+                stored_call,
+                tool_request,
+                workspace_root,
+                remaining_seconds,
+                user_id=user_id,
             )
         except TimeoutError:
             raise ProviderError("provider_timeout", "The run deadline was reached.") from None
@@ -2055,8 +2075,30 @@ class RunService:
         request: ModelToolCall,
         workspace_root: Path | None,
         remaining_seconds: float,
+        *,
+        user_id: str,
     ) -> ToolResult:
         assert self._tool_registry is not None
+        assert stored_call.dispatch_id is not None
+
+        async def assert_run_active() -> None:
+            await self._renew_before_local_tool(run.id, expected_generation=run.generation)
+
+        context = ToolExecutionContext(
+            user_id=user_id,
+            session_id=run.session_id,
+            run_id=run.id,
+            tool_call_id=stored_call.id,
+            dispatch_id=stored_call.dispatch_id,
+            dispatch_attempt=stored_call.dispatch_attempt,
+            generation=run.generation,
+            deadline_at=datetime.fromisoformat(run.deadline_at.replace("Z", "+00:00")),
+            budget_limits=self._limits(run),
+            workspace_root=workspace_root
+            if self._tool_registry.requires_workspace(stored_call.name)
+            else None,
+            _assert_run_active=assert_run_active,
+        )
         async with asyncio.timeout(remaining_seconds):
             return await self._tool_registry.execute(
                 request,
@@ -2064,6 +2106,7 @@ class RunService:
                 approved=stored_call.approval_decision is ToolApprovalDecision.APPROVED,
                 approval_preview=stored_call.approval_preview,
                 capabilities=self._capabilities,
+                context=context,
             )
 
     async def _record_tool_result(
