@@ -33,6 +33,8 @@ Use $pstack to investigate how chat streaming works. Keep this read-only.
 Use $pstack to reproduce and fix this bug, then verify the behavior.
 Use $pstack to review this design before implementation.
 Use $pstack to improve the chat composer while preserving Trellis's design.
+Use $pstack to model-check this cancellation race and explain each counterexample.
+Use $pstack to bring existing formal checks back in line with the code.
 ```
 
 Pstack routes to the appropriate upstream playbook. It loads focused source
@@ -40,6 +42,11 @@ references instead of treating every vendored file as a separate local
 integration. Local `AGENTS.md` files specify what application boundaries and
 checks apply. Diagnosis-only, design-only, and review-only requests keep those
 scope limits.
+
+Formal verification guidance stays in focused pstack references, with the
+covered code, properties, bounds, assumptions, command, and sync commit.
+The optional statechart helper can install Java and TLC through mise.
+The adapter maps helper setup and chart rendering to the available Codex tools.
 
 For frontend work, preserve the Bun, Turbo, Vite, React, and TypeScript stack and
 read [`frontend/AGENTS.md`](../frontend/AGENTS.md). It records Trellis's visual

@@ -32,6 +32,14 @@ Resolve references within an upstream file relative to that file.
   [interrogate](../../pstack/upstream/skills/interrogate/SKILL.md) when the
   task warrants that depth. Use the Codex mappings when model diversity is
   unavailable.
+- When a requested property needs formal verification beyond ordinary tests,
+  read [create-formal-verification-skill](../../pstack/upstream/skills/create-formal-verification-skill/SKILL.md).
+  Keep generated verification guidance in this adapter's focused references.
+- To bring existing formal checks back in line with changed code, read
+  [maintain-formal-verification-skill](../../pstack/upstream/skills/maintain-formal-verification-skill/SKILL.md).
+- To check a TLA+ model and explain its results as paths through states, read
+  [statechart](../../pstack/upstream/skills/statechart/SKILL.md).
+  Apply the adapter's helper and rendering mappings before running its tools.
 - For an empirical design choice, use [prototype](../../pstack/upstream/skills/poteto-mode/playbooks/prototype.md).
   Use [visual parity](../../pstack/upstream/skills/poteto-mode/playbooks/visual-parity.md)
   only when the task compares implementations against an established visual
