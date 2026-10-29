@@ -1,11 +1,11 @@
 {
   "repository": "https://github.com/cursor/plugins",
   "path": "pstack",
-  "commit": "850d7f2e9f5e55dff7eb00a0a479337fe79eb22f",
-  "tree": "8ff8d978aee18904b8be529b477ade363a53f7dd",
-  "version": "0.15.25",
-  "imported_on": "2026-10-15",
+  "commit": "1ba91fc25c0977741dd0e267849e6234b037ed0a",
+  "tree": "4719e1c4b4c43bac85d4206a8b41dd2899769c1c",
+  "version": "0.15.36",
+  "imported_on": "2026-10-30",
   "license": "MIT",
   "copyright": "Copyright (c) 2026 Lauren Tan",
-  "files": 169
+  "files": 573
 }

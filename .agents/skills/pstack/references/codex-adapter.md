@@ -1,9 +1,10 @@
 # Codex execution mappings
 
 Read this before applying an official pstack workflow. The source is Lauren
-Tan's `cursor/plugins` pstack, version `0.15.25`, at commit
-`850d7f2e9f5e55dff7eb00a0a479337fe79eb22f`. It is a reference snapshot, not an
-installed Cursor runtime. Read repository instructions first.
+Tan's `cursor/plugins` pstack. [Pinned source metadata](../../../pstack/upstream.json)
+records its version and commit. It is a reference snapshot, not an installed
+Cursor runtime. Upstream setup for other hosts does not configure Codex.
+Read repository instructions first.
 
 ## Tools and delegation
 
@@ -16,11 +17,17 @@ installed Cursor runtime. Read repository instructions first.
 | Todo tools                                                       | Use an available planning tool or keep a concise written plan. Do not invent tool calls or require verbatim imported task lists.                                                                           |
 | Cursor `/loop`, cloud workers, `drive`, or orchestration scripts | Use supported tools for a bounded task. Do not claim unavailable sessions or start persistent execution from the reference alone.                                                                          |
 | Cursor-only companions and tools                                 | Inspect the original reference and use a supported Codex tool when it fits. Do not claim Cursor-only tools are installed.                                                                                  |
+| Cursor's built-in `create-skill`                                  | Use the available Codex `skill-creator` skill for local skill changes. Keep Trellis engineering guidance in the pstack entrypoint and its focused references.                                                  |
+| Project tracker/store and event subscriptions                     | Keep task state in the workspace and use supported collaboration tools. Use connected services within the requested scope. Schedule persistent follow-ups only when the user requests them.                  |
 
 Give independent writers disjoint files or isolated checkouts. Serialize shared
 writes. Set a clear stopping condition and verification scope. Review their actual
 changes and evidence. Cancel obsolete work and stop processes started for the
 task. A missing agent result is a gap, not a pass.
+
+For `interrogate`, give adversaries isolated checkouts containing the scoped
+diff. Rerun each finding's command yourself and keep only failures that break
+the stated intent. Keep a review-only request limited to findings.
 
 ## Scope and external effects
 
@@ -31,6 +38,25 @@ requested delivery scope. Do not install packages, execute upstream helpers,
 activate plugins, or start automations just because a playbook names them.
 Inspect a helper before using it and use it only when its effects are authorized
 and needed.
+
+When an upstream workflow generates a project-local verification skill, keep
+its instructions in a focused reference under this adapter and link it from
+`SKILL.md` with its trigger. Keep runnable checks with the code they verify.
+Preserve the covered files, properties, bounds, assumptions, command, and sync
+commit so later maintenance can find and rerun the check through pstack.
+For formal-check maintenance, discover those references through this entrypoint
+as well as any verification skill the user explicitly requested separately.
+
+## Formal verification helpers
+
+The `statechart` wrapper can install Java and TLC through mise on its first run.
+Its image-rendering reference uses Pele. Inspect those helpers and their setup
+effects before running them. Importing the reference snapshot does not authorize
+tool installation. Use an existing toolchain when it meets the check's needs.
+
+Show generated Mermaid directly in Codex. If a requested image needs an
+unavailable renderer, report that limitation and keep the Mermaid result.
+Record the model's bounds, unchecked rules, and assumptions with its findings.
 
 ## Trellis verification and frontend work
 
