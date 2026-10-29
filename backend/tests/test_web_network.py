@@ -67,6 +67,8 @@ def test_nonpublic_and_transition_addresses_are_rejected(address: str) -> None:
         "file:///etc/passwd",
         "http://user:pass@example.com/",
         "http://example.com:8080/",
+        "http://example.com:0/",
+        "https://example.com:0/",
         "http://example.com:/",
         "http://example.com./",
         "http://example.com\\@other.com/",
