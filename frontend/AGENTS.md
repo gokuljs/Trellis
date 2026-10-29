@@ -24,6 +24,10 @@ as permission to implement a change.
 
 Keep frontend engineering workflows in the pstack entrypoint. The shared
 grill-me and grilling skills provide complementary design interviews.
+For frontend polish, motion, mobile behavior, or UI exploration, use pstack's
+[frontend craft reference](../.agents/skills/pstack/references/frontend-craft.md).
 When a future task needs more frontend guidance, add a focused reference beneath
 `.agents/skills/pstack/references/` and route to it from the pstack entrypoint.
-Do not add a separate frontend skill package or installer lock.
+Add complementary frontend craft skills and their installer lock only when
+the user explicitly requests installation. Keep pstack as the engineering
+workflow entrypoint.
