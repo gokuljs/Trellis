@@ -169,6 +169,8 @@ Sources remain until cleared, subject to quota. Clearing requires the active run
 to finish or be cancelled. It removes source content and identifying metadata,
 increments the evidence generation, and fences delayed writers. Minimal source
 tombstones let old answers display "Source removed" without reusing an identity.
+Clearing evidence does not erase earlier answers or excerpts already saved in
+the conversation's tool history.
 
 ## Security boundaries
 
