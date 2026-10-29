@@ -66,6 +66,12 @@
       "sourceType": "github",
       "skillPath": "skills/pick-ui-library/SKILL.md",
       "computedHash": "5d2a77bf0ecafbda85aa95fb49999b6d77945d9066ec83d970b62e5b388cd686"
+    },
+    "prototype": {
+      "source": "emilkowalski/skill",
+      "sourceType": "github",
+      "skillPath": "skills/prototype/SKILL.md",
+      "computedHash": "77be567d8c946608fdd15e61b62ab383cdf289a194dce2479828b7eda860d3ba"
     }
   }
 }
