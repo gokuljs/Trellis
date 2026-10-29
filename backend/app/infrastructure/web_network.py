@@ -83,7 +83,8 @@ def parse_public_url(value: str) -> PublicURL:
         or parts.netloc.endswith(":")
     ):
         raise DestinationBlocked("invalid_authority")
-    port = port or (443 if parts.scheme == "https" else 80)
+    if port is None:
+        port = 443 if parts.scheme == "https" else 80
     if port not in {80, 443}:
         raise DestinationBlocked("blocked_port")
     try:
