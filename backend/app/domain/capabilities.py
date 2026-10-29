@@ -4,7 +4,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
-RuntimeCapability = Literal["local_read", "local_patch", "local_command"]
+RuntimeCapability = Literal[
+    "local_read", "local_patch", "local_command", "web_search", "web_read", "web_crawl"
+]
+
+WORKSPACE_CAPABILITIES: frozenset[RuntimeCapability] = frozenset(
+    {"local_read", "local_patch", "local_command"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,7 +19,7 @@ class RuntimeCapabilities:
 
     @property
     def workspace_enabled(self) -> bool:
-        return bool(self.enabled)
+        return bool(self.enabled & WORKSPACE_CAPABILITIES)
 
     def allows(self, capability: RuntimeCapability) -> bool:
         return capability in self.enabled

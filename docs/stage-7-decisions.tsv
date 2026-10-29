@@ -2,3 +2,5 @@ ts	phase	decision	why	evidence	result
 2026-10-29T22:37:24Z	start	Implement the approved nine-branch stack with user-owned PR creation	The user wants each layer readable before merge	docs/stage-7-stack.md	in progress
 2026-10-29T22:37:24Z	baseline	Fast-forward the clean feature branch to current main	Start from the merged repository state before implementation	c190672133963f8f1e6955dcd233f32670c216e5	fast-forwarded
 2026-10-29T22:37:24Z	architecture	Keep web tools inside the existing normal-chat loop	Deep research is deferred and the user chose ordinary chat integration	docs/stage-7-web.md	approved contract
+2026-10-29T22:39:28Z	runtime	Add trusted tool context and separate web from workspace access	Web tools must inherit recorded run identity without local filesystem authority	backend/tests/test_tool_context.py	make check passed; 98 tests; uv 0.12.5
+2026-10-29T22:39:58Z	runtime	Propagate tool deadline expiration through the read-only wrapper	A timeout must stop the run rather than become ordinary source content	backend/tests/test_tool_context.py	make check passed; 99 tests; uv 0.12.5
