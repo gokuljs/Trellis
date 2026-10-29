@@ -1,0 +1,14 @@
+*
+!app/
+!app/domain/
+!app/domain/*.py
+!app/infrastructure/
+!app/infrastructure/web_gateway.py
+!app/infrastructure/web_network.py
+!app/infrastructure/web_reader.py
+!containers/
+!containers/gateway_guard.py
+!containers/trellis-gateway-init
+!containers/trellis-check-egress-policy
+!containers/worker-requirements.txt
+!containers/gateway-requirements.txt
