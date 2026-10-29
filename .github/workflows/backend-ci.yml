@@ -78,3 +78,5 @@ jobs:
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/reliable_runs.sql
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/run_stopping.sql
           bash supabase/tests/reliable_runs_concurrency.sh
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/web_evidence.sql
+          bash supabase/tests/web_evidence_concurrency.sh

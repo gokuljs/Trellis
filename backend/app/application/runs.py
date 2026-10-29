@@ -747,7 +747,8 @@ class RunService:
                                 ToolCallStatus.RUNNING,
                                 ToolCallStatus.OUTCOME_UNKNOWN,
                             }
-                            and tool.recovery_policy != ToolRecoveryPolicy.READ_ONLY
+                            and tool.recovery_policy
+                            not in {ToolRecoveryPolicy.READ_ONLY, ToolRecoveryPolicy.CHECKPOINTED}
                             for tool in snapshot.tool_calls
                         )
                         if snapshot is not None
@@ -840,7 +841,10 @@ class RunService:
                         reconciliation="unchanged_original",
                         proof=reconciliation.proof(),
                     )
-                elif resolution.action is RecoveryAction.RETRY_READ_TOOL:
+                elif resolution.action in {
+                    RecoveryAction.RETRY_READ_TOOL,
+                    RecoveryAction.RESUME_CHECKPOINTED_TOOL,
+                }:
                     if operation is not None:
                         await operation.capture_inputs()
                     tool = await self._runs.authorize_tool_retry(
@@ -848,7 +852,9 @@ class RunService:
                         tool.id,
                         expected_dispatch_id=tool.dispatch_id or "",
                         expected_attempt=tool.dispatch_attempt,
-                        reconciliation="read_retry",
+                        reconciliation="checkpoint_resume"
+                        if resolution.action is RecoveryAction.RESUME_CHECKPOINTED_TOOL
+                        else "read_retry",
                     )
                 elif operation is not None:
                     await operation.capture_inputs()
@@ -2126,6 +2132,18 @@ class RunService:
         )
         if result.truncated:
             result_content += "\n[Output truncated by Trellis.]"
+        result_content = self._redactor.redact_text(result_content)
+        if (
+            result_snapshot is None
+            and stored_call.recovery_policy == ToolRecoveryPolicy.CHECKPOINTED
+            and stored_call.dispatch_id is not None
+        ):
+            result_snapshot = {
+                "source": "checkpointed_web",
+                "dispatch_id": stored_call.dispatch_id,
+                "generation": stored_call.dispatch_generation,
+                "content_sha256": hashlib.sha256(result_content.encode("utf-8")).hexdigest(),
+            }
         result_status = status or (
             ToolCallStatus.FAILED if result.is_error else ToolCallStatus.COMPLETED
         )
@@ -2133,14 +2151,14 @@ class RunService:
             _message, _call, event = await self._runs.record_tool_result(
                 run_id,
                 stored_call.id,
-                self._redactor.redact_text(result_content),
+                result_content,
                 status=result_status,
             )
         elif result_source == "executor":
             _message, _call, event = await self._runs.record_tool_result(
                 run_id,
                 stored_call.id,
-                self._redactor.redact_text(result_content),
+                result_content,
                 status=result_status,
                 result_snapshot=result_snapshot,
             )
@@ -2148,7 +2166,7 @@ class RunService:
             _message, _call, event = await self._runs.record_tool_result(
                 run_id,
                 stored_call.id,
-                self._redactor.redact_text(result_content),
+                result_content,
                 status=result_status,
                 result_snapshot=result_snapshot,
                 result_source=result_source,
@@ -2825,12 +2843,23 @@ class RunService:
                 continue
             if (
                 tool.status is ToolCallStatus.RUNNING or tool.dispatch_attempt > 0
-            ) and tool.recovery_policy != ToolRecoveryPolicy.READ_ONLY:
+            ) and tool.recovery_policy not in {
+                ToolRecoveryPolicy.READ_ONLY,
+                ToolRecoveryPolicy.CHECKPOINTED,
+            }:
                 await self._runs.mark_tool_outcome_unknown(
                     run_id, tool.id, "Execution stopped before a confirmed tool result was saved."
                 )
                 continue
             try:
+                if tool.recovery_policy == ToolRecoveryPolicy.CHECKPOINTED:
+                    await self._record_tool_result(
+                        run_id,
+                        tool,
+                        ToolResult(tool.provider_call_id, tool.name, content),
+                        status=status,
+                    )
+                    continue
                 _message, _updated, event = await self._runs.record_tool_result(
                     run_id, tool.id, content, status=status
                 )

@@ -198,6 +198,7 @@ class ModelCallPurpose(StrEnum):
 
 class ToolRecoveryPolicy(StrEnum):
     READ_ONLY = "read_only"
+    CHECKPOINTED = "checkpointed"
     PATCH = "patch"
     COMMAND = "command"
     NEVER = "never"
@@ -210,6 +211,7 @@ class RecoveryAction(StrEnum):
     EXECUTE_TOOL = "execute_tool"
     RECORD_DENIED_TOOL = "record_denied_tool"
     RETRY_READ_TOOL = "retry_read_tool"
+    RESUME_CHECKPOINTED_TOOL = "resume_checkpointed_tool"
     RECONCILE_PATCH = "reconcile_patch"
     AWAIT_APPROVAL = "await_approval"
     CONTINUE_COMPACTION = "continue_compaction"
@@ -342,7 +344,7 @@ def _consistent(snapshot: RecoverySnapshot) -> bool:
                 ToolCallStatus.RUNNING,
                 ToolCallStatus.OUTCOME_UNKNOWN,
             }
-            and tool.recovery_policy in {"read_only", "patch", "command"}
+            and tool.recovery_policy in {"read_only", "checkpointed", "patch", "command"}
             and tool.result_snapshot is None
         ):
             return False
@@ -403,6 +405,14 @@ def _tool_resolution(tool: ToolCallRecord) -> RecoveryResolution:
             RecoveryAction.STOP, "tool_outcome_unknown", tool_call_id=tool.id, retry_allowed=False
         )
     if tool.status is ToolCallStatus.RUNNING or tool.dispatch_attempt > 0:
+        if policy is ToolRecoveryPolicy.CHECKPOINTED:
+            return RecoveryResolution(
+                RecoveryAction.RESUME_CHECKPOINTED_TOOL
+                if tool.dispatch_attempt < 4
+                else RecoveryAction.STOP,
+                "resume_web_checkpoint" if tool.dispatch_attempt < 4 else "web_recovery_exhausted",
+                tool_call_id=tool.id,
+            )
         if policy is ToolRecoveryPolicy.READ_ONLY and tool.dispatch_attempt == 1:
             return RecoveryResolution(
                 RecoveryAction.RETRY_READ_TOOL, "retry_interrupted_read", tool_call_id=tool.id
@@ -448,7 +458,7 @@ def resolve_recovery(
             or (
                 tool.status in {ToolCallStatus.RUNNING, ToolCallStatus.PENDING}
                 and tool.dispatch_attempt > 0
-                and tool.recovery_policy != "read_only"
+                and tool.recovery_policy not in {"read_only", "checkpointed"}
             )
         ),
         None,

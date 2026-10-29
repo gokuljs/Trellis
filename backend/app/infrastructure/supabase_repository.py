@@ -20,6 +20,7 @@ import httpx
 from app.application.budgets import BudgetPreset, limits_for_preset
 from app.application.errors import ApplicationError
 from app.application.model_catalog import profile_for_model
+from app.application.web_evidence import WEB_ERROR_MESSAGES
 from app.core.config import Settings
 from app.core.supabase import project_base_url
 from app.domain.context import (
@@ -59,6 +60,7 @@ from app.domain.runtime import (
     ToolCallRecord,
     ToolCallStatus,
 )
+from app.infrastructure.web_repository import WebRepositoryMixin
 
 _REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=3.0)
 _READ_PAGE_SIZE = 500
@@ -175,7 +177,7 @@ def _nullable_number(row: Mapping[str, object], key: str) -> float | None:
     return None if row.get(key) is None else _number(row, key)
 
 
-class SupabaseRepository:
+class SupabaseRepository(WebRepositoryMixin):
     async def load_context_window(self, session_id: str, *, limit: int = 128) -> ContextWindow:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 128:
             raise ValueError("context page limit is invalid")
@@ -411,14 +413,21 @@ class SupabaseRepository:
             raise ApplicationError(
                 "database_unavailable", "Cloud data is temporarily unavailable."
             ) from None
-        if response.status_code in {401, 403}:
-            raise ApplicationError("cloud_access_denied", "Your cloud session has expired.")
         error: dict[str, object] = {}
         if response.status_code >= 400:
             with suppress(ValueError, RuntimeError):
                 error = _object(response.json())
         error_code = error.get("code")
         error_message = error.get("message")
+        if (
+            path == "rpc/web_mutate"
+            and response.status_code >= 400
+            and isinstance(error_message, str)
+            and error_message in WEB_ERROR_MESSAGES
+        ):
+            raise ApplicationError(error_message, WEB_ERROR_MESSAGES[error_message])
+        if response.status_code in {401, 403}:
+            raise ApplicationError("cloud_access_denied", "Your cloud session has expired.")
         if response.status_code == 406 and error_code == "PGRST106":
             raise ApplicationError(
                 "database_not_configured",
