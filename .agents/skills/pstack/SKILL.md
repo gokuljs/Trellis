@@ -53,9 +53,10 @@ checks. Apply those constraints through pstack. Complementary design interviews
 use [grill-me](../grill-me/SKILL.md) and [grilling](../grilling/SKILL.md).
 
 Read [frontend guidance](../../../frontend/AGENTS.md) before frontend work.
-Keep Trellis's visual system unless the user asks for a redesign. For future
-frontend-specific pstack guidance, add a focused reference in this folder and
-link it from the frontend guidance and this adapter as needed.
+Keep Trellis's visual system unless the user asks for a redesign. For frontend
+polish, motion, mobile behavior, or UI exploration, read
+[frontend craft](references/frontend-craft.md) and load only the relevant
+complementary skill leaves within the selected pstack workflow.
 
 For backend changes, preserve the transport, application, domain, and provider
 boundaries. Run the required backend checks whenever backend code, dependencies,
