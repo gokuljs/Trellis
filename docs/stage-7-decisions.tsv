@@ -1,0 +1,4 @@
+ts	phase	decision	why	evidence	result
+2026-10-29T22:37:24Z	start	Implement the approved nine-branch stack with user-owned PR creation	The user wants each layer readable before merge	docs/stage-7-stack.md	in progress
+2026-10-29T22:37:24Z	baseline	Fast-forward the clean feature branch to current main	Start from the merged repository state before implementation	c190672133963f8f1e6955dcd233f32670c216e5	fast-forwarded
+2026-10-29T22:37:24Z	architecture	Keep web tools inside the existing normal-chat loop	Deep research is deferred and the user chose ordinary chat integration	docs/stage-7-web.md	approved contract
