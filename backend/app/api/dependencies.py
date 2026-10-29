@@ -8,11 +8,13 @@ from app.api.auth import VerifiedUser
 from app.api.request_logging import owned_chat_logging
 from app.application.chat import ChatService
 from app.application.context_preview import ContextPreviewService
+from app.application.errors import ApplicationError
 from app.application.onboarding import OnboardingService
 from app.application.profile import ProfileService
 from app.application.runs import RunService
 from app.application.sessions import SessionService
 from app.application.settings import SettingsService
+from app.application.web_evidence import WebEvidenceService
 from app.application.workspaces import WorkspacePickerService
 from app.infrastructure.accounts import AccountContext
 
@@ -91,3 +93,12 @@ RunServiceDep = Annotated[RunService, Depends(get_run_service)]
 WorkspacePickerDep = Annotated[WorkspacePickerService, Depends(get_workspace_picker)]
 
 ContextPreviewServiceDep = Annotated[ContextPreviewService, Depends(get_context_preview_service)]
+
+
+def get_web_evidence_service(account: AccountDep) -> WebEvidenceService:
+    if account.web_evidence_service is None:
+        raise ApplicationError("database_not_configured", "Web evidence storage is unavailable.")
+    return account.web_evidence_service
+
+
+WebEvidenceServiceDep = Annotated[WebEvidenceService, Depends(get_web_evidence_service)]
