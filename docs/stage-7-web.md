@@ -205,9 +205,54 @@ and scanned documents requiring OCR return accurate unsupported outcomes.
 Docker alone does not enforce public-only destinations. Worker networking must
 restrict outgoing connections to the public-egress gateway. The gateway validates
 actual destinations. Enforced network rules also block direct DNS, UDP, QUIC,
-host access, and browser paths that bypass the proxy. Tests cover script, frame,
-WebSocket, and service-worker requests. Worker readiness fails closed if these
+host access, and browser paths that bypass the proxy. Browser-layer tests must
+cover script, frame, WebSocket, and service-worker requests. Worker readiness fails closed if these
 requirements cannot be enforced.
+
+The retrieval implementation uses a fresh worker with Docker `--network none`.
+The backend supplies bounded JSON through fixed Docker commands. The worker
+mounts only the gateway's Unix socket volume, read-only. The socket is shared
+between Linux containers inside Docker, avoiding host socket sharing on macOS.
+An authenticated gateway control listener is published on host loopback only.
+The worker receives an operation lease instead of the control credential.
+
+```mermaid
+flowchart LR
+    B[Backend] -->|Fixed Docker commands and bounded stdio| W[Worker with networking disabled]
+    B -->|Authenticated loopback control| A[Gateway lease administration]
+    W -->|Read-only Unix socket mount and scoped lease| G[Public egress gateway]
+    A --> G
+    G -->|Vetted IP, ports 80 and 443| P[Public websites]
+```
+
+The gateway installs a kernel egress policy before dropping privileges. Its DNS
+exception covers the actual Docker resolver translation and the gateway's user.
+The hostname resolver uses cancellable asynchronous DNS. Address checks reject
+reserved and transitional ranges even when Python reports `is_global` as true.
+The connection uses a vetted numeric address and verifies the socket peer.
+
+The gateway independently bounds tunnel count, lifetime, and bytes forwarded
+through the tunnel. The durable response-byte reservation must cover that entire
+transport allowance, including TLS overhead. Confirmed gateway receipts determine
+settlement. Missing receipts keep the conservative reservation charged.
+Tunnel bytes are application-level transport bytes, not TCP/IP packet accounting.
+
+Encrypted tunnels do not reveal every HTTP request, redirect, or decoded response.
+The fixed reader and later renderer enforce those limits. The gateway does not
+prove exact HTTP request accounting or GET-only behavior against a compromised
+browser process. Public-only egress, transport limits, process limits, and lease
+expiry remain independent controls.
+
+The reader uses the already locked `h11` package for bounded HTTP framing.
+The gateway uses the already locked `dnspython` package for cancellable DNS.
+Both are direct, pinned dependencies because this security boundary relies on
+their APIs. Deployment requirements also pin package hashes.
+
+Run `uv run --locked python -m scripts.verify_web_isolation` from `backend/` to
+exercise the actual Docker boundary. Run one proof per Docker daemon because the
+isolated fixture reserves `93.184.216.0/24`. The proof removes its temporary
+containers, networks, volume, certificates, and derived images. It retains the
+production images and reports their immutable IDs.
 
 Cancellation closes sockets and terminates outstanding processes. Timing out an
 await while leaving a browser or parser running does not satisfy cancellation.
