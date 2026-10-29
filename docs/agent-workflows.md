@@ -1,17 +1,22 @@
 # Pstack in Trellis
 
-Trellis uses Lauren Tan's official pstack as its single repository-local agent
-skill. Pstack selects how to investigate, plan, implement, and verify work. The
-root and nested `AGENTS.md` files retain Trellis-specific frontend, backend,
+Trellis uses Lauren Tan's official pstack as its single engineering workflow
+entrypoint. Pstack selects how to investigate, plan, implement, and verify work.
+The root and nested `AGENTS.md` files retain Trellis-specific frontend, backend,
 icon, architecture, and verification constraints.
+
+The [grill-me](../.agents/skills/grill-me/SKILL.md) and
+[grilling](../.agents/skills/grilling/SKILL.md) skills provide complementary
+design interviews.
 
 ## Source and entrypoint
 
 - Use the discoverable [`pstack` skill](../.agents/skills/pstack/SKILL.md), or
   ask Codex to use `$pstack` or `poteto-mode` for a substantial task.
-- The [official source snapshot](../.agents/pstack/upstream/) is pinned to
-  `cursor/plugins` commit `850d7f2e9f5e55dff7eb00a0a479337fe79eb22f`, version
-  `0.15.25`. Its license and update procedure are kept alongside it.
+- The [official source snapshot](../.agents/pstack/upstream/) comes from
+  `cursor/plugins`. [Pinned source metadata](../.agents/pstack/upstream.json)
+  records its version and full commit. Its license and update procedure are
+  kept alongside it.
 - The upstream tree contains skills and playbooks for pstack to load when
   needed. Only the native adapter is registered for repository discovery.
 - The adapter maps Cursor-specific tools and model roles to supported Codex
@@ -44,8 +49,8 @@ including the required `make check` command and pinned uv version.
 
 ## Extend frontend guidance inside pstack
 
-Keep the discoverable skill catalog to one pstack entrypoint. When future
-frontend work needs additional reusable guidance, place a focused Markdown
+Keep engineering workflows in the pstack entrypoint. When future frontend work
+needs additional reusable guidance, place a focused Markdown
 reference in `.agents/skills/pstack/references/`. Link it from the pstack entry
 point and frontend instructions only when its trigger applies. Add executable
 helpers only when they have a clear maintenance benefit, and verify them.
@@ -65,7 +70,7 @@ From the repository root, verify the snapshot:
 ```
 
 When guidance or routing changes, validate pstack frontmatter, all local links,
-formatting, and that the only repository-local discoverable skill is pstack.
+formatting, and that pstack remains the single engineering workflow entrypoint.
 When the app changes, run the checks required for the changed package. Backend
 code, dependencies, or configuration changes require `make check` from `backend/`
 with uv `0.12.5` as specified in `backend/AGENTS.md`.
