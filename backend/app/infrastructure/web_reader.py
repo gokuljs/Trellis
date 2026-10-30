@@ -1,4 +1,4 @@
-"""Worker-only raw reader. No extraction, provider keys, cookies or environment proxies."""
+"""Worker-only public reader and fixed document extraction operations."""
 
 import asyncio
 import base64
@@ -15,14 +15,17 @@ import h11
 from app.domain.retrieval import (
     HTML_DECODED_BYTES,
     HTML_RAW_BYTES,
+    MAX_EXTRACTED_RESULT_BYTES,
     MAX_REDIRECTS,
     MAX_WORKER_REQUEST_BYTES,
     PDF_RAW_BYTES,
+    ExtractedDocumentResult,
     RetrievalRequest,
     RetrievalResult,
     RetrievalStatus,
 )
 from app.domain.web import WebUsage
+from app.infrastructure.web_extraction import extract_document
 from app.infrastructure.web_network import (
     DestinationBlocked,
     PublicURL,
@@ -297,7 +300,12 @@ def result_to_wire(result: RetrievalResult) -> dict[str, object]:
     return {**asdict(result), "body": base64.b64encode(result.body).decode("ascii")}
 
 
-async def _run(payload: object) -> RetrievalResult:
+async def _run(payload: object) -> RetrievalResult | ExtractedDocumentResult:
+    if not isinstance(payload, dict):
+        raise ValueError("invalid worker request")
+    operation = payload.pop("operation", "raw")
+    if operation not in {"raw", "extracted"}:
+        raise ValueError("invalid worker operation")
     if not isinstance(payload, dict) or set(payload) != {
         "url",
         "max_requests",
@@ -317,7 +325,12 @@ async def _run(payload: object) -> RetrievalResult:
     ):
         raise ValueError("invalid worker gateway")
     request = RetrievalRequest(**payload)
-    return await RawDocumentReader(Path(socket), token).retrieve(request)
+    started = asyncio.get_running_loop().time()
+    raw = await RawDocumentReader(Path(socket), token).retrieve(request)
+    if operation == "raw":
+        return raw
+    remaining = request.timeout_seconds - (asyncio.get_running_loop().time() - started)
+    return await extract_document(raw, timeout_seconds=max(0.001, remaining))
 
 
 def main() -> None:
@@ -326,7 +339,17 @@ def main() -> None:
     if len(raw) > MAX_WORKER_REQUEST_BYTES:
         raise ValueError("worker request exceeds limit")
     result = asyncio.run(_run(json.loads(raw)))
-    sys.stdout.write(json.dumps(result_to_wire(result), separators=(",", ":")))
+    payload = json.dumps(
+        result_to_wire(result) if isinstance(result, RetrievalResult) else asdict(result),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if (
+        isinstance(result, ExtractedDocumentResult)
+        and len(payload.encode()) > MAX_EXTRACTED_RESULT_BYTES
+    ):
+        raise ValueError("extracted result exceeds limit")
+    sys.stdout.write(payload)
 
 
 if __name__ == "__main__":

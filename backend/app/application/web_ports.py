@@ -22,6 +22,12 @@ from app.domain.web import (
 
 
 class WebRepository(Protocol):
+    async def web_tools_ready(self) -> bool: ...
+
+    async def reserve_search_attempt(
+        self, scope: WebScope, request_id: str, key_hash: str, monthly_limit: int
+    ) -> None: ...
+
     async def open_web_run(self, dispatch: WebDispatch) -> WebRunState: ...
 
     async def reserve_web_budget(

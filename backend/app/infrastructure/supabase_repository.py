@@ -420,7 +420,7 @@ class SupabaseRepository(WebRepositoryMixin):
         error_code = error.get("code")
         error_message = error.get("message")
         if (
-            path == "rpc/web_mutate"
+            path in {"rpc/web_mutate", "rpc/web_reserve_search_attempt"}
             and response.status_code >= 400
             and isinstance(error_message, str)
             and error_message in WEB_ERROR_MESSAGES

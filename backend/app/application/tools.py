@@ -159,6 +159,7 @@ class ToolRegistration:
     requires_workspace: bool = False
     recovery_policy: ToolRecoveryPolicy = ToolRecoveryPolicy.NEVER
     recovery_version: str = "v1"
+    result_format: Literal["text", "json"] = "text"
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +219,7 @@ class ToolRegistry:
         self._patch_executor = patch_executor
         self._command_executor = command_executor
         self._generic_executors: dict[str, ToolExecutor] = {}
+        self._json_results: set[str] = set()
         self._recovery_versions = {name: "v1" for name in _LOCAL_CAPABILITIES}
         self._recovery_policies = {
             **{name: ToolRecoveryPolicy.READ_ONLY for name, _description, _model in _DEFINITIONS},
@@ -235,6 +237,8 @@ class ToolRegistry:
                 raise ValueError("Tools require a bounded recovery version")
             self._recovery_versions[tool.name] = tool.recovery_version
             self._generic_executors[tool.name] = tool.executor
+            if tool.result_format == "json":
+                self._json_results.add(tool.name)
             self._recovery_policies[tool.name] = tool.recovery_policy
             self._requirements[tool.name] = _ToolRequirements(
                 tool.required_capabilities, tool.requires_workspace
@@ -264,6 +268,9 @@ class ToolRegistry:
     def requires_workspace(self, name: str) -> bool:
         requirements = self._requirements.get(name)
         return requirements is not None and requirements.requires_workspace
+
+    def uses_json_result(self, name: str) -> bool:
+        return name in self._json_results
 
     def recovery_versions(self) -> tuple[tuple[str, str], ...]:
         return tuple(
@@ -459,6 +466,20 @@ class ToolRegistry:
             return ToolResult(
                 call.id, call.name, "The tool could not complete.", True, "tool_failed"
             )
+        if call.name in self._json_results:
+            try:
+                value = json.loads(content)
+                if not isinstance(value, dict):
+                    raise ValueError("tool result must be an object")
+                safe_content = json.dumps(
+                    self._redactor.redact_record(value), ensure_ascii=False, separators=(",", ":")
+                )
+            except ValueError, TypeError:
+                safe_content = '{"status":"unavailable","error_code":"invalid_tool_result"}'
+            if len(safe_content.encode("utf-8")) >= MAX_RESULT_BYTES:
+                safe_content = '{"status":"oversized","error_code":"tool_result_limit"}'
+                truncated = True
+            return ToolResult(call.id, call.name, safe_content, truncated=truncated)
         safe_content = self._redactor.redact_text(content)
         encoded = safe_content.encode("utf-8")
         if len(encoded) > MAX_RESULT_BYTES:

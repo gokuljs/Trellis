@@ -2130,9 +2130,16 @@ class RunService:
             if result.is_error and result.error_code is not None
             else result.content
         )
-        if result.truncated:
+        json_result = self._tool_registry is not None and self._tool_registry.uses_json_result(
+            stored_call.name
+        )
+        if result.truncated and not json_result:
             result_content += "\n[Output truncated by Trellis.]"
-        result_content = self._redactor.redact_text(result_content)
+        result_content = (
+            self._redactor.redact_tool_text(result_content)
+            if json_result
+            else self._redactor.redact_text(result_content)
+        )
         if (
             result_snapshot is None
             and stored_call.recovery_policy == ToolRecoveryPolicy.CHECKPOINTED
