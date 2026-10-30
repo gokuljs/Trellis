@@ -3,7 +3,7 @@
 The byte-based fallback is deliberately conservative and is always labelled as
 an estimate. Provider counts are accepted only for the same normalized input.
 An over-budget plan with an eligible prefix must be compacted and counted again
-before a generation call. The current turn is never an eligible prefix.
+before a generation call. The current request is never an eligible prefix.
 """
 
 import hashlib
@@ -26,6 +26,13 @@ MAX_TOOL_RESULT_BYTES = 32768
 MAX_RECENT_TURNS = 4
 MAX_RECENT_TOKENS = 16384
 _TRUNCATED = "[Tool result truncated for context.]"
+_FINAL_ANSWER_INSTRUCTIONS = (
+    "\n\nStop using tools to preserve this run's remaining allowance for an answer. "
+    "Answer the user's request now using the information already available. "
+    "Cite recorded supporting source lines. If the task is incomplete, explain what "
+    "was collected or completed, what remains, and that collection stopped to stay "
+    "within the run budget. Do not promise further tool work in this run."
+)
 _ENCODER = json.JSONEncoder(
     ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
 )
@@ -90,15 +97,20 @@ def _turn_units(items: Sequence[ContextItem]) -> list[tuple[ContextItem, ...]]:
     pending: set[str] = set()
     tool_ids: set[str] = set()
     for item in items:
-        if not units or units[-1][0].turn_id != item.turn_id:
-            if pending or item.turn_id in closed_turns:
+        message = item.message
+        if (
+            not units
+            or units[-1][0].turn_id != item.turn_id
+            or units[-1][0].source_kind != item.source_kind
+            or (item.source_kind == "run_message" and message.role != "tool")
+        ):
+            if pending or (item.source_kind == "message" and item.turn_id in closed_turns):
                 raise ApplicationError(
                     "context_invalid_tool_sequence", "Context has an incomplete tool exchange."
                 )
-            if units:
+            if units and units[-1][0].source_kind == "message":
                 closed_turns.add(units[-1][0].turn_id)
             units.append([])
-        message = item.message
         if message.role == "tool":
             if message.tool_call_id not in pending:
                 raise ApplicationError(
@@ -195,6 +207,38 @@ def _affordable_output(
         else:
             upper = middle - 1
     return lower
+
+
+def answer_only_request(request: ModelRequest) -> ModelRequest:
+    return replace(
+        request,
+        tools=(),
+        system_instructions=request.system_instructions + _FINAL_ANSWER_INSTRUCTIONS,
+    )
+
+
+def needs_final_answer(
+    plan: ContextPreflight,
+    *,
+    profile: ModelProfile,
+    remaining_run_tokens: int,
+    remaining_model_calls: int,
+    remaining_tool_calls: int,
+    remaining_run_cost_usd: float | None,
+) -> bool:
+    if not plan.request.tools:
+        return False
+    if remaining_model_calls <= 1 or remaining_tool_calls <= 0:
+        return True
+    output = min(4096, profile.max_output_tokens or 0)
+    if remaining_run_tokens <= 2 * (plan.input_tokens + output):
+        return True
+    cost = _cost(profile, plan.input_tokens, output, plan.pricing_context_tokens)
+    return (
+        remaining_run_cost_usd is not None
+        and cost is not None
+        and remaining_run_cost_usd <= 2 * cost
+    )
 
 
 def preflight_context(
@@ -313,7 +357,13 @@ def preflight_context(
         budget.safety_margin_tokens,
         usable,
         fits,
-        bool(prefix) and (not fits or count.tokens >= usable * 4 // 5),
+        bool(prefix)
+        and (not fits or count.tokens >= usable * 4 // 5)
+        and not (
+            fits
+            and not prepared.tools
+            and prepared.system_instructions.endswith(_FINAL_ANSWER_INSTRUCTIONS)
+        ),
         checkpoint_id,
         estimated_cost,
         source_hash,

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Literal
 
 from app.application.budgets import BudgetPreset, limits_for_preset
+from app.application.compaction import summary_message
 from app.application.context import build_model_context
 from app.application.context_budget import estimate_input_tokens
 from app.application.errors import ApplicationError
@@ -173,13 +174,7 @@ class ContextPreviewService:
         )
         checkpoint = window.checkpoint if window else None
         prefix = (
-            (
-                ModelMessage(
-                    "user",
-                    "Saved conversation summary (historical context):\n"
-                    + self._redactor.redact_text(checkpoint.draft.summary),
-                ),
-            )
+            (summary_message(self._redactor.redact_text(checkpoint.draft.summary)),)
             if checkpoint is not None
             else ()
         )
