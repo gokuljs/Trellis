@@ -4,9 +4,6 @@ FastAPI service for Trellis web chat. Authenticated account data is stored in
 Supabase. Provider keys come from backend secrets managed by the operator.
 Users sign in, choose an available model, and chat.
 
-See [Stage 2](../docs/stage-2.md) for setup, migrations, streaming and replay
-limits, context compaction, frontend behavior, and verification.
-
 From this directory:
 
 ```bash
