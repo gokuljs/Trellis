@@ -14,6 +14,7 @@ from app.application.secret_redaction import SecretRedactor
 from app.application.tool_context import ToolExecutionContext
 from app.application.web_ports import WebRepository
 from app.application.web_source_safety import accepted_source, sensitive_url
+from app.application.web_source_summary import bound_source_summaries, source_summary
 from app.domain.crawl import CrawlScope
 from app.domain.retrieval import MAX_RETRIEVAL_SECONDS, ExtractedDocumentResult, RetrievalRequest
 from app.domain.web import (
@@ -279,6 +280,7 @@ class WebCrawlService:
                 result.error_code,
             ),
             self._redactor,
+            discovered_links=result.links if result.media_type == "text/html" else None,
         )
         if any(
             value is not None and sensitive_url(value, self._redactor)
@@ -333,14 +335,8 @@ class WebCrawlService:
             source = await self._repository.read_web_source(scope.session_id, page.source_id, 1, 1)
             if source is None:
                 raise RuntimeError("Completed crawl page has no recorded source")
-            outcomes.append(
-                {
-                    "source_id": source.source.id,
-                    "status": source.source.status.value,
-                    "error_code": source.source.error_code,
-                }
-            )
-        return {
+            outcomes.append(await source_summary(self._repository, source, self._redactor))
+        value: dict[str, object] = {
             "crawl_id": crawl_id,
             "status": status,
             "stop_reason": reason,
@@ -350,3 +346,4 @@ class WebCrawlService:
             "claimed_attempts": sum(page.attempt for page in pages.items),
             "run_page_attempts_charged": state.usage.page_attempts,
         }
+        return bound_source_summaries(value, outcomes, self._redactor)

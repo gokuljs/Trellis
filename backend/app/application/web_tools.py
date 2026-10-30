@@ -20,6 +20,7 @@ from app.application.tools import MAX_RESULT_BYTES, ToolRegistration
 from app.application.web_crawl import WebCrawlArguments, WebCrawlService
 from app.application.web_evidence import WEB_ERROR_MESSAGES, WebEvidenceService
 from app.application.web_source_safety import accepted_source
+from app.application.web_source_summary import bound_source_summaries, source_summary
 from app.domain.capabilities import RuntimeCapability
 from app.domain.recovery import ToolRecoveryPolicy
 from app.domain.retrieval import (
@@ -34,7 +35,6 @@ from app.domain.web import (
     MAX_SOURCE_BYTES,
     MAX_SOURCE_LINES,
     SourceDraft,
-    SourceLines,
     SourceStatus,
     WebScope,
     WebUsage,
@@ -323,7 +323,7 @@ class WebToolService:
                     raise ApplicationError(
                         "web_scope_invalid", WEB_ERROR_MESSAGES["web_scope_invalid"]
                     )
-                page = self._source_summary(existing)
+                page = await source_summary(self._repository, existing, self._redactor)
                 page["reused"] = True
             elif context.dispatch_attempt > 1:
                 page = {
@@ -354,22 +354,7 @@ class WebToolService:
             "untrusted_sources": True,
             "pages": pages,
         }
-        while len(_encoded(self._redactor.redact_record(value)).encode()) > _JSON_LIMIT:
-            candidates = [page for page in pages if page.get("untrusted_excerpt")]
-            if candidates:
-                longest = max(candidates, key=lambda page: len(_encoded(page)))
-                excerpts = longest["untrusted_excerpt"]
-                assert isinstance(excerpts, list)
-                excerpts.pop()
-                longest["excerpt_omitted"] = True
-                continue
-            for page in pages:
-                if page.get("final_url") is not None:
-                    page["final_url"] = None
-                    break
-            else:
-                break
-        return value
+        return bound_source_summaries(value, pages, self._redactor)
 
     async def _read_page(
         self,
@@ -438,7 +423,11 @@ class WebToolService:
             result.status,
             result.error_code,
         )
-        draft = accepted_source(draft, self._redactor)
+        draft = accepted_source(
+            draft,
+            self._redactor,
+            discovered_links=result.links if result.media_type == "text/html" else None,
+        )
         try:
             await self._repository.record_web_source(scope, reservation_id, draft)
         except ApplicationError as error:
@@ -458,48 +447,10 @@ class WebToolService:
         )
         if lines is None:
             raise ApplicationError("source_not_found", WEB_ERROR_MESSAGES["source_not_found"])
-        return self._source_summary(lines)
+        return await source_summary(self._repository, lines, self._redactor)
 
     def _accepted_metadata(self, value: str, limit: int) -> str:
         return self._redactor.redact_source_text(value)[:limit]
-
-    def _source_summary(self, result: SourceLines) -> dict[str, object]:
-        source = result.source
-        lines = []
-        for offset, line in enumerate(result.lines):
-            safe_line = self._redactor.redact_text(line)
-            text = safe_line.encode()[:600].decode(errors="ignore")
-            lines.append(
-                {
-                    "line": result.start_line + offset,
-                    "text": text,
-                    "text_truncated": text != safe_line,
-                }
-            )
-        value: dict[str, object] = {
-            "source_id": source.id,
-            "status": source.status.value,
-            "error_code": source.error_code,
-            "content_hash": source.content_hash,
-            "total_lines": source.line_count,
-            "untrusted_excerpt": lines,
-            "display_redacted": source.error_code == "sensitive_content_redacted"
-            or any(self._redactor.redact_text(line) != line for line in result.lines),
-            "title": (source.title or "")[:300] or None,
-            "final_url": source.final_url
-            if source.final_url is None or len(source.final_url.encode()) <= 1024
-            else None,
-            "final_url_available_in_source": source.final_url is not None,
-            "final_url_omitted": source.final_url is not None
-            and len(source.final_url.encode()) > 1024,
-            "publisher": (source.publisher or "")[:100] or None,
-            "published_at": source.published_at,
-            "fetched_at": source.fetched_at,
-        }
-        value["display_redacted"] = (
-            bool(value["display_redacted"]) or self._redactor.redact_record(value) != value
-        )
-        return value
 
     async def _source_lines(
         self, arguments: WebSourceArguments, context: ToolExecutionContext
