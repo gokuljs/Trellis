@@ -4,7 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "dev": "vite",
+    "dev": "node ../../../scripts/prepare-dev-env.mjs --frontend-only && vite",
     "build": "tsc -b && vite build",
     "lint": "eslint",
     "format": "prettier --write \"**/*.{ts,tsx}\"",
