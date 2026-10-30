@@ -6,7 +6,7 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 from uuid import UUID, uuid4, uuid5
@@ -74,7 +74,7 @@ from app.domain.recovery import (
     ToolRecoveryPolicy,
     resolve_recovery,
 )
-from app.domain.research import ResearchTask, ResearchTaskInput, ResearchTaskStatus
+from app.domain.research import ResearchTask, ResearchTaskInput, ResearchTaskStatus, research_limits
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -2053,6 +2053,7 @@ class RunService:
                 monitor.cancel()
                 await asyncio.gather(monitor, return_exceptions=True)
             return
+        self._budget_totals(run.model_id, await self._runs.list_model_calls(run.id))
         await self._append_and_publish(
             run.id, RunEventType.PHASE, {"phase": "writing", "label": "Preparing the report"}
         )
@@ -2115,6 +2116,40 @@ class RunService:
             "context_too_large",
         }
 
+    @staticmethod
+    def _research_execution_scope(run: RunSnapshot, *, finalization: bool) -> RunSnapshot:
+        if finalization:
+            return run
+        deadline = datetime.fromisoformat(run.deadline_at.replace("Z", "+00:00"))
+        reserved = research_limits(run.budget_preset).seconds * 0.25
+        return replace(run, deadline_at=(deadline - timedelta(seconds=reserved)).isoformat())
+
+    async def _close_research_tools(
+        self, run: RunSnapshot, task: ResearchTask, *, timed_out_tool_id: str | None = None
+    ) -> None:
+        for tool in await self._runs.list_tool_calls(run.id):
+            if tool.task_id != task.id or tool.status not in {
+                ToolCallStatus.PENDING,
+                ToolCallStatus.RUNNING,
+            }:
+                continue
+            status = (
+                ToolCallStatus.TIMED_OUT
+                if tool.id == timed_out_tool_id
+                else ToolCallStatus.CANCELLED
+            )
+            await self._record_tool_result(
+                run.id,
+                tool,
+                ToolResult(
+                    tool.provider_call_id,
+                    tool.name,
+                    '{"status":"stopped","reason":"research_finalization_reserve"}',
+                    True,
+                ),
+                status=status,
+            )
+
     async def _run_research_task(
         self,
         run: RunSnapshot,
@@ -2127,6 +2162,7 @@ class RunService:
     ) -> ResearchGeneration | None:
         repository = self._research_repository
         assert repository is not None
+        scope = self._research_execution_scope(run, finalization=finalization)
         result: ResearchGeneration | None = None
         available = () if finalization else (*execution.tools, *control_specs(task.role))
         await self._append_and_publish(
@@ -2145,7 +2181,14 @@ class RunService:
 
         async def advance() -> bool:
             nonlocal result, task
-            if not await self._execute_research_tools(run, execution, coordinator, task):
+            if not finalization and self._remaining_seconds(scope) <= 0:
+                await self._close_research_tools(run, task)
+                raise ProviderError(
+                    "research_finalization_reserve", "Preparing the report from saved findings."
+                )
+            if not await self._execute_research_tools(
+                run, execution, coordinator, task, execution_scope=scope
+            ):
                 return False
             task = next(item for item in (await coordinator.snapshot()).tasks if item.id == task.id)
             calls = await repository.read_research_task_calls(run.id, task.id)
@@ -2181,7 +2224,7 @@ class RunService:
                     "objective": task.objective,
                     "checkpoint": task.checkpoint,
                     "research_brief": snapshot.checkpoint if task.role == "lead" else {},
-                    "remaining_seconds": self._remaining_seconds(run),
+                    "remaining_seconds": self._remaining_seconds(scope),
                 }
                 if task.role == "lead":
                     state["worker_findings"] = [
@@ -2203,7 +2246,7 @@ class RunService:
                     )
                 )
                 plan = await execution.runtime.prepare_task(
-                    run,
+                    scope,
                     execution.provider,
                     execution.api_key,
                     execution.user_id,
@@ -2240,7 +2283,7 @@ class RunService:
             known_completion: dict[str, object] | None = None
             try:
                 step = await self._stream_model_step(
-                    run,
+                    scope,
                     call,
                     request,
                     execution.provider,
@@ -2376,13 +2419,21 @@ class RunService:
         execution: _ExecutionContext,
         coordinator: ResearchCoordinator,
         task: ResearchTask,
+        *,
+        execution_scope: RunSnapshot | None = None,
     ) -> bool:
+        scope = execution_scope or run
         calls = [
             item for item in await self._runs.list_tool_calls(run.id) if item.task_id == task.id
         ]
         for stored in calls:
             if stored.status not in {ToolCallStatus.PENDING, ToolCallStatus.RUNNING}:
                 continue
+            if self._remaining_seconds(scope) <= 0:
+                await self._close_research_tools(run, task)
+                raise ProviderError(
+                    "research_finalization_reserve", "Preparing the report from saved findings."
+                )
             if stored.status is ToolCallStatus.RUNNING:
                 stored = await self._runs.authorize_tool_retry(
                     run.id,
@@ -2394,15 +2445,25 @@ class RunService:
             if stored.name not in RESEARCH_CONTROL_NAMES:
                 if stored.name not in RESEARCH_WEB_NAMES:
                     raise ProviderError("unknown_tool", "Research can only use web tools.")
-                async with asyncio.timeout(self._remaining_seconds(run)):
-                    await self._execute_stored_tool(
-                        run,
-                        stored,
-                        None,
-                        self._remaining_seconds(run),
-                        None,
-                        user_id=execution.user_id,
-                    )
+                try:
+                    async with asyncio.timeout(self._remaining_seconds(scope)):
+                        await self._execute_stored_tool(
+                            scope,
+                            stored,
+                            None,
+                            self._remaining_seconds(scope),
+                            None,
+                            user_id=execution.user_id,
+                        )
+                except (TimeoutError, ProviderError) as error:
+                    if isinstance(error, ProviderError) and (
+                        error.code != "provider_timeout" or self._remaining_seconds(scope) > 0
+                    ):
+                        raise
+                    await self._close_research_tools(run, task, timed_out_tool_id=stored.id)
+                    raise ProviderError(
+                        "research_finalization_reserve", "Preparing the report from saved findings."
+                    ) from None
                 continue
             stored, event = await self._runs.begin_tool_execution(
                 run.id,
@@ -2428,9 +2489,21 @@ class RunService:
                     "reason": "Request clarification separately after other tools settle.",
                 }
             else:
-                response = await coordinator.control(
-                    task, stored.name, stored.arguments, operation_id
-                )
+                try:
+                    if stored.name == "delegate_research":
+                        response = await coordinator.control(
+                            task, stored.name, stored.arguments, operation_id
+                        )
+                    else:
+                        async with asyncio.timeout(self._remaining_seconds(scope)):
+                            response = await coordinator.control(
+                                task, stored.name, stored.arguments, operation_id
+                            )
+                except TimeoutError:
+                    await self._close_research_tools(run, task, timed_out_tool_id=stored.id)
+                    raise ProviderError(
+                        "research_finalization_reserve", "Preparing the report from saved findings."
+                    ) from None
             content = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
             if len(content.encode()) > 28_000:
                 content = json.dumps(

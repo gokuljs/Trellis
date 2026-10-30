@@ -198,6 +198,7 @@ export function outputStatusLabel(output: AssistantOutput): string {
 
 export type ThreadMessage = Message & {
   output: AssistantOutput | null
+  reportOutput: AssistantOutput | null
   attemptNumber: number | null
 }
 
@@ -240,6 +241,7 @@ export function threadMessages(
     model: null,
     created_at: output.created_at,
     output,
+    reportOutput: output,
     attemptNumber: attemptNumber(output),
   })
   const byTurn = new Map<string, AssistantOutput[]>()
@@ -274,6 +276,7 @@ export function threadMessages(
     entries.push({
       ...message,
       output: null,
+      reportOutput: promoted ?? null,
       attemptNumber: attemptNumber(promoted),
     })
     if (message.role !== "user" || attachedTurns.has(message.turn_id)) continue

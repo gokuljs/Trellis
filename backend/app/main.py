@@ -15,6 +15,7 @@ from app.api.errors import ApiErrorResponse
 from app.api.request_logging import RequestLoggingMiddleware
 from app.application.errors import ApplicationError
 from app.application.ports import ProviderAdapter, StreamingProviderAdapter
+from app.application.research_errors import RESEARCH_ERROR_MESSAGES
 from app.application.tools import ToolRegistry
 from app.application.workspaces import (
     DEFAULT_WORKSPACE_PICKER_TIMEOUT_SECONDS,
@@ -53,6 +54,11 @@ ERROR_STATUS = {
     "web_invalid_range": 422,
     "citation_invalid": 422,
     "run_not_found": 404,
+    "research_not_found": 404,
+    "research_unavailable": 503,
+    "research_conflict": 409,
+    "research_budget_exhausted": 409,
+    "research_report_unavailable": 409,
     "run_not_owned": 409,
     "run_lease_lost": 409,
     "reauth_required": 401,
@@ -96,6 +102,7 @@ ERROR_STATUS = {
     "onboarding_step_out_of_order": 409,
     "onboarding_already_complete": 409,
 }
+ERROR_STATUS.update({code: 409 for code in RESEARCH_ERROR_MESSAGES if code not in ERROR_STATUS})
 
 
 def create_app(

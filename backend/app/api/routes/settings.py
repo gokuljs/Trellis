@@ -53,6 +53,8 @@ class SettingsResponse(BaseModel):
     models: list[ModelOption]
     default_budget_preset: BudgetPreset
     capabilities: list[RuntimeCapability]
+    research_available: bool = False
+    research_unavailable_reason: str | None = None
 
 
 class ProviderSelection(BaseModel):
@@ -86,6 +88,8 @@ def serialize_settings(settings: AppSettings) -> SettingsResponse:
         selected_model_id=settings.selected_model_id,
         default_budget_preset=settings.default_budget_preset,
         capabilities=list(settings.capabilities),
+        research_available=settings.research_available,
+        research_unavailable_reason=settings.research_unavailable_reason,
         models=[
             ModelOption(
                 id=model.id,

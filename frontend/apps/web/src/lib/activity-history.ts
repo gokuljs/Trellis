@@ -9,6 +9,7 @@ import type {
 export function runInfoFromSummary(summary: RunSummary): RuntimeRunInfo {
   return {
     runId: summary.run_id,
+    runMode: summary.run_mode,
     status: summary.status,
     retryAllowed: summary.retry_allowed,
     recoveryReason: summary.recovery_reason,

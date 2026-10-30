@@ -35,6 +35,8 @@ from app.application.ports import (
 from app.application.profile import ProfileService
 from app.application.recovery_contracts import RecoveryContracts
 from app.application.recovery_discovery import RecoveryDiscovery
+from app.application.research_ports import ResearchRepository
+from app.application.research_reports import ResearchReportService
 from app.application.run_capacity import RunCapacity
 from app.application.runs import RunService
 from app.application.secret_redaction import SecretRedactor
@@ -77,6 +79,7 @@ class AccountRepository(
     RunRepository,
     RunLeasePort,
     WebRepository,
+    ResearchRepository,
     Protocol,
 ):
     async def ensure_account(self) -> None: ...
@@ -453,6 +456,8 @@ class AccountRegistry:
                         recovery_repository=database,
                         recovery_compatibility=recovery_contracts.compatibility,
                         recovery_contract_factory=recovery_contracts.create,
+                        research_repository=database,
+                        research_reports=ResearchReportService(database, database),
                     )
                     try:
                         recovery_discovery = RecoveryDiscovery(
@@ -472,7 +477,18 @@ class AccountRegistry:
                                 capabilities=self._capabilities,
                             ),
                             settings_service=SettingsService(
-                                database, secret_store, capabilities=self._capabilities
+                                database,
+                                secret_store,
+                                capabilities=self._capabilities,
+                                research_available=await database.research_ready()
+                                and {"web_search", "web_read"}.issubset(
+                                    {
+                                        tool.name
+                                        for tool in tools.specs(
+                                            None, capabilities=self._capabilities
+                                        )
+                                    }
+                                ),
                             ),
                             onboarding_service=OnboardingService(database, database, secret_store),
                             chat_service=ChatService(

@@ -1,11 +1,13 @@
 import { ChevronDown } from "lucide-react"
 import { useEffect, useId, useRef, useState } from "react"
 import { ThinkingOrb } from "thinking-orbs"
-import { useInfiniteQuery } from "@tanstack/react-query"
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query"
 
 import { SavedTurnActivity } from "@/components/saved-turn-activity"
 import { SavedRunActivity } from "@/components/saved-run-activity"
 import { RunActivity } from "@/components/run-activity"
+import { ResearchProgress } from "@/components/research-progress"
+import { researchQueryOptions } from "@/lib/research"
 import { describeActivity } from "@/lib/activity-status"
 import { runSummariesQueryOptions } from "@/lib/server-queries"
 import { newestRunSummary } from "@/lib/activity-summary"
@@ -63,6 +65,13 @@ export function RunActivityDisclosure({
       .find((item) => item.run_id === runId),
     activity.summary
   )
+  const researchMode =
+    activity.runInfo?.runMode === "research" || summary?.run_mode === "research"
+  const research = useQuery({
+    ...researchQueryOptions(sessionId ?? "", runId ?? ""),
+    enabled: Boolean(expanded && researchMode && sessionId && runId),
+    refetchInterval: expanded && pending && researchMode ? 2500 : false,
+  })
   const status = describeActivity(
     activity.events,
     pending,
@@ -156,6 +165,25 @@ export function RunActivityDisclosure({
           aria-label="Activity details"
           tabIndex={0}
         >
+          {researchMode ? (
+            research.data ? (
+              <ResearchProgress research={research.data} />
+            ) : (
+              <p
+                className="run-activity-load-state"
+                role={research.error ? "alert" : "status"}
+              >
+                {research.error
+                  ? "Research details could not be loaded."
+                  : "Loading research details…"}
+                {research.error ? (
+                  <button type="button" onClick={() => void research.refetch()}>
+                    Retry
+                  </button>
+                ) : null}
+              </p>
+            )
+          ) : null}
           {sessionId && turnId && !pending ? (
             <SavedTurnActivity
               sessionId={sessionId}

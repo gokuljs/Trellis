@@ -41,6 +41,9 @@ export function turnFailureAction(
     "model_not_streaming",
     "provider_not_available",
     "provider_not_configured",
+    "research_unavailable",
+    "research_question_too_large",
+    "invalid_run_mode",
     "run_capacity",
     "run_token_too_short",
     "session_not_found",
@@ -77,6 +80,7 @@ export function recoveryTranscript(
 export function recoveryRunInfo(run: LatestRun): RuntimeRunInfo {
   return {
     runId: run.run_id,
+    runMode: run.run_mode,
     status: run.status,
     retryAllowed: run.retry_allowed,
     recoveryReason: run.recovery_reason,
@@ -109,12 +113,16 @@ export function runInfoFromEvent(
     "run.cancellation_requested": "cancelling",
     "tool.approval_requested": "waiting_for_approval",
     "tool.approval_decided": "running",
+    "research.clarification_requested": "waiting_for_input",
+    "research.clarification_answered": "running",
     "run.completed": "completed",
     "run.failed": "failed",
     "run.cancelled": "cancelled",
     "run.interrupted": "interrupted",
   }
   if (statuses[event.eventType]) incoming.status = statuses[event.eventType]
+  if (event.data.run_mode === "research" || event.data.run_mode === "chat")
+    incoming.runMode = event.data.run_mode
   if (typeof event.data.retry_allowed === "boolean")
     incoming.retryAllowed = event.data.retry_allowed
   if (

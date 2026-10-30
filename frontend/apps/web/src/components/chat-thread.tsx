@@ -1,13 +1,15 @@
 import { RotateCcw, Square } from "lucide-react"
-import { useState } from "react"
+import { useMemo, useState } from "react"
 import Markdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { ThinkingOrb } from "thinking-orbs"
+import { useQuery } from "@tanstack/react-query"
 
 import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 import { WorkspaceRecoveryNotice } from "@/components/workspace-review"
 import { HistoryPagination } from "@/components/history-pagination"
 import { RunActivityDisclosure } from "@/components/run-activity-disclosure"
+import { ResearchSourcePanel } from "@/components/research-source-panel"
 import type {
   AssistantOutput,
   LatestRun,
@@ -15,8 +17,16 @@ import type {
   Message,
   Session,
   TimelineRow,
+  SourceCitation,
 } from "@/lib/app-types"
 import { outputStatusLabel, threadMessages } from "@/lib/assistant-outputs"
+import {
+  citationFromHref,
+  reportCitations,
+  researchQueryOptions,
+  sameCitation,
+  remarkSourceCitations,
+} from "@/lib/research"
 import type {
   ToolApprovalDecision,
   TurnRunActivity,
@@ -97,16 +107,72 @@ const markdownComponents: Components = {
   },
 }
 
-function MessageMarkdown({ content }: { content: string }) {
+function MessageMarkdown({
+  content,
+  sessionId,
+  reportOutput,
+}: {
+  content: string
+  sessionId?: string
+  reportOutput?: AssistantOutput | null
+}) {
+  const [selectedCitation, setSelectedCitation] =
+    useState<SourceCitation | null>(null)
+  const citations = reportCitations(content)
+  const research = useQuery({
+    ...researchQueryOptions(sessionId ?? "", reportOutput?.run_id ?? ""),
+    enabled: Boolean(sessionId && reportOutput && citations.length),
+  })
+  const components = useMemo<Components>(
+    () => ({
+      ...markdownComponents,
+      a({ href, children }) {
+        const marker = citationFromHref(href)
+        if (!marker) return <a href={href}>{children}</a>
+        const { citation, index } = marker
+        const bound = Boolean(
+          citation &&
+          research.data?.report_model_call_id === reportOutput?.model_call_id &&
+          research.data?.citations.some((binding) =>
+            sameCitation(binding, citation)
+          )
+        )
+        return (
+          <button
+            className="thread-citation"
+            type="button"
+            aria-label={`Source ${index}${bound ? ", view cited evidence" : ", evidence unavailable"}`}
+            title={
+              bound
+                ? "View cited evidence"
+                : "Saved citation evidence is unavailable"
+            }
+            disabled={!bound}
+            onClick={() => citation && setSelectedCitation(citation)}
+          >
+            {children}
+          </button>
+        )
+      },
+    }),
+    [research.data, reportOutput?.model_call_id]
+  )
   return (
     <div className="thread-markdown">
       <Markdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkSourceCitations]}
         skipHtml
-        components={markdownComponents}
+        components={components}
       >
         {content}
       </Markdown>
+      {selectedCitation && sessionId ? (
+        <ResearchSourcePanel
+          sessionId={sessionId}
+          citation={selectedCitation}
+          onClose={() => setSelectedCitation(null)}
+        />
+      ) : null}
     </div>
   )
 }
@@ -267,7 +333,13 @@ export function ChatThread({
                     : ""}
                 </span>
               </div>
-              <MessageMarkdown content={message.content} />
+              <MessageMarkdown
+                content={message.content}
+                sessionId={session.id}
+                reportOutput={
+                  message.role === "assistant" ? message.reportOutput : null
+                }
+              />
             </div>
           </article>,
           message.role === "user" && !firstAssistantByTurn.has(message.turn_id)

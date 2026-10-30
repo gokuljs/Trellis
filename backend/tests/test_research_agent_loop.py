@@ -4,6 +4,7 @@ import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import cast
+from unittest.mock import patch
 from uuid import uuid4
 
 from pydantic import BaseModel
@@ -23,6 +24,7 @@ from app.application.research_ports import ResearchRepository
 from app.application.run_context import RunContext
 from app.application.runs import RunService, _ExecutionContext
 from app.application.secret_redaction import COMMON_SECRET_REDACTOR
+from app.application.tool_context import ToolExecutionContext
 from app.application.tools import ToolRegistration, ToolRegistry
 from app.domain.models import ModelDescriptor
 from app.domain.recovery import ToolRecoveryPolicy
@@ -296,6 +298,23 @@ class MemoryResearch:
         call = next(call for call in self.calls if call.id == call_id)
         self.calls[self.calls.index(call)] = replace(call, error_code=error_code)
 
+    async def checkpoint_research(
+        self,
+        run_id: str,
+        generation: int,
+        task_id: str,
+        expected_revision: int,
+        operation_id: str,
+        checkpoint: dict[str, object],
+    ) -> ResearchTask:
+        self.task = replace(
+            self.task,
+            checkpoint=checkpoint,
+            revision=self.task.revision + 1,
+            status=ResearchTaskStatus.FAILED if checkpoint.get("stop_reason") else self.task.status,
+        )
+        return self.task
+
     async def append_assistant_batch(
         self, run_id: str, call_id: str, batch_index: int, text: str
     ) -> None:
@@ -507,6 +526,76 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             validate_task_recovery(run, (records.task, other), records.calls, records.tools), ()
         )
+
+    async def test_collection_scope_preserves_root_deadline_and_report_time(self) -> None:
+        run = make_run()
+        scope = RunService._research_execution_scope(run, finalization=False)
+        root_deadline = datetime.fromisoformat(run.deadline_at)
+        self.assertEqual(
+            (root_deadline - datetime.fromisoformat(scope.deadline_at)).total_seconds(), 150
+        )
+        self.assertEqual(run.deadline_at, root_deadline.isoformat())
+        self.assertIs(RunService._research_execution_scope(run, finalization=True), run)
+
+    async def test_expired_collection_cutoff_starts_no_paid_call(self) -> None:
+        run, records, provider, _pages, service, execution, coordinator = self.harness()
+        run = replace(run, deadline_at=(datetime.now(UTC) + timedelta(seconds=149)).isoformat())
+        records.run = run
+        result = await service._run_research_task(run, execution, coordinator, records.task)
+        self.assertIsNone(result)
+        self.assertEqual(records.calls, [])
+        self.assertEqual(provider.requests, [])
+        self.assertEqual(records.task.checkpoint["stop_reason"], "research_finalization_reserve")
+        self.assertEqual(records.run.deadline_at, run.deadline_at)
+
+    async def test_tool_cutoff_closes_current_and_pending_records_without_unknown_usage(
+        self,
+    ) -> None:
+        run, records, provider, _pages, service, execution, coordinator = self.harness()
+        cutoff = RunService._research_execution_scope(run, finalization=False)
+        expired = False
+        deadlines: list[datetime] = []
+        actual_remaining = service._remaining_seconds
+
+        class DeadlineTool:
+            async def execute(
+                self, name: str, arguments: dict[str, object], context: ToolExecutionContext
+            ) -> tuple[str, bool]:
+                nonlocal expired
+                deadlines.append(context.deadline_at)
+                expired = True
+                raise TimeoutError
+
+        tools = ToolRegistry(
+            additional_tools=(
+                ToolRegistration(
+                    "web_read",
+                    "Read a source",
+                    ReadArguments,
+                    DeadlineTool(),
+                    recovery_policy=ToolRecoveryPolicy.CHECKPOINTED,
+                    result_format="json",
+                ),
+            )
+        )
+        service._tool_registry = tools
+        execution = replace(execution, tools=tools.specs())
+
+        def remaining(snapshot: RunSnapshot) -> float:
+            if expired and snapshot.deadline_at == cutoff.deadline_at:
+                return 0
+            return actual_remaining(snapshot)
+
+        with patch.object(service, "_remaining_seconds", side_effect=remaining):
+            result = await service._run_research_task(run, execution, coordinator, records.task)
+        self.assertIsNone(result)
+        self.assertEqual(deadlines, [datetime.fromisoformat(cutoff.deadline_at)])
+        self.assertEqual(len(provider.requests), 1)
+        self.assertEqual(records.tools[0].status, ToolCallStatus.TIMED_OUT)
+        self.assertTrue(all(tool.status is ToolCallStatus.CANCELLED for tool in records.tools[1:]))
+        self.assertFalse(records.unknown)
+        self.assertEqual(records.task.checkpoint["stop_reason"], "research_finalization_reserve")
+        self.assertEqual(records.run.deadline_at, run.deadline_at)
 
 
 if __name__ == "__main__":

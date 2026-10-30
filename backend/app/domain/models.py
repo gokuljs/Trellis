@@ -136,6 +136,8 @@ class AppSettings:
     models: list[ModelStatus]
     default_budget_preset: Literal["conservative", "longer"] = "conservative"
     capabilities: tuple[RuntimeCapability, ...] = ()
+    research_available: bool = False
+    research_unavailable_reason: str | None = "Research is unavailable on this backend."
 
 
 @dataclass(frozen=True, slots=True)
