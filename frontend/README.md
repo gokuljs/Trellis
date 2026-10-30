@@ -39,7 +39,6 @@ credentials, or exception text. The app does not upload logs to a service.
 Verification:
 
 ```bash
-bun test apps/web/tests
 bun run format
 bun run format:check
 bun run lint

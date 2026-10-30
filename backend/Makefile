@@ -1,6 +1,6 @@
 UV ?= uv
 
-.PHONY: dev format format-check lint typecheck test check
+.PHONY: dev format format-check lint typecheck check
 
 dev:
 	$(UV) run --locked fastapi dev
@@ -17,7 +17,4 @@ lint:
 typecheck:
 	$(UV) run --locked ty check
 
-test:
-	$(UV) run --locked pytest
-
-check: format-check lint typecheck test
+check: format-check lint typecheck

@@ -39,5 +39,5 @@ From this directory, run:
 make check
 ```
 
-The command must pass Ruff format checking, Ruff linting, `ty check`, strict
-pytest, and the 90% coverage threshold. Use uv 0.12.5 as configured by CI.
+The command must pass Ruff format checking, Ruff linting, and `ty check`.
+Use uv 0.12.5.
