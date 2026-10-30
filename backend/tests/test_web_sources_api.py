@@ -10,7 +10,7 @@ from web_fixtures import SESSION, SOURCE, source_row
 from app.api.dependencies import get_web_evidence_service
 from app.api.routes.sources import router
 from app.application.errors import ApplicationError
-from app.domain.web import ClearSourcesResult, SourceLines, SourcePage, WebSource
+from app.domain.web import CitationBinding, ClearSourcesResult, SourceLines, SourcePage, WebSource
 from app.main import ERROR_STATUS
 
 
@@ -42,6 +42,38 @@ def test_source_http_contract_is_bounded_and_omits_private_runtime_identity():
 
     asyncio.run(exercise())
     service.read_source.assert_awaited_once_with(SESSION, SOURCE, 1, 1)
+
+
+def test_citation_http_contract_exposes_only_owned_answer_bindings():
+    call_id = "32000000-0000-4000-8000-000000000001"
+    service = AsyncMock()
+    service.read_citations.return_value = (CitationBinding(call_id, SOURCE, 1, 2, 1),)
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_web_evidence_service] = lambda: service
+
+    async def exercise():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.get(f"/api/sessions/{SESSION}/citations/{call_id}")
+            assert response.status_code == 200
+            assert response.json() == {
+                "items": [
+                    {
+                        "model_call_id": call_id,
+                        "source_id": SOURCE,
+                        "start_line": 1,
+                        "end_line": 2,
+                        "citation_index": 1,
+                    }
+                ]
+            }
+            invalid = await client.get(f"/api/sessions/{SESSION}/citations/not-a-uuid")
+            assert invalid.status_code == 422
+
+    asyncio.run(exercise())
+    service.read_citations.assert_awaited_once_with(SESSION, call_id)
 
 
 @pytest.mark.parametrize(

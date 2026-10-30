@@ -8,6 +8,7 @@ from app.application.tool_context import ToolExecutionContext
 from app.application.web_ports import WebRepository
 from app.domain.web import (
     MAX_SOURCE_LINES,
+    CitationBinding,
     ClearSourcesResult,
     SourceLines,
     SourcePage,
@@ -78,3 +79,9 @@ class WebEvidenceService:
     async def clear_sources(self, session_id: str) -> ClearSourcesResult:
         await self._require_session(session_id)
         return await self.repository.clear_web_sources(session_id)
+
+    async def read_citations(
+        self, session_id: str, model_call_id: str
+    ) -> tuple[CitationBinding, ...]:
+        await self._require_session(session_id)
+        return await self.repository.read_web_citations(session_id, model_call_id)

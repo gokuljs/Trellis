@@ -474,6 +474,7 @@ class AccountRegistry:
                         tool_registry=tools,
                         capabilities=self._capabilities,
                         redactor=self._redactor,
+                        web_repository=database,
                         workspace_guidance_reader=read_workspace_guidance
                         if self._capabilities.allows("local_read")
                         else None,

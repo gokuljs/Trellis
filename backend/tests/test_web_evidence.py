@@ -103,9 +103,25 @@ def test_historical_evidence_requires_owned_conversation_before_repository_acces
         sessions.get_session.return_value = Session(SESSION, OTHER, "Other", "now", "now", 0)
         with pytest.raises(ApplicationError) as other:
             await service.clear_sources(SESSION)
+        with pytest.raises(ApplicationError) as citations:
+            await service.read_citations(SESSION, OTHER)
         assert other.value.code == missing.value.code
+        assert citations.value.code == missing.value.code
         sources.list_web_sources.assert_not_awaited()
         sources.clear_web_sources.assert_not_awaited()
+        sources.read_web_citations.assert_not_awaited()
+
+    asyncio.run(exercise())
+
+
+def test_answer_bindings_are_read_only_after_owned_session_lookup():
+    async def exercise():
+        sources, sessions = AsyncMock(), AsyncMock()
+        sessions.get_session.return_value = Session(SESSION, OWNER, "Chat", "now", "now", 0)
+        sources.read_web_citations.return_value = ()
+        service = WebEvidenceService(sources, sessions, owner_id=OWNER)
+        assert await service.read_citations(SESSION, OTHER) == ()
+        sources.read_web_citations.assert_awaited_once_with(SESSION, OTHER)
 
     asyncio.run(exercise())
 

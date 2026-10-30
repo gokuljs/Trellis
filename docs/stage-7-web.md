@@ -169,12 +169,32 @@ Labeling a crawl as an ordinary read-only tool would replay too much work.
 The answer uses structured references such as
 `[[source:<source-id>:L12-L20]]`. Validation checks ownership, conversation,
 successful retrieval, available content, and the requested line range.
-Streaming tolerates incomplete markers. Invalid final references trigger bounded
-correction or an explicit missing-support outcome.
+Streaming tolerates incomplete markers. Invalid final references produce an
+explicit missing-support outcome without another paid model call.
 
 The source viewer loads authenticated conversation-scoped metadata and lines.
 Valid references identify evidence. They do not automatically establish that a
 claim follows from that evidence, so acceptance fixtures also check support.
+
+Citation syntax is recognized with `markdown-it-py` 4.2.0, already present in the
+lockfile and now declared directly because runtime validation relies on it.
+Native Markdown rules distinguish prose from code, links, images, definitions,
+and HTML. A raw inline token prevents escaped or entity-constructed text from
+becoming a citation. The frontend transforms only unchanged raw text nodes.
+
+Validation accepts at most 50 distinct references. Answers containing the raw
+citation prefix have a 64 KiB UTF-8 validation ceiling; plain answers without that
+prefix keep their existing limits. Native parsing runs outside the event loop.
+This bound follows measured adversarial bracket-input cost and is checked before
+Markdown parsing. Very unusual bare Unicode URL markers are rejected
+conservatively, and normalized indented paragraph text may remain literal in the
+frontend. These cases cannot create a validated UI reference without a binding.
+
+Finalization binds owned recorded lines before promoting the answer. Controlled
+binding errors, timeouts, or cancellation retain the paid model snapshot and
+usage without promoting unsupported content or making another paid call. Hard
+process death retains the existing unknown-model-outcome recovery policy; this
+stage does not add a provider exactly-once guarantee.
 
 Sources remain until cleared, subject to quota. Clearing requires the active run
 to finish or be cancelled. It removes source content and identifying metadata,
@@ -343,25 +363,26 @@ upfront ledger reservation, and confirmed gateway receipts account for network
 usage. Crawl activation also requires the worker's distinct `public-crawl-v1`
 protocol; an older ordinary-reader image cannot advertise crawling.
 
-| Limit                      | Initial value                             |
-| -------------------------- | ----------------------------------------- |
-| Search results             | 5 default, 10 maximum per search          |
-| Search calls               | 5 per run                                 |
-| URLs per read              | 5                                         |
-| Attempted pages            | 20 across the run                         |
-| Crawl depth                | 2                                         |
-| Retained crawl URLs        | 200                                       |
-| Concurrent target requests | 2, with at most 1 browser render          |
-| HTTP duration              | 30 seconds, capped by parent deadline     |
-| Browser duration           | 60 seconds, capped by parent deadline     |
-| Redirects                  | 5                                         |
-| HTML size                  | 2 MiB transferred, 4 MiB decoded          |
-| PDF input                  | 16 MiB, at most 100 pages processed       |
-| Response data              | 64 MiB across the run                     |
-| Network requests           | 300 across the run, at most 75 per render |
-| Extracted text             | 256 KiB per source, 8 MiB per run         |
-| Retained extracted text    | 100 MiB per user                          |
-| Transient retries          | At most one, none for policy rejection    |
+| Limit                      | Initial value                                               |
+| -------------------------- | ----------------------------------------------------------- |
+| Search results             | 5 default, 10 maximum per search                            |
+| Search calls               | 5 per run                                                   |
+| URLs per read              | 5                                                           |
+| Attempted pages            | 20 across the run                                           |
+| Crawl depth                | 2                                                           |
+| Retained crawl URLs        | 200                                                         |
+| Concurrent target requests | 2, with at most 1 browser render                            |
+| HTTP duration              | 30 seconds, capped by parent deadline                       |
+| Browser duration           | 60 seconds, capped by parent deadline                       |
+| Redirects                  | 5                                                           |
+| HTML size                  | 2 MiB transferred, 4 MiB decoded                            |
+| PDF input                  | 16 MiB, at most 100 pages processed                         |
+| Response data              | 64 MiB across the run                                       |
+| Network requests           | 300 across the run, at most 75 per render                   |
+| Extracted text             | 256 KiB per source, 8 MiB per run                           |
+| Citation validation        | 64 KiB for answers containing the raw prefix; 50 references |
+| Retained extracted text    | 100 MiB per user                                            |
+| Transient retries          | At most one, none for policy rejection                      |
 
 Tools share the ledger, so repeated calls cannot multiply these ceilings.
 Brave has a separately configured application usage ceiling. Missing credentials
