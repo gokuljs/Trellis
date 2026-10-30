@@ -40,6 +40,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 require_command bun
+require_command node
+node "$repository_root/scripts/prepare-dev-env.mjs"
 
 if [[ -x "$repository_root/backend/.venv/bin/fastapi" ]]; then
   backend_command=("$repository_root/backend/.venv/bin/fastapi" dev)
