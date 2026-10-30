@@ -1,5 +1,6 @@
 """Verified-user RPC adapter for immutable evidence and collection checkpoints."""
 
+import math
 import re
 from collections.abc import Mapping
 from datetime import datetime
@@ -57,6 +58,16 @@ def _optional_string(row: Mapping[str, object], key: str) -> str | None:
     return None if row.get(key) is None else _string(row, key)
 
 
+def _link_snapshot(value: object) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or len(value) > 32
+        or any(not isinstance(link, str) or not 1 <= len(link.encode()) <= 4096 for link in value)
+    ):
+        raise RuntimeError("Supabase returned invalid crawl links")
+    return cast(list[str], value)
+
+
 class WebRepositoryMixin:
     _user_id: UUID
 
@@ -86,6 +97,8 @@ class WebRepositoryMixin:
             "enqueue_pages",
             "complete_page",
             "checkpoint_crawl",
+            "finalize_crawl_page",
+            "reserve_crawl_origin",
             "bind_citations",
         }
         for attempt in range(2 if retryable else 1):
@@ -142,14 +155,14 @@ class WebRepositoryMixin:
             raise RuntimeError("Supabase returned an oversized web settlement")
         return result
 
-    async def web_tools_ready(self) -> bool:
+    async def web_tools_ready(self, *, crawl: bool = False) -> bool:
         try:
             value = await self._request("POST", "rpc/web_readiness", payload={})
             return (
                 isinstance(value, dict)
                 and set(value) == {"schema_version", "ready"}
                 and type(value["schema_version"]) is int
-                and value["schema_version"] == 2
+                and value["schema_version"] in ({3} if crawl else {2, 3})
                 and value["ready"] is True
             )
         except ApplicationError, RuntimeError, ValueError, TypeError:
@@ -374,9 +387,74 @@ class WebRepositoryMixin:
             _integer(row, "attempt", 4),
             None if row.get("generation") is None else _integer(row, "generation"),
             _optional_string(row, "source_id"),
+            tuple(_link_snapshot(row.get("discovered_links", []))),
         )
         if result.crawl_id != crawl_id or result.status not in {"queued", "fetching", "completed"}:
             raise RuntimeError("Supabase returned an invalid crawl page")
+        return result
+
+    async def reserve_crawl_origin(
+        self, scope: WebScope, crawl_id: str, url: str, page_attempt: int
+    ) -> float:
+        row = _object(
+            await self._web_call(
+                "reserve_crawl_origin",
+                {
+                    **self._scope_payload(scope),
+                    "crawl_id": crawl_id,
+                    "url": url,
+                    "page_attempt": page_attempt,
+                },
+                run_id=scope.run_id,
+            )
+        )
+        wait = row.get("wait_seconds")
+        if (
+            isinstance(wait, bool)
+            or not isinstance(wait, int | float)
+            or not math.isfinite(wait)
+            or not 0 <= wait <= 1
+        ):
+            raise RuntimeError("Supabase returned invalid crawl pacing")
+        return float(wait)
+
+    async def finalize_crawl_page(
+        self,
+        scope: WebScope,
+        crawl_id: str,
+        url: str,
+        page_attempt: int,
+        reservation_id: str,
+        source: SourceDraft,
+        usage: WebUsage,
+        discovered_links: tuple[str, ...],
+    ) -> CrawlPage:
+        result = self._page(
+            await self._web_call(
+                "finalize_crawl_page",
+                {
+                    **self._scope_payload(scope),
+                    "crawl_id": crawl_id,
+                    "url": url,
+                    "page_attempt": page_attempt,
+                    "reservation_id": reservation_id,
+                    "source": source.to_dict(),
+                    "usage": usage.to_dict(),
+                    "discovered_links": list(discovered_links),
+                },
+                run_id=scope.run_id,
+            ),
+            crawl_id,
+        )
+        if (
+            result.status != "completed"
+            or result.url != url
+            or result.attempt != page_attempt
+            or result.generation != scope.generation
+            or result.source_id != source.id
+            or result.discovered_links != discovered_links
+        ):
+            raise RuntimeError("Supabase changed the finalized crawl page")
         return result
 
     async def create_web_crawl(

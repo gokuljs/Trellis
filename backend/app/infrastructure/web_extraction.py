@@ -171,7 +171,7 @@ class _HTMLDocument(HTMLParser):
             )
         if tag == "time" and not parent_blocked:
             self.published_at = self.published_at or _publication_date(attributes.get("datetime"))
-        if tag == "a" and not parent_blocked and len(self.links) < MAX_DOCUMENT_LINKS:
+        if tag == "a" and len(self.links) < MAX_DOCUMENT_LINKS:
             link = _document_url(attributes.get("href"), self._final_url)
             if link is not None and link not in self.links:
                 self.links.append(link)

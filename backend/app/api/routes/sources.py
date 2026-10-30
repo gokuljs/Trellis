@@ -46,7 +46,29 @@ class ClearSourcesResponse(BaseModel):
     cleared_count: int
 
 
+class CitationResponse(BaseModel):
+    model_call_id: str
+    source_id: str
+    start_line: int
+    end_line: int
+    citation_index: int
+
+
+class CitationsResponse(BaseModel):
+    items: list[CitationResponse]
+
+
 router = APIRouter(prefix="/api/sessions", tags=["sources"])
+
+
+@router.get("/{session_id}/citations/{model_call_id}")
+async def read_citations(
+    session_id: UUID, model_call_id: UUID, service: WebEvidenceServiceDep
+) -> CitationsResponse:
+    result = await service.read_citations(str(session_id), str(model_call_id))
+    return CitationsResponse(
+        items=[CitationResponse.model_validate(item, from_attributes=True) for item in result]
+    )
 
 
 @router.get("/{session_id}/sources")

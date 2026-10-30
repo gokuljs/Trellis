@@ -119,7 +119,9 @@ class RawDocumentReader:
         except OSError, TimeoutError:
             pass
 
-    async def retrieve(self, request: RetrievalRequest) -> RetrievalResult:
+    async def retrieve(
+        self, request: RetrievalRequest, *, allow_redirects: bool = True
+    ) -> RetrievalResult:
         requests = 0
         transferred = 0
         current: PublicURL | None = None
@@ -202,6 +204,10 @@ class RawDocumentReader:
                                         RetrievalStatus.OVERSIZED, "response_header_limit"
                                     )
                                 if event.status_code in _REDIRECTS:
+                                    if not allow_redirects:
+                                        raise _RetrievalFailure(
+                                            RetrievalStatus.BLOCKED, "crawl_redirect_blocked"
+                                        )
                                     location = headers.get("location", "")
                                     if redirect >= MAX_REDIRECTS or not location:
                                         raise _RetrievalFailure(
@@ -304,7 +310,7 @@ async def _run(payload: object) -> RetrievalResult | ExtractedDocumentResult:
     if not isinstance(payload, dict):
         raise ValueError("invalid worker request")
     operation = payload.pop("operation", "raw")
-    if operation not in {"raw", "extracted"}:
+    if operation not in {"raw", "extracted", "crawl"}:
         raise ValueError("invalid worker operation")
     if not isinstance(payload, dict) or set(payload) != {
         "url",
@@ -326,7 +332,13 @@ async def _run(payload: object) -> RetrievalResult | ExtractedDocumentResult:
         raise ValueError("invalid worker gateway")
     request = RetrievalRequest(**payload)
     started = asyncio.get_running_loop().time()
-    raw = await RawDocumentReader(Path(socket), token).retrieve(request)
+    reader = RawDocumentReader(Path(socket), token)
+    if operation == "crawl":
+        from app.infrastructure.web_robots import retrieve_crawl_document
+
+        raw = await retrieve_crawl_document(reader, request)
+    else:
+        raw = await reader.retrieve(request)
     if operation == "raw":
         return raw
     remaining = request.timeout_seconds - (asyncio.get_running_loop().time() - started)

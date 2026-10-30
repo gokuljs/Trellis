@@ -11,6 +11,8 @@ PDF_RAW_BYTES = 16 * 1024 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_NETWORK_REQUESTS = 300
 MAX_RETRIEVAL_SECONDS = 30.0
+MAX_RENDER_SECONDS = 60.0
+MAX_RENDER_REQUESTS = 75
 MAX_REDIRECTS = 5
 MAX_WORKER_REQUEST_BYTES = 64 * 1024
 MAX_EXTRACTED_RESULT_BYTES = 1024 * 1024
@@ -55,6 +57,36 @@ class RetrievalRequest:
             not isinstance(self.scope_origin, str) or not 1 <= len(self.scope_origin) <= 4096
         ):
             raise ValueError("invalid retrieval scope origin")
+
+
+@dataclass(frozen=True, slots=True)
+class RenderRequest:
+    """One sandboxed render with a distinct duration and HTTP request allowance."""
+
+    url: str
+    max_requests: int = MAX_RENDER_REQUESTS
+    max_response_bytes: int = PDF_RAW_BYTES
+    timeout_seconds: float = MAX_RENDER_SECONDS
+    scope_origin: str | None = None
+    scope_path_prefix: str = "/"
+
+    def __post_init__(self) -> None:
+        if type(self.max_requests) is not int or not 1 <= self.max_requests <= MAX_RENDER_REQUESTS:
+            raise ValueError("invalid render request allowance")
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, int | float)
+            or not 0 < self.timeout_seconds <= MAX_RENDER_SECONDS
+        ):
+            raise ValueError("invalid render timeout")
+        RetrievalRequest(
+            self.url,
+            self.max_requests,
+            self.max_response_bytes,
+            min(self.timeout_seconds, MAX_RETRIEVAL_SECONDS),
+            self.scope_origin,
+            self.scope_path_prefix,
+        )
 
 
 class RetrievalStatus(StrEnum):

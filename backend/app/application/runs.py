@@ -63,6 +63,8 @@ from app.application.tools import (
     ToolExecutionError,
     ToolRegistry,
 )
+from app.application.web_citations import CITATION_FAILURE_MESSAGE, answer_citations
+from app.application.web_ports import WebRepository
 from app.domain.capabilities import DEFAULT_RUNTIME_CAPABILITIES, RuntimeCapabilities
 from app.domain.models import ModelDescriptor, Session
 from app.domain.recovery import (
@@ -242,6 +244,7 @@ class RunService:
         redactor: SecretRedactor | None = None,
         research_repository: ResearchRepository | None = None,
         research_reports: ResearchReportFinalizer | None = None,
+        web_repository: WebRepository | None = None,
         recovery_repository: RecoveryRepository | None = None,
         recovery_compatibility: Callable[[RunSnapshot], Awaitable[RecoveryCompatibility]]
         | None = None,
@@ -270,6 +273,7 @@ class RunService:
         self._tool_registry = tool_registry
         self._capabilities = capabilities
         self._redactor = redactor or COMMON_SECRET_REDACTOR
+        self._web_repository = web_repository
         self._workspace_guidance_reader = workspace_guidance_reader
         self._workspace_bindings = workspace_bindings
         self._workspace_execution = workspace_execution
@@ -1813,7 +1817,26 @@ class RunService:
                         total_tokens,
                         total_cost,
                     )
-                except ProviderError:
+                    if not step.tool_calls:
+                        citations = (
+                            await asyncio.to_thread(answer_citations, step.content)
+                            if "[[source:" in step.content
+                            else ()
+                        )
+                        if citations:
+                            if self._web_repository is None:
+                                raise ProviderError("citation_invalid", CITATION_FAILURE_MESSAGE)
+                            try:
+                                await self._web_repository.bind_web_citations(
+                                    run.id, run.generation, call.id, citations
+                                )
+                            except ApplicationError as error:
+                                if error.code == "citation_invalid":
+                                    raise ProviderError(
+                                        "citation_invalid", CITATION_FAILURE_MESSAGE
+                                    ) from None
+                                raise
+                except Exception, asyncio.CancelledError:
                     # Invalid paid responses still retain their usage, but never
                     # publish an assistant exchange or a final answer.
                     call = await self._runs.update_model_call(

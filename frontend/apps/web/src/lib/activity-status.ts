@@ -20,6 +20,7 @@ const phaseStates = new Map<string, StatusCopy>([
   ["compacting", { label: "Compacting conversation", orb: "shaping" }],
   ["web_search", { label: "Searching sources", orb: "searching" }],
   ["web_read", { label: "Reading evidence", orb: "searching" }],
+  ["web_crawl", { label: "Collecting site pages", orb: "weaving" }],
   ["scoping", { label: "Understanding the question", orb: "working" }],
   ["planning", { label: "Planning the research", orb: "working" }],
   ["researching", { label: "Researching subquestions", orb: "searching" }],

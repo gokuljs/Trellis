@@ -22,7 +22,7 @@ from app.domain.web import (
 
 
 class WebRepository(Protocol):
-    async def web_tools_ready(self) -> bool: ...
+    async def web_tools_ready(self, *, crawl: bool = False) -> bool: ...
 
     async def reserve_search_attempt(
         self, scope: WebScope, request_id: str, key_hash: str, monthly_limit: int
@@ -73,6 +73,22 @@ class WebRepository(Protocol):
 
     async def complete_web_page(
         self, scope: WebScope, crawl_id: str, url: str, source_id: str
+    ) -> CrawlPage: ...
+
+    async def reserve_crawl_origin(
+        self, scope: WebScope, crawl_id: str, url: str, page_attempt: int
+    ) -> float: ...
+
+    async def finalize_crawl_page(
+        self,
+        scope: WebScope,
+        crawl_id: str,
+        url: str,
+        page_attempt: int,
+        reservation_id: str,
+        source: SourceDraft,
+        usage: WebUsage,
+        discovered_links: tuple[str, ...],
     ) -> CrawlPage: ...
 
     async def list_web_pages(

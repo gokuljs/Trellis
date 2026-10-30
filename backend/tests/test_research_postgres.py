@@ -19,6 +19,8 @@ def literal(value: str) -> str:
     os.environ.get("TRELLIS_TEST_POSTGRES_PORT"), "isolated PostgreSQL is required"
 )
 class ResearchPostgresTests(unittest.TestCase):
+    budget_preset = "conservative"
+
     def sql(self, statement: str, *, authenticated: bool = True, check: bool = True):
         prefix = (
             f"SET request.jwt.claim.sub={literal(self.owner)}; SET ROLE authenticated;"
@@ -79,14 +81,16 @@ class ResearchPostgresTests(unittest.TestCase):
                 "client_request_id": str(uuid4()),
                 "content": "Compare A and B",
                 "model_id": model,
-                "budget_preset": "conservative",
+                "budget_preset": self.budget_preset,
                 "run_mode": "research",
             },
             research=False,
         )
         self.run_id = created["run"]["id"]
         self.session_id = session["id"]
-        self.assertEqual(created["run"]["max_model_calls"], 24)
+        self.assertEqual(
+            created["run"]["max_model_calls"], 40 if self.budget_preset == "longer" else 24
+        )
         self.rpc(
             "transition_run_record",
             {
@@ -185,7 +189,7 @@ class ResearchPostgresTests(unittest.TestCase):
         blocked = self.rpc("reserve_call", self.reservation(self.tasks[1]), check=False)
         self.assertIn("research_usage_unknown", blocked.stderr)
 
-    def completed_task(self, *, tool_call: bool = False) -> dict:
+    def completed_task(self, *, tool_call: bool = False, tool_name: str = "web_read") -> dict:
         admitted = self.rpc("reserve_call", self.reservation(self.tasks[0]))
         call_id = admitted["model_call"]["id"]
         self.rpc(
@@ -196,7 +200,7 @@ class ResearchPostgresTests(unittest.TestCase):
             [
                 {
                     "id": "read-" + str(uuid4()),
-                    "name": "web_read",
+                    "name": tool_name,
                     "arguments": {"url": "https://example.com/pricing"},
                 }
             ]

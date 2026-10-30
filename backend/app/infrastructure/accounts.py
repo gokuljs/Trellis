@@ -48,7 +48,7 @@ from app.application.web_evidence import WebEvidenceService
 from app.application.web_ports import WebRepository
 from app.application.web_tools import WebToolService
 from app.core.config import Settings
-from app.domain.capabilities import RuntimeCapabilities
+from app.domain.capabilities import RuntimeCapabilities, RuntimeCapability
 from app.domain.models import ProviderName
 from app.domain.runtime import RunEventType
 from app.infrastructure.brave_search import BraveSearchProvider
@@ -58,6 +58,7 @@ from app.infrastructure.local_tools import LocalReadToolExecutor, read_workspace
 from app.infrastructure.retrieval_worker import (
     DockerPublicRetriever,
     GatewayControlClient,
+    RetrievalConcurrency,
     WorkerDeployment,
 )
 from app.infrastructure.runtime_events import RuntimeEventHub
@@ -200,6 +201,7 @@ class AccountRegistry:
             max_active_runs=settings.max_active_runs,
             max_active_runs_per_user=settings.max_active_runs_per_user,
         )
+        self._web_concurrency = RetrievalConcurrency()
         self._capabilities = RuntimeCapabilities(settings.enabled_capabilities)
         self._credentials = ServerCredentialStore(settings)
         self._redactor = SecretRedactor(
@@ -242,7 +244,7 @@ class AccountRegistry:
         evidence: WebEvidenceService,
         event_hub: RuntimeEventHub,
     ) -> tuple[ToolRegistration, ...]:
-        if not self._capabilities.enabled.intersection({"web_read", "web_search"}):
+        if not self._capabilities.enabled.intersection({"web_read", "web_search", "web_crawl"}):
             return ()
         if not await database.web_tools_ready():
             return ()
@@ -256,8 +258,10 @@ class AccountRegistry:
         except ValueError:
             search = BraveSearchProvider(None)
         retriever = None
+        renderer = None
+        crawler = None
         if (
-            self._capabilities.allows("web_read")
+            self._capabilities.enabled.intersection({"web_read", "web_crawl"})
             and settings.web_worker_image is not None
             and settings.web_gateway_image is not None
             and settings.web_gateway_secret_file is not None
@@ -277,12 +281,31 @@ class AccountRegistry:
                         settings.web_gateway_control_url,
                         settings.web_gateway_admin_secret.get_secret_value().strip(),
                     ),
+                    concurrency=self._web_concurrency,
                 )
                 async with asyncio.timeout(15):
                     if await candidate.is_ready():
                         retriever = candidate
             except ValueError, TimeoutError:
                 pass
+            if (
+                retriever is not None
+                and self._capabilities.allows("web_crawl")
+                and await database.web_tools_ready(crawl=True)
+            ):
+                try:
+                    async with asyncio.timeout(15):
+                        if await retriever.is_crawl_ready() is True:
+                            crawler = retriever
+                except ValueError, TimeoutError:
+                    pass
+            if retriever is not None and self._capabilities.allows("web_read"):
+                try:
+                    async with asyncio.timeout(15):
+                        if await retriever.is_render_ready() is True:
+                            renderer = retriever
+                except ValueError, TimeoutError:
+                    pass
 
         async def publish(context: ToolExecutionContext, metadata: dict[str, object]) -> None:
             await context.assert_active()
@@ -296,14 +319,27 @@ class AccountRegistry:
         service = WebToolService(
             evidence,
             retriever=retriever,
+            renderer=renderer,
+            crawler=crawler,
             search=search if search.configured else None,
             search_key_hash=search.key_hash,
             monthly_search_limit=settings.brave_search_monthly_limit,
             redactor=self._redactor,
             publish_progress=publish,
         )
+        source_capability: RuntimeCapability = (
+            "web_read"
+            if self._capabilities.allows("web_read")
+            else "web_crawl"
+            if self._capabilities.allows("web_crawl")
+            else "web_search"
+        )
         return service.registrations(
-            search_ready=search.configured, read_ready=retriever is not None
+            search_ready=search.configured and self._capabilities.allows("web_search"),
+            read_ready=retriever is not None and self._capabilities.allows("web_read"),
+            render_ready=renderer is not None,
+            crawl_ready=crawler is not None,
+            source_capability=source_capability,
         )
 
     async def _get_installation(self) -> InstallationIdentity:
@@ -445,6 +481,7 @@ class AccountRegistry:
                         tool_registry=tools,
                         capabilities=self._capabilities,
                         redactor=self._redactor,
+                        web_repository=database,
                         workspace_guidance_reader=read_workspace_guidance
                         if self._capabilities.allows("local_read")
                         else None,
