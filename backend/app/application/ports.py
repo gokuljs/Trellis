@@ -37,6 +37,7 @@ from app.domain.runtime import (
     RunEvent,
     RunEventType,
     RunMessageRecord,
+    RunMode,
     RunSnapshot,
     RunStatus,
     RunSummary,
@@ -216,6 +217,7 @@ class RunRepository(Protocol):
         submitted_model_id: str | None = None,
         submitted_budget_preset: BudgetPreset | None = None,
         recovery_contract: RecoveryContract | None = None,
+        run_mode: RunMode = "chat",
     ) -> RunSnapshot: ...
 
     async def match_run_request(

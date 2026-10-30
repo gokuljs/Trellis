@@ -203,7 +203,8 @@ BEGIN
     SELECT * INTO v_state FROM trellis.research_runs WHERE user_id=v_user AND run_id=v_run.id FOR UPDATE;
     IF NOT FOUND THEN RAISE EXCEPTION 'research_not_found' USING ERRCODE='22023'; END IF;
     v_op_id:=(p_payload->>'operation_id')::uuid;
-    v_fingerprint:=encode(sha256(convert_to(jsonb_build_object('action',p_action,'payload',p_payload-'generation')::text,'UTF8')),'hex');
+    v_fingerprint:=encode(sha256(convert_to(jsonb_build_object('action',p_action,'payload',
+        CASE WHEN p_action='checkpoint' THEN p_payload-'generation'-'expected_revision' ELSE p_payload-'generation' END)::text,'UTF8')),'hex');
     IF v_op_id IS NOT NULL THEN
         SELECT * INTO v_op FROM trellis.research_operations WHERE user_id=v_user AND run_id=v_run.id AND operation_id=v_op_id;
         IF FOUND THEN
@@ -256,10 +257,12 @@ BEGIN
            OR v_task.status NOT IN ('queued','running') THEN
             RAISE EXCEPTION 'research_revision_changed' USING ERRCODE='22023';
         END IF;
-        UPDATE trellis.research_tasks SET checkpoint=p_payload->'checkpoint',revision=revision+1,updated_at=v_now
+        UPDATE trellis.research_tasks SET checkpoint=p_payload->'checkpoint',revision=revision+1,updated_at=v_now,
+            status=CASE WHEN COALESCE(p_payload#>>'{checkpoint,stop_reason}','')<>'' THEN 'failed' ELSE status END
             WHERE id=v_task.id AND user_id=v_user RETURNING * INTO v_task;
         IF v_task.role='lead' THEN
-            UPDATE trellis.research_runs SET checkpoint=v_task.checkpoint,revision=revision+1,
+            UPDATE trellis.research_runs SET checkpoint=checkpoint||v_task.checkpoint,revision=revision+1,
+                stop_reason=COALESCE(v_task.checkpoint->>'stop_reason',stop_reason),
                 phase=COALESCE(v_task.checkpoint->>'phase',phase),updated_at=v_now WHERE run_id=v_run.id;
         END IF;
         v_result:=to_jsonb(v_task)-'user_id';
@@ -310,7 +313,7 @@ BEGIN
             RETURNING * INTO v_res;
         UPDATE trellis.research_tasks SET status='running',updated_at=v_now WHERE id=v_task.id;
         v_result:=jsonb_build_object('reservation',to_jsonb(v_res)-'user_id','model_call',to_jsonb(v_call)-'completion_fingerprint'-'completion_owner_digest'-'completion_receipt');
-    ELSIF p_action='commit_generation' THEN
+    ELSIF p_action IN ('commit_generation','reject_generation') THEN
         SELECT * INTO v_call FROM trellis.model_calls WHERE user_id=v_user AND run_id=v_run.id AND id=(p_payload->>'call_id')::uuid FOR UPDATE;
         IF NOT FOUND OR v_call.task_id IS DISTINCT FROM (p_payload->>'task_id')::uuid THEN
             RAISE EXCEPTION 'research_scope_invalid' USING ERRCODE='22023';
@@ -324,7 +327,8 @@ BEGIN
         SELECT * INTO v_res FROM trellis.research_reservations WHERE user_id=v_user AND run_id=v_run.id AND model_call_id=v_call.id FOR UPDATE;
         IF NOT FOUND OR v_res.status<>'reserved' OR v_call.status<>'streaming'
            OR jsonb_typeof(v_completion) IS DISTINCT FROM 'object'
-           OR (jsonb_typeof(v_assistant)='object')=(jsonb_typeof(v_terminal)='object') THEN
+           OR (p_action='commit_generation' AND COALESCE(jsonb_typeof(v_assistant)='object',false)=COALESCE(jsonb_typeof(v_terminal)='object',false))
+           OR (p_action='reject_generation' AND COALESCE(length(p_payload->>'error_code'),0) NOT BETWEEN 1 AND 100) THEN
             RAISE EXCEPTION 'research_scope_invalid' USING ERRCODE='22023';
         END IF;
         v_tokens:=(v_completion->>'accounted_total_tokens')::bigint;
@@ -333,8 +337,11 @@ BEGIN
             UPDATE trellis.research_reservations SET status='unknown' WHERE id=v_res.id;
             UPDATE trellis.research_runs SET budget_unknown=true,stop_reason='model_usage_unknown',updated_at=v_now WHERE run_id=v_run.id;
         ELSE
-            IF v_tokens<0 OR v_cost<0 OR v_tokens>v_res.reserved_tokens OR v_cost>v_res.reserved_cost THEN
+            IF v_tokens<0 OR v_cost<0 OR (p_action='commit_generation' AND (v_tokens>v_res.reserved_tokens OR v_cost>v_res.reserved_cost)) THEN
                 RAISE EXCEPTION 'research_reservation_exceeded' USING ERRCODE='22023';
+            END IF;
+            IF v_tokens>v_res.reserved_tokens OR v_cost>v_res.reserved_cost THEN
+                UPDATE trellis.research_runs SET budget_unknown=true,stop_reason='research_reservation_exceeded',updated_at=v_now WHERE run_id=v_run.id;
             END IF;
             UPDATE trellis.research_reservations SET status='settled',actual_tokens=v_tokens,actual_cost=v_cost WHERE id=v_res.id;
         END IF;
@@ -344,8 +351,14 @@ BEGIN
            OR jsonb_typeof(v_response->'continuation_items') IS DISTINCT FROM 'array' THEN
             RAISE EXCEPTION 'research_scope_invalid' USING ERRCODE='22023';
         END IF;
-        PERFORM trellis_private.mutate('update_model_call',v_completion||jsonb_build_object('call_id',v_call.id,'next_status','completed'),p_capability);
-        IF jsonb_typeof(v_assistant)='object' THEN
+        PERFORM trellis_private.mutate('update_model_call',v_completion||jsonb_build_object('call_id',v_call.id,'next_status','completed',
+            'error_code',CASE WHEN p_action='reject_generation' THEN p_payload->>'error_code' ELSE NULL END),p_capability);
+        IF p_action='reject_generation' THEN
+            IF v_tokens IS NULL OR v_cost IS NULL THEN RAISE EXCEPTION 'research_usage_unknown' USING ERRCODE='22023'; END IF;
+            UPDATE trellis.research_tasks SET status='failed',result=jsonb_build_object('error_code',p_payload->>'error_code'),
+                checkpoint=checkpoint||jsonb_build_object('stop_reason',p_payload->>'error_code'),revision=revision+1,updated_at=v_now
+                WHERE user_id=v_user AND run_id=v_run.id AND id=v_call.task_id;
+        ELSIF jsonb_typeof(v_assistant)='object' THEN
             IF v_assistant->>'role' IS DISTINCT FROM 'assistant' OR v_assistant->>'content' IS DISTINCT FROM v_response->>'content'
                OR v_assistant->'tool_calls' IS DISTINCT FROM v_response->'tool_calls'
                OR v_assistant->'continuation_items' IS DISTINCT FROM v_response->'continuation_items'
@@ -363,8 +376,15 @@ BEGIN
                    OR jsonb_typeof(v_item->'arguments') IS DISTINCT FROM 'object' THEN
                     RAISE EXCEPTION 'research_scope_invalid' USING ERRCODE='22023';
                 END IF;
-                INSERT INTO trellis.tool_calls(user_id,run_id,assistant_message_id,call_index,provider_call_id,name,arguments,status,task_id)
-                    VALUES(v_user,v_run.id,v_message.id,v_index,v_item->>'id',v_item->>'name',v_item->'arguments','pending',v_call.task_id)
+                IF v_item->>'name' IN ('research_checkpoint','delegate_research','request_research_clarification') THEN
+                    SELECT * INTO v_task FROM trellis.research_tasks WHERE user_id=v_user AND run_id=v_run.id AND id=v_call.task_id;
+                    IF v_task.role NOT IN ('lead','worker') OR (v_task.role='worker' AND v_item->>'name'<>'research_checkpoint') THEN
+                        RAISE EXCEPTION 'research_scope_invalid' USING ERRCODE='22023';
+                    END IF;
+                END IF;
+                INSERT INTO trellis.tool_calls(user_id,run_id,assistant_message_id,call_index,provider_call_id,name,arguments,status,task_id,recovery_policy)
+                    VALUES(v_user,v_run.id,v_message.id,v_index,v_item->>'id',v_item->>'name',v_item->'arguments','pending',v_call.task_id,
+                        CASE WHEN v_item->>'name' IN ('research_checkpoint','delegate_research','request_research_clarification') THEN 'checkpointed' ELSE NULL END)
                     RETURNING * INTO v_tool;
                 v_tools:=v_tools||jsonb_build_array(trellis_private.public_tool_call(to_jsonb(v_tool)));
                 v_event:=trellis_private.append_event(v_user,v_run.id,'tool.call',jsonb_build_object('tool_call_id',v_tool.id,
@@ -581,5 +601,40 @@ BEGIN
     RETURN v_result;
 END;
 $$;
+
+CREATE FUNCTION trellis_private.record_research_phase() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
+DECLARE v_phase text;
+BEGIN
+    IF NEW.event_type='run.phase' THEN
+        v_phase:=CASE NEW.data->>'phase'
+            WHEN 'planning' THEN 'scoping'
+            WHEN 'scoping' THEN 'scoping'
+            WHEN 'web_search' THEN 'researching'
+            WHEN 'web_read' THEN 'researching'
+            WHEN 'researching' THEN 'researching'
+            WHEN 'checking_conflicts' THEN 'checking_conflict'
+            WHEN 'checking_conflict' THEN 'checking_conflict'
+            WHEN 'drafting' THEN 'writing'
+            WHEN 'repairing' THEN 'writing'
+            WHEN 'writing' THEN 'writing'
+            WHEN 'reviewing' THEN 'reviewing'
+            WHEN 'checking_citations' THEN 'reviewing'
+            WHEN 'waiting_for_input' THEN 'waiting_for_input'
+            ELSE NULL END;
+    ELSIF NEW.event_type IN ('run.failed','run.cancelled','run.interrupted') THEN
+        v_phase:='stopped';
+    END IF;
+    IF v_phase IS NOT NULL THEN
+        UPDATE trellis.research_runs SET phase=v_phase,revision=revision+1,updated_at=clock_timestamp()
+            WHERE user_id=NEW.user_id AND run_id=NEW.run_id AND phase NOT IN ('completed','partial','stopped')
+                AND phase IS DISTINCT FROM v_phase;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER research_phase AFTER INSERT ON trellis.run_events
+    FOR EACH ROW EXECUTE FUNCTION trellis_private.record_research_phase();
+REVOKE ALL ON FUNCTION trellis_private.record_research_phase() FROM PUBLIC,anon,authenticated;
 
 COMMIT;

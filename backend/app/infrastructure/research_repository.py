@@ -302,6 +302,30 @@ class ResearchRepositoryMixin:
             },
         )
 
+    async def reject_research_generation(
+        self,
+        run_id: str,
+        generation: int,
+        task_id: str,
+        call_id: str,
+        completion: dict[str, object],
+        error_code: str,
+    ) -> None:
+        saved_completion = dict(completion)
+        if "cached_tokens" in saved_completion:
+            saved_completion["cached_read_tokens"] = saved_completion.pop("cached_tokens")
+        await self._research_call(
+            "reject_generation",
+            {
+                "run_id": run_id,
+                "generation": generation,
+                "task_id": task_id,
+                "call_id": call_id,
+                "completion": saved_completion,
+                "error_code": error_code,
+            },
+        )
+
     async def _research_task(self, run_id: str, task_id: str) -> dict[str, object]:
         research_identifier(run_id)
         research_identifier(task_id)

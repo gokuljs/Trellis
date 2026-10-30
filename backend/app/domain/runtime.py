@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from app.domain.recovery import RecoveryContract
 
 ModelFinishKind = Literal["final", "tool", "incomplete"]
+RunMode = Literal["chat", "research"]
 
 
 class RunStatus(StrEnum):
@@ -15,6 +16,7 @@ class RunStatus(StrEnum):
     RUNNING = "running"
     RECOVERING = "recovering"
     WAITING_FOR_APPROVAL = "waiting_for_approval"
+    WAITING_FOR_INPUT = "waiting_for_input"
     CANCELLING = "cancelling"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -43,6 +45,8 @@ class RunEventType(StrEnum):
     RESUMED = "run.resumed"
     PHASE = "run.phase"
     CONTEXT = "run.context"
+    RESEARCH_CLARIFICATION_REQUESTED = "research.clarification_requested"
+    RESEARCH_CLARIFICATION_ANSWERED = "research.clarification_answered"
 
 
 class ModelCallStatus(StrEnum):
@@ -83,6 +87,7 @@ _TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.RUNNING: frozenset(
         {
             RunStatus.WAITING_FOR_APPROVAL,
+            RunStatus.WAITING_FOR_INPUT,
             RunStatus.RECOVERING,
             RunStatus.CANCELLING,
             RunStatus.COMPLETED,
@@ -90,6 +95,9 @@ _TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
             RunStatus.CANCELLED,
             RunStatus.INTERRUPTED,
         }
+    ),
+    RunStatus.WAITING_FOR_INPUT: frozenset(
+        {RunStatus.QUEUED, RunStatus.CANCELLING, RunStatus.CANCELLED, RunStatus.FAILED}
     ),
     RunStatus.WAITING_FOR_APPROVAL: frozenset(
         {
@@ -134,6 +142,11 @@ _TRANSITION_EVENTS: dict[tuple[RunStatus, RunStatus], RunEventType] = {
     (RunStatus.QUEUED, RunStatus.CANCELLED): RunEventType.CANCELLED,
     (RunStatus.QUEUED, RunStatus.INTERRUPTED): RunEventType.INTERRUPTED,
     (RunStatus.RUNNING, RunStatus.CANCELLING): RunEventType.CANCELLATION_REQUESTED,
+    (RunStatus.RUNNING, RunStatus.WAITING_FOR_INPUT): RunEventType.RESEARCH_CLARIFICATION_REQUESTED,
+    (RunStatus.WAITING_FOR_INPUT, RunStatus.QUEUED): RunEventType.RESEARCH_CLARIFICATION_ANSWERED,
+    (RunStatus.WAITING_FOR_INPUT, RunStatus.CANCELLING): RunEventType.CANCELLATION_REQUESTED,
+    (RunStatus.WAITING_FOR_INPUT, RunStatus.CANCELLED): RunEventType.CANCELLED,
+    (RunStatus.WAITING_FOR_INPUT, RunStatus.FAILED): RunEventType.FAILED,
     (RunStatus.RUNNING, RunStatus.WAITING_FOR_APPROVAL): RunEventType.TOOL_APPROVAL_REQUESTED,
     (RunStatus.WAITING_FOR_APPROVAL, RunStatus.RUNNING): RunEventType.RESUMED,
     (RunStatus.WAITING_FOR_APPROVAL, RunStatus.CANCELLING): RunEventType.CANCELLATION_REQUESTED,
@@ -155,6 +168,8 @@ _LIFECYCLE_EVENT_TYPES = frozenset(
         RunEventType.CANCELLATION_REQUESTED,
         RunEventType.TOOL_APPROVAL_REQUESTED,
         RunEventType.RESUMED,
+        RunEventType.RESEARCH_CLARIFICATION_REQUESTED,
+        RunEventType.RESEARCH_CLARIFICATION_ANSWERED,
         RunEventType.COMPLETED,
         RunEventType.FAILED,
         RunEventType.CANCELLED,
@@ -368,6 +383,7 @@ class RunSnapshot:
     retry_allowed: bool = True
     recovery_reason: str | None = None
     uncertain_tool_call_id: str | None = None
+    run_mode: RunMode = "chat"
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,6 +421,7 @@ class ModelCallRecord:
     started_at: str
     finished_at: str | None
     accounted_total_tokens: int | None = None
+    task_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,6 +436,7 @@ class RunMessageRecord:
     created_at: str
     tool_calls: tuple[ModelToolCall, ...] = ()
     continuation_items: tuple[ModelContinuationItem, ...] = ()
+    task_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -445,3 +463,4 @@ class ToolCallRecord:
     input_snapshot: dict[str, object] | None = None
     reviewed_at: str | None = None
     result_snapshot: dict[str, object] | None = None
+    task_id: str | None = None

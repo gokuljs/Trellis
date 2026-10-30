@@ -51,7 +51,18 @@ class PricingUnavailable(Exception):
         self.model_id = model_id
 
 
-def limits_for_preset(preset: BudgetPreset) -> RunLimits:
+def limits_for_preset(preset: BudgetPreset, *, run_mode: str = "chat") -> RunLimits:
+    if run_mode == "research":
+        from app.domain.research import research_limits
+
+        limits = research_limits(preset)
+        return RunLimits(
+            limits.model_calls,
+            limits.tool_calls,
+            limits.total_tokens,
+            limits.seconds,
+            limits.model_cost_usd,
+        )
     return _PRESETS[preset]
 
 

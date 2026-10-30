@@ -70,6 +70,16 @@ class ResearchRepository(Protocol):
         self, run_id: str, generation: int, call_id: str, error_code: str = "model_outcome_unknown"
     ) -> None: ...
 
+    async def reject_research_generation(
+        self,
+        run_id: str,
+        generation: int,
+        task_id: str,
+        call_id: str,
+        completion: dict[str, object],
+        error_code: str,
+    ) -> None: ...
+
     async def read_research_task_messages(
         self, run_id: str, task_id: str
     ) -> list[RunMessageRecord]: ...
