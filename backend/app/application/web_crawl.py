@@ -1,6 +1,7 @@
 """Serial crawl scheduling over leased, atomic evidence checkpoints."""
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import UUID, uuid5
@@ -26,6 +27,8 @@ from app.domain.web import (
 
 CRAWL_TRANSPORT_BYTES = 18 * 1024 * 1024
 CRAWL_NETWORK_REQUESTS = 7
+CrawlProgressPublisher = Callable[[ToolExecutionContext, dict[str, object]], Awaitable[None]]
+CrawlProgress = Callable[[dict[str, object]], Awaitable[None]]
 
 
 class WebCrawlArguments(BaseModel):
@@ -39,14 +42,51 @@ class WebCrawlArguments(BaseModel):
 
 class WebCrawlService:
     def __init__(
-        self, repository: WebRepository, retriever: CrawlRetriever | None, redactor: SecretRedactor
+        self,
+        repository: WebRepository,
+        retriever: CrawlRetriever | None,
+        redactor: SecretRedactor,
+        *,
+        publish_progress: CrawlProgressPublisher | None = None,
     ) -> None:
         self._repository = repository
         self._retriever = retriever
         self._redactor = redactor
+        self._publish_progress = publish_progress
 
     async def execute(
         self, arguments: WebCrawlArguments, scope: WebScope, context: ToolExecutionContext
+    ) -> dict[str, object]:
+        collection_started = False
+
+        async def progress(metadata: dict[str, object]) -> None:
+            nonlocal collection_started
+            await self._progress(context, metadata)
+            collection_started = True
+
+        result = await self._execute(arguments, scope, context, progress)
+        if collection_started:
+            await self._progress(
+                context,
+                {
+                    "status": "completed" if result.get("status") == "completed" else "partial",
+                    "pages_completed": result.get("completed_pages", 0),
+                    "max_pages": arguments.max_pages,
+                },
+            )
+        return result
+
+    async def _progress(self, context: ToolExecutionContext, metadata: dict[str, object]) -> None:
+        await context.assert_active()
+        if self._publish_progress is not None:
+            await self._publish_progress(context, {"phase": "web_crawl", **metadata})
+
+    async def _execute(
+        self,
+        arguments: WebCrawlArguments,
+        scope: WebScope,
+        context: ToolExecutionContext,
+        progress: CrawlProgress,
     ) -> dict[str, object]:
         if self._retriever is None:
             return {"status": "unavailable", "stop_reason": "crawler_not_configured", "pages": []}
@@ -71,6 +111,7 @@ class WebCrawlService:
         if crawl.status != "running":
             return await self._summary(scope, crawl_id, crawl.status, crawl.stop_reason)
         await self._repository.enqueue_web_pages(scope, crawl_id, ((seed, 0),))
+        started = False
         while True:
             await context.assert_active()
             checkpoint = await self._repository.get_web_crawl(scope.session_id, crawl_id)
@@ -81,6 +122,16 @@ class WebCrawlService:
                     scope, crawl_id, checkpoint.status, checkpoint.stop_reason
                 )
             frontier = await self._repository.list_web_pages(scope.session_id, crawl_id)
+            pages_completed = sum(item.status == "completed" for item in frontier.items)
+            if not started:
+                await progress(
+                    {
+                        "status": "started",
+                        "pages_completed": pages_completed,
+                        "max_pages": arguments.max_pages,
+                    }
+                )
+                started = True
             if all(item.status == "completed" for item in frontier.items):
                 return await self._stop(scope, crawl_id, "frontier_exhausted", completed=True)
             if sum(item.status == "completed" for item in frontier.items) >= arguments.max_pages:
@@ -161,6 +212,7 @@ class WebCrawlService:
             draft = self._draft(result, reservation_id, page.url)
             links = self._links(result, navigation) if page.depth < arguments.max_depth else ()
             usage = replace(result.usage, extracted_bytes=len(draft.text.encode()))
+            stop_reason = None
             try:
                 await self._repository.finalize_crawl_page(
                     scope, crawl_id, page.url, page.attempt, reservation_id, draft, usage, links
@@ -181,7 +233,18 @@ class WebCrawlService:
                     replace(usage, extracted_bytes=0),
                     (),
                 )
-                return await self._stop(scope, crawl_id, "storage_limit")
+                stop_reason = "storage_limit"
+            await progress(
+                {
+                    "status": "page_completed",
+                    "page_index": pages_completed + 1,
+                    "pages_completed": pages_completed + 1,
+                    "max_pages": arguments.max_pages,
+                    "source_id": draft.id,
+                }
+            )
+            if stop_reason is not None:
+                return await self._stop(scope, crawl_id, stop_reason)
 
     async def _pace(
         self, scope: WebScope, crawl_id: str, page: CrawlPage, context: ToolExecutionContext

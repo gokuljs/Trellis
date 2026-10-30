@@ -217,6 +217,47 @@ def test_crawl_follows_bounded_scope_deduplicates_fragments_and_preserves_querie
     asyncio.run(exercise())
 
 
+def test_crawl_progress_reports_recorded_page_counts_without_page_content_or_urls():
+    async def exercise():
+        repository = CrawlRepository()
+        seed, child = "https://example.com/docs", "https://example.com/docs/child"
+        reader = crawler({seed: ("Seed.", [child]), child: ("Child.", [])})
+        publish = AsyncMock()
+        service = WebCrawlService(
+            cast(WebRepository, repository), reader, SecretRedactor(), publish_progress=publish
+        )
+        trusted = context()
+        await service.execute(
+            WebCrawlArguments(seed_url=seed, max_pages=2), scope_for(trusted), trusted
+        )
+        events = [call.args[1] for call in publish.await_args_list]
+        assert [item["status"] for item in events] == [
+            "started",
+            "page_completed",
+            "page_completed",
+            "completed",
+        ]
+        assert [item["pages_completed"] for item in events] == [0, 1, 2, 2]
+        assert all(item["phase"] == "web_crawl" and item["max_pages"] == 2 for item in events)
+        assert [item["page_index"] for item in events if item["status"] == "page_completed"] == [
+            1,
+            2,
+        ]
+        assert all(
+            set(item)
+            <= {"phase", "status", "pages_completed", "max_pages", "page_index", "source_id"}
+            for item in events
+        )
+        assert seed not in json.dumps(events) and "Seed." not in json.dumps(events)
+        publish.reset_mock()
+        await service.execute(
+            WebCrawlArguments(seed_url=seed, max_pages=2), scope_for(trusted), trusted
+        )
+        publish.assert_not_awaited()
+
+    asyncio.run(exercise())
+
+
 def test_completed_page_and_link_snapshot_survive_lost_finalize_response_without_refetch():
     async def exercise():
         repository = CrawlRepository()

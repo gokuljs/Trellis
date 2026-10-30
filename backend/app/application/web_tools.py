@@ -123,7 +123,9 @@ class WebToolService:
         self._monthly_limit = monthly_search_limit
         self._redactor = redactor
         self._publish_progress = publish_progress
-        self._crawler = WebCrawlService(evidence.repository, crawler, redactor)
+        self._crawler = WebCrawlService(
+            evidence.repository, crawler, redactor, publish_progress=publish_progress
+        )
 
     def registrations(
         self,
