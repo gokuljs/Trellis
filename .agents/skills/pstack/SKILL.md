@@ -10,6 +10,18 @@ to Lauren Tan's official source, pinned under `../../pstack/upstream/`. Follow
 repository instructions and the user's task scope. The adapter maps Cursor
 assumptions to supported Codex tools; it does not change the upstream snapshot.
 
+## Documentation scope
+
+Create planning documents, decision logs, audit trails, branch trackers, and
+architecture, verification, or handoff reports only when the user explicitly
+requests them. Long, autonomous, or multi-phase work does not trigger these
+artifacts or automatically activate `show-me-your-work`. This overrides upstream
+requirements to create or commit those artifacts.
+
+Keep routine plans, progress, decisions, and verification summaries in chat.
+Continue running required checks and update existing setup or API documentation
+when a code change needs it.
+
 ## Choose the workflow
 
 Read [Codex execution mappings](references/codex-adapter.md), then load the
