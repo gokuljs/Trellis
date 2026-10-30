@@ -11,6 +11,7 @@ import type {
 } from "@/lib/runtime-client"
 import { groupRunEvents } from "@/lib/run-event-groups"
 import { RunEventLog, RunEventTimestamp } from "@/components/run-event-log"
+import { ToolResult } from "@/components/tool-result"
 import "./run-activity.css"
 
 type RunActivityProps = {
@@ -388,7 +389,7 @@ export function RunActivity({
                     tone = status === "completed" ? "normal" : "warning"
                     const content = textField(event.data, "content")
                     detail = content ? (
-                      <pre className="run-tool-result">{content}</pre>
+                      <ToolResult content={content} toolName={toolName} />
                     ) : null
                     break
                   }
