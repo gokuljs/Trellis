@@ -2,10 +2,13 @@
 !app/
 !app/domain/
 !app/domain/*.py
+!app/application/
+!app/application/secret_redaction.py
 !app/infrastructure/
 !app/infrastructure/web_gateway.py
 !app/infrastructure/web_network.py
 !app/infrastructure/web_reader.py
+!app/infrastructure/web_robots.py
 !app/infrastructure/web_extraction.py
 !app/infrastructure/pdf_extractor.py
 !app/infrastructure/browser_http.py

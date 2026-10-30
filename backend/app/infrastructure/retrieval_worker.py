@@ -467,6 +467,30 @@ class DockerPublicRetriever:
         self._control = control
         self._concurrency = concurrency or RetrievalConcurrency()
 
+    async def is_crawl_ready(self) -> bool:
+        try:
+            async with asyncio.timeout(15):
+                if not await self.is_ready():
+                    return False
+                code, payload = await _run_docker(
+                    ("image", "inspect", self._deployment.worker_image)
+                )
+                images = json.loads(payload) if code == 0 else None
+                if (
+                    not isinstance(images, list)
+                    or len(images) != 1
+                    or not isinstance(images[0], dict)
+                ):
+                    return False
+                config = images[0].get("Config")
+                labels = config.get("Labels") if isinstance(config, dict) else None
+                return (
+                    isinstance(labels, dict)
+                    and labels.get("trellis.crawl.protocol") == "public-crawl-v1"
+                )
+        except OSError, ValueError, WorkerBoundaryError, TimeoutError, ExceptionGroup:
+            return False
+
     async def is_render_ready(self) -> bool:
         try:
             async with asyncio.timeout(30):
@@ -676,6 +700,15 @@ class DockerPublicRetriever:
         assert isinstance(result, ExtractedDocumentResult)
         return result
 
+    async def crawl_document(
+        self, request: RetrievalRequest, context: ToolExecutionContext
+    ) -> ExtractedDocumentResult:
+        if request.scope_origin is None:
+            raise ValueError("crawl retrieval requires a bounded scope")
+        result = await self._retrieve(request, context, extracted=True, crawl=True)
+        assert isinstance(result, ExtractedDocumentResult)
+        return result
+
     async def _retrieve(
         self,
         request: RetrievalRequest | RenderRequest,
@@ -683,6 +716,7 @@ class DockerPublicRetriever:
         *,
         extracted: bool,
         render: bool = False,
+        crawl: bool = False,
     ) -> RetrievalResult | ExtractedDocumentResult:
         await context.assert_active()
         timeout = min(request.timeout_seconds, context.remaining_seconds)
@@ -694,7 +728,13 @@ class DockerPublicRetriever:
         operation = AsyncExitStack()
         try:
             async with asyncio.timeout_at(deadline):
-                if not await (self.is_render_ready() if render else self.is_ready()):
+                if not await (
+                    self.is_render_ready()
+                    if render
+                    else self.is_crawl_ready()
+                    if crawl
+                    else self.is_ready()
+                ):
                     raise WorkerBoundaryError("retrieval boundary is not ready")
                 await operation.enter_async_context(self._concurrency.operation(render=render))
                 await context.assert_active()
@@ -720,6 +760,8 @@ class DockerPublicRetriever:
                             "lease_token": token,
                             "operation": "render"
                             if render
+                            else "crawl"
+                            if crawl
                             else "extracted"
                             if extracted
                             else "raw",

@@ -120,6 +120,28 @@ async def handle(reader, writer):
                 b"<p>Supporting HTML evidence.</p><script>Do not execute this</script>"
                 b"</main><footer>Footer</footer></body></html>"
             )
+        elif path == "/robots.txt":
+            media_type = b"text/plain"
+            body = b"User-agent: *\\nDisallow: /crawl-denied\\nAllow: /crawl-denied/allowed\\n"
+            if host == "robots-denied.test":
+                body = b"User-agent: *\\nDisallow: /\\n"
+            elif host == "robots-missing.test":
+                status = b"404 Not Found"
+                body = b"missing"
+            elif host == "robots-error.test":
+                status = b"503 Unavailable"
+            elif host == "robots-private-redirect.test":
+                status = b"302 Found"
+                extra = b"Location: http://metadata.test/robots.txt\\r\\n"
+        elif path == "/crawl":
+            body = (
+                b"<html><body><main>Supporting crawl evidence.</main>"
+                b"<a href='/crawl/child'>Child</a>"
+                b"<a href='http://private.test/crawl/private'>Private link</a></body></html>"
+            )
+        elif path == "/crawl-target-redirect":
+            status = b"302 Found"
+            extra = b"Location: http://public.test/crawl-target\\r\\n"
         elif path == "/browser":
             body = (
                 b"<html><body><main id='evidence'></main><script>"
@@ -701,6 +723,59 @@ async def verify() -> None:
             assert scanned.status is SourceStatus.UNSUPPORTED, scanned
             assert scanned.error_code == "pdf_no_extractable_text_ocr_unsupported", scanned
             print("worker_html_text_pdf_extraction_pass", flush=True)
+            for host in ("public.test", "robots-missing.test"):
+                crawled = await retriever.crawl_document(
+                    RetrievalRequest(
+                        f"http://{host}/crawl",
+                        max_requests=7,
+                        scope_origin=f"http://{host}",
+                        scope_path_prefix="/crawl",
+                    ),
+                    _context(),
+                )
+                assert crawled.status is SourceStatus.SUCCESS, crawled
+                assert crawled.text.startswith("Supporting crawl evidence."), crawled
+                assert crawled.usage.network_requests == 2, crawled
+            for host, path in (
+                ("public.test", "/crawl-denied"),
+                ("robots-denied.test", "/crawl"),
+                ("robots-error.test", "/crawl"),
+                ("robots-private-redirect.test", "/crawl"),
+            ):
+                before_policy = await _docker("logs", fixture_name)
+                denied = await retriever.crawl_document(
+                    RetrievalRequest(
+                        f"http://{host}{path}",
+                        max_requests=7,
+                        scope_origin=f"http://{host}",
+                    ),
+                    _context(),
+                )
+                assert denied.status is SourceStatus.BLOCKED, denied
+                policy_logs = (await _docker("logs", fixture_name))[len(before_policy) :]
+                assert f'"path": "{path}"' not in policy_logs, policy_logs
+                assert '"host": "metadata.test"' not in policy_logs, policy_logs
+            allowed_rule = await retriever.crawl_document(
+                RetrievalRequest(
+                    "http://public.test/crawl-denied/allowed",
+                    max_requests=7,
+                    scope_origin="http://public.test",
+                ),
+                _context(),
+            )
+            assert allowed_rule.status is SourceStatus.SUCCESS, allowed_rule
+            redirected_crawl = await retriever.crawl_document(
+                RetrievalRequest(
+                    "http://public.test/crawl-target-redirect",
+                    max_requests=7,
+                    scope_origin="http://public.test",
+                ),
+                _context(),
+            )
+            assert redirected_crawl.status is SourceStatus.BLOCKED, redirected_crawl
+            assert redirected_crawl.error_code == "crawl_redirect_blocked", redirected_crawl
+            assert '"path": "/crawl-target"' not in await _docker("logs", fixture_name)
+            print("worker_robots_scope_redirect_policy_pass", flush=True)
             render_ready = await retriever.is_render_ready()
             if not render_ready:
                 await _docker(*_worker_args(deployment, probe_name, render=True))

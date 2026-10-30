@@ -31,3 +31,11 @@ class BrowserRenderer(Protocol):
     async def render_document(
         self, request: RenderRequest, context: ToolExecutionContext
     ) -> ExtractedDocumentResult: ...
+
+
+class CrawlRetriever(Protocol):
+    async def is_crawl_ready(self) -> bool: ...
+
+    async def crawl_document(
+        self, request: RetrievalRequest, context: ToolExecutionContext
+    ) -> ExtractedDocumentResult: ...
