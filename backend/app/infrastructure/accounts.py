@@ -46,7 +46,7 @@ from app.application.web_evidence import WebEvidenceService
 from app.application.web_ports import WebRepository
 from app.application.web_tools import WebToolService
 from app.core.config import Settings
-from app.domain.capabilities import RuntimeCapabilities
+from app.domain.capabilities import RuntimeCapabilities, RuntimeCapability
 from app.domain.models import ProviderName
 from app.domain.runtime import RunEventType
 from app.infrastructure.brave_search import BraveSearchProvider
@@ -241,7 +241,7 @@ class AccountRegistry:
         evidence: WebEvidenceService,
         event_hub: RuntimeEventHub,
     ) -> tuple[ToolRegistration, ...]:
-        if not self._capabilities.enabled.intersection({"web_read", "web_search"}):
+        if not self._capabilities.enabled.intersection({"web_read", "web_search", "web_crawl"}):
             return ()
         if not await database.web_tools_ready():
             return ()
@@ -256,8 +256,9 @@ class AccountRegistry:
             search = BraveSearchProvider(None)
         retriever = None
         renderer = None
+        crawler = None
         if (
-            self._capabilities.allows("web_read")
+            self._capabilities.enabled.intersection({"web_read", "web_crawl"})
             and settings.web_worker_image is not None
             and settings.web_gateway_image is not None
             and settings.web_gateway_secret_file is not None
@@ -284,7 +285,14 @@ class AccountRegistry:
                         retriever = candidate
             except ValueError, TimeoutError:
                 pass
-            if retriever is not None:
+            if retriever is not None and self._capabilities.allows("web_crawl"):
+                try:
+                    async with asyncio.timeout(15):
+                        if await retriever.is_crawl_ready() is True:
+                            crawler = retriever
+                except ValueError, TimeoutError:
+                    pass
+            if retriever is not None and self._capabilities.allows("web_read"):
                 try:
                     async with asyncio.timeout(15):
                         if await retriever.is_render_ready() is True:
@@ -305,16 +313,26 @@ class AccountRegistry:
             evidence,
             retriever=retriever,
             renderer=renderer,
+            crawler=crawler,
             search=search if search.configured else None,
             search_key_hash=search.key_hash,
             monthly_search_limit=settings.brave_search_monthly_limit,
             redactor=self._redactor,
             publish_progress=publish,
         )
+        source_capability: RuntimeCapability = (
+            "web_read"
+            if self._capabilities.allows("web_read")
+            else "web_crawl"
+            if self._capabilities.allows("web_crawl")
+            else "web_search"
+        )
         return service.registrations(
-            search_ready=search.configured,
-            read_ready=retriever is not None,
+            search_ready=search.configured and self._capabilities.allows("web_search"),
+            read_ready=retriever is not None and self._capabilities.allows("web_read"),
             render_ready=renderer is not None,
+            crawl_ready=crawler is not None,
+            source_capability=source_capability,
         )
 
     async def _get_installation(self) -> InstallationIdentity:

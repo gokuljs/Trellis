@@ -148,7 +148,7 @@ The storage contract preserves these records.
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Sources           | Ownership, run/tool identity, requested/final/canonical URLs, title, available publisher/date, fetch time, extractor version, content hash, stable lines, outcome |
 | Crawls            | Scope, parent run, dispatch generation, limits, counters, checkpoint, status, stopping reason                                                                     |
-| Crawl pages       | Normalized URL, depth, state, attempt, reservation, resulting source                                                                                              |
+| Crawl pages       | Normalized URL, depth, state, attempt, reservation, discovered links, resulting source                                                                            |
 | Shared web ledger | Reserved and consumed searches, page attempts, requests, bytes, and storage                                                                                       |
 | Citation bindings | Answer/message reference, source ID, valid line range                                                                                                             |
 
@@ -308,10 +308,40 @@ documentation. The worker protects application secrets and internal networks.
 ## Crawl policy and default limits
 
 Fix the allowed origin and optional path prefix when a crawl begins. Normalize
-and deduplicate URLs. Record off-scope links without following them. Revalidate
-redirects. Apply robots/access rules, per-origin pacing, and bounded retries.
+and deduplicate URLs. Drop off-scope, malformed, private, and credential-bearing
+links without following them. Apply robots/access rules, per-origin pacing, and
+bounded retries.
 [RFC 9309](https://www.rfc-editor.org/rfc/rfc9309.html) defines robots handling.
 Robots rules do not grant authorization to access a resource.
+
+The initial crawler reads HTML, text, and text PDFs one page operation at a time.
+Use `web_read(render=True)` separately for JavaScript pages. It does not grant a
+crawler unrestricted browser interaction. Crawl-page HTTP redirects are rejected
+explicitly, including redirects within the same origin, so a redirected target
+cannot bypass the robots decision. Start from the final public URL when needed.
+The ordinary page reader still supports validated redirects.
+
+Each page operation checks `/robots.txt` inside the isolated worker, before
+requesting the page. A missing robots file allows collection; an unavailable
+policy, explicit access denial, or disallow rule stops that page. The raw robots
+policy is bounded independently and is not canonicalized as source evidence.
+Policy and page requests consume the same persisted request and byte allowance.
+A global origin pacer coordinates page-operation starts across backend processes.
+Robots and page requests within an operation share its bounded worker lifetime.
+
+A completed-page transaction records the accepted source, actual usage, bounded
+snapshot of at most 32 accepted in-scope links, frontier expansion, and page
+completion together. If the frontier
+fills, it preserves fetched evidence and a stopping reason. Recovery reuses
+completed records. A crash before completion can require another HTTP attempt;
+that attempt consumes a new reservation while unknown prior usage stays charged.
+The retained frontier includes completed and queued rows and never exceeds 200.
+The result distinguishes durable claim attempts from the shared run's charged
+page attempts. A crash can leave a claim before any network work starts; that
+claim is not an exact fetch count. Every external page attempt still requires an
+upfront ledger reservation, and confirmed gateway receipts account for network
+usage. Crawl activation also requires the worker's distinct `public-crawl-v1`
+protocol; an older ordinary-reader image cannot advertise crawling.
 
 | Limit                      | Initial value                             |
 | -------------------------- | ----------------------------------------- |
@@ -320,7 +350,7 @@ Robots rules do not grant authorization to access a resource.
 | URLs per read              | 5                                         |
 | Attempted pages            | 20 across the run                         |
 | Crawl depth                | 2                                         |
-| Queued crawl URLs          | 200                                       |
+| Retained crawl URLs        | 200                                       |
 | Concurrent target requests | 2, with at most 1 browser render          |
 | HTTP duration              | 30 seconds, capped by parent deadline     |
 | Browser duration           | 60 seconds, capped by parent deadline     |
