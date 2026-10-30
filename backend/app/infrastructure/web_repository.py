@@ -1,5 +1,6 @@
 """Verified-user RPC adapter for immutable evidence and collection checkpoints."""
 
+import re
 from collections.abc import Mapping
 from datetime import datetime
 from typing import cast
@@ -140,6 +141,54 @@ class WebRepositoryMixin:
         ):
             raise RuntimeError("Supabase returned an oversized web settlement")
         return result
+
+    async def web_tools_ready(self) -> bool:
+        try:
+            value = await self._request("POST", "rpc/web_readiness", payload={})
+            return (
+                isinstance(value, dict)
+                and set(value) == {"schema_version", "ready"}
+                and type(value["schema_version"]) is int
+                and value["schema_version"] == 2
+                and value["ready"] is True
+            )
+        except ApplicationError, RuntimeError, ValueError, TypeError:
+            return False
+
+    async def reserve_search_attempt(
+        self, scope: WebScope, request_id: str, key_hash: str, monthly_limit: int
+    ) -> None:
+        if (
+            str(UUID(request_id)) != request_id
+            or re.fullmatch(r"[0-9a-f]{64}", key_hash) is None
+            or type(monthly_limit) is not int
+            or not 1 <= monthly_limit <= 1000
+        ):
+            raise ValueError("invalid search attempt reservation")
+        payload: dict[str, object] = {
+            "p_payload": self._scope_payload(scope),
+            "p_request_id": request_id,
+            "p_key_hash": key_hash,
+            "p_monthly_limit": monthly_limit,
+            "p_capability": self._run_capability(scope.run_id),
+        }
+        for attempt in range(2):
+            try:
+                value = await self._request(
+                    "POST", "rpc/web_reserve_search_attempt", payload=payload
+                )
+            except ApplicationError as error:
+                if attempt or error.code != "database_unavailable":
+                    raise
+                continue
+            if (
+                value != {"reserved": True}
+                or not isinstance(value, dict)
+                or value["reserved"] is not True
+            ):
+                raise RuntimeError("Supabase returned an invalid search reservation")
+            return
+        raise AssertionError("bounded search reservation retry exhausted")
 
     async def open_web_run(self, dispatch: WebDispatch) -> WebRunState:
         row = _object(

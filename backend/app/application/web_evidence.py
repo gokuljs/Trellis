@@ -16,6 +16,7 @@ from app.domain.web import (
 )
 
 WEB_ERROR_MESSAGES = {
+    "web_search_budget_exhausted": "The operator search allowance for this month was reached.",
     "web_budget_exhausted": "The run reached its web collection allowance.",
     "web_sources_busy": "Finish or cancel the active run before clearing sources.",
     "web_source_conflict": "The recorded source conflicts with this operation.",
