@@ -172,6 +172,14 @@ successful retrieval, available content, and the requested line range.
 Streaming tolerates incomplete markers. Invalid final references produce an
 explicit missing-support outcome without another paid model call.
 
+Normal chat exposes a Sources panel with paged metadata and escaped recorded
+lines. Citation controls activate only after a matching final-answer binding
+loads. Active-stream markers stay pending; terminal partial outputs remain
+unverified. The viewer uses the fetched final URL, not self-asserted canonical
+metadata. Markdown images become explicit links instead of automatic remote
+requests. Clearing is disabled during active work, and account/session changes
+abort reads and discard stale source views.
+
 The source viewer loads authenticated conversation-scoped metadata and lines.
 Valid references identify evidence. They do not automatically establish that a
 claim follows from that evidence, so acceptance fixtures also check support.

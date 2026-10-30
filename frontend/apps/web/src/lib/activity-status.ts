@@ -18,6 +18,9 @@ const phaseStates = new Map<string, StatusCopy>([
   ["waiting", { label: "Waiting", orb: "listening" }],
   ["finishing", { label: "Finishing", orb: "shaping" }],
   ["compacting", { label: "Compacting conversation", orb: "shaping" }],
+  ["web_search", { label: "Searching the web", orb: "searching" }],
+  ["web_read", { label: "Reading a page", orb: "working" }],
+  ["web_crawl", { label: "Collecting site pages", orb: "weaving" }],
 ])
 
 const terminalStates = new Map<string, StatusCopy>([

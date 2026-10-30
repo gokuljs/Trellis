@@ -21,6 +21,7 @@ import type {
   Session,
   SessionHistoryPage,
 } from "../../src/lib/app-types"
+import type { WebSource } from "../../src/lib/web-evidence"
 
 const ids = {
   a: "11111111-1111-4111-a111-111111111111",
@@ -29,6 +30,7 @@ const ids = {
   missing: "44444444-4444-4444-a444-444444444444",
   transient: "55555555-5555-4555-a555-555555555555",
   created: "66666666-6666-4666-a666-666666666666",
+  evidence: "77777777-7777-4777-a777-777777777777",
 }
 const now = "2026-10-18T00:00:00Z"
 const sessions = new Map(
@@ -82,6 +84,13 @@ let accessTokenUnavailable = false
 let acceptanceFailure: string | null = null
 let busyFailure: string | null = null
 let rejectBeforeAcceptance = false
+const evidenceSourceId = "88888888-8888-4888-a888-888888888888"
+const evidenceFailureId = "99999999-9999-4999-a999-999999999999"
+const evidenceCallId = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa"
+let evidenceCleared = false
+let delaySource = false
+let releaseSource: (() => void) | null = null
+let sourceAborted = false
 const user = { id: "fixture-user", email: "fixture@example.test" } as User
 const credential = { token: "fixture-token", userId: user.id, sessionEpoch: 1 }
 let authState: AuthState = {
@@ -186,6 +195,75 @@ function runSummary(run: LatestRun): RunSummary {
   }
 }
 Object.assign(api, {
+  listWebSources: async (sessionId: string) => {
+    requests.push(`sources:${sessionId}`)
+    return {
+      items:
+        sessionId === ids.evidence
+          ? [fixtureSource(evidenceSourceId), fixtureSource(evidenceFailureId)]
+          : [],
+      next_offset: null,
+    }
+  },
+  readWebCitations: async (sessionId: string, modelCallId: string) => {
+    requests.push(`citations:${sessionId}:${modelCallId}`)
+    return {
+      items:
+        sessionId === ids.evidence && modelCallId === evidenceCallId
+          ? [
+              {
+                model_call_id: evidenceCallId,
+                source_id: evidenceSourceId,
+                start_line: 1,
+                end_line: 5,
+                citation_index: 1,
+              },
+            ]
+          : [],
+    }
+  },
+  readWebSource: async (
+    sessionId: string,
+    sourceId: string,
+    start: number,
+    _count: number,
+    options?: { signal?: AbortSignal }
+  ) => {
+    requests.push(`source:${sessionId}:${sourceId}:${start}`)
+    if (delaySource)
+      await new Promise<void>((resolve) => {
+        releaseSource = resolve
+        options?.signal?.addEventListener(
+          "abort",
+          () => {
+            sourceAborted = true
+            resolve()
+          },
+          { once: true }
+        )
+      })
+    const source = fixtureSource(sourceId)
+    return {
+      source,
+      start_line: start,
+      lines:
+        evidenceCleared || sourceId === evidenceFailureId
+          ? []
+          : [
+              "First supporting line.",
+              "<script>Source text stays inert.</script>",
+              "Third supporting line.",
+              "Fourth supporting line.",
+              "Fifth supporting line.",
+            ].slice(start - 1, start + 1),
+      total_lines: source.line_count,
+    }
+  },
+  clearWebSources: async (sessionId: string) => {
+    requests.push(`clear-sources:${sessionId}`)
+    evidenceCleared = true
+    return { evidence_epoch: 1, cleared_count: 2 }
+  },
   getProfile: async () => ({
     id: user.id,
     email: user.email,
@@ -276,6 +354,42 @@ Object.assign(api, {
     status: "unavailable",
   }),
 })
+
+function fixtureSource(id: string): WebSource {
+  const failed = id === evidenceFailureId
+  return {
+    id,
+    session_id: ids.evidence,
+    run_id: "evidence-run",
+    tool_call_id: "evidence-tool",
+    requested_url: evidenceCleared
+      ? null
+      : "https://evidence.example.test/requested",
+    final_url: evidenceCleared
+      ? null
+      : failed
+        ? "https://evidence.example.test/?token=[REDACTED]"
+        : "https://evidence.example.test/article",
+    canonical_url: evidenceCleared
+      ? null
+      : "https://untrusted.example.test/claimed-canonical",
+    title: evidenceCleared
+      ? null
+      : failed
+        ? "Blocked fixture source"
+        : "Fixture web evidence",
+    publisher: evidenceCleared ? null : "Fixture publisher",
+    published_at: evidenceCleared ? null : "2026-10-28",
+    fetched_at: evidenceCleared ? null : now,
+    extractor_version: evidenceCleared ? null : "fixture-v1",
+    content_hash: evidenceCleared ? null : "a".repeat(64),
+    line_count: evidenceCleared || failed ? 0 : 5,
+    byte_count: evidenceCleared || failed ? 0 : 100,
+    status: evidenceCleared ? "cleared" : failed ? "blocked" : "success",
+    error_code: evidenceCleared ? null : failed ? "web_url_blocked" : null,
+    created_at: now,
+  }
+}
 
 class FixtureSocket {
   onopen: (() => void) | null = null
@@ -1143,6 +1257,7 @@ async function runChecks() {
     "Unknown route did not normalize"
   )
   pass("Malformed and unknown routes replace with root")
+  await runWebEvidenceChecks()
   assert(
     blockedRequests.length === 0,
     `Unexpected browser request: ${blockedRequests.join(", ")}`
@@ -1156,6 +1271,344 @@ async function runChecks() {
   )
   checks.push("ALL ROUTING CHECKS PASSED")
   evidence()
+}
+
+async function runWebEvidenceChecks() {
+  const reference = `[[source:${evidenceSourceId.toUpperCase()}:L1-L5]]`
+  const answer: Message = {
+    id: "evidence-message",
+    turn_id: "evidence-turn",
+    role: "assistant",
+    content: `A supported answer ${reference}. Repeated ${reference}.\n\n\`${reference}\`\n\n![tracking](https://images.example.test/pixel.png)\n\n<img src="https://images.example.test/html.png">`,
+    provider: "fixture",
+    model: "fixture-model",
+    created_at: now,
+  }
+  transcripts.set(ids.evidence, [answer])
+  savedOutputs.set(ids.evidence, [
+    {
+      id: "evidence-output",
+      turn_id: answer.turn_id,
+      run_id: "evidence-run",
+      model_call_id: evidenceCallId,
+      step_index: 1,
+      content: answer.content,
+      status: "complete",
+      stop_reason: null,
+      promoted_message_id: answer.id,
+      created_at: now,
+    },
+    {
+      id: "evidence-partial",
+      turn_id: "partial-evidence-turn",
+      run_id: "evidence-failed-run",
+      model_call_id: "unvalidated-call",
+      step_index: 1,
+      content: `Interrupted [[source:${evidenceSourceId}:L1-`,
+      status: "partial",
+      stop_reason: "citation_invalid",
+      promoted_message_id: null,
+      created_at: now,
+    },
+  ])
+  const sourceRequestsBefore = requests.filter((request) =>
+    request.startsWith("sources:")
+  ).length
+  await open(ids.evidence)
+  await until(
+    () =>
+      document.querySelectorAll(
+        '.thread-citation[aria-label="Source 1, lines 1 to 5"]'
+      ).length === 2,
+    "Validated final citations did not render"
+  )
+  assert(
+    requests.filter((request) => request.startsWith("sources:")).length ===
+      sourceRequestsBefore,
+    "Closed source list fetched evidence eagerly"
+  )
+  assert(
+    requests.filter(
+      (request) => request === `citations:${ids.evidence}:${evidenceCallId}`
+    ).length === 1,
+    "Repeated citations duplicated binding requests"
+  )
+  assert(
+    !requests.some((request) => request.endsWith(":unvalidated-call")),
+    "Partial answer fetched a saved binding"
+  )
+  assert(
+    document.querySelector(".thread-citation.unavailable")?.textContent ===
+      "Citation unavailable",
+    "Terminal partial citation remained pending"
+  )
+  assert(
+    !document.querySelector("#root img, #root iframe, #root object"),
+    "Markdown created automatically loaded media"
+  )
+  pass(
+    "Saved citations retain final identity, deduplicate binding reads, and keep partial markers unverified"
+  )
+  button("Source 1, lines 1 to 5").click()
+  await until(
+    () =>
+      document
+        .querySelector(".web-source-range")
+        ?.textContent?.includes("Showing L1–L2 of 5") === true,
+    "Bounded source excerpt did not render"
+  )
+  assert(
+    document
+      .querySelector(".web-source-lines")
+      ?.textContent?.includes("<script>Source text stays inert.</script>"),
+    "Source text was not shown verbatim"
+  )
+  assert(
+    !document.querySelector(".web-source-excerpt script"),
+    "Source text executed as HTML"
+  )
+  assert(
+    document.querySelector<HTMLAnchorElement>(".web-source-url a")?.href ===
+      "https://evidence.example.test/article",
+    "Source link trusted claimed canonical URL"
+  )
+  assert(
+    document
+      .querySelector(".web-source-metadata")
+      ?.textContent?.includes("Fixture publisher"),
+    "Source publisher metadata is missing"
+  )
+  button("Load next lines").click()
+  await until(
+    () =>
+      document
+        .querySelector(".web-source-range")
+        ?.textContent?.includes("Showing L3–L4 of 5") === true,
+    "Truncated source excerpt did not advance"
+  )
+  button("Blocked fixture source").click()
+  await until(
+    () =>
+      document
+        .querySelector(".web-source-excerpt")
+        ?.textContent?.includes("web url blocked") === true,
+    "Retrieval failure details were hidden"
+  )
+  assert(
+    !document.querySelector(".web-source-url a"),
+    "Redacted source URL remained navigable"
+  )
+  pass(
+    "Source viewer shows escaped line ranges, bounded continuation, metadata, failures, and vetted final links"
+  )
+  await submit("Fixture web progress")
+  const running = sockets.at(-1)!
+  running.event("run.started", {}, 1)
+  assert(
+    button("Clear sources").disabled,
+    "Active run allowed clearing sources"
+  )
+  assert(
+    document
+      .querySelector(".web-sources-clear")
+      ?.textContent?.includes("Finish or stop"),
+    "Clear lock has no explanation"
+  )
+  const delta = {
+    output_id: "web-live-output",
+    model_call_id: "live-call",
+    step_index: 1,
+    batch_index: 0,
+    text: `Working [[source:${evidenceSourceId}:L1-`,
+  }
+  const liveRun = latest.get(ids.evidence)!
+  const liveOutput: AssistantOutput = {
+    id: delta.output_id,
+    turn_id: liveRun.turn_id,
+    run_id: liveRun.run_id,
+    model_call_id: delta.model_call_id,
+    step_index: 1,
+    content: delta.text,
+    status: "streaming",
+    stop_reason: null,
+    promoted_message_id: null,
+    created_at: now,
+    next_batch_index: 1,
+  }
+  savedOutputs.set(ids.evidence, [
+    ...savedOutputs.get(ids.evidence)!,
+    liveOutput,
+  ])
+  running.event("assistant.delta", delta, 2)
+  running.event("assistant.delta", delta, 2)
+  await until(
+    () => document.querySelectorAll(".thread-citation.pending").length === 1,
+    "Streaming partial marker was not pending or duplicated on replay"
+  )
+  running.event(
+    "tool.call",
+    { tool_call_id: "crawl-tool", name: "web_crawl", arguments: {} },
+    3
+  )
+  running.event(
+    "run.phase",
+    {
+      tool_call_id: "crawl-tool",
+      phase: "web_crawl",
+      status: "page_completed",
+      pages_completed: 1,
+      max_pages: 2,
+    },
+    4
+  )
+  await until(
+    () =>
+      [...document.querySelectorAll(".run-activity-trigger")].some((trigger) =>
+        trigger.textContent?.includes("Collecting site pages")
+      ),
+    "Collapsed activity did not show crawl progress"
+  )
+  const crawlActivity = [
+    ...document.querySelectorAll<HTMLButtonElement>(".run-activity-trigger"),
+  ].find((trigger) => trigger.textContent?.includes("Collecting site pages"))!
+  crawlActivity.click()
+  await until(
+    () =>
+      document
+        .querySelector(".run-activity-detail")
+        ?.textContent?.includes("1 of 2 pages processed") === true,
+    "Opened activity did not show bounded crawl progress"
+  )
+  pass(
+    "Collapsed activity names the web phase and detailed activity reports processed page counts"
+  )
+  crawlActivity.click()
+  running.event(
+    "tool.result",
+    { tool_call_id: "crawl-tool", name: "web_crawl", status: "completed" },
+    5
+  )
+  savedOutputs.set(
+    ids.evidence,
+    savedOutputs
+      .get(ids.evidence)!
+      .map((output) =>
+        output.id === liveOutput.id
+          ? { ...output, status: "partial", stop_reason: "cancelled" }
+          : output
+      )
+  )
+  button("Stop generating").click()
+  running.event("run.cancelled", {}, 6)
+  await until(
+    () =>
+      !button("Clear sources").disabled &&
+      !document.querySelector(".thread-citation.pending"),
+    "Terminal partial output remained pending"
+  )
+  assert(
+    document.querySelectorAll(".thread-citation.unavailable").length >= 2,
+    "Stopped live citation did not lose pending state"
+  )
+  pass(
+    "Active streams keep citation markers pending through replay and block clear until terminal cancellation"
+  )
+  button("Clear sources").click()
+  await until(
+    () =>
+      document
+        .querySelector(".web-sources-panel")
+        ?.textContent?.includes("Sources cleared.") === true,
+    "Source clearing did not complete"
+  )
+  await until(
+    () =>
+      document.querySelector(
+        '.thread-citation[aria-label="Source 1, lines 1 to 5"]'
+      ) !== null,
+    "Historical bindings did not reload after clear"
+  )
+  button("Source 1, lines 1 to 5").click()
+  await until(
+    () =>
+      document
+        .querySelector(".web-source-excerpt")
+        ?.textContent?.includes(
+          "Its text and metadata are no longer available."
+        ) === true,
+    "Historical citation reused a cleared excerpt"
+  )
+  assert(
+    !document.querySelector(
+      ".web-source-lines, .web-source-metadata, .web-source-url"
+    ),
+    "Cleared source retained metadata or excerpt"
+  )
+  pass(
+    "Clearing removes source caches and historical citations resolve to tombstones"
+  )
+  button("Close sources").click()
+  await until(
+    () => !document.querySelector(".web-sources-panel"),
+    "Source panel did not close"
+  )
+  delaySource = true
+  button("Source 1, lines 1 to 5").click()
+  await until(
+    () => releaseSource !== null,
+    "Delayed source request did not begin"
+  )
+  await open(ids.b)
+  await until(
+    () => sourceAborted,
+    "Changing chats did not abort source request"
+  )
+  releaseSource!()
+  delaySource = false
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert(
+    !document.querySelector(".web-source-excerpt"),
+    "Old chat source appeared after navigation"
+  )
+  pass(
+    "Changing chats aborts source requests and prevents stale source content from appearing"
+  )
+  sourceAborted = false
+  releaseSource = null
+  delaySource = true
+  await open(ids.evidence)
+  await until(
+    () =>
+      document.querySelector(
+        '.thread-citation[aria-label="Source 1, lines 1 to 5"]'
+      ) !== null,
+    "Saved binding did not restore for account-change check"
+  )
+  button("Source 1, lines 1 to 5").click()
+  await until(
+    () => releaseSource !== null,
+    "Account-change source request did not begin"
+  )
+  publishAuth("signed-out")
+  await until(
+    () => sourceAborted && !!document.querySelector(".auth-screen"),
+    "Signing out did not abort private source request"
+  )
+  releaseSource!()
+  delaySource = false
+  assert(
+    !document.querySelector(".web-sources-panel"),
+    "Source viewer survived the account boundary"
+  )
+  publishAuth("signed-in")
+  await until(
+    () => !!document.querySelector(".app-shell"),
+    "Sign-in did not restore workspace after source request"
+  )
+  await open(ids.b)
+  pass(
+    "Account changes abort source requests and remove the previous account source viewer"
+  )
 }
 document.getElementById("run-checks")!.addEventListener("click", () => {
   const control = document.getElementById("run-checks") as HTMLButtonElement

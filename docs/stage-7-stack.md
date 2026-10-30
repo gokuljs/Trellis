@@ -18,7 +18,7 @@ merge from the first row downward. Keep descendants aligned after a parent merge
 | 5     | `search-and-crawler-reading`      | `search-and-crawler-fetch`   | Brave, HTML, PDF, and source tools              | Verified   |
 | 6     | `search-and-crawler-browser`      | `search-and-crawler-reading` | Sandboxed browser rendering                     | Verified   |
 | 7     | `search-and-crawler-crawl`        | `search-and-crawler-browser` | Bounded crawl and persistent frontier           | Verified   |
-| 8     | `search-and-crawler-chat`         | `search-and-crawler-crawl`   | Progress, citations, source viewer, clearing    | Planned    |
+| 8     | `search-and-crawler-chat`         | `search-and-crawler-crawl`   | Progress, citations, source viewer, clearing    | Verified   |
 | 9     | `search-and-crawler-verification` | `search-and-crawler-chat`    | Complete acceptance and operator instructions   | Planned    |
 
 ## Implementation checkpoints
