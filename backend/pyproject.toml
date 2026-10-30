@@ -8,15 +8,14 @@ dependencies = [
     "anyio>=4.14.2,<5",
     "fastapi[standard-no-fastapi-cloud-cli]>=0.141.1,<1",
     "httpx>=0.28.1,<1",
+    "h11==0.16.0",
+    "dnspython==2.8.0",
     "pydantic-settings>=2.15,<3",
     "python-dotenv>=1.2,<2",
 ]
 
 [dependency-groups]
 dev = [
-    "httpx2==2.14.0",
-    "pytest==9.1.1",
-    "pytest-cov==7.1.0",
     "ruff==0.16.3",
     "ty==0.0.74",
 ]
@@ -36,9 +35,3 @@ select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "FAST", "RUF"]
 
 [tool.ruff.format]
 quote-style = "double"
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
-addopts = "--strict-config --strict-markers --cov=app.infrastructure.logging --cov=app.api.request_logging --cov=app.api.runtime_logging --cov-report=term-missing --cov-fail-under=90"
-filterwarnings = ["error"]

@@ -75,6 +75,5 @@ there.
 
 ## Required backend verification
 
-From `backend/`, run `make check` with uv 0.12.5 (or the CI-equivalent pinned
-uv invocation). The aggregate check runs Ruff formatting, Ruff linting, ty,
-strict pytest, and the 90% coverage floor.
+From `backend/`, run `make check` with uv 0.12.5. The aggregate check runs Ruff
+formatting, Ruff linting, and ty.

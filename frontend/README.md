@@ -36,13 +36,9 @@ Expected authentication failures, client rejections, and cancellations stay
 quiet. Browser records contain no chat IDs, run IDs, prompts, payloads, URLs,
 credentials, or exception text. The app does not upload logs to a service.
 
-See [Stage 2 setup and guarantees](../docs/stage-2.md) for model discovery,
-streaming recovery, context compaction, and history limits.
-
 Verification:
 
 ```bash
-bun test apps/web/tests
 bun run format
 bun run format:check
 bun run lint

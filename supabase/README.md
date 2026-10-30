@@ -1,8 +1,5 @@
 # Trellis web database
 
-See [Stage 2](../docs/stage-2.md) for migrations 001–011, catalog-worker setup,
-streaming/replay limits, context checkpoints, and verification.
-
 Apply the numbered SQL files in `migrations/` in order to the Supabase project.
 Use the Supabase SQL Editor or the Supabase CLI migration workflow. In the
 dashboard, open **Integrations → Data API → Settings**, add `trellis` to

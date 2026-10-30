@@ -41,6 +41,8 @@ from app.application.secret_redaction import SecretRedactor
 from app.application.sessions import SessionService
 from app.application.settings import SettingsService
 from app.application.tools import ToolRegistry
+from app.application.web_evidence import WebEvidenceService
+from app.application.web_ports import WebRepository
 from app.core.config import Settings
 from app.domain.capabilities import RuntimeCapabilities
 from app.domain.models import ProviderName
@@ -65,6 +67,7 @@ class AccountRepository(
     RecoveryRepository,
     RunRepository,
     RunLeasePort,
+    WebRepository,
     Protocol,
 ):
     async def ensure_account(self) -> None: ...
@@ -87,6 +90,7 @@ class AccountContext:
     chat_service: ChatService
     run_service: RunService
     event_hub: RuntimeEventHub
+    web_evidence_service: WebEvidenceService | None = None
     workspace_bindings: LocalWorkspaceBindings | None = None
     workspace_execution: LocalWorkspaceExecution | None = None
     recovery_discovery: RecoveryDiscovery | None = None
@@ -371,6 +375,9 @@ class AccountRegistry:
                         )
                         context = AccountContext(
                             database=database,
+                            web_evidence_service=WebEvidenceService(
+                                database, database, owner_id=str(user_id)
+                            ),
                             secret_store=secret_store,
                             profile_service=ProfileService(database),
                             session_service=SessionService(

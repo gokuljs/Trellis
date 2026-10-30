@@ -1,4 +1,4 @@
-"""Provider-neutral definitions and validation for local read tools."""
+"""Provider-neutral tool registration, validation, and dispatch."""
 
 import json
 import shlex
@@ -8,7 +8,9 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from app.application.errors import ApplicationError
 from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
+from app.application.tool_context import ToolExecutionContext
 from app.domain.capabilities import (
     DEFAULT_RUNTIME_CAPABILITIES,
     RuntimeCapabilities,
@@ -143,7 +145,7 @@ class CommandToolExecutor(Protocol):
 
 class ToolExecutor(Protocol):
     async def execute(
-        self, name: str, arguments: dict[str, object], workspace_root: Path | None
+        self, name: str, arguments: dict[str, object], context: ToolExecutionContext
     ) -> tuple[str, bool]: ...
 
 
@@ -258,6 +260,10 @@ class ToolRegistry:
 
     def recovery_policy(self, name: str) -> ToolRecoveryPolicy:
         return self._recovery_policies.get(name, ToolRecoveryPolicy.NEVER)
+
+    def requires_workspace(self, name: str) -> bool:
+        requirements = self._requirements.get(name)
+        return requirements is not None and requirements.requires_workspace
 
     def recovery_versions(self) -> tuple[tuple[str, str], ...]:
         return tuple(
@@ -400,6 +406,7 @@ class ToolRegistry:
         approved: bool = False,
         approval_preview: dict[str, object] | None = None,
         capabilities: RuntimeCapabilities | None = None,
+        context: ToolExecutionContext | None = None,
     ) -> ToolResult:
         try:
             arguments = self.validate_execution(
@@ -414,9 +421,12 @@ class ToolRegistry:
         try:
             generic_executor = self._generic_executors.get(call.name)
             if generic_executor is not None:
-                content, truncated = await generic_executor.execute(
-                    call.name, arguments, workspace_root
-                )
+                if context is None:
+                    raise ToolExecutionError(
+                        "tool_context_required", "This tool requires a trusted run context."
+                    )
+                await context.assert_active()
+                content, truncated = await generic_executor.execute(call.name, arguments, context)
             elif workspace_root is None:
                 raise ToolExecutionError(
                     "workspace_required", "This tool requires a selected workspace."
@@ -441,6 +451,8 @@ class ToolRegistry:
                 )
         except ToolExecutionError as error:
             return self._safe_error(call, error)
+        except ApplicationError, TimeoutError:
+            raise
         except Exception:
             if self.recovery_policy(call.name) is not ToolRecoveryPolicy.READ_ONLY:
                 raise
