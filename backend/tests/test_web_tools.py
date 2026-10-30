@@ -157,7 +157,9 @@ class EvidenceRepository:
         return self._lines(source_id, start_line, max_lines)
 
 
-def tools(repository=None, *, reader=None, search=None, redactor=None, progress=None):
+def tools(
+    repository=None, *, reader=None, renderer=None, search=None, redactor=None, progress=None
+):
     repository = repository or EvidenceRepository()
     sessions = Mock(
         get_session=AsyncMock(return_value=Session(SESSION, OWNER, "title", "now", "now", 0))
@@ -166,6 +168,7 @@ def tools(repository=None, *, reader=None, search=None, redactor=None, progress=
     executor = WebToolService(
         evidence,
         retriever=reader,
+        renderer=renderer,
         search=search,
         search_key_hash=hashlib.sha256(KEY.encode()).hexdigest() if search is not None else None,
         redactor=redactor or SecretRedactor(),
@@ -173,7 +176,9 @@ def tools(repository=None, *, reader=None, search=None, redactor=None, progress=
     )
     registry = ToolRegistry(
         capabilities=CAPABILITIES,
-        additional_tools=executor.registrations(search_ready=True, read_ready=True),
+        additional_tools=executor.registrations(
+            search_ready=True, read_ready=True, render_ready=renderer is not None
+        ),
         redactor=redactor,
     )
     return repository, executor, registry
@@ -225,6 +230,116 @@ def test_web_registry_has_narrow_strict_arguments_and_no_workspace_access():
                 ModelToolCall("call", name, arguments), None, context=context()
             )
             assert result.error_code == "invalid_tool_arguments"
+
+    asyncio.run(exercise())
+
+
+def test_render_is_advertised_only_after_readiness_and_accepts_only_a_boolean():
+    async def exercise():
+        _, _, plain = tools()
+        specification = next(item for item in plain.specs(None) if item.name == "web_read")
+        assert "render" not in specification.input_schema["properties"]
+        renderer = Mock(render_document=reader().read_document)
+        _, _, rendered = tools(renderer=renderer)
+        specification = next(item for item in rendered.specs(None) if item.name == "web_read")
+        assert specification.input_schema["properties"]["render"]["default"] is False
+        assert "render=True" in specification.description
+        for value in ("true", 1, None):
+            result = await rendered.execute(
+                ModelToolCall(
+                    "call", "web_read", {"urls": ["https://example.com"], "render": value}
+                ),
+                None,
+                context=context(),
+            )
+            assert result.error_code == "invalid_tool_arguments"
+        renderer.render_document.assert_not_awaited()
+
+    asyncio.run(exercise())
+
+
+def test_render_reserves_one_page_and_bounded_browser_allowance_before_dispatch():
+    async def exercise():
+        raw = reader()
+        renderer = Mock(render_document=reader().read_document)
+        repository, _, registry = tools(reader=raw, renderer=renderer)
+        trusted = context(deadline_at=datetime.now(UTC) + timedelta(seconds=45))
+        result = await registry.execute(
+            ModelToolCall("call", "web_read", {"urls": ["https://example.com"], "render": True}),
+            None,
+            context=trusted,
+        )
+        assert json.loads(result.content)["pages"][0]["status"] == "success"
+        raw.read_document.assert_not_awaited()
+        request, passed_context = renderer.render_document.await_args.args
+        assert type(request).__name__ == "RenderRequest"
+        assert passed_context is trusted
+        assert 0 < request.timeout_seconds <= 45
+        assert request.max_requests == 75
+        assert request.max_response_bytes == 18 * 1024 * 1024
+        reservation = next(iter(repository.reservations.values()))
+        assert reservation.reserved.page_attempts == 1
+        assert reservation.reserved.network_requests == 75
+        assert repository.operations.index("reserve") < repository.operations.index("record")
+
+    asyncio.run(exercise())
+
+
+def test_unavailable_renderer_skips_io_and_reuses_completed_render_sources():
+    async def exercise():
+        raw = reader()
+        renderer = Mock(render_document=reader().read_document)
+        repository, executor, _ = tools(reader=raw, renderer=renderer)
+        arguments = {"urls": ["https://example.com"], "render": True}
+        content, _ = await executor.execute("web_read", arguments, context())
+        source_id = json.loads(content)["pages"][0]["source_id"]
+        executor._renderer = None
+        content, _ = await executor.execute(
+            "web_read", arguments, context(dispatch_attempt=2, generation=3)
+        )
+        page = json.loads(content)["pages"][0]
+        assert page["source_id"] == source_id
+        assert page["reused"]
+        assert renderer.render_document.await_count == 1
+        raw.read_document.assert_not_awaited()
+        calls = len(repository.reservations)
+        content, _ = await executor.execute(
+            "web_read", arguments, context(tool_call_id=str(uuid4()))
+        )
+        page = json.loads(content)["pages"][0]
+        assert page["status"] == "unavailable"
+        assert page["error_code"] == "renderer_not_configured"
+        assert page["not_attempted"]
+        assert len(repository.reservations) == calls
+        raw.read_document.assert_not_awaited()
+
+    asyncio.run(exercise())
+
+
+def test_unavailable_render_schema_keeps_checkpointed_arguments_executable():
+    async def exercise():
+        renderer = Mock(render_document=reader().read_document)
+        repository, executor, registry = tools(renderer=renderer)
+        call = ModelToolCall("call", "web_read", {"urls": ["https://example.com"], "render": True})
+        first = await registry.execute(call, None, context=context())
+        source = json.loads(first.content)["pages"][0]["source_id"]
+        executor._renderer = None
+        unavailable = ToolRegistry(
+            None,
+            capabilities=CAPABILITIES,
+            additional_tools=executor.registrations(search_ready=False, read_ready=True),
+        )
+        specification = next(item for item in unavailable.specs(None) if item.name == "web_read")
+        properties = specification.input_schema["properties"]
+        assert isinstance(properties, dict) and "render" not in properties
+        resumed = await unavailable.execute(
+            call, None, context=context(dispatch_attempt=2, generation=3)
+        )
+        assert not resumed.is_error
+        page = json.loads(resumed.content)["pages"][0]
+        assert page["source_id"] == source and page["reused"]
+        assert renderer.render_document.await_count == 1
+        assert len(repository.reservations) == 1
 
     asyncio.run(exercise())
 
@@ -828,7 +943,9 @@ def test_read_readiness_does_not_require_search_key_and_invalid_worker_config_fa
             web_gateway_secret_file=tmp_path / "gateway-secret",
             web_gateway_admin_secret="g" * 32,
         )
-        candidate = Mock(is_ready=AsyncMock(return_value=True))
+        candidate = Mock(
+            is_ready=AsyncMock(return_value=True), is_render_ready=AsyncMock(return_value=False)
+        )
         constructor = Mock(return_value=candidate)
         monkeypatch.setattr("app.infrastructure.accounts.DockerPublicRetriever", constructor)
         registry = AccountRegistry(settings, {}, {})
@@ -840,6 +957,18 @@ def test_read_readiness_does_not_require_search_key_and_invalid_worker_config_fa
         assert {tool.name for tool in registrations} == {"web_source", "web_read"}
         assert all(not tool.requires_workspace for tool in registrations)
         candidate.is_ready.assert_awaited_once()
+        reading = next(tool for tool in registrations if tool.name == "web_read")
+        assert "render" not in reading.arguments_model.model_json_schema()["properties"]
+        candidate.is_render_ready.return_value = True
+        registrations = await registry._web_tool_registrations(
+            repository, evidence, RuntimeEventHub()
+        )
+        reading = next(tool for tool in registrations if tool.name == "web_read")
+        assert "render" in reading.arguments_model.model_json_schema()["properties"]
+        assert all(
+            call.kwargs["concurrency"] is registry._web_concurrency
+            for call in constructor.call_args_list
+        )
         candidate.is_ready.return_value = False
         registrations = await registry._web_tool_registrations(
             repository, evidence, RuntimeEventHub()

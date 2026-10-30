@@ -56,6 +56,7 @@ from app.infrastructure.local_tools import LocalReadToolExecutor, read_workspace
 from app.infrastructure.retrieval_worker import (
     DockerPublicRetriever,
     GatewayControlClient,
+    RetrievalConcurrency,
     WorkerDeployment,
 )
 from app.infrastructure.runtime_events import RuntimeEventHub
@@ -197,6 +198,7 @@ class AccountRegistry:
             max_active_runs=settings.max_active_runs,
             max_active_runs_per_user=settings.max_active_runs_per_user,
         )
+        self._web_concurrency = RetrievalConcurrency()
         self._capabilities = RuntimeCapabilities(settings.enabled_capabilities)
         self._credentials = ServerCredentialStore(settings)
         self._redactor = SecretRedactor(
@@ -253,6 +255,7 @@ class AccountRegistry:
         except ValueError:
             search = BraveSearchProvider(None)
         retriever = None
+        renderer = None
         if (
             self._capabilities.allows("web_read")
             and settings.web_worker_image is not None
@@ -274,12 +277,20 @@ class AccountRegistry:
                         settings.web_gateway_control_url,
                         settings.web_gateway_admin_secret.get_secret_value().strip(),
                     ),
+                    concurrency=self._web_concurrency,
                 )
                 async with asyncio.timeout(15):
                     if await candidate.is_ready():
                         retriever = candidate
             except ValueError, TimeoutError:
                 pass
+            if retriever is not None:
+                try:
+                    async with asyncio.timeout(15):
+                        if await retriever.is_render_ready() is True:
+                            renderer = retriever
+                except ValueError, TimeoutError:
+                    pass
 
         async def publish(context: ToolExecutionContext, metadata: dict[str, object]) -> None:
             await context.assert_active()
@@ -293,6 +304,7 @@ class AccountRegistry:
         service = WebToolService(
             evidence,
             retriever=retriever,
+            renderer=renderer,
             search=search if search.configured else None,
             search_key_hash=search.key_hash,
             monthly_search_limit=settings.brave_search_monthly_limit,
@@ -300,7 +312,9 @@ class AccountRegistry:
             publish_progress=publish,
         )
         return service.registrations(
-            search_ready=search.configured, read_ready=retriever is not None
+            search_ready=search.configured,
+            read_ready=retriever is not None,
+            render_ready=renderer is not None,
         )
 
     async def _get_installation(self) -> InstallationIdentity:

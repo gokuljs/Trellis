@@ -8,9 +8,14 @@
 !app/infrastructure/web_reader.py
 !app/infrastructure/web_extraction.py
 !app/infrastructure/pdf_extractor.py
+!app/infrastructure/browser_http.py
+!app/infrastructure/web_renderer.py
 !containers/
 !containers/gateway_guard.py
 !containers/trellis-gateway-init
 !containers/trellis-check-egress-policy
 !containers/worker-requirements.txt
 !containers/gateway-requirements.txt
+!containers/chromium-seccomp.json
+!containers/chromium-seccomp.LICENSE
+!containers/chromium-seccomp.README.md
