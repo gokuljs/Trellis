@@ -330,6 +330,101 @@ class ResearchPostgresTests(unittest.TestCase):
         )
         self.assertEqual(state, {"outputs": 0, "leaked_events": 0, "usage": 120})
 
+    def test_pause_rejects_dispatched_paid_work(self) -> None:
+        self.rpc("reserve_call", self.reservation(self.tasks[0]))
+        paused = self.rpc(
+            "pause",
+            {
+                "run_id": self.run_id,
+                "generation": 0,
+                "clarification_id": str(uuid4()),
+                "question": "Which market?",
+            },
+            check=False,
+        )
+        self.assertIn("research_not_quiescent", paused.stderr)
+
+    def test_clarification_pauses_clock_and_answer_is_idempotent(self) -> None:
+        question_id = str(uuid4())
+        paused = self.rpc(
+            "pause",
+            {
+                "run_id": self.run_id,
+                "generation": 0,
+                "clarification_id": question_id,
+                "question": "Which market?",
+            },
+        )
+        self.assertEqual(paused["run"]["status"], "waiting_for_input")
+        self.assertEqual(paused["events"][0]["event_type"], "research.clarification_requested")
+        snapshot = json.loads(
+            self.sql(f"SELECT trellis.read_research({literal(self.run_id)});").stdout
+        )
+        self.assertGreater(snapshot["remaining_seconds"], 580)
+        self.sql(
+            "UPDATE trellis.runs SET deadline_at=clock_timestamp()-interval '1 hour' "
+            f"WHERE id={literal(self.run_id)};",
+            authenticated=False,
+        )
+        answer_payload = {
+            "run_id": self.run_id,
+            "clarification_id": question_id,
+            "operation_id": str(uuid4()),
+            "text": "India",
+        }
+        answered = self.rpc("answer", answer_payload)
+        self.assertEqual(answered["events"][0]["event_type"], "research.clarification_answered")
+        replayed = self.rpc("answer", answer_payload)
+        self.assertEqual(answered["run"]["deadline_at"], replayed["run"]["deadline_at"])
+        self.assertEqual(answered["run"]["generation"], 1)
+        self.assertEqual(replayed["run"]["recovery_count"], 0)
+        self.assertEqual(replayed["run"]["max_model_calls"], 24)
+        resumed = json.loads(
+            self.sql(f"SELECT trellis.read_research({literal(self.run_id)});").stdout
+        )
+        self.assertGreater(resumed["remaining_seconds"], 570)
+        self.assertEqual(resumed["checkpoint"]["clarifications"][0]["answer"], "India")
+
+    def test_cancelled_clarification_cannot_resume_or_extend_deadline(self) -> None:
+        question_id = str(uuid4())
+        self.rpc(
+            "pause",
+            {
+                "run_id": self.run_id,
+                "generation": 0,
+                "clarification_id": question_id,
+                "question": "Which market?",
+            },
+        )
+        cancelled = self.rpc("request_run_cancellation", {"run_id": self.run_id}, research=False)
+        self.assertEqual(cancelled["run"]["status"], "cancelled")
+        answer = self.rpc(
+            "answer",
+            {
+                "run_id": self.run_id,
+                "clarification_id": question_id,
+                "operation_id": str(uuid4()),
+                "text": "India",
+            },
+            check=False,
+        )
+        self.assertIn("research_clarification_stale", answer.stderr)
+
+    def test_unleased_waiting_run_cancels_through_recovery_route(self) -> None:
+        self.rpc(
+            "pause",
+            {
+                "run_id": self.run_id,
+                "generation": 0,
+                "clarification_id": str(uuid4()),
+                "question": "Which market?",
+            },
+        )
+        cancelled = self.rpc(
+            "request_recovery_cancellation", {"run_id": self.run_id}, research=False
+        )
+        self.assertEqual(cancelled["run"]["status"], "cancelled")
+
     def test_another_account_cannot_read_research(self) -> None:
         owner = self.owner
         self.owner = str(uuid4())

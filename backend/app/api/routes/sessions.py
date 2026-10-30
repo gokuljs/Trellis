@@ -97,6 +97,7 @@ class LatestRunResponse(BaseModel):
     run_id: str
     turn_id: str
     status: str
+    run_mode: str = "chat"
     last_sequence: int
     retry_allowed: bool = True
     recovery_reason: str | None = None
@@ -109,6 +110,7 @@ class RunSummaryResponse(BaseModel):
     turn_id: str
     retry_of: str | None
     status: str
+    run_mode: str = "chat"
     budget_preset: str
     max_model_calls: int
     max_tool_calls: int
@@ -190,6 +192,7 @@ def serialize_run_summary(summary: RunSummary) -> RunSummaryResponse:
         turn_id=run.turn_id,
         retry_of=run.retry_of,
         status=run.status.value,
+        run_mode=run.run_mode,
         budget_preset=run.budget_preset,
         max_model_calls=run.max_model_calls,
         max_tool_calls=run.max_tool_calls,
@@ -324,6 +327,7 @@ async def get_latest_run(
             run_id=run.id,
             turn_id=run.turn_id,
             status=run.status.value,
+            run_mode=run.run_mode,
             last_sequence=run.last_event_sequence,
             retry_allowed=run.retry_allowed,
             recovery_reason=run.recovery_reason,
