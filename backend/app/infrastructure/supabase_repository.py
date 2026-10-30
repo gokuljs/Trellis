@@ -60,6 +60,7 @@ from app.domain.runtime import (
     ToolCallRecord,
     ToolCallStatus,
 )
+from app.infrastructure.research_repository import ResearchRepositoryMixin
 from app.infrastructure.web_repository import WebRepositoryMixin
 
 _REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=3.0)
@@ -177,7 +178,7 @@ def _nullable_number(row: Mapping[str, object], key: str) -> float | None:
     return None if row.get(key) is None else _number(row, key)
 
 
-class SupabaseRepository(WebRepositoryMixin):
+class SupabaseRepository(ResearchRepositoryMixin, WebRepositoryMixin):
     async def load_context_window(self, session_id: str, *, limit: int = 128) -> ContextWindow:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 128:
             raise ValueError("context page limit is invalid")
