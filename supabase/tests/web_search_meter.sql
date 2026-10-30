@@ -48,7 +48,7 @@ DECLARE v_scope jsonb; v_other jsonb; v_result jsonb;
     v_usage jsonb:='{"search_calls":1,"page_attempts":0,"network_requests":1,"response_bytes":1048576,"extracted_bytes":0}';
     v_hash text:=repeat('c',64); v_i integer;
 BEGIN
-    ASSERT trellis.web_readiness()='{"schema_version":2,"ready":true}'::jsonb;
+    ASSERT trellis.web_readiness()='{"schema_version":3,"ready":true}'::jsonb;
     v_scope:=pg_temp.web_fixture('32000000-0000-0000-0000-000000000010','meter-a','web_search')-'model_call_id';
     PERFORM trellis.web_mutate('open_run',v_scope,repeat('a',32));
     BEGIN

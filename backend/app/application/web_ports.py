@@ -75,6 +75,22 @@ class WebRepository(Protocol):
         self, scope: WebScope, crawl_id: str, url: str, source_id: str
     ) -> CrawlPage: ...
 
+    async def reserve_crawl_origin(
+        self, scope: WebScope, crawl_id: str, url: str, page_attempt: int
+    ) -> float: ...
+
+    async def finalize_crawl_page(
+        self,
+        scope: WebScope,
+        crawl_id: str,
+        url: str,
+        page_attempt: int,
+        reservation_id: str,
+        source: SourceDraft,
+        usage: WebUsage,
+        discovered_links: tuple[str, ...],
+    ) -> CrawlPage: ...
+
     async def list_web_pages(
         self, session_id: str, crawl_id: str, offset: int = 0, limit: int = 200
     ) -> CrawlPageBatch: ...

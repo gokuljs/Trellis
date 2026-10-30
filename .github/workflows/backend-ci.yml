@@ -106,3 +106,5 @@ jobs:
           bash supabase/tests/web_evidence_concurrency.sh
           psql -X -v ON_ERROR_STOP=1 -f supabase/tests/web_search_meter.sql
           bash supabase/tests/web_search_meter_concurrency.sh
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/web_crawl.sql
+          bash supabase/tests/web_crawl_concurrency.sh

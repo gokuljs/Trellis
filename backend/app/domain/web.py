@@ -311,6 +311,7 @@ class CrawlPage:
     attempt: int
     generation: int | None
     source_id: str | None
+    discovered_links: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

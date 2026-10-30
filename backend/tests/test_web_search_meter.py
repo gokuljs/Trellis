@@ -69,12 +69,13 @@ def test_meter_response_must_not_expose_or_accept_ambiguous_global_data(payload)
 @pytest.mark.parametrize(
     "payload,ready",
     [
-        ({"schema_version": 2, "ready": True}, True),
+        ({"schema_version": 3, "ready": True}, True),
+        ({"schema_version": 2, "ready": True}, False),
         ({"schema_version": 1, "ready": True}, False),
-        ({"schema_version": 2, "ready": False}, False),
+        ({"schema_version": 3, "ready": False}, False),
         ({"schema_version": True, "ready": True}, False),
-        ({"schema_version": 2, "ready": 1}, False),
-        ({"schema_version": 2, "ready": True, "global_attempts": 3}, False),
+        ({"schema_version": 3, "ready": 1}, False),
+        ({"schema_version": 3, "ready": True, "global_attempts": 3}, False),
         (None, False),
     ],
 )

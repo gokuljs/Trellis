@@ -314,7 +314,7 @@ SET CONSTRAINTS ALL IMMEDIATE;
 SET LOCAL ROLE anon;
 DO $$
 BEGIN
-    ASSERT trellis.web_readiness()='{"schema_version":2,"ready":true}'::jsonb;
+    ASSERT trellis.web_readiness()='{"schema_version":3,"ready":true}'::jsonb;
     ASSERT NOT has_table_privilege('anon','trellis.web_sources','SELECT');
     ASSERT NOT has_function_privilege('anon','trellis.web_mutate(text,jsonb,text)','EXECUTE');
 END;
@@ -324,7 +324,7 @@ ALTER TABLE trellis.tool_calls DROP CONSTRAINT tool_calls_recovery_policy_check;
 SET LOCAL ROLE anon;
 DO $$
 BEGIN
-    ASSERT trellis.web_readiness()='{"schema_version":2,"ready":false}'::jsonb,
+    ASSERT trellis.web_readiness()='{"schema_version":3,"ready":false}'::jsonb,
         'web readiness ignored the missing checkpoint recovery constraint';
 END;
 $$;
