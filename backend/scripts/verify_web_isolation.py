@@ -202,6 +202,9 @@ _limits()
 assert resource.getrlimit(resource.RLIMIT_AS)==(256*1024*1024,256*1024*1024)
 assert resource.getrlimit(resource.RLIMIT_CPU)==(8,8)
 assert os.getuid()==10001
+assert os.environ["HOME"]=="/tmp"
+assert os.environ["XDG_CONFIG_HOME"]=="/tmp/trellis-config"
+assert os.environ["XDG_CACHE_HOME"]=="/tmp/trellis-cache"
 status=open("/proc/self/status").read()
 assert "CapEff:\\t0000000000000000" in status
 for key in os.environ:

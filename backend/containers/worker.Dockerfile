@@ -15,5 +15,6 @@ COPY app/domain /opt/trellis/app/domain
 COPY app/infrastructure/web_reader.py app/infrastructure/web_network.py app/infrastructure/web_extraction.py app/infrastructure/pdf_extractor.py app/infrastructure/browser_http.py app/infrastructure/web_renderer.py /opt/trellis/app/infrastructure/
 COPY containers/chromium-seccomp.json containers/chromium-seccomp.LICENSE containers/chromium-seccomp.README.md /opt/trellis/browser-policy/
 RUN touch /opt/trellis/app/__init__.py /opt/trellis/app/infrastructure/__init__.py
+ENV HOME=/tmp XDG_CONFIG_HOME=/tmp/trellis-config XDG_CACHE_HOME=/tmp/trellis-cache
 USER 10001:10001
 CMD ["python", "-m", "app.infrastructure.web_reader"]

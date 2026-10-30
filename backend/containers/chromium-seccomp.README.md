@@ -37,3 +37,8 @@ time. Chromium downloads and apt repositories are upstream build inputs. The
 operator's immutable worker image ID pins the resulting artifact for execution.
 The launcher selects the full Chromium headless channel. The separate headless
 shell lacks the `chrome://sandbox` diagnostics required by the readiness probe.
+
+The worker directs `HOME` and XDG configuration/cache paths to its private bounded
+`/tmp` filesystem. Chromium crash handling also needs writable configuration
+[storage](https://chromium.googlesource.com/experimental/chromium/src/+/HEAD/docs/linux/debugging_minidump.md).
+A read-only root filesystem must not send those writes to `/root` or a host home.
