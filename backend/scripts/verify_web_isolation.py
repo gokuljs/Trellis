@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from app.application.budgets import RunLimits
 from app.application.tool_context import ToolExecutionContext
-from app.domain.retrieval import RetrievalRequest, RetrievalStatus
+from app.domain.retrieval import RenderRequest, RetrievalRequest, RetrievalStatus
 from app.domain.web import SourceStatus
 from app.infrastructure.retrieval_worker import (
     DockerPublicRetriever,
@@ -120,7 +120,44 @@ async def handle(reader, writer):
                 b"<p>Supporting HTML evidence.</p><script>Do not execute this</script>"
                 b"</main><footer>Footer</footer></body></html>"
             )
-        elif path in {"/hold", "/hold-expiry"}:
+        elif path == "/browser":
+            body = (
+                b"<html><body><main id='evidence'></main><script>"
+                b"fetch('/browser-data').then(r=>r.json()).then(v=>"
+                b"document.getElementById('evidence').textContent=v.text)"
+                b"</script></body></html>"
+            )
+        elif path.startswith("/browser-data"):
+            body = b'{"text":"JavaScript supporting evidence."}'
+            media_type = b"application/json"
+        elif path == "/browser-blocked":
+            body = (
+                b"<html><body><main>Public evidence with blocked requests.</main>"
+                b"<script>fetch('http://metadata.test/browser-forbidden').catch(()=>{});"
+                b"fetch('http://private.test/browser-forbidden').catch(()=>{});"
+                b"fetch('http://[::1]/browser-forbidden').catch(()=>{});"
+                b"fetch('/browser-subredirect').catch(()=>{});"
+                b"new WebSocket('ws://public.test/browser-websocket');"
+                b"navigator.serviceWorker.register('/browser-sw').catch(()=>{});"
+                b"</script><iframe src='/browser-frame'></iframe></body></html>"
+            )
+        elif path == "/browser-subredirect":
+            status = b"302 Found"
+            extra = b"Location: http://public.test/browser-redirect-target\\r\\n"
+        elif path == "/browser-budget":
+            body = (
+                b"<html><body><main id='evidence'></main><script>"
+                b"Promise.all(Array.from({length:90},(_,i)=>"
+                b"fetch('/browser-data?i='+i).catch(()=>null))).then(()=>"
+                b"document.getElementById('evidence').textContent='Bounded browser evidence.')"
+                b"</script></body></html>"
+            )
+        elif path == "/browser-cancel":
+            body = (
+                b"<html><body><main></main><script>"
+                b"fetch('/hold-browser').catch(()=>{})</script></body></html>"
+            )
+        elif path in {"/hold", "/hold-expiry", "/hold-browser"}:
             writer.write(
                 b"HTTP/1.1 200 OK\\r\\nContent-Type: text/html\\r\\n"
                 b"Connection: close\\r\\n\\r\\n"
@@ -267,7 +304,7 @@ def _pdf_fixture(text: str) -> bytes:
     return bytes(output)
 
 
-def _context() -> ToolExecutionContext:
+def _context(seconds: int = 30) -> ToolExecutionContext:
     return ToolExecutionContext(
         "fixture",
         "fixture",
@@ -276,7 +313,7 @@ def _context() -> ToolExecutionContext:
         "fixture",
         1,
         1,
-        datetime.now(UTC) + timedelta(seconds=30),
+        datetime.now(UTC) + timedelta(seconds=seconds),
         RunLimits(8, 16, 100000, 600, 2.0),
         None,
         _context_active,
@@ -382,7 +419,7 @@ async def verify() -> None:
                 "-f",
                 str(_BACKEND / "containers/worker.Dockerfile"),
                 str(_BACKEND),
-                deadline_seconds=240,
+                deadline_seconds=600,
             )
             gateway_image = await _docker(
                 "build",
@@ -661,6 +698,66 @@ async def verify() -> None:
             assert scanned.status is SourceStatus.UNSUPPORTED, scanned
             assert scanned.error_code == "pdf_no_extractable_text_ocr_unsupported", scanned
             print("worker_html_text_pdf_extraction_pass", flush=True)
+            assert await retriever.is_render_ready(), "Chromium sandbox readiness failed"
+            rendered = await retriever.render_document(
+                RenderRequest("http://public.test/browser"), _context(60)
+            )
+            assert rendered.status is SourceStatus.SUCCESS, rendered
+            assert rendered.text == "JavaScript supporting evidence.", rendered
+            assert rendered.usage.network_requests == 2, rendered
+            blocked_render = await retriever.render_document(
+                RenderRequest("http://public.test/browser-blocked"), _context(60)
+            )
+            assert blocked_render.status is SourceStatus.PARTIAL, blocked_render
+            assert "Public evidence with blocked requests." in blocked_render.text
+            browser_logs = await _docker("logs", fixture_name)
+            for forbidden in (
+                "/browser-forbidden",
+                "/browser-redirect-target",
+                "/browser-frame",
+                "/browser-websocket",
+                "/browser-sw",
+            ):
+                assert forbidden not in browser_logs, (forbidden, browser_logs)
+            browser_before = len(browser_logs.splitlines())
+            bounded_render = await retriever.render_document(
+                RenderRequest("http://public.test/browser-budget"), _context(60)
+            )
+            assert bounded_render.status is SourceStatus.PARTIAL, bounded_render
+            assert bounded_render.text == "Bounded browser evidence.", bounded_render
+            assert bounded_render.usage.network_requests <= 75, bounded_render
+            assert len((await _docker("logs", fixture_name)).splitlines()) - browser_before <= 75
+            browser_cancel = asyncio.create_task(
+                retriever.render_document(
+                    RenderRequest("http://public.test/browser-cancel"), _context(60)
+                )
+            )
+            for _ in range(150):
+                if '"path": "/hold-browser"' in await _docker("logs", fixture_name):
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                raise AssertionError("browser cancellation fixture did not begin")
+            browser_cancel.cancel()
+            try:
+                await browser_cancel
+            except asyncio.CancelledError:
+                pass
+            else:
+                raise AssertionError("browser cancellation did not propagate")
+            for _ in range(20):
+                if '"closed": "/hold-browser"' in await _docker("logs", fixture_name):
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                raise AssertionError("browser cancellation left remote socket open")
+            assert not await _docker(
+                "ps", "--all", "--quiet", "--filter", "label=trellis.role=retrieval-worker"
+            )
+            assert await retriever.is_render_ready(), (
+                "browser gate remained held after cancellation"
+            )
+            print("chromium_sandbox_js_requests_limits_cancellation_pass", flush=True)
             logs = await _docker("logs", fixture_name)
             assert '"sni": "public.test"' in logs and '"host": "public.test"' in logs
             before = len(logs.splitlines())
@@ -766,6 +863,7 @@ async def verify() -> None:
                 "overflow": "bounded",
                 "cancellation": "worker removed, lease revoked",
                 "kernel_policy": "inspected",
+                "chromium": "sandbox, JS, public subrequests, limits, cancellation verified",
                 "temporary_resources": "removed",
             }
         ),

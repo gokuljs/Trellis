@@ -249,10 +249,34 @@ settlement. Missing receipts keep the conservative reservation charged.
 Tunnel bytes are application-level transport bytes, not TCP/IP packet accounting.
 
 Encrypted tunnels do not reveal every HTTP request, redirect, or decoded response.
-The fixed reader and later renderer enforce those limits. The gateway does not
+The fixed reader and renderer enforce those limits. The gateway does not
 prove exact HTTP request accounting or GET-only behavior against a compromised
 browser process. Public-only egress, transport limits, process limits, and lease
 expiry remain independent controls.
+
+Chromium receives no direct transport authority. A trusted HTTP client fetches
+and validates the initial redirect chain, then fulfills that final document in
+Chromium. Context-wide routing fulfills later GET/HEAD requests through the same
+client, with two concurrent target requests. It never continues a browser request
+or follows a subresource redirect. Subresource redirects return an explicit
+partial outcome. Subsequent frame/document navigation, popups, downloads,
+service workers, and WebSockets are blocked; images, media, and fonts are omitted.
+A dead loopback proxy and disabled worker networking also block native bypasses.
+
+Each render reserves both slots of the backend's shared two-request gate. One
+renderer or sandbox readiness probe may run at a time, and its gate remains held
+until cleanup finishes. The inspected worker uses 2 GiB of memory, two CPUs,
+256 processes, private 256 MiB shared memory, and 256 MiB temporary scratch.
+Playwright 1.64.1 and its Chromium revision live only in the worker image. The
+restricted seccomp profile and its upstream license are versioned beside the
+Dockerfile. No capability is added, and Chromium's sandbox is explicitly enabled.
+Readiness requires both the gateway's render protocol and a real sandbox probe;
+a failed probe leaves ordinary reading available and rendering unavailable.
+
+DOM extraction stores bounded visible text and at most 32 links. Rendering is an
+optional `web_read` argument within normal chat, not a separate research mode.
+The renderer does not perform authenticated browsing, login, form submission,
+OCR, or unrestricted interaction. These exclusions keep public reading bounded.
 
 The reader uses the already locked `h11` package for bounded HTTP framing.
 The gateway uses the already locked `dnspython` package for cancellable DNS.
