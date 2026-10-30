@@ -7,6 +7,13 @@ Users sign in, choose an available model, and chat.
 See [Stage 2](../docs/stage-2.md) for setup, migrations, streaming and replay
 limits, context compaction, frontend behavior, and verification.
 
+Stage 7 adds normal-chat web search, page reading, sandboxed rendering, bounded
+crawling and saved-source citations. Read the [architecture and security report](../docs/stage-7-web.md),
+[private operator setup](../docs/stage-7-operations.md), and
+[verification handoff](../docs/stage-7-verification.md) before enabling web tools.
+Search uses a separate Brave backend key. Live migrations and deployment remain
+separate actions.
+
 From this directory:
 
 ```bash

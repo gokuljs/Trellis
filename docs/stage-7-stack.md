@@ -19,7 +19,7 @@ merge from the first row downward. Keep descendants aligned after a parent merge
 | 6     | `search-and-crawler-browser`      | `search-and-crawler-reading` | Sandboxed browser rendering                     | Verified   |
 | 7     | `search-and-crawler-crawl`        | `search-and-crawler-browser` | Bounded crawl and persistent frontier           | Verified   |
 | 8     | `search-and-crawler-chat`         | `search-and-crawler-crawl`   | Progress, citations, source viewer, clearing    | Verified   |
-| 9     | `search-and-crawler-verification` | `search-and-crawler-chat`    | Complete acceptance and operator instructions   | Planned    |
+| 9     | `search-and-crawler-verification` | `search-and-crawler-chat`    | Complete acceptance and operator instructions   | Verified   |
 
 ## Implementation checkpoints
 
@@ -51,3 +51,7 @@ The final handoff lists pushed branch tips, comparison links, commit summaries,
 commands run, outcomes, setup requirements, and unverified limitations.
 No production deployment, live database migration, or provider billing activation
 is part of pushing the branches.
+
+The completed [verification handoff](stage-7-verification.md) includes every
+comparison link, implementation commit, test result, and remaining limit. Use
+the [operator guide](stage-7-operations.md) for private local setup after review.
