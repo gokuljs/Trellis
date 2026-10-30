@@ -15,7 +15,7 @@ merge from the first row downward. Keep descendants aligned after a parent merge
 | 2     | `search-and-crawler-runtime`      | `search-and-crawler`         | Trusted tool context and capability separation  | Verified    |
 | 3     | `search-and-crawler-sources`      | `search-and-crawler-runtime` | Evidence, RLS, source APIs, budgets, recovery   | Verified    |
 | 4     | `search-and-crawler-fetch`        | `search-and-crawler-sources` | Isolated worker and controlled public retrieval | Verified    |
-| 5     | `search-and-crawler-reading`      | `search-and-crawler-fetch`   | Brave, HTML, PDF, and source tools              | Planned     |
+| 5     | `search-and-crawler-reading`      | `search-and-crawler-fetch`   | Brave, HTML, PDF, and source tools              | Verified    |
 | 6     | `search-and-crawler-browser`      | `search-and-crawler-reading` | Sandboxed browser rendering                     | Planned     |
 | 7     | `search-and-crawler-crawl`        | `search-and-crawler-browser` | Bounded crawl and persistent frontier           | Planned     |
 | 8     | `search-and-crawler-chat`         | `search-and-crawler-crawl`   | Progress, citations, source viewer, clearing    | Planned     |

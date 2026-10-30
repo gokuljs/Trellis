@@ -33,6 +33,15 @@ class Settings(BaseSettings):
     max_active_runs_per_user: int = Field(default=4, ge=1, le=256)
     openai_api_key: SecretStr | None = Field(default=None, repr=False)
     anthropic_api_key: SecretStr | None = Field(default=None, repr=False)
+    brave_search_api_key: SecretStr | None = Field(default=None, repr=False)
+    brave_search_monthly_limit: int = Field(default=1000, ge=1, le=1000)
+    web_worker_image: str | None = None
+    web_gateway_image: str | None = None
+    web_gateway_container: str = "trellis-public-egress"
+    web_gateway_ipc_volume: str = "trellis-public-egress"
+    web_gateway_secret_file: Path | None = None
+    web_gateway_control_url: str = "http://127.0.0.1:8081"
+    web_gateway_admin_secret: SecretStr | None = Field(default=None, repr=False)
     release: str = Field(default="development", pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}$")
 
     @model_validator(mode="after")

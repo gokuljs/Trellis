@@ -131,6 +131,17 @@ Bounded extracted text lives in Postgres for this release. Raw documents and
 browser artifacts are transient. Successful source content is immutable.
 Refetching creates a new version instead of changing evidence behind an answer.
 
+The backend removes configured application credentials before source persistence.
+Matching covers credentials split by canonical line wrapping, so separate line
+requests cannot reconstruct a filtered credential. Metadata and blocked input
+URLs receive the same filtering. The worker never receives the application's
+credential list.
+
+A filtered citable source has status `partial` and error code
+`sensitive_content_redacted`. Its content hash identifies the accepted, stored
+text after filtering and canonicalization. Clean source text keeps its normal
+hash. Citation lines always refer to the immutable accepted version.
+
 The storage contract preserves these records.
 
 | Record            | Preserved information                                                                                                                                             |
@@ -301,6 +312,25 @@ Robots rules do not grant authorization to access a resource.
 Tools share the ledger, so repeated calls cannot multiply these ceilings.
 Brave has a separately configured application usage ceiling. Missing credentials
 produce an explicit unavailable result without a silent provider fallback.
+
+Search uses Brave's fixed
+[POST endpoint](https://api-dashboard.search.brave.com/api-reference/web/search/post)
+with the query in a JSON body. A dedicated client disables environment proxies,
+cookies, and redirects. Search snippets remain discovery data.
+
+The search meter reserves an attempt before provider I/O. It shares a key hash
+and database-clock UTC month across users and backend restarts. The default
+ceiling is 1,000 attempts per key per month, and configuration can lower it.
+Interrupted requests and provider errors retain their monthly charge.
+Clearing sources does not reset that allowance. The private meter exposes no
+shared-key usage records through ordinary authenticated table reads.
+
+Run cost totals cover model usage. Brave billing is separate, and the provider's
+account controls remain authoritative. A shared key used outside Trellis or a
+different provider billing period can differ from Trellis's meter. The ceiling
+does not promise a zero provider bill. Brave's response counter measures bounded
+application payload bytes. Source gateway receipts measure forwarded transport
+bytes, including TLS, rather than physical packet traffic.
 
 ## Acceptance criteria
 

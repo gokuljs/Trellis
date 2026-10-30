@@ -40,15 +40,24 @@ from app.application.runs import RunService
 from app.application.secret_redaction import SecretRedactor
 from app.application.sessions import SessionService
 from app.application.settings import SettingsService
-from app.application.tools import ToolRegistry
+from app.application.tool_context import ToolExecutionContext
+from app.application.tools import ToolRegistration, ToolRegistry
 from app.application.web_evidence import WebEvidenceService
 from app.application.web_ports import WebRepository
+from app.application.web_tools import WebToolService
 from app.core.config import Settings
 from app.domain.capabilities import RuntimeCapabilities
 from app.domain.models import ProviderName
+from app.domain.runtime import RunEventType
+from app.infrastructure.brave_search import BraveSearchProvider
 from app.infrastructure.command_tools import LocalCommandToolExecutor
 from app.infrastructure.local_patch import LocalPatchToolExecutor
 from app.infrastructure.local_tools import LocalReadToolExecutor, read_workspace_guidance
+from app.infrastructure.retrieval_worker import (
+    DockerPublicRetriever,
+    GatewayControlClient,
+    WorkerDeployment,
+)
 from app.infrastructure.runtime_events import RuntimeEventHub
 from app.infrastructure.server_credentials import ServerCredentialStore
 from app.infrastructure.supabase_repository import SupabaseRepository, VerifiedTokenSource
@@ -193,7 +202,12 @@ class AccountRegistry:
         self._redactor = SecretRedactor(
             *(
                 key.get_secret_value().strip()
-                for key in (settings.openai_api_key, settings.anthropic_api_key)
+                for key in (
+                    settings.openai_api_key,
+                    settings.anthropic_api_key,
+                    settings.brave_search_api_key,
+                    settings.web_gateway_admin_secret,
+                )
                 if key is not None
             )
         )
@@ -218,6 +232,76 @@ class AccountRegistry:
         self._installation_lock = asyncio.Lock()
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
+
+    async def _web_tool_registrations(
+        self,
+        database: AccountRepository,
+        evidence: WebEvidenceService,
+        event_hub: RuntimeEventHub,
+    ) -> tuple[ToolRegistration, ...]:
+        if not self._capabilities.enabled.intersection({"web_read", "web_search"}):
+            return ()
+        if not await database.web_tools_ready():
+            return ()
+        settings = self._settings
+        try:
+            search = BraveSearchProvider(
+                settings.brave_search_api_key.get_secret_value().strip()
+                if settings.brave_search_api_key is not None
+                else None
+            )
+        except ValueError:
+            search = BraveSearchProvider(None)
+        retriever = None
+        if (
+            self._capabilities.allows("web_read")
+            and settings.web_worker_image is not None
+            and settings.web_gateway_image is not None
+            and settings.web_gateway_secret_file is not None
+            and settings.web_gateway_admin_secret is not None
+        ):
+            try:
+                deployment = WorkerDeployment(
+                    settings.web_worker_image,
+                    settings.web_gateway_image,
+                    settings.web_gateway_container,
+                    settings.web_gateway_ipc_volume,
+                    settings.web_gateway_secret_file,
+                )
+                candidate = DockerPublicRetriever(
+                    deployment,
+                    GatewayControlClient(
+                        settings.web_gateway_control_url,
+                        settings.web_gateway_admin_secret.get_secret_value().strip(),
+                    ),
+                )
+                async with asyncio.timeout(15):
+                    if await candidate.is_ready():
+                        retriever = candidate
+            except ValueError, TimeoutError:
+                pass
+
+        async def publish(context: ToolExecutionContext, metadata: dict[str, object]) -> None:
+            await context.assert_active()
+            event = await database.append_run_event(
+                context.run_id,
+                RunEventType.PHASE,
+                {**metadata, "tool_call_id": context.tool_call_id},
+            )
+            await event_hub.publish(event)
+
+        service = WebToolService(
+            evidence,
+            retriever=retriever,
+            search=search if search.configured else None,
+            search_key_hash=search.key_hash,
+            monthly_search_limit=settings.brave_search_monthly_limit,
+            redactor=self._redactor,
+            publish_progress=publish,
+        )
+        return service.registrations(
+            search_ready=search.configured, read_ready=retriever is not None
+        )
 
     async def _get_installation(self) -> InstallationIdentity:
         async with self._installation_lock:
@@ -303,6 +387,7 @@ class AccountRegistry:
                     await database.ensure_account()
                     secret_store = self._credentials
                     event_hub = RuntimeEventHub()
+                    web_evidence = WebEvidenceService(database, database, owner_id=str(user_id))
                     installation = await self._get_installation()
                     workspace_bindings = None
                     workspace_execution = None
@@ -333,6 +418,9 @@ class AccountRegistry:
                             else None,
                             capabilities=self._capabilities,
                             redactor=self._redactor,
+                            additional_tools=await self._web_tool_registrations(
+                                database, web_evidence, event_hub
+                            ),
                         )
                     )
                     recovery_contracts = RecoveryContracts(
@@ -375,9 +463,7 @@ class AccountRegistry:
                         )
                         context = AccountContext(
                             database=database,
-                            web_evidence_service=WebEvidenceService(
-                                database, database, owner_id=str(user_id)
-                            ),
+                            web_evidence_service=web_evidence,
                             secret_store=secret_store,
                             profile_service=ProfileService(database),
                             session_service=SessionService(
