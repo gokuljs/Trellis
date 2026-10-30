@@ -425,6 +425,44 @@ class ResearchPostgresTests(unittest.TestCase):
         )
         self.assertEqual(cancelled["run"]["status"], "cancelled")
 
+    def test_report_publication_is_atomic_and_idempotent_with_unicode_hash(self) -> None:
+        payload = self.publication()
+        first = self.rpc("publish", payload)
+        replayed = self.rpc("publish", payload)
+        self.assertEqual(first, replayed)
+        self.assertEqual(first["run"]["status"], "completed")
+        state = json.loads(
+            self.sql(
+                "SELECT jsonb_build_object('messages',"
+                "(SELECT count(*) FROM trellis.messages "
+                f"WHERE run_id={literal(self.run_id)} AND role='assistant'),"
+                "'bindings',(SELECT count(*) FROM trellis.web_citations "
+                f"WHERE run_id={literal(self.run_id)}),"
+                "'outputs',(SELECT count(*) FROM trellis.run_assistant_outputs "
+                f"WHERE run_id={literal(self.run_id)} AND promoted_message_id IS NOT NULL));"
+            ).stdout
+        )
+        self.assertEqual(state, {"messages": 1, "bindings": 1, "outputs": 1})
+
+    def test_changed_report_cannot_reuse_review_hash(self) -> None:
+        payload = self.publication()
+        payload["report"]["markdown"] += "\nA new unsupported assertion."
+        rejected = self.rpc("publish", payload, check=False)
+        self.assertIn("research_review_changed", rejected.stderr)
+
+    def test_changed_source_hash_prevents_report_publication(self) -> None:
+        payload = self.publication()
+        source_id = next(iter(payload["review"]["source_hashes"]))
+        payload["review"]["source_hashes"][source_id] = "0" * 64
+        rejected = self.rpc("publish", payload, check=False)
+        self.assertIn("research_source_changed", rejected.stderr)
+        self.assertEqual(
+            self.sql(
+                f"SELECT count(*) FROM trellis.web_citations WHERE run_id={literal(self.run_id)};"
+            ).stdout.strip(),
+            "0",
+        )
+
     def test_another_account_cannot_read_research(self) -> None:
         owner = self.owner
         self.owner = str(uuid4())
