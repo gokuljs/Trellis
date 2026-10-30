@@ -698,7 +698,26 @@ async def verify() -> None:
             assert scanned.status is SourceStatus.UNSUPPORTED, scanned
             assert scanned.error_code == "pdf_no_extractable_text_ocr_unsupported", scanned
             print("worker_html_text_pdf_extraction_pass", flush=True)
-            assert await retriever.is_render_ready(), "Chromium sandbox readiness failed"
+            render_ready = await retriever.is_render_ready()
+            if not render_ready:
+                await _docker(*_worker_args(deployment, probe_name, render=True))
+                probe_code, probe_output = await _run_docker(
+                    ("start", "--attach", "--interactive", probe_name),
+                    payload=b'{"operation":"sandbox_probe"}\n',
+                    deadline_seconds=25,
+                    capture_stderr=True,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "sandbox_probe_code": probe_code,
+                            "sandbox_probe_output": probe_output.decode(errors="replace"),
+                        }
+                    ),
+                    flush=True,
+                )
+                await _docker("rm", "--force", probe_name)
+            assert render_ready, "Chromium sandbox readiness failed"
             rendered = await retriever.render_document(
                 RenderRequest("http://public.test/browser"), _context(60)
             )
