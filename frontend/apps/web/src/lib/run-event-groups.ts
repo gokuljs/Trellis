@@ -44,7 +44,11 @@ export function groupRunEvents(events: RuntimeRunEvent[]): RunEventGroup[] {
       continue
     }
 
-    if (event.eventType.startsWith("tool.")) {
+    const webProgress =
+      event.eventType === "run.phase" &&
+      typeof event.data.tool_call_id === "string" &&
+      ["web_search", "web_read", "web_crawl"].includes(String(event.data.phase))
+    if (event.eventType.startsWith("tool.") || webProgress) {
       model = null
       const callId =
         typeof event.data.tool_call_id === "string"

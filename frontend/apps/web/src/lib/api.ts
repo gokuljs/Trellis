@@ -21,6 +21,11 @@ import {
 } from "@/lib/auth-controller"
 import { configuredApiUrl } from "@/lib/service-targets"
 import { waitUntilServiceReady } from "@/lib/service-readiness"
+import type {
+  CitationBinding,
+  WebSourceLines,
+  WebSourcePage,
+} from "@/lib/web-evidence"
 
 type ErrorPayload = {
   error?: {
@@ -373,6 +378,43 @@ export function createApiClient({
       }),
     getSession: (sessionId: string) =>
       request<SessionDetail>(`/api/sessions/${sessionId}`),
+    listWebSources: (
+      sessionId: string,
+      offset = 0,
+      options: RequestOptions = {}
+    ) =>
+      request<WebSourcePage>(
+        `/api/sessions/${encodeURIComponent(sessionId)}/sources?offset=${offset}&limit=20`,
+        {},
+        options
+      ),
+    readWebSource: (
+      sessionId: string,
+      sourceId: string,
+      startLine = 1,
+      maxLines = 100,
+      options: RequestOptions = {}
+    ) =>
+      request<WebSourceLines>(
+        `/api/sessions/${encodeURIComponent(sessionId)}/sources/${encodeURIComponent(sourceId)}?start_line=${startLine}&max_lines=${maxLines}`,
+        {},
+        options
+      ),
+    readWebCitations: (
+      sessionId: string,
+      modelCallId: string,
+      options: RequestOptions = {}
+    ) =>
+      request<{ items: CitationBinding[] }>(
+        `/api/sessions/${encodeURIComponent(sessionId)}/citations/${encodeURIComponent(modelCallId)}`,
+        {},
+        options
+      ),
+    clearWebSources: (sessionId: string) =>
+      request<{ evidence_epoch: number; cleared_count: number }>(
+        `/api/sessions/${encodeURIComponent(sessionId)}/sources`,
+        { method: "DELETE" }
+      ),
     selectSessionModel: (sessionId: string, modelId: string) =>
       request<Session>(`/api/sessions/${encodeURIComponent(sessionId)}/model`, {
         method: "PUT",

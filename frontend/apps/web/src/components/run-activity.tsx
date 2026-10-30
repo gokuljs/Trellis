@@ -262,6 +262,71 @@ export function RunActivity({
                 let tone = "normal"
 
                 switch (event.eventType) {
+                  case "run.phase": {
+                    const phase = textField(event.data, "phase")
+                    const progress = textField(event.data, "status")
+                    if (
+                      !["web_search", "web_read", "web_crawl"].includes(
+                        phase ?? ""
+                      )
+                    )
+                      return null
+                    title =
+                      phase === "web_search"
+                        ? "Searching the web"
+                        : phase === "web_read"
+                          ? "Reading a page"
+                          : "Collecting site pages"
+                    const completed = numberField(event.data, "pages_completed")
+                    const maximum = numberField(event.data, "max_pages")
+                    const results = numberField(event.data, "results")
+                    const labels: Record<string, string> = {
+                      started: "Started",
+                      page_completed: "Page processed",
+                      completed: "Completed",
+                      success: "Completed",
+                      partial: "Partial result",
+                      blocked: "Blocked",
+                      unavailable: "Unavailable",
+                      timeout: "Timed out",
+                      cancelled: "Cancelled",
+                      budget_exhausted: "Allowance reached",
+                      oversized: "Page too large",
+                      unsupported: "Unsupported page",
+                      extraction_failed: "Text extraction failed",
+                    }
+                    detail = (
+                      <span>
+                        {labels[progress ?? ""] ?? "Collecting"}
+                        {completed !== null &&
+                        maximum !== null &&
+                        completed >= 0 &&
+                        maximum >= completed &&
+                        maximum <= 20
+                          ? ` · ${completed} of ${maximum} pages processed`
+                          : ""}
+                        {results !== null && results >= 0 && results <= 50
+                          ? ` · ${results} results`
+                          : ""}
+                      </span>
+                    )
+                    tone =
+                      progress &&
+                      [
+                        "partial",
+                        "blocked",
+                        "unavailable",
+                        "timeout",
+                        "cancelled",
+                        "budget_exhausted",
+                        "oversized",
+                        "unsupported",
+                        "extraction_failed",
+                      ].includes(progress)
+                        ? "warning"
+                        : "normal"
+                    break
+                  }
                   case "run.queued":
                     title = "Run queued"
                     break
