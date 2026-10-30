@@ -12,7 +12,7 @@ uvx --from uv==0.12.5 uv run fastapi dev
 ```
 
 The `uvx` form keeps the repository reproducible without changing an older
-global uv installation. CI installs the same pinned uv version.
+global uv installation.
 
 ## Logs
 
@@ -164,6 +164,4 @@ Lost model responses retain partial output and unknown usage without another pai
 attempt. A reconciled patch can still stop if a saved search, listing, or Git
 observation changed and its relationship to that patch cannot be proven.
 
-`make check` with uv 0.12.5 runs formatting, lint, type checking, and the
-remaining backend tests with a 90% logging coverage floor. The existing disposable
-PostgreSQL tests and concurrency harness in `supabase/tests/` run in backend CI.
+`make check` with uv 0.12.5 runs formatting, lint, and type checking.
