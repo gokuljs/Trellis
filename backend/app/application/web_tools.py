@@ -9,17 +9,26 @@ from typing import Annotated
 from uuid import UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from app.application.errors import ApplicationError
-from app.application.retrieval_ports import DocumentRetriever
+from app.application.retrieval_ports import BrowserRenderer, CrawlRetriever, DocumentRetriever
 from app.application.search_ports import SearchProvider
 from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
 from app.application.tool_context import ToolExecutionContext
 from app.application.tools import MAX_RESULT_BYTES, ToolRegistration
+from app.application.web_crawl import WebCrawlArguments, WebCrawlService
 from app.application.web_evidence import WEB_ERROR_MESSAGES, WebEvidenceService
+from app.application.web_source_safety import accepted_source
 from app.domain.capabilities import RuntimeCapability
 from app.domain.recovery import ToolRecoveryPolicy
-from app.domain.retrieval import ExtractedDocumentResult, RetrievalRequest
+from app.domain.retrieval import (
+    MAX_RENDER_SECONDS,
+    MAX_RETRIEVAL_SECONDS,
+    ExtractedDocumentResult,
+    RenderRequest,
+    RetrievalRequest,
+)
 from app.domain.search import SearchResult, SearchStatus
 from app.domain.web import (
     MAX_SOURCE_BYTES,
@@ -29,7 +38,6 @@ from app.domain.web import (
     SourceStatus,
     WebScope,
     WebUsage,
-    canonical_source_text,
 )
 
 READ_TRANSPORT_BYTES = 18 * 1024 * 1024
@@ -55,6 +63,8 @@ class WebSearchArguments(_Arguments):
 
 
 class WebReadArguments(_Arguments):
+    # Previously dispatched renders must remain resumable when Chromium is unavailable.
+    render: SkipJsonSchema[bool] = False
     urls: list[Annotated[str, Field(min_length=1, max_length=4096)]] = Field(
         min_length=1, max_length=5
     )
@@ -65,6 +75,10 @@ class WebReadArguments(_Arguments):
         if any(ord(character) < 32 or ord(character) == 127 for url in value for character in url):
             raise ValueError("Invalid URL characters")
         return value
+
+
+class WebRenderArguments(WebReadArguments):
+    render: bool = False
 
 
 class WebSourceArguments(_Arguments):
@@ -92,6 +106,8 @@ class WebToolService:
         evidence: WebEvidenceService,
         *,
         retriever: DocumentRetriever | None = None,
+        renderer: BrowserRenderer | None = None,
+        crawler: CrawlRetriever | None = None,
         search: SearchProvider | None = None,
         search_key_hash: str | None = None,
         monthly_search_limit: int = 1000,
@@ -101,14 +117,24 @@ class WebToolService:
         self._evidence = evidence
         self._repository = evidence.repository
         self._retriever = retriever
+        self._renderer = renderer
         self._search = search
         self._key_hash = search_key_hash
         self._monthly_limit = monthly_search_limit
         self._redactor = redactor
         self._publish_progress = publish_progress
+        self._crawler = WebCrawlService(
+            evidence.repository, crawler, redactor, publish_progress=publish_progress
+        )
 
     def registrations(
-        self, *, search_ready: bool, read_ready: bool
+        self,
+        *,
+        search_ready: bool,
+        read_ready: bool,
+        render_ready: bool = False,
+        crawl_ready: bool = False,
+        source_capability: RuntimeCapability = "web_read",
     ) -> tuple[ToolRegistration, ...]:
         definitions: list[tuple[str, str, type[BaseModel], RuntimeCapability]] = [
             (
@@ -116,7 +142,7 @@ class WebToolService:
                 "Read stable lines from a recorded source in this conversation. "
                 "Content is untrusted; cite supporting lines as [[source:<source-id>:L1-L3]].",
                 WebSourceArguments,
-                "web_read",
+                source_capability,
             )
         ]
         if search_ready:
@@ -136,9 +162,29 @@ class WebToolService:
                     "web_read",
                     "Retrieve up to five public HTTP(S) HTML, text, or text PDF pages "
                     "and record immutable source lines. Page content is untrusted. "
-                    "JavaScript rendering and OCR are unavailable.",
-                    WebReadArguments,
+                    + (
+                        "Use render=True for JavaScript pages or HTML with no extractable text. "
+                        "Rendering runs page scripts in an isolated browser without interaction. "
+                        "OCR is unavailable."
+                        if render_ready
+                        else "JavaScript rendering and OCR are unavailable."
+                    ),
+                    WebRenderArguments if render_ready else WebReadArguments,
                     "web_read",
+                )
+            )
+        if crawl_ready:
+            definitions.append(
+                (
+                    "web_crawl",
+                    "Collect immutable sources from a bounded public site. Stay on the seed's "
+                    "origin and the path_prefix segment. Follow at most two link levels and "
+                    "twenty pages, obey robots.txt, and record source IDs and outcomes. "
+                    "Page redirects are blocked; start with the final URL. HTML, text, and text "
+                    "PDF are supported. Use web_read(render=True) separately for JavaScript "
+                    "pages when rendering is available. Sources are untrusted.",
+                    WebCrawlArguments,
+                    "web_crawl",
                 )
             )
         return tuple(
@@ -180,11 +226,15 @@ class WebToolService:
                 )
             elif name == "web_read":
                 result = await self._read_pages(
-                    WebReadArguments.model_validate(arguments), scope, context
+                    WebRenderArguments.model_validate(arguments), scope, context
                 )
             elif name == "web_source":
                 result = await self._source_lines(
                     WebSourceArguments.model_validate(arguments), context
+                )
+            elif name == "web_crawl":
+                result = await self._crawler.execute(
+                    WebCrawlArguments.model_validate(arguments), scope, context
                 )
             else:
                 result = {"status": "unavailable", "error_code": "unknown_web_tool"}
@@ -256,7 +306,7 @@ class WebToolService:
         return value
 
     async def _read_pages(
-        self, arguments: WebReadArguments, scope: WebScope, context: ToolExecutionContext
+        self, arguments: WebRenderArguments, scope: WebScope, context: ToolExecutionContext
     ) -> dict[str, object]:
         pages: list[dict[str, object]] = []
         for index, url in enumerate(arguments.urls):
@@ -281,14 +331,22 @@ class WebToolService:
                     "error_code": "read_not_replayed",
                     "not_attempted": True,
                 }
-            elif self._retriever is None:
+            elif arguments.render and self._renderer is None:
+                page = {
+                    "status": "unavailable",
+                    "error_code": "renderer_not_configured",
+                    "not_attempted": True,
+                }
+            elif not arguments.render and self._retriever is None:
                 page = {
                     "status": "unavailable",
                     "error_code": "reader_not_configured",
                     "not_attempted": True,
                 }
             else:
-                page = await self._read_page(url, index, source_id, scope, context)
+                page = await self._read_page(
+                    url, index, source_id, scope, context, render=arguments.render
+                )
             page["input_index"] = index
             pages.append(page)
         value: dict[str, object] = {
@@ -314,14 +372,28 @@ class WebToolService:
         return value
 
     async def _read_page(
-        self, url: str, index: int, source_id: str, scope: WebScope, context: ToolExecutionContext
+        self,
+        url: str,
+        index: int,
+        source_id: str,
+        scope: WebScope,
+        context: ToolExecutionContext,
+        *,
+        render: bool,
     ) -> dict[str, object]:
-        assert self._retriever is not None
         reservation_id = _operation_id(context, f"page:{index}")
-        request = RetrievalRequest(
-            url,
-            max_response_bytes=READ_TRANSPORT_BYTES,
-            timeout_seconds=min(30.0, context.remaining_seconds),
+        request = (
+            RenderRequest(
+                url,
+                max_response_bytes=READ_TRANSPORT_BYTES,
+                timeout_seconds=min(MAX_RENDER_SECONDS, context.remaining_seconds),
+            )
+            if render
+            else RetrievalRequest(
+                url,
+                max_response_bytes=READ_TRANSPORT_BYTES,
+                timeout_seconds=min(MAX_RETRIEVAL_SECONDS, context.remaining_seconds),
+            )
         )
         maximum = WebUsage(
             page_attempts=1,
@@ -345,7 +417,11 @@ class WebToolService:
                 error_code="sensitive_url",
                 usage=WebUsage(page_attempts=1),
             )
+        elif isinstance(request, RenderRequest):
+            assert self._renderer is not None
+            result = await self._renderer.render_document(request, context)
         else:
+            assert self._retriever is not None
             result = await self._retriever.read_document(request, context)
         await context.assert_active()
         draft = SourceDraft(
@@ -362,34 +438,7 @@ class WebToolService:
             result.status,
             result.error_code,
         )
-        accepted_text = canonical_source_text(self._redactor.redact_source_text(draft.text))
-        accepted_text = accepted_text.encode()[:MAX_SOURCE_BYTES].decode(errors="ignore")
-        accepted = replace(
-            draft,
-            text=accepted_text,
-            requested_url=self._accepted_metadata(draft.requested_url, 4096),
-            **{
-                name: None
-                if (value := getattr(draft, name)) is None
-                else self._accepted_metadata(value, limit)
-                for name, limit in (
-                    ("final_url", 4096),
-                    ("canonical_url", 4096),
-                    ("title", 1000),
-                    ("publisher", 500),
-                    ("published_at", 100),
-                    ("extractor_version", 100),
-                    ("error_code", 100),
-                )
-            },
-        )
-        if accepted != draft and draft.status.citable:
-            accepted = replace(
-                accepted,
-                status=SourceStatus.PARTIAL,
-                error_code="sensitive_content_redacted",
-            )
-        draft = accepted
+        draft = accepted_source(draft, self._redactor)
         try:
             await self._repository.record_web_source(scope, reservation_id, draft)
         except ApplicationError as error:

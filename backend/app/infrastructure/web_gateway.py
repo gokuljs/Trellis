@@ -13,7 +13,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from app.domain.retrieval import MAX_NETWORK_REQUESTS, MAX_RESPONSE_BYTES, MAX_RETRIEVAL_SECONDS
+from app.domain.retrieval import (
+    MAX_NETWORK_REQUESTS,
+    MAX_RENDER_REQUESTS,
+    MAX_RENDER_SECONDS,
+    MAX_RESPONSE_BYTES,
+    MAX_RETRIEVAL_SECONDS,
+)
 from app.infrastructure.web_network import DestinationBlocked, PublicConnector
 
 POLICY_VERSION = "public-http-v1"
@@ -52,13 +58,17 @@ class PublicGateway:
         self._receipts: dict[str, dict[str, int]] = {}
         self._handlers: set[asyncio.Task[None]] = set()
 
-    def issue(self, ttl_seconds: float, max_tunnels: int, max_bytes: int) -> str:
+    def issue(
+        self, ttl_seconds: float, max_tunnels: int, max_bytes: int, *, render: bool = False
+    ) -> str:
         if (
             isinstance(ttl_seconds, bool)
             or not isinstance(ttl_seconds, int | float)
-            or not 0 < ttl_seconds <= MAX_RETRIEVAL_SECONDS
+            or type(render) is not bool
+            or not 0 < ttl_seconds <= (MAX_RENDER_SECONDS if render else MAX_RETRIEVAL_SECONDS)
             or type(max_tunnels) is not int
             or not 1 <= max_tunnels <= MAX_NETWORK_REQUESTS
+            or (render and max_tunnels > MAX_RENDER_REQUESTS)
             or type(max_bytes) is not int
             or not 1 <= max_bytes <= MAX_RESPONSE_BYTES
         ):
@@ -248,13 +258,18 @@ class PublicGateway:
                     status, result = 403, {"error": "access_denied"}
                 elif method == "GET" and path == "/ready" and length == 0:
                     status, result = 200, {"policy": POLICY_VERSION}
+                elif method == "GET" and path == "/ready/render" and length == 0:
+                    status, result = 200, {"policy": "public-render-v1"}
                 elif method == "POST" and path == "/leases":
                     payload = json.loads(await reader.readexactly(length))
-                    if not isinstance(payload, dict) or set(payload) != {
-                        "ttl_seconds",
-                        "max_tunnels",
-                        "max_bytes",
-                    }:
+                    if not isinstance(payload, dict) or set(payload) not in (
+                        {
+                            "ttl_seconds",
+                            "max_tunnels",
+                            "max_bytes",
+                        },
+                        {"ttl_seconds", "max_tunnels", "max_bytes", "render"},
+                    ):
                         raise ValueError("invalid lease fields")
                     token = self.issue(**payload)
                     status, result = 201, {"token": token}

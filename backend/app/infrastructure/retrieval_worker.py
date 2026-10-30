@@ -3,10 +3,12 @@
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import re
 import sys
-from contextlib import suppress
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Protocol
@@ -22,6 +24,7 @@ from app.domain.retrieval import (
     MAX_WORKER_REQUEST_BYTES,
     PDF_RAW_BYTES,
     ExtractedDocumentResult,
+    RenderRequest,
     RetrievalRequest,
     RetrievalResult,
     RetrievalStatus,
@@ -32,10 +35,31 @@ _MAX_RESULT_JSON = ((PDF_RAW_BYTES + 2) // 3) * 4 + 64 * 1024
 _WORKER_SOCKET = "/run/trellis-egress/gateway.sock"
 _POLICY = "public-http-v1"
 _CONTROL_DEADLINE_SECONDS = 3.0
+_BROWSER_PROFILE = Path(__file__).resolve().parents[2] / "containers/chromium-seccomp.json"
+_BROWSER_PROFILE_SHA256 = "9c86a46bf3b2ef2c7cfece632b4ece1127698810857ef98914f87d99fdc74a27"
 
 
 class WorkerBoundaryError(Exception):
     """The configured isolation boundary could not be proved or cleaned up."""
+
+
+class RetrievalConcurrency:
+    """One backend owns two HTTP slots and one renderer, including readiness probes."""
+
+    def __init__(self) -> None:
+        self._http = asyncio.Semaphore(2)
+        self._render = asyncio.Lock()
+        self.proved_renderers: set[tuple[str, str]] = set()
+
+    @asynccontextmanager
+    async def operation(self, *, render: bool) -> AsyncIterator[None]:
+        async with AsyncExitStack() as stack:
+            if render:
+                await stack.enter_async_context(self._render)
+            await stack.enter_async_context(self._http)
+            if render:
+                await stack.enter_async_context(self._http)
+            yield
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +85,11 @@ class WorkerDeployment:
 class LeaseControl(Protocol):
     async def is_ready(self) -> bool: ...
 
-    async def issue(self, request: RetrievalRequest, timeout_seconds: float) -> str: ...
+    async def is_render_ready(self) -> bool: ...
+
+    async def issue(
+        self, request: RetrievalRequest | RenderRequest, timeout_seconds: float
+    ) -> str: ...
 
     async def revoke(self, token: str) -> GatewayReceipt | None: ...
 
@@ -133,7 +161,13 @@ class GatewayControlClient:
         except httpx.HTTPError, ValueError, WorkerBoundaryError, TimeoutError:
             return False
 
-    async def issue(self, request: RetrievalRequest, timeout_seconds: float) -> str:
+    async def is_render_ready(self) -> bool:
+        try:
+            return await self._request("GET", "/ready/render") == {"policy": "public-render-v1"}
+        except httpx.HTTPError, ValueError, WorkerBoundaryError, TimeoutError:
+            return False
+
+    async def issue(self, request: RetrievalRequest | RenderRequest, timeout_seconds: float) -> str:
         value = await self._request(
             "POST",
             "/leases",
@@ -141,6 +175,7 @@ class GatewayControlClient:
                 "ttl_seconds": min(request.timeout_seconds, timeout_seconds),
                 "max_tunnels": request.max_requests,
                 "max_bytes": request.max_response_bytes,
+                **({"render": True} if isinstance(request, RenderRequest) else {}),
             },
         )
         token = value.get("token")
@@ -208,7 +243,9 @@ async def _run_docker(
         await process.wait()
 
 
-def _worker_args(deployment: WorkerDeployment, name: str) -> tuple[str, ...]:
+def _worker_args(
+    deployment: WorkerDeployment, name: str, *, render: bool = False
+) -> tuple[str, ...]:
     return (
         "create",
         "--name",
@@ -223,21 +260,24 @@ def _worker_args(deployment: WorkerDeployment, name: str) -> tuple[str, ...]:
         "ALL",
         "--security-opt",
         "no-new-privileges",
+        *(("--security-opt", "seccomp=" + str(_BROWSER_PROFILE)) if render else ()),
         "--user",
         "10001:10001",
         "--init",
         "--memory",
-        "512m",
+        "2g" if render else "512m",
         "--memory-swap",
-        "512m",
+        "2g" if render else "512m",
         "--cpus",
-        "1",
+        "2" if render else "1",
         "--pids-limit",
-        "64",
+        "256" if render else "64",
         "--shm-size",
-        "32m",
+        "256m" if render else "32m",
         "--tmpfs",
-        "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777",
+        "/tmp:rw,noexec,nosuid,nodev,size=256m,mode=1777"
+        if render
+        else "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777",
         "--mount",
         f"type=volume,src={deployment.ipc_volume},dst=/run/trellis-egress,readonly",
         "--label",
@@ -245,11 +285,11 @@ def _worker_args(deployment: WorkerDeployment, name: str) -> tuple[str, ...]:
         deployment.worker_image,
         "python",
         "-m",
-        "app.infrastructure.web_reader",
+        "app.infrastructure.web_renderer" if render else "app.infrastructure.web_reader",
     )
 
 
-def _inspect_worker(value: dict, deployment: WorkerDeployment) -> None:
+def _inspect_worker(value: dict, deployment: WorkerDeployment, *, render: bool = False) -> None:
     host, config = value.get("HostConfig", {}), value.get("Config", {})
     mounts = value.get("Mounts", [])
     expected_mounts = [
@@ -263,7 +303,12 @@ def _inspect_worker(value: dict, deployment: WorkerDeployment) -> None:
     if not (
         value.get("Image") == deployment.worker_image
         and config.get("User") == "10001:10001"
-        and config.get("Cmd") == ["python", "-m", "app.infrastructure.web_reader"]
+        and config.get("Cmd")
+        == [
+            "python",
+            "-m",
+            "app.infrastructure.web_renderer" if render else "app.infrastructure.web_reader",
+        ]
         and config.get("Entrypoint") in (None, [])
         and host.get("NetworkMode") == "none"
         and host.get("IpcMode") == "private"
@@ -271,14 +316,23 @@ def _inspect_worker(value: dict, deployment: WorkerDeployment) -> None:
         and host.get("Privileged") is False
         and host.get("CapDrop") in (["ALL"], ["CAP_ALL"])
         and host.get("CapAdd") in (None, [])
-        and host.get("SecurityOpt") == ["no-new-privileges"]
+        and (
+            _browser_security(host.get("SecurityOpt"))
+            if render
+            else host.get("SecurityOpt") == ["no-new-privileges"]
+        )
         and host.get("Init") is True
-        and host.get("Memory") == 512 * 1024 * 1024
-        and host.get("MemorySwap") == 512 * 1024 * 1024
-        and host.get("NanoCpus") == 1_000_000_000
-        and host.get("PidsLimit") == 64
-        and host.get("ShmSize") == 32 * 1024 * 1024
-        and host.get("Tmpfs") == {"/tmp": "rw,noexec,nosuid,nodev,size=64m,mode=1777"}
+        and host.get("Memory") == (2048 if render else 512) * 1024 * 1024
+        and host.get("MemorySwap") == (2048 if render else 512) * 1024 * 1024
+        and host.get("NanoCpus") == (2 if render else 1) * 1_000_000_000
+        and host.get("PidsLimit") == (256 if render else 64)
+        and host.get("ShmSize") == (256 if render else 32) * 1024 * 1024
+        and host.get("Tmpfs")
+        == {
+            "/tmp": "rw,noexec,nosuid,nodev,size=256m,mode=1777"
+            if render
+            else "rw,noexec,nosuid,nodev,size=64m,mode=1777"
+        }
         and len(mounts) == len(expected_mounts) == 1
         and not host.get("Devices")
         and not host.get("DeviceRequests")
@@ -288,7 +342,19 @@ def _inspect_worker(value: dict, deployment: WorkerDeployment) -> None:
         raise WorkerBoundaryError("actual worker isolation differs from the required policy")
 
 
-def _decode_result(payload: bytes, request: RetrievalRequest) -> RetrievalResult:
+def _browser_security(options: object) -> bool:
+    if not isinstance(options, list) or len(options) != 2 or "no-new-privileges" not in options:
+        return False
+    try:
+        profile = next(
+            item.removeprefix("seccomp=") for item in options if item.startswith("seccomp=")
+        )
+        return json.loads(profile) == json.loads(_BROWSER_PROFILE.read_text())
+    except StopIteration, ValueError, OSError, AttributeError:
+        return False
+
+
+def _decode_result(payload: bytes, request: RetrievalRequest | RenderRequest) -> RetrievalResult:
     try:
         value = json.loads(payload)
         if not isinstance(value, dict) or set(value) != {
@@ -333,7 +399,9 @@ def _decode_result(payload: bytes, request: RetrievalRequest) -> RetrievalResult
         raise WorkerBoundaryError("invalid bounded worker result") from None
 
 
-def _decode_document(payload: bytes, request: RetrievalRequest) -> ExtractedDocumentResult:
+def _decode_document(
+    payload: bytes, request: RetrievalRequest | RenderRequest
+) -> ExtractedDocumentResult:
     try:
         if len(payload) > MAX_EXTRACTED_RESULT_BYTES:
             raise ValueError("extracted result exceeds limit")
@@ -388,9 +456,90 @@ def _decode_document(payload: bytes, request: RetrievalRequest) -> ExtractedDocu
 
 
 class DockerPublicRetriever:
-    def __init__(self, deployment: WorkerDeployment, control: LeaseControl) -> None:
+    def __init__(
+        self,
+        deployment: WorkerDeployment,
+        control: LeaseControl,
+        *,
+        concurrency: RetrievalConcurrency | None = None,
+    ) -> None:
         self._deployment = deployment
         self._control = control
+        self._concurrency = concurrency or RetrievalConcurrency()
+
+    async def is_crawl_ready(self) -> bool:
+        try:
+            async with asyncio.timeout(15):
+                if not await self.is_ready():
+                    return False
+                code, payload = await _run_docker(
+                    ("image", "inspect", self._deployment.worker_image)
+                )
+                images = json.loads(payload) if code == 0 else None
+                if (
+                    not isinstance(images, list)
+                    or len(images) != 1
+                    or not isinstance(images[0], dict)
+                ):
+                    return False
+                config = images[0].get("Config")
+                labels = config.get("Labels") if isinstance(config, dict) else None
+                return (
+                    isinstance(labels, dict)
+                    and labels.get("trellis.crawl.protocol") == "public-crawl-v1"
+                )
+        except OSError, ValueError, WorkerBoundaryError, TimeoutError, ExceptionGroup:
+            return False
+
+    async def is_render_ready(self) -> bool:
+        try:
+            async with asyncio.timeout(30):
+                if not await self.is_ready():
+                    return False
+                if await self._control.is_render_ready() is not True:
+                    return False
+                digest = hashlib.sha256(_BROWSER_PROFILE.read_bytes()).hexdigest()
+                if digest != _BROWSER_PROFILE_SHA256:
+                    return False
+                code, payload = await _run_docker(
+                    ("image", "inspect", self._deployment.worker_image)
+                )
+                images = json.loads(payload) if code == 0 else []
+                labels = images[0].get("Config", {}).get("Labels", {}) if len(images) == 1 else {}
+                if (
+                    labels.get("trellis.browser.protocol") != "public-render-v1"
+                    or labels.get("trellis.browser.seccomp-sha256") != digest
+                ):
+                    return False
+                key = (self._deployment.worker_image, digest)
+                async with self._concurrency.operation(render=True):
+                    if key in self._concurrency.proved_renderers:
+                        return True
+                    name = "trellis-browser-probe-" + uuid4().hex
+                    try:
+                        code, _ = await _run_docker(
+                            _worker_args(self._deployment, name, render=True)
+                        )
+                        if code:
+                            return False
+                        _inspect_worker(await self._inspect(name), self._deployment, render=True)
+                        code, payload = await _run_docker(
+                            ("start", "--attach", "--interactive", name),
+                            payload=b'{"operation":"sandbox_probe"}\n',
+                            limit=4096,
+                            deadline_seconds=20,
+                        )
+                        proved = code == 0 and json.loads(payload) == {
+                            "protocol": "public-render-v1",
+                            "sandbox": True,
+                        }
+                    finally:
+                        await self._cleanup_safely(name, None, True)
+                    if proved:
+                        self._concurrency.proved_renderers.add(key)
+                    return proved
+        except OSError, ValueError, IndexError, WorkerBoundaryError, TimeoutError, ExceptionGroup:
+            return False
 
     async def _inspect(self, name: str) -> dict:
         code, payload = await _run_docker(("inspect", name))
@@ -515,6 +664,21 @@ class DockerPublicRetriever:
             raise WorkerBoundaryError("retrieval cleanup could not be confirmed")
         return receipt
 
+    async def _cleanup_safely(
+        self, name: str, token: str | None, creation_attempted: bool
+    ) -> GatewayReceipt | None:
+        cleanup = asyncio.create_task(self._cleanup(name, token, creation_attempted))
+        interrupted = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                interrupted = True
+        receipt = cleanup.result()
+        if interrupted:
+            raise asyncio.CancelledError
+        return receipt
+
     async def retrieve(
         self, request: RetrievalRequest, context: ToolExecutionContext
     ) -> RetrievalResult:
@@ -529,8 +693,30 @@ class DockerPublicRetriever:
         assert isinstance(result, ExtractedDocumentResult)
         return result
 
+    async def render_document(
+        self, request: RenderRequest, context: ToolExecutionContext
+    ) -> ExtractedDocumentResult:
+        result = await self._retrieve(request, context, extracted=True, render=True)
+        assert isinstance(result, ExtractedDocumentResult)
+        return result
+
+    async def crawl_document(
+        self, request: RetrievalRequest, context: ToolExecutionContext
+    ) -> ExtractedDocumentResult:
+        if request.scope_origin is None:
+            raise ValueError("crawl retrieval requires a bounded scope")
+        result = await self._retrieve(request, context, extracted=True, crawl=True)
+        assert isinstance(result, ExtractedDocumentResult)
+        return result
+
     async def _retrieve(
-        self, request: RetrievalRequest, context: ToolExecutionContext, *, extracted: bool
+        self,
+        request: RetrievalRequest | RenderRequest,
+        context: ToolExecutionContext,
+        *,
+        extracted: bool,
+        render: bool = False,
+        crawl: bool = False,
     ) -> RetrievalResult | ExtractedDocumentResult:
         await context.assert_active()
         timeout = min(request.timeout_seconds, context.remaining_seconds)
@@ -539,20 +725,28 @@ class DockerPublicRetriever:
         name = "trellis-retrieval-" + uuid4().hex
         token: str | None = None
         creation_attempted = False
+        operation = AsyncExitStack()
         try:
             async with asyncio.timeout_at(deadline):
-                if not await self.is_ready():
+                if not await (
+                    self.is_render_ready()
+                    if render
+                    else self.is_crawl_ready()
+                    if crawl
+                    else self.is_ready()
+                ):
                     raise WorkerBoundaryError("retrieval boundary is not ready")
+                await operation.enter_async_context(self._concurrency.operation(render=render))
                 await context.assert_active()
                 remaining = min(context.remaining_seconds, deadline - loop.time())
                 if remaining <= 0:
                     raise TimeoutError
                 token = await self._control.issue(request, remaining)
                 creation_attempted = True
-                code, _ = await _run_docker(_worker_args(self._deployment, name))
+                code, _ = await _run_docker(_worker_args(self._deployment, name, render=render))
                 if code:
                     raise WorkerBoundaryError("could not create retrieval worker")
-                _inspect_worker(await self._inspect(name), self._deployment)
+                _inspect_worker(await self._inspect(name), self._deployment, render=render)
                 await context.assert_active()
                 remaining = min(context.remaining_seconds, deadline - loop.time())
                 if remaining <= 0:
@@ -564,7 +758,13 @@ class DockerPublicRetriever:
                             "timeout_seconds": remaining,
                             "gateway_socket": _WORKER_SOCKET,
                             "lease_token": token,
-                            "operation": "extracted" if extracted else "raw",
+                            "operation": "render"
+                            if render
+                            else "crawl"
+                            if crawl
+                            else "extracted"
+                            if extracted
+                            else "raw",
                         },
                         ensure_ascii=False,
                     ).encode()
@@ -607,17 +807,10 @@ class DockerPublicRetriever:
                 )
             )
         finally:
-            cleanup = asyncio.create_task(self._cleanup(name, token, creation_attempted))
-            interrupted = False
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    interrupted = True
-                    continue
-            receipt = cleanup.result()
-            if interrupted:
-                raise asyncio.CancelledError
+            try:
+                receipt = await self._cleanup_safely(name, token, creation_attempted)
+            finally:
+                await operation.aclose()
         if (
             receipt is not None
             and receipt.transferred_bytes == request.max_response_bytes
@@ -631,11 +824,15 @@ class DockerPublicRetriever:
                 error_code="gateway_transport_allowance_exhausted",
             )
         usage = self._settled_usage(request, receipt, token is not None)
+        if render and receipt is not None:
+            usage = replace(
+                usage, network_requests=max(usage.network_requests, result.usage.network_requests)
+            )
         return replace(result, usage=replace(usage, extracted_bytes=result.usage.extracted_bytes))
 
     @staticmethod
     def _settled_usage(
-        request: RetrievalRequest, receipt: GatewayReceipt | None, issued: bool
+        request: RetrievalRequest | RenderRequest, receipt: GatewayReceipt | None, issued: bool
     ) -> WebUsage:
         if receipt is not None:
             if (
