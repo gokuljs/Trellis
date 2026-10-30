@@ -3,6 +3,7 @@ import type { LucideIcon } from "lucide-react"
 export type WorkspaceView = "New session" | "Settings" | "session"
 export type ProviderId = string
 export type ModelId = string
+export type RunMode = "chat" | "research"
 export type OnboardingStep = "intro" | "profile" | "model"
 
 export type OnboardingState = {
@@ -73,7 +74,11 @@ export type Settings = {
   selected_model_id?: ModelId
   models?: ModelStatus[]
   default_budget_preset?: "conservative" | "longer"
-  capabilities?: ("local_read" | "local_patch" | "local_command")[]
+  capabilities?: (
+    "local_read" | "local_patch" | "local_command" | "web_search" | "web_read"
+  )[]
+  research_available?: boolean
+  research_unavailable_reason?: string | null
 }
 
 export type Message = {
@@ -148,6 +153,7 @@ export type LatestRun = RecoveryMetadata & {
   run_id: string
   turn_id: string
   status: string
+  run_mode?: RunMode
   last_sequence: number
   input_message?: Message | null
   uncertain_operation?: UncertainOperation | null
@@ -158,6 +164,7 @@ export type RunSummary = RecoveryMetadata & {
   turn_id: string
   retry_of: string | null
   status: string
+  run_mode?: RunMode
   budget_preset: string
   max_model_calls: number
   max_tool_calls: number
@@ -209,4 +216,47 @@ export type SavedRunEvent = {
   event_version: number
   data: Record<string, unknown>
   created_at: string
+}
+
+export type SourceCitation = {
+  source_id: string
+  start_line: number
+  end_line: number
+}
+
+export type WebSource = {
+  id: string
+  session_id: string
+  run_id: string
+  title: string | null
+  requested_url: string | null
+  final_url: string | null
+  canonical_url: string | null
+  publisher: string | null
+  fetched_at: string | null
+  status: string
+  line_count: number
+  content_hash: string | null
+}
+
+export type SourceLines = {
+  source: WebSource
+  start_line: number
+  lines: string[]
+  total_lines: number
+}
+
+export type ResearchSnapshot = {
+  run_id: string
+  phase: string
+  objective: string
+  subquestions: { id: string; question: string; status: string }[]
+  tasks: { id: string; objective: string; status: string }[]
+  gaps: string[]
+  conflicts: string[]
+  pending_clarification: { id: string; question: string } | null
+  remaining_seconds: number | null
+  stop_reason: string | null
+  citations: SourceCitation[]
+  report_model_call_id?: string | null
 }

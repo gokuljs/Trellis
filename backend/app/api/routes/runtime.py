@@ -4,7 +4,8 @@ import logging
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from contextvars import Context
-from typing import cast
+from typing import Literal, cast
+from uuid import UUID
 
 import anyio
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
@@ -173,6 +174,13 @@ def _event_notification(event: RunEvent) -> dict[str, object]:
     }
 
 
+def _required_uuid(params: Mapping[str, object], name: str) -> str:
+    try:
+        return str(UUID(_required_string(params, name, maximum=36)))
+    except ValueError:
+        raise RpcFault(-32602, f"Invalid params: {name}") from None
+
+
 def _run_result(run) -> dict[str, object]:
     return {
         "runId": run.id,
@@ -183,6 +191,7 @@ def _run_result(run) -> dict[str, object]:
         "recoveryReason": run.recovery_reason,
         "uncertainToolCallId": run.uncertain_tool_call_id,
         "budgetPreset": run.budget_preset,
+        "runMode": run.run_mode,
         "limits": {
             "maxModelCalls": run.max_model_calls,
             "maxToolCalls": run.max_tool_calls,
@@ -593,6 +602,9 @@ async def runtime_websocket(websocket: WebSocket) -> None:
             budget_preset = params.get("budgetPreset")
             if budget_preset is not None and budget_preset not in ("conservative", "longer"):
                 raise RpcFault(-32602, "Invalid params: budgetPreset")
+            run_mode = params.get("runMode", "chat")
+            if run_mode not in ("chat", "research"):
+                raise RpcFault(-32602, "Invalid params: runMode")
             model_id = params.get("modelId")
             if model_id is not None and (
                 not isinstance(model_id, str) or not model_id or len(model_id) > 200
@@ -606,6 +618,17 @@ async def runtime_websocket(websocket: WebSocket) -> None:
                 turn_id=turn_id,
                 budget_preset=cast(BudgetPreset | None, budget_preset),
                 model_id=cast(str | None, model_id),
+                run_mode=cast(Literal["chat", "research"], run_mode),
+            )
+            command.correlate(run)
+            await subscribe(run.id, 0)
+            result = _run_result(run)
+        elif method == "research.clarify":
+            run = await service.clarify_research(
+                _required_uuid(params, "runId"),
+                _required_uuid(params, "clarificationId"),
+                _required_uuid(params, "clientRequestId"),
+                _required_string(params, "text", maximum=16_000),
             )
             command.correlate(run)
             await subscribe(run.id, 0)

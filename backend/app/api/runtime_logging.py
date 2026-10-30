@@ -9,7 +9,15 @@ from app.domain.runtime import RunSnapshot
 
 logger = logging.getLogger(__name__)
 _RPC_METHODS = frozenset(
-    {"auth.authenticate", "run.start", "run.lookup", "run.resume", "run.cancel", "run.respond"}
+    {
+        "auth.authenticate",
+        "run.start",
+        "run.lookup",
+        "run.resume",
+        "run.cancel",
+        "run.respond",
+        "research.clarify",
+    }
 )
 
 

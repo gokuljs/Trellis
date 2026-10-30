@@ -1,3 +1,5 @@
+import type { RunMode } from "@/lib/app-types"
+
 export type PendingRun = {
   userId: string
   sessionId: string
@@ -5,6 +7,7 @@ export type PendingRun = {
   clientRequestId: string
   runId: string | null
   lastSequence: number
+  runMode?: RunMode
 }
 
 const prefix = "trellis:pending-run:"
@@ -27,7 +30,10 @@ export function readPendingRun(
       !(value.runId === null || typeof value.runId === "string") ||
       typeof value.lastSequence !== "number" ||
       !Number.isSafeInteger(value.lastSequence) ||
-      value.lastSequence < 0
+      value.lastSequence < 0 ||
+      (value.runMode !== undefined &&
+        value.runMode !== "chat" &&
+        value.runMode !== "research")
     )
       return null
     return value as PendingRun
@@ -47,6 +53,7 @@ export function savePendingRun(pending: PendingRun): void {
         clientRequestId: pending.clientRequestId,
         runId: pending.runId,
         lastSequence: pending.lastSequence,
+        runMode: pending.runMode,
       })
     )
   } catch {

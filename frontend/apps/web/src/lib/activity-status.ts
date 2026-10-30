@@ -18,9 +18,27 @@ const phaseStates = new Map<string, StatusCopy>([
   ["waiting", { label: "Waiting", orb: "listening" }],
   ["finishing", { label: "Finishing", orb: "shaping" }],
   ["compacting", { label: "Compacting conversation", orb: "shaping" }],
-  ["web_search", { label: "Searching the web", orb: "searching" }],
-  ["web_read", { label: "Reading a page", orb: "working" }],
+  ["web_search", { label: "Searching sources", orb: "searching" }],
+  ["web_read", { label: "Reading evidence", orb: "searching" }],
   ["web_crawl", { label: "Collecting site pages", orb: "weaving" }],
+  ["scoping", { label: "Understanding the question", orb: "working" }],
+  ["planning", { label: "Planning the research", orb: "working" }],
+  ["researching", { label: "Researching subquestions", orb: "searching" }],
+  ["collecting", { label: "Gathering evidence", orb: "searching" }],
+  ["comparing", { label: "Comparing sources", orb: "solving" }],
+  [
+    "checking_conflicts",
+    { label: "Checking conflicting claims", orb: "solving" },
+  ],
+  ["writing", { label: "Preparing the report", orb: "composing" }],
+  ["drafting", { label: "Preparing the report", orb: "composing" }],
+  ["reviewing", { label: "Checking cited claims", orb: "solving" }],
+  ["checking_citations", { label: "Checking cited claims", orb: "solving" }],
+  ["repairing", { label: "Revising the report", orb: "shaping" }],
+  [
+    "waiting_for_input",
+    { label: "Waiting for your clarification", orb: "listening" },
+  ],
 ])
 
 const terminalStates = new Map<string, StatusCopy>([
@@ -34,6 +52,7 @@ const summaryEvents: Record<string, string> = {
   queued: "run.queued",
   recovering: "run.recovering",
   waiting_for_approval: "tool.approval_requested",
+  waiting_for_input: "research.clarification_requested",
   cancelling: "run.cancellation_requested",
   completed: "run.completed",
   failed: "run.failed",
@@ -61,6 +80,11 @@ function elapsedLabel(milliseconds: number): string {
 function currentState(event: RuntimeRunEvent): StatusCopy | null {
   switch (event.eventType) {
     case "run.phase":
+      if (typeof event.data.label === "string" && event.data.label.trim())
+        return {
+          label: event.data.label.slice(0, 200),
+          orb: phaseStates.get(String(event.data.phase))?.orb ?? "working",
+        }
       return typeof event.data.phase === "string"
         ? (phaseStates.get(event.data.phase) ?? null)
         : null
@@ -89,6 +113,10 @@ function currentState(event: RuntimeRunEvent): StatusCopy | null {
       return { label: "Using tools", orb: "weaving" }
     case "tool.approval_requested":
       return { label: "Waiting for approval", orb: "listening" }
+    case "research.clarification_requested":
+      return { label: "Waiting for your clarification", orb: "listening" }
+    case "research.clarification_answered":
+      return { label: "Continuing research", orb: "working" }
     case "tool.approval_decided":
       return { label: "Thinking", orb: "working" }
     case "run.cancellation_requested":
@@ -146,9 +174,11 @@ export function describeActivity(
           data: {},
         }) ?? { label: "Thinking", orb: "working" }),
         duration:
-          Number.isFinite(start) && Number.isFinite(finish)
-            ? elapsedLabel(finish - start)
-            : null,
+          summary.status === "waiting_for_input"
+            ? null
+            : Number.isFinite(start) && Number.isFinite(finish)
+              ? elapsedLabel(finish - start)
+              : null,
         terminal,
       }
     }
@@ -156,6 +186,13 @@ export function describeActivity(
       return {
         label: "Recovering",
         orb: "connecting",
+        duration: null,
+        terminal: false,
+      }
+    if (confirmedStatus === "waiting_for_input")
+      return {
+        label: "Waiting for your clarification",
+        orb: "listening",
         duration: null,
         terminal: false,
       }
@@ -226,12 +263,18 @@ export function describeActivity(
       state = currentState(event)!
       continue
     }
-    if (event.eventType === "tool.approval_requested") {
+    if (
+      event.eventType === "tool.approval_requested" ||
+      event.eventType === "research.clarification_requested"
+    ) {
       awaitingApproval = true
-      state = { label: "Waiting for approval", orb: "listening" }
+      state = currentState(event)!
       continue
     }
-    if (event.eventType === "tool.approval_decided") {
+    if (
+      event.eventType === "tool.approval_decided" ||
+      event.eventType === "research.clarification_answered"
+    ) {
       awaitingApproval = false
       state = { label: "Waiting", orb: "working" }
       continue
@@ -249,6 +292,8 @@ export function describeActivity(
     state = { label: "Recovering", orb: "connecting" }
   if (summaryIsCurrent && matchingSummary?.status === "cancelling")
     state = { label: "Stopping", orb: "shaping" }
+  if (summaryIsCurrent && matchingSummary?.status === "waiting_for_input")
+    state = { label: "Waiting for your clarification", orb: "listening" }
   if (
     matchingSummary?.status === "waiting_for_approval" &&
     summaryIsCurrent &&
@@ -273,5 +318,10 @@ export function describeActivity(
       data: {},
     })!
   }
-  return { ...state, duration, terminal }
+  return {
+    ...state,
+    duration:
+      state.label === "Waiting for your clarification" ? null : duration,
+    terminal,
+  }
 }

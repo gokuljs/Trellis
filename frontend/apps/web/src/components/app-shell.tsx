@@ -50,6 +50,7 @@ import {
   lookupRun,
   resumeRun,
   respondToToolApproval,
+  clarifyResearch,
   streamRun,
   type RuntimeRunEvent,
   type RuntimeRunInfo,
@@ -68,6 +69,7 @@ import type {
   Settings,
   WorkspaceView,
   WorkspaceReviewStatus,
+  RunMode,
 } from "@/lib/app-types"
 import {
   ownsRun,
@@ -122,6 +124,8 @@ import {
   savePendingRun,
 } from "@/lib/pending-run"
 import "./workspace-bootstrap.css"
+import { researchQueryOptions } from "@/lib/research"
+import "./research.css"
 
 type BootstrapState =
   | { status: "loading" }
@@ -135,6 +139,7 @@ type FailedTurn = {
   content: string
   modelId?: string
   budgetPreset?: "conservative" | "longer"
+  runMode?: RunMode
 }
 
 function visibleError(error: unknown) {
@@ -163,6 +168,7 @@ const activeRunStatuses = new Set([
   "running",
   "recovering",
   "waiting_for_approval",
+  "waiting_for_input",
   "cancelling",
 ])
 const maxRestoredReconnectAttempts = 4
@@ -179,6 +185,14 @@ export function AppShell({
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [composerValue, setComposerValue] = useState("")
+  const [runMode, setRunMode] = useState<RunMode>("chat")
+  const [clarificationSubmitting, setClarificationSubmitting] = useState(false)
+  const clarificationRequestRef = useRef<{
+    runId: string
+    clarificationId: string
+    text: string
+    clientRequestId: string
+  } | null>(null)
   const [draftModelId, setDraftModelId] = useState<string | null>(null)
   const [modelSelection, setModelSelection] = useState<{
     sessionId: string
@@ -352,6 +366,7 @@ export function AppShell({
           run_id: merged.runId,
           turn_id: turnId,
           status: merged.status ?? "running",
+          run_mode: merged.runMode,
           last_sequence:
             current?.run_id === runInfo.runId ? current.last_sequence : 0,
           retry_allowed: merged.retryAllowed,
@@ -393,6 +408,16 @@ export function AppShell({
       }
       if (activeSessionIdRef.current)
         summaryRefresh.schedule(activeSessionIdRef.current, event)
+      if (
+        sessionId &&
+        (event.eventType.startsWith("research.") ||
+          event.eventType === "run.phase" ||
+          event.eventType === "run.completed")
+      ) {
+        void queryClient.invalidateQueries({
+          queryKey: ["research", sessionId, event.runId],
+        })
+      }
       setRunContextState((current) => reduceRunContext(current, event))
       setAssistantOutputState((current) =>
         reduceAssistantOutputEvent(current, event, turnId)
@@ -403,6 +428,7 @@ export function AppShell({
         return {
           ...current,
           status: info.status ?? current.status,
+          run_mode: info.runMode ?? current.run_mode,
           last_sequence: Math.max(current.last_sequence, event.sequence),
           retry_allowed: info.retryAllowed,
           recovery_reason: info.recoveryReason,
@@ -489,7 +515,7 @@ export function AppShell({
         setStreamingText((current) => (current ?? "") + event.data.text)
       }
     },
-    [summaryRefresh, refreshWorkspaceReview]
+    [summaryRefresh, refreshWorkspaceReview, queryClient]
   )
 
   const restoreSessionRun = useCallback(
@@ -541,6 +567,7 @@ export function AppShell({
       let submissionMissing: boolean
       const userId = getAuthController().getSnapshot().user?.id
       const saved = userId ? readPendingRun(userId, sessionId) : null
+      if (turn && saved?.runMode) turn = { ...turn, runMode: saved.runMode }
       try {
         const exact = saved
           ? await lookupRun(sessionId, saved.clientRequestId)
@@ -994,6 +1021,9 @@ export function AppShell({
     sessionLoadSequenceRef.current += 1
     activeSessionIdRef.current = sessionId
     setComposerValue("")
+    setRunMode("chat")
+    setClarificationSubmitting(false)
+    clarificationRequestRef.current = null
     setActiveSession(null)
     setMessages([])
     setTimelineOrder([])
@@ -1291,6 +1321,7 @@ export function AppShell({
           clientRequestId: turn.clientRequestId,
           runId: null,
           lastSequence: 0,
+          runMode: turn.runMode,
         })
       await streamRun(
         {
@@ -1300,6 +1331,7 @@ export function AppShell({
           content: turn.content,
           ...(turn.modelId ? { modelId: turn.modelId } : {}),
           ...(turn.budgetPreset ? { budgetPreset: turn.budgetPreset } : {}),
+          ...(turn.runMode ? { runMode: turn.runMode } : {}),
         },
         {
           signal: connection.signal,
@@ -1579,6 +1611,60 @@ export function AppShell({
 
   const submitComposer = async () => {
     const content = composerValue.trim()
+    if (awaitingClarification && pendingClarification && activeRunId) {
+      if (!content || clarificationSubmitting || cancellingRun) return
+      const owner = {
+        sessionId: activeSessionIdRef.current,
+        generation: runGenerationRef.current,
+      }
+      let request = clarificationRequestRef.current
+      if (
+        request?.runId !== activeRunId ||
+        request.clarificationId !== pendingClarification.id ||
+        request.text !== content
+      ) {
+        request = {
+          runId: activeRunId,
+          clarificationId: pendingClarification.id,
+          text: content,
+          clientRequestId: crypto.randomUUID(),
+        }
+        clarificationRequestRef.current = request
+      }
+      setClarificationSubmitting(true)
+      setError(null)
+      try {
+        const info = await clarifyResearch(request)
+        if (
+          !ownsRun(owner, {
+            sessionId: activeSessionIdRef.current,
+            generation: runGenerationRef.current,
+          })
+        )
+          return
+        if (activeRunTurnId) recordRunInfo(activeRunTurnId, info)
+        setComposerValue("")
+        clarificationRequestRef.current = null
+        await researchQuery.refetch()
+      } catch (clarificationError) {
+        if (
+          ownsRun(owner, {
+            sessionId: activeSessionIdRef.current,
+            generation: runGenerationRef.current,
+          })
+        )
+          setError(visibleError(clarificationError))
+      } finally {
+        if (
+          ownsRun(owner, {
+            sessionId: activeSessionIdRef.current,
+            generation: runGenerationRef.current,
+          })
+        )
+          setClarificationSubmitting(false)
+      }
+      return
+    }
     if (
       !content ||
       pending ||
@@ -1645,6 +1731,7 @@ export function AppShell({
           content,
           modelId: model.id,
           budgetPreset: selectedBudgetPreset,
+          runMode,
         },
         true
       )
@@ -1832,6 +1919,21 @@ export function AppShell({
   const selectedBudgetPreset =
     runBudgetChoice ?? settings?.default_budget_preset ?? "conservative"
   const activeActivity = activeRunTurnId ? runActivities[activeRunTurnId] : null
+  const activeMode =
+    activeActivity?.runInfo?.runMode ??
+    activeActivity?.summary?.run_mode ??
+    (latestRun?.run_id === activeRunId ? latestRun.run_mode : undefined)
+  const researchQuery = useQuery({
+    ...researchQueryOptions(activeSession?.id ?? "", activeRunId ?? ""),
+    enabled: Boolean(activeSession && activeRunId && activeMode === "research"),
+    refetchInterval: pending && activeMode === "research" ? 2500 : false,
+  })
+  const pendingClarification = researchQuery.data?.pending_clarification
+  const awaitingClarification = Boolean(
+    pending &&
+    !cancellingRun &&
+    activeActivity?.runInfo?.status === "waiting_for_input"
+  )
   const recovering = pending && activeActivity?.runInfo?.status === "recovering"
   const activeBudgetPreset = activeActivity?.runInfo?.budgetPreset
   const lockedBudgetPreset =
@@ -1867,6 +1969,7 @@ export function AppShell({
       !sessionLoading &&
       (route.kind !== "chat" || activeSession?.id === route.chatId) &&
       !modelSaving &&
+      runMode === "chat" &&
       Boolean(selectedModelId)
   )
 
@@ -2083,17 +2186,50 @@ export function AppShell({
 
         {activeView !== "Settings" ? (
           <>
+            {awaitingClarification ? (
+              <section
+                className="research-clarification"
+                aria-label="Research clarification"
+              >
+                <h2>Clarification needed</h2>
+                {pendingClarification ? (
+                  <p>{pendingClarification.question}</p>
+                ) : (
+                  <p role="status">
+                    {researchQuery.error
+                      ? "The saved question could not be loaded."
+                      : "Loading the research question…"}
+                    {researchQuery.error ? (
+                      <button
+                        type="button"
+                        onClick={() => void researchQuery.refetch()}
+                      >
+                        Retry
+                      </button>
+                    ) : null}
+                  </p>
+                )}
+                <p className="research-clarification-note">
+                  Reply below to continue this research. The execution timer is
+                  paused.
+                </p>
+              </section>
+            ) : null}
             <Composer
               value={composerValue}
               placeholder={
-                activeView === "New session"
-                  ? "What are we building?"
-                  : "Adjust or continue"
+                awaitingClarification
+                  ? "Clarify the research question"
+                  : activeView === "New session"
+                    ? "What are we building?"
+                    : "Adjust or continue"
               }
               onChange={setComposerValue}
               onSubmit={() => void submitComposer()}
               disabled={
-                pending ||
+                (pending && !awaitingClarification) ||
+                (awaitingClarification && !pendingClarification) ||
+                clarificationSubmitting ||
                 sessionLoading ||
                 modelSaving ||
                 (route.kind === "chat" && activeSession?.id !== route.chatId)
@@ -2101,38 +2237,66 @@ export function AppShell({
               runStatus={
                 sessionLoading
                   ? "Checking current run…"
-                  : pending
-                    ? cancellingRun
-                      ? "Stopping…"
-                      : reconnectAvailable || error?.includes("Reconnecting")
-                        ? "Reconnecting. This chat stays locked until its run is checked."
-                        : recovering
-                          ? "Recovering. Checking saved work before continuing."
-                          : "Running. You can close this page and return to this chat."
-                    : undefined
+                  : awaitingClarification
+                    ? clarificationSubmitting
+                      ? "Saving clarification…"
+                      : "Waiting for your reply. Research time and remaining budget are preserved."
+                    : pending
+                      ? cancellingRun
+                        ? "Stopping…"
+                        : reconnectAvailable || error?.includes("Reconnecting")
+                          ? "Reconnecting. This chat stays locked until its run is checked."
+                          : recovering
+                            ? "Recovering. Checking saved work before continuing."
+                            : "Running. You can close this page and return to this chat."
+                      : undefined
               }
               budgetPreset={lockedBudgetPreset}
+              runMode={pending ? (activeMode ?? runMode) : runMode}
+              onRunModeChange={setRunMode}
+              researchAvailable={
+                settings?.research_available === true &&
+                settings.models?.find((model) => model.id === lockedModelId)
+                  ?.supports_tools === true
+              }
+              researchUnavailableReason={
+                settings?.research_available
+                  ? "Choose a model that supports tools for research."
+                  : settings?.research_unavailable_reason
+              }
+              answeringClarification={awaitingClarification}
+              controlsDisabled={
+                pending ||
+                sessionLoading ||
+                modelSaving ||
+                (route.kind === "chat" && activeSession?.id !== route.chatId)
+              }
               onBudgetChange={setRunBudgetChoice}
               models={settings?.models ?? []}
               selectedModelId={lockedModelId}
               modelSaving={modelSaving}
               onModelChange={(modelId) => void changeChatModel(modelId)}
               contextGauge={
-                <ContextGauge
-                  preview={pending ? liveContext : contextPreview.preview}
-                  modelName={
-                    settings?.models?.find(
-                      (model) => model.id === lockedModelId
-                    )?.name ?? lockedModelId
-                  }
-                  loading={
-                    pending
-                      ? !liveContext && !compacting
-                      : contextPreview.loading || sessionLoading || modelSaving
-                  }
-                  error={pending ? null : contextPreview.error}
-                  compacting={compacting}
-                />
+                (pending ? (activeMode ?? runMode) : runMode) ===
+                "research" ? undefined : (
+                  <ContextGauge
+                    preview={pending ? liveContext : contextPreview.preview}
+                    modelName={
+                      settings?.models?.find(
+                        (model) => model.id === lockedModelId
+                      )?.name ?? lockedModelId
+                    }
+                    loading={
+                      pending
+                        ? !liveContext && !compacting
+                        : contextPreview.loading ||
+                          sessionLoading ||
+                          modelSaving
+                    }
+                    error={pending ? null : contextPreview.error}
+                    compacting={compacting}
+                  />
+                )
               }
             />
           </>

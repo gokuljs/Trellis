@@ -70,5 +70,10 @@ export function retryInputForRun(
     )
   if (!input || input.role !== "user" || input.turn_id !== latest.turn_id)
     return null
-  return { sessionId, turnId: input.turn_id, content: input.content }
+  return {
+    sessionId,
+    turnId: input.turn_id,
+    content: input.content,
+    runMode: latest.run_mode,
+  }
 }

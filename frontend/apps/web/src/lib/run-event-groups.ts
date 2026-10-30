@@ -14,6 +14,7 @@ function toolName(event: RuntimeRunEvent): string {
 export function groupRunEvents(events: RuntimeRunEvent[]): RunEventGroup[] {
   const groups: RunEventGroup[] = []
   const tools = new Map<string, RunEventGroup>()
+  const models = new Map<string, RunEventGroup>()
   let model: RunEventGroup | null = null
   let modelComplete = false
   let start: RunEventGroup | null = null
@@ -29,6 +30,22 @@ export function groupRunEvents(events: RuntimeRunEvent[]): RunEventGroup[] {
         event.eventType
       )
     ) {
+      const callId = event.data.model_call_id
+      if (typeof callId === "string") {
+        let group = models.get(callId)
+        if (!group) {
+          group = {
+            key: `model-${callId}`,
+            title: "Model call",
+            kind: "model",
+            events: [],
+          }
+          models.set(callId, group)
+          groups.push(group)
+        }
+        group.events.push(event)
+        continue
+      }
       if (!model || (event.eventType === "model.usage" && modelComplete)) {
         model = {
           key: `model-${event.sequence}`,

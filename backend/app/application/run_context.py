@@ -555,6 +555,65 @@ class RunContext:
             tools=tools,
         )
 
+    async def prepare_task(
+        self,
+        run: RunSnapshot,
+        provider: StreamingProviderAdapter,
+        api_key: str,
+        user_id: str,
+        *,
+        task_id: str,
+        prompt: str,
+        instructions: str,
+        messages: list[RunMessageRecord],
+        tool_calls: list[ToolCallRecord],
+        tools: tuple[ModelToolSpec, ...],
+    ) -> ContextPreflight:
+        profile = profile_for_model(run.model_id)
+        if profile is None:
+            raise ApplicationError("model_not_available", "Model metadata is unavailable.")
+        context = build_model_context(
+            (),
+            messages,
+            workspace_root=None,
+            run_tool_calls=tool_calls,
+            tools=tools,
+            redactor=self.redactor,
+        )
+        request = ModelRequest(
+            run.provider_id,
+            run.model_id,
+            run.adapter_kind,
+            run.upstream_model_id,
+            (ModelMessage("user", self.redactor.redact_text(prompt)), *context.messages),
+            4096,
+            context.system_instructions + "\n" + self.redactor.redact_text(instructions),
+            tools,
+        )
+        items = tuple(
+            ContextItem(f"{task_id}:{index}", task_id, message, True, "run_message")
+            for index, message in enumerate(request.messages)
+        )
+        calls = await self.runs.list_model_calls(run.id)
+        tokens, cost = self.totals(run.model_id, calls)
+        plan = await self._preflight(
+            run,
+            provider,
+            api_key,
+            user_id,
+            request,
+            items=items,
+            profile=profile,
+            remaining_run_tokens=max(0, run.max_total_tokens - tokens),
+            remaining_run_cost_usd=None if cost is None else max(0.0, run.max_cost_usd - cost),
+            pricing_context_tokens=self._pricing_highwater(profile, calls),
+        )
+        if not plan.fits:
+            raise ApplicationError(
+                "research_context_limit", "The research task reached its context limit."
+            )
+        return plan
+
     def _restore_generation_plan(self, run: RunSnapshot, call: ModelCallRecord) -> ContextPreflight:
         try:
             plan = restore_context_plan(call.request_snapshot.get("generation_plan"), run)

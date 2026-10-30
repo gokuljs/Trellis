@@ -12,6 +12,8 @@ import type {
   ContextPreview,
   ContextPreviewRequest,
   WorkspaceReviewStatus,
+  ResearchSnapshot,
+  SourceLines,
 } from "@/lib/app-types"
 import {
   AuthAccessError,
@@ -438,6 +440,28 @@ export function createApiClient({
       ),
     getLatestRun: (sessionId: string) =>
       request<LatestRun | null>(`/api/sessions/${sessionId}/runs/latest`),
+    getResearch: (
+      sessionId: string,
+      runId: string,
+      options: RequestOptions = {}
+    ) =>
+      request<ResearchSnapshot>(
+        `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/research`,
+        {},
+        options
+      ),
+    readSource: (
+      sessionId: string,
+      sourceId: string,
+      startLine: number,
+      maxLines: number,
+      options: RequestOptions = {}
+    ) =>
+      request<SourceLines>(
+        `/api/sessions/${encodeURIComponent(sessionId)}/sources/${encodeURIComponent(sourceId)}?start_line=${startLine}&max_lines=${Math.min(200, maxLines)}`,
+        {},
+        options
+      ),
     listRunSummaries: (
       sessionId: string,
       offset: number,

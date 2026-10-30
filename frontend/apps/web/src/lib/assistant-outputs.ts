@@ -198,6 +198,7 @@ export function outputStatusLabel(output: AssistantOutput): string {
 
 export type ThreadMessage = Message & {
   output: AssistantOutput | null
+  reportOutput: AssistantOutput | null
   attemptNumber: number | null
   modelCallId: string | null
   finalOutput: boolean
@@ -242,6 +243,7 @@ export function threadMessages(
     model: null,
     created_at: output.created_at,
     output,
+    reportOutput: output,
     attemptNumber: attemptNumber(output),
     modelCallId: output.model_call_id,
     finalOutput:
@@ -279,6 +281,7 @@ export function threadMessages(
     entries.push({
       ...message,
       output: null,
+      reportOutput: promoted ?? null,
       attemptNumber: attemptNumber(promoted),
       modelCallId: promoted?.model_call_id ?? null,
       finalOutput: promoted?.status === "complete",

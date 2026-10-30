@@ -17,6 +17,8 @@ const summaryEvents = new Set([
   "tool.result",
   "tool.approval_requested",
   "tool.approval_decided",
+  "research.clarification_requested",
+  "research.clarification_answered",
 ])
 
 export function updatesRunSummary(event: RuntimeRunEvent): boolean {

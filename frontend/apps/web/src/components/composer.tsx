@@ -11,7 +11,7 @@ import { BEND, MetalFx, useMetalBend } from "metal-fx"
 
 import { useTheme } from "@/components/theme-provider"
 import { ModelSelect } from "@/components/model-select"
-import type { ModelStatus } from "@/lib/app-types"
+import type { ModelStatus, RunMode } from "@/lib/app-types"
 import { isModelSelectable } from "@/lib/model-choice"
 
 type BudgetPreset = "conservative" | "longer"
@@ -30,6 +30,12 @@ type ComposerProps = {
   onModelChange: (modelId: string) => void
   contextGauge?: ReactNode
   runStatus?: string
+  runMode?: RunMode
+  onRunModeChange?: (mode: RunMode) => void
+  researchAvailable?: boolean
+  researchUnavailableReason?: string | null
+  answeringClarification?: boolean
+  controlsDisabled?: boolean
 }
 
 function usePrefersReducedMotion() {
@@ -65,12 +71,19 @@ export function Composer({
   onModelChange,
   contextGauge,
   runStatus,
+  runMode = "chat",
+  onRunModeChange,
+  researchAvailable = false,
+  researchUnavailableReason,
+  answeringClarification = false,
+  controlsDisabled = disabled,
 }: ComposerProps) {
   const { resolvedTheme } = useTheme()
   const prefersReducedMotion = usePrefersReducedMotion()
   const isSendable =
     Boolean(value.trim()) &&
     !disabled &&
+    (runMode === "chat" || researchAvailable || answeringClarification) &&
     isModelSelectable(models.find((model) => model.id === selectedModelId))
   const sendRef = useRef<HTMLDivElement>(null)
   const getBendConfig = useCallback(
@@ -107,15 +120,34 @@ export function Composer({
             <ModelSelect
               models={models}
               selectedModelId={selectedModelId}
-              disabled={disabled}
+              disabled={controlsDisabled}
               saving={modelSaving}
               onChange={onModelChange}
             />
             <select
               className="composer-select"
+              aria-label="Run mode"
+              value={runMode}
+              disabled={controlsDisabled}
+              title={
+                !researchAvailable
+                  ? (researchUnavailableReason ?? "Research is unavailable")
+                  : undefined
+              }
+              onChange={(event) =>
+                onRunModeChange?.(event.target.value as RunMode)
+              }
+            >
+              <option value="chat">Chat</option>
+              <option value="research" disabled={!researchAvailable}>
+                Research
+              </option>
+            </select>
+            <select
+              className="composer-select"
               aria-label="Run budget"
               value={budgetPreset}
-              disabled={disabled}
+              disabled={controlsDisabled}
               onChange={(event) =>
                 onBudgetChange(event.target.value as BudgetPreset)
               }
@@ -137,7 +169,9 @@ export function Composer({
             >
               <button
                 className="send-button"
-                aria-label="Send"
+                aria-label={
+                  answeringClarification ? "Send clarification" : "Send"
+                }
                 disabled={!isSendable}
                 onClick={onSubmit}
               >
@@ -151,7 +185,12 @@ export function Composer({
         className="composer-footnote"
         role={runStatus ? "status" : undefined}
       >
-        {runStatus ?? "Trellis can make mistakes. Check important info."}
+        {runStatus ??
+          (runMode === "research"
+            ? budgetPreset === "longer"
+              ? "Research limits: 20 minutes, $5 estimated model cost, 16 searches, 40 pages."
+              : "Research limits: 10 minutes, $2 estimated model cost, 8 searches, 20 pages."
+            : "Trellis can make mistakes. Check important info.")}
       </div>
     </div>
   )

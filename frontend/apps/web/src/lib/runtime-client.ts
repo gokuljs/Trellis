@@ -1,4 +1,4 @@
-import type { RunSummary } from "@/lib/app-types"
+import type { RunMode, RunSummary } from "@/lib/app-types"
 import {
   AuthAccessError,
   getAuthController,
@@ -22,6 +22,7 @@ export type RuntimeRunEvent = {
 
 export type RuntimeRunInfo = {
   runId: string
+  runMode?: RunMode
   modelId?: string
   status?: string
   retryAllowed?: boolean
@@ -83,6 +84,7 @@ export type StartRunInput = {
   content: string
   modelId?: string
   budgetPreset?: "conservative" | "longer"
+  runMode?: RunMode
 }
 
 export class RuntimeError extends Error {
@@ -264,6 +266,8 @@ function credentialWasRejected(error: RuntimeError): boolean {
 function parseRunInfo(result: Record<string, unknown>): RuntimeRunInfo {
   const runId = result.runId as string
   const info: RuntimeRunInfo = { runId }
+  if (result.runMode === "research" || result.runMode === "chat")
+    info.runMode = result.runMode
   if (typeof result.status === "string") info.status = result.status
   if (typeof result.retryAllowed === "boolean")
     info.retryAllowed = result.retryAllowed
@@ -801,7 +805,7 @@ export function resumeRun(
 }
 
 async function requestRunAction<TResult>(
-  method: "run.cancel" | "run.respond" | "run.lookup",
+  method: "run.cancel" | "run.respond" | "run.lookup" | "research.clarify",
   params: Record<string, unknown>,
   requestId: string,
   failureMessage: string,
@@ -1082,6 +1086,30 @@ export async function respondToToolApproval(
         )
       }
       return { runId, toolCallId, decision }
+    }
+  )
+}
+
+export function clarifyResearch(input: {
+  runId: string
+  clarificationId: string
+  clientRequestId: string
+  text: string
+}): Promise<RuntimeRunInfo> {
+  return requestRunAction(
+    "research.clarify",
+    input,
+    `research-clarify-${input.clientRequestId}`,
+    "Trellis could not save your clarification.",
+    (value) => {
+      const result = asRecord(value)
+      if (result?.runId !== input.runId) {
+        throw new RuntimeError(
+          "runtime_protocol_error",
+          "The Trellis service returned a different research run."
+        )
+      }
+      return parseRunInfo(result)
     }
   )
 }

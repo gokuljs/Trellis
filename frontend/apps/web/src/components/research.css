@@ -1,0 +1,78 @@
+.research-progress {
+  margin: var(--space-3) 0;
+  border-top: 1px solid var(--shell-line);
+  padding-top: var(--space-3);
+  color: var(--shell-text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.research-progress-heading,
+.research-questions li {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.research-progress-heading > :first-child,
+.research-detail-label {
+  color: var(--shell-text-strong);
+  font-weight: 500;
+}
+
+.research-questions {
+  display: grid;
+  gap: var(--space-2);
+  margin: var(--space-3) 0;
+  padding: 0;
+  list-style: none;
+}
+
+.research-question-status {
+  flex: 0 0 auto;
+  color: var(--shell-text-muted);
+  font-size: 11px;
+}
+
+.research-workers summary {
+  min-height: 32px;
+  cursor: pointer;
+}
+
+.research-clarification {
+  margin: var(--space-4) 0;
+  border: 1px solid var(--shell-line);
+  border-radius: 8px;
+  padding: var(--space-4);
+  background: var(--shell-card);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.research-clarification h2 {
+  margin: 0 0 var(--space-2);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.research-clarification p {
+  margin: var(--space-2) 0 0;
+}
+
+.research-clarification-note {
+  color: var(--shell-text-muted);
+  font-size: 12px;
+}
+
+@media (max-width: 760px) {
+  .research-progress-heading,
+  .research-questions li {
+    flex-wrap: wrap;
+    gap: var(--space-1);
+  }
+
+  .research-workers summary {
+    min-height: 44px;
+  }
+}

@@ -13,6 +13,7 @@ import { groupRunEvents } from "@/lib/run-event-groups"
 import { RunEventLog, RunEventTimestamp } from "@/components/run-event-log"
 import { ToolResult } from "@/components/tool-result"
 import "./run-activity.css"
+import { researchPhaseLabel } from "@/lib/research"
 
 type RunActivityProps = {
   label?: string
@@ -171,6 +172,9 @@ export function RunActivity({
     ? (textField(latestResumedDeadline.data, "deadline_at") ?? undefined)
     : (summary?.deadline_at ?? runInfo?.limits?.deadlineAt)
   const deadline = deadlineAt ? new Date(deadlineAt) : null
+  const waitingForInput =
+    runInfo?.status === "waiting_for_input" ||
+    (summary?.status === "waiting_for_input" && !totals.updating)
 
   return (
     <section className="run-activity" aria-label={label}>
@@ -182,7 +186,11 @@ export function RunActivity({
       </div>
       <div className="run-activity-budget" aria-label="Run limits and usage">
         <span>{status.label}</span>
-        <span>Elapsed {status.duration ?? "—"}</span>
+        <span>
+          {waitingForInput
+            ? "Execution timer paused"
+            : `Elapsed ${status.duration ?? "—"}`}
+        </span>
         <span>
           {totals.modelCalls ?? "—"} / {modelLimit ?? "—"} model calls
         </span>
@@ -202,11 +210,12 @@ export function RunActivity({
         <span>
           {totals.totalCost === null ? "—" : estimatedCost(totals.totalCost)} /{" "}
           {costLimit === undefined ? "—" : estimatedCost(costLimit)} estimated
+          model cost
           {totals.totalCost !== null && !totals.costComplete
             ? " (partial)"
             : ""}
         </span>
-        {deadline && Number.isFinite(deadline.getTime()) ? (
+        {!waitingForInput && deadline && Number.isFinite(deadline.getTime()) ? (
           <time dateTime={deadlineAt}>
             Deadline{" "}
             {deadline.toLocaleString(undefined, {
@@ -269,8 +278,12 @@ export function RunActivity({
                       !["web_search", "web_read", "web_crawl"].includes(
                         phase ?? ""
                       )
-                    )
-                      return null
+                    ) {
+                      title =
+                        textField(event.data, "label") ??
+                        researchPhaseLabel(phase ?? "")
+                      break
+                    }
                     title =
                       phase === "web_search"
                         ? "Searching the web"
@@ -338,6 +351,13 @@ export function RunActivity({
                     break
                   case "run.resumed":
                     title = "Run resumed"
+                    break
+                  case "research.clarification_requested":
+                    title = "Clarification requested · Timer paused"
+                    detail = textField(event.data, "question")
+                    break
+                  case "research.clarification_answered":
+                    title = "Clarification saved · Research continuing"
                     break
                   case "model.usage": {
                     title = "Model usage"

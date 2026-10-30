@@ -20,10 +20,12 @@ class SettingsService:
         secret_store: SecretStorePort,
         *,
         capabilities: RuntimeCapabilities | None = None,
+        research_available: bool = False,
     ) -> None:
         self._repository = repository
         self._secret_store = secret_store
         self._capabilities = capabilities or RuntimeCapabilities()
+        self._research_available = research_available
 
     async def get(self) -> AppSettings:
         descriptors = await self._repository.list_catalog_models()
@@ -91,6 +93,10 @@ class SettingsService:
             models=statuses,
             default_budget_preset=await self._repository.get_default_budget_preset(),
             capabilities=tuple(sorted(self._capabilities.enabled)),
+            research_available=self._research_available,
+            research_unavailable_reason=None
+            if self._research_available
+            else "Research requires available web search, page reading, and research storage.",
         )
 
     async def select_default_budget(self, preset: BudgetPreset) -> AppSettings:

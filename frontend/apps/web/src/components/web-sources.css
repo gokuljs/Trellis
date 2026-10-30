@@ -95,6 +95,7 @@
 .web-source-lines {
   max-height: 360px;
   overflow: auto;
+  list-style-type: decimal;
   padding: var(--space-3) var(--space-3) var(--space-3) 4.5em;
   background: var(--shell-hover);
   border-radius: 6px;

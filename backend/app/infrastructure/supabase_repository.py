@@ -20,6 +20,7 @@ import httpx
 from app.application.budgets import BudgetPreset, limits_for_preset
 from app.application.errors import ApplicationError
 from app.application.model_catalog import profile_for_model
+from app.application.research_errors import RESEARCH_ERROR_MESSAGES
 from app.application.web_evidence import WEB_ERROR_MESSAGES
 from app.core.config import Settings
 from app.core.supabase import project_base_url
@@ -53,6 +54,7 @@ from app.domain.runtime import (
     RunEvent,
     RunEventType,
     RunMessageRecord,
+    RunMode,
     RunSnapshot,
     RunStatus,
     RunSummary,
@@ -60,6 +62,7 @@ from app.domain.runtime import (
     ToolCallRecord,
     ToolCallStatus,
 )
+from app.infrastructure.research_repository import ResearchRepositoryMixin
 from app.infrastructure.web_repository import WebRepositoryMixin
 
 _REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=3.0)
@@ -177,7 +180,7 @@ def _nullable_number(row: Mapping[str, object], key: str) -> float | None:
     return None if row.get(key) is None else _number(row, key)
 
 
-class SupabaseRepository(WebRepositoryMixin):
+class SupabaseRepository(ResearchRepositoryMixin, WebRepositoryMixin):
     async def load_context_window(self, session_id: str, *, limit: int = 128) -> ContextWindow:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 128:
             raise ValueError("context page limit is invalid")
@@ -419,6 +422,12 @@ class SupabaseRepository(WebRepositoryMixin):
                 error = _object(response.json())
         error_code = error.get("code")
         error_message = error.get("message")
+        if (
+            response.status_code >= 400
+            and isinstance(error_message, str)
+            and error_message in RESEARCH_ERROR_MESSAGES
+        ):
+            raise ApplicationError(error_message, RESEARCH_ERROR_MESSAGES[error_message])
         if (
             path in {"rpc/web_mutate", "rpc/web_reserve_search_attempt"}
             and response.status_code >= 400
@@ -982,6 +991,7 @@ class SupabaseRepository(WebRepositoryMixin):
             retry_allowed=_boolean(row, "retry_allowed") if "retry_allowed" in row else True,
             recovery_reason=_nullable_text(row, "recovery_reason"),
             uncertain_tool_call_id=_nullable_text(row, "uncertain_tool_call_id"),
+            run_mode=cast(RunMode, row.get("run_mode", "chat")),
         )
 
     def _event(self, row: dict[str, object]) -> RunEvent:
@@ -1026,6 +1036,7 @@ class SupabaseRepository(WebRepositoryMixin):
             created_at=_text(row, "created_at"),
             tool_calls=tool_calls,
             continuation_items=continuation_items,
+            task_id=_nullable_text(row, "task_id"),
         )
 
     async def _runs(self, filters: dict[str, str]) -> list[RunSnapshot]:
@@ -1038,7 +1049,7 @@ class SupabaseRepository(WebRepositoryMixin):
                 "deadline_at,cancel_requested_at,lease_expires_at,recovery_count,stop_reason,"
                 "last_event_sequence,error_code,error_message,created_at,started_at,finished_at,"
                 "waiting_tool_call_id,recovery_contract,generation,retry_allowed,"
-                "recovery_reason,uncertain_tool_call_id"
+                "recovery_reason,uncertain_tool_call_id,run_mode"
             ),
             filters={"user_id": f"eq.{self._user_id}", **filters},
         )
@@ -1140,6 +1151,7 @@ class SupabaseRepository(WebRepositoryMixin):
             started_at=_text(row, "started_at"),
             finished_at=_nullable_text(row, "finished_at"),
             accounted_total_tokens=_nullable_integer(row, "accounted_total_tokens"),
+            task_id=_nullable_text(row, "task_id"),
         )
 
     async def list_model_calls(self, run_id: str) -> list[ModelCallRecord]:
@@ -1150,7 +1162,7 @@ class SupabaseRepository(WebRepositoryMixin):
                 "request_snapshot,response_snapshot,provider_response_id,finish_reason,"
                 "input_tokens,output_tokens,reasoning_tokens,cached_read_tokens,"
                 "cache_creation_tokens,estimated_cost,error_code,error_message,started_at,"
-                "finished_at,accounted_total_tokens"
+                "finished_at,accounted_total_tokens,task_id"
             ),
             filters={
                 "user_id": f"eq.{self._user_id}",
@@ -1189,6 +1201,7 @@ class SupabaseRepository(WebRepositoryMixin):
             dispatch_id=_nullable_text(row, "dispatch_id"),
             input_snapshot=None if input_snapshot is None else _object(input_snapshot),
             reviewed_at=_nullable_text(row, "reviewed_at"),
+            task_id=_nullable_text(row, "task_id"),
             result_snapshot=(
                 None if row.get("result_snapshot") is None else _object(row["result_snapshot"])
             ),
@@ -1201,7 +1214,7 @@ class SupabaseRepository(WebRepositoryMixin):
                 "id,user_id,run_id,assistant_message_id,call_index,provider_call_id,name,"
                 "arguments,status,approval_decision,approval_decided_at,approval_preview,"
                 "created_at,finished_at,dispatch_attempt,dispatch_generation,dispatched_at,"
-                "recovery_policy,result_source,dispatch_id,input_snapshot,reviewed_at,result_snapshot"
+                "recovery_policy,result_source,dispatch_id,input_snapshot,reviewed_at,result_snapshot,task_id"
             ),
             filters={
                 "user_id": f"eq.{self._user_id}",
@@ -1215,7 +1228,7 @@ class SupabaseRepository(WebRepositoryMixin):
             "run_messages",
             select=(
                 "id,user_id,run_id,ordinal,role,content,continuation,model_call_id,"
-                "tool_call_id,created_at"
+                "tool_call_id,created_at,task_id"
             ),
             filters={
                 "user_id": f"eq.{self._user_id}",
@@ -1308,6 +1321,7 @@ class SupabaseRepository(WebRepositoryMixin):
         submitted_model_id: str | None = None,
         submitted_budget_preset: BudgetPreset | None = None,
         recovery_contract: RecoveryContract | None = None,
+        run_mode: RunMode = "chat",
     ) -> RunSnapshot:
         normalized_content = content.strip()
         if not normalized_content:
@@ -1330,6 +1344,7 @@ class SupabaseRepository(WebRepositoryMixin):
             "request_fingerprint": request_fingerprint,
             "submitted_model_id": submitted_model_id,
             "submitted_budget_preset": submitted_budget_preset,
+            "run_mode": run_mode,
         }
         if recovery_contract is not None:
             if recovery_contract.request_identity != client_request_id:
