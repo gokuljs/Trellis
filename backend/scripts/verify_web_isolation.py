@@ -20,6 +20,7 @@ from uuid import uuid4
 from app.application.budgets import RunLimits
 from app.application.tool_context import ToolExecutionContext
 from app.domain.retrieval import RetrievalRequest, RetrievalStatus
+from app.domain.web import SourceStatus
 from app.infrastructure.retrieval_worker import (
     DockerPublicRetriever,
     GatewayControlClient,
@@ -74,6 +75,7 @@ _FIXTURE = """import asyncio
 import gzip
 import json
 import ssl
+from pathlib import Path
 
 async def handle(reader, writer):
     try:
@@ -86,6 +88,7 @@ async def handle(reader, writer):
         )
         print(json.dumps({"host": host, "path": path}), flush=True)
         body = b"<html><body>fixture document</body></html>"
+        media_type = b"text/html"
         extra = b""
         status = b"200 OK"
         if path == "/redirect":
@@ -101,6 +104,22 @@ async def handle(reader, writer):
             extra = b"Content-Encoding: gzip\\r\\n"
         elif path == "/denied":
             status = b"403 Forbidden"
+        elif path == "/pdf":
+            body = Path("/fixture/text.pdf").read_bytes()
+            media_type = b"application/pdf"
+        elif path == "/pdf-no-text":
+            body = Path("/fixture/blank.pdf").read_bytes()
+            media_type = b"application/pdf"
+        elif path == "/plain":
+            body = b"First plain-text line.\\nSecond plain-text line."
+            media_type = b"text/plain"
+        elif path == "/html-extraction":
+            body = (
+                b"<html><head><title>Extraction fixture</title></head><body>"
+                b"<nav>Navigation</nav><main><h1>Supporting heading</h1>"
+                b"<p>Supporting HTML evidence.</p><script>Do not execute this</script>"
+                b"</main><footer>Footer</footer></body></html>"
+            )
         elif path in {"/hold", "/hold-expiry"}:
             writer.write(
                 b"HTTP/1.1 200 OK\\r\\nContent-Type: text/html\\r\\n"
@@ -111,7 +130,7 @@ async def handle(reader, writer):
             print(json.dumps({"closed": path}), flush=True)
             return
         writer.write(
-            b"HTTP/1.1 " + status + b"\\r\\nContent-Type: text/html\\r\\n"
+            b"HTTP/1.1 " + status + b"\\r\\nContent-Type: " + media_type + b"\\r\\n"
             b"Connection: close\\r\\n" + extra + b"\\r\\n"
         )
         for offset in range(0, len(body), 16384):
@@ -140,7 +159,11 @@ async def main():
 
 asyncio.run(main())
 """
-_DIRECT_NETWORK_PROBE = """import errno,json,os,socket
+_DIRECT_NETWORK_PROBE = """import errno,json,os,resource,socket
+from app.infrastructure.pdf_extractor import _limits
+_limits()
+assert resource.getrlimit(resource.RLIMIT_AS)==(256*1024*1024,256*1024*1024)
+assert resource.getrlimit(resource.RLIMIT_CPU)==(8,8)
 assert os.getuid()==10001
 status=open("/proc/self/status").read()
 assert "CapEff:\\t0000000000000000" in status
@@ -215,6 +238,33 @@ async def _docker(*args: str, deadline_seconds: float = 15, limit: int = 65536) 
 
 async def _context_active() -> None:
     return None
+
+
+def _pdf_fixture(text: str) -> bytes:
+    contents = f"BT /F1 12 Tf 50 700 Td ({text}) Tj ET".encode() if text else b""
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(contents)).encode() + b" >>\nstream\n" + contents + b"\nendstream",
+        b"<< /Title (Fixture PDF) >>",
+    ]
+    output = bytearray(b"%PDF-1.7\n")
+    offsets = [0]
+    for index, value in enumerate(objects, 1):
+        offsets.append(len(output))
+        output.extend(f"{index} 0 obj\n".encode() + value + b"\nendobj\n")
+    start = len(output)
+    output.extend(f"xref\n0 {len(offsets)}\n0000000000 65535 f \n".encode())
+    for offset in offsets[1:]:
+        output.extend(f"{offset:010d} 00000 n \n".encode())
+    output.extend(
+        f"trailer\n<< /Size {len(offsets)} /Root 1 0 R /Info 6 0 R >>\n"
+        f"startxref\n{start}\n%%EOF\n".encode()
+    )
+    return bytes(output)
 
 
 def _context() -> ToolExecutionContext:
@@ -323,6 +373,8 @@ async def verify() -> None:
         (directory / "admin").chmod(0o444)
         (directory / "fixture.py").write_text(_FIXTURE)
         (directory / "gateway.py").write_text(_GATEWAY)
+        (directory / "text.pdf").write_bytes(_pdf_fixture("Supporting PDF evidence."))
+        (directory / "blank.pdf").write_bytes(_pdf_fixture(""))
         try:
             worker_image = await _docker(
                 "build",
@@ -430,6 +482,7 @@ async def verify() -> None:
                 "app/infrastructure/_production_gateway.py\n"
                 "COPY gateway.py app/infrastructure/web_gateway.py\n"
                 "COPY fixture.py /fixture/fixture.py\nCOPY server.crt server.key /fixture/\n"
+                "COPY text.pdf blank.pdf /fixture/\n"
             )
             fixture_gateway = await _docker(
                 "build",
@@ -589,6 +642,25 @@ async def verify() -> None:
             )
             assert result.status is RetrievalStatus.SUCCESS, result
             assert result.body == b"<html><body>fixture document</body></html>"
+            for path, text in (
+                ("/html-extraction", "Supporting heading\nSupporting HTML evidence."),
+                ("/plain", "First plain-text line.\nSecond plain-text line."),
+                ("/pdf", "Supporting PDF evidence."),
+            ):
+                extracted = await retriever.read_document(
+                    RetrievalRequest("https://public.test" + path), _context()
+                )
+                assert extracted.status is SourceStatus.SUCCESS, extracted
+                assert extracted.text == text, extracted
+                assert extracted.usage.extracted_bytes == len(text.encode())
+                assert not hasattr(extracted, "body")
+                assert extracted.usage.response_bytes > len(text.encode())
+            scanned = await retriever.read_document(
+                RetrievalRequest("https://public.test/pdf-no-text"), _context()
+            )
+            assert scanned.status is SourceStatus.UNSUPPORTED, scanned
+            assert scanned.error_code == "pdf_no_extractable_text_ocr_unsupported", scanned
+            print("worker_html_text_pdf_extraction_pass", flush=True)
             logs = await _docker("logs", fixture_name)
             assert '"sni": "public.test"' in logs and '"host": "public.test"' in logs
             before = len(logs.splitlines())

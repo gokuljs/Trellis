@@ -18,13 +18,15 @@ import httpx
 from app.application.tool_context import ToolExecutionContext
 from app.domain.retrieval import (
     HTML_DECODED_BYTES,
+    MAX_EXTRACTED_RESULT_BYTES,
     MAX_WORKER_REQUEST_BYTES,
     PDF_RAW_BYTES,
+    ExtractedDocumentResult,
     RetrievalRequest,
     RetrievalResult,
     RetrievalStatus,
 )
-from app.domain.web import WebUsage
+from app.domain.web import SourceStatus, WebUsage
 
 _MAX_RESULT_JSON = ((PDF_RAW_BYTES + 2) // 3) * 4 + 64 * 1024
 _WORKER_SOCKET = "/run/trellis-egress/gateway.sock"
@@ -331,6 +333,60 @@ def _decode_result(payload: bytes, request: RetrievalRequest) -> RetrievalResult
         raise WorkerBoundaryError("invalid bounded worker result") from None
 
 
+def _decode_document(payload: bytes, request: RetrievalRequest) -> ExtractedDocumentResult:
+    try:
+        if len(payload) > MAX_EXTRACTED_RESULT_BYTES:
+            raise ValueError("extracted result exceeds limit")
+        value = json.loads(payload)
+        if (
+            not isinstance(value, dict)
+            or set(value)
+            != {
+                "status",
+                "requested_url",
+                "final_url",
+                "media_type",
+                "text",
+                "usage",
+                "error_code",
+                "title",
+                "publisher",
+                "published_at",
+                "canonical_url",
+                "links",
+                "extractor_version",
+            }
+            or value["requested_url"] != request.url
+            or not isinstance(value["links"], list)
+        ):
+            raise ValueError("invalid extracted result fields")
+        usage = WebUsage.from_dict(value["usage"])
+        if (
+            usage.search_calls
+            or usage.page_attempts != 1
+            or usage.network_requests > request.max_requests
+            or usage.response_bytes > request.max_response_bytes
+        ):
+            raise ValueError("extracted result exceeds its allowance")
+        return ExtractedDocumentResult(
+            status=SourceStatus(value["status"]),
+            requested_url=value["requested_url"],
+            final_url=value["final_url"],
+            media_type=value["media_type"],
+            text=value["text"],
+            usage=usage,
+            error_code=value["error_code"],
+            title=value["title"],
+            publisher=value["publisher"],
+            published_at=value["published_at"],
+            canonical_url=value["canonical_url"],
+            links=tuple(value["links"]),
+            extractor_version=value["extractor_version"],
+        )
+    except ValueError, TypeError, KeyError:
+        raise WorkerBoundaryError("invalid bounded extracted worker result") from None
+
+
 class DockerPublicRetriever:
     def __init__(self, deployment: WorkerDeployment, control: LeaseControl) -> None:
         self._deployment = deployment
@@ -347,6 +403,23 @@ class DockerPublicRetriever:
 
     async def is_ready(self) -> bool:
         try:
+            code, payload = await _run_docker(("image", "inspect", self._deployment.worker_image))
+            images = json.loads(payload) if code == 0 else None
+            if (
+                not isinstance(images, list)
+                or len(images) != 1
+                or not isinstance(images[0], dict)
+                or images[0].get("Id") != self._deployment.worker_image
+                or images[0].get("Os") != "linux"
+            ):
+                return False
+            image_config = images[0].get("Config")
+            labels = image_config.get("Labels") if isinstance(image_config, dict) else None
+            if (
+                not isinstance(labels, dict)
+                or labels.get("trellis.worker.protocol") != "public-document-v1"
+            ):
+                return False
             gateway = await self._inspect(self._deployment.gateway_container)
             host = gateway.get("HostConfig", {})
             ports = gateway.get("NetworkSettings", {}).get("Ports", {})
@@ -445,6 +518,20 @@ class DockerPublicRetriever:
     async def retrieve(
         self, request: RetrievalRequest, context: ToolExecutionContext
     ) -> RetrievalResult:
+        result = await self._retrieve(request, context, extracted=False)
+        assert isinstance(result, RetrievalResult)
+        return result
+
+    async def read_document(
+        self, request: RetrievalRequest, context: ToolExecutionContext
+    ) -> ExtractedDocumentResult:
+        result = await self._retrieve(request, context, extracted=True)
+        assert isinstance(result, ExtractedDocumentResult)
+        return result
+
+    async def _retrieve(
+        self, request: RetrievalRequest, context: ToolExecutionContext, *, extracted: bool
+    ) -> RetrievalResult | ExtractedDocumentResult:
         await context.assert_active()
         timeout = min(request.timeout_seconds, context.remaining_seconds)
         loop = asyncio.get_running_loop()
@@ -477,6 +564,7 @@ class DockerPublicRetriever:
                             "timeout_seconds": remaining,
                             "gateway_socket": _WORKER_SOCKET,
                             "lease_token": token,
+                            "operation": "extracted" if extracted else "raw",
                         },
                         ensure_ascii=False,
                     ).encode()
@@ -487,24 +575,36 @@ class DockerPublicRetriever:
                 code, output = await _run_docker(
                     ("start", "--attach", "--interactive", name),
                     payload=payload,
-                    limit=_MAX_RESULT_JSON,
+                    limit=MAX_EXTRACTED_RESULT_BYTES if extracted else _MAX_RESULT_JSON,
                     deadline_seconds=remaining,
                 )
                 if code:
                     raise WorkerBoundaryError("retrieval worker did not finish")
-                result = _decode_result(output, request)
+                result = (
+                    _decode_document(output, request)
+                    if extracted
+                    else _decode_result(output, request)
+                )
                 await context.assert_active()
         except TimeoutError:
-            result = RetrievalResult(
-                RetrievalStatus.TIMEOUT,
-                request.url,
-                error_code="worker_timeout",
+            result = (
+                ExtractedDocumentResult(
+                    SourceStatus.TIMEOUT, request.url, error_code="worker_timeout"
+                )
+                if extracted
+                else RetrievalResult(
+                    RetrievalStatus.TIMEOUT, request.url, error_code="worker_timeout"
+                )
             )
         except OSError, ValueError, WorkerBoundaryError, httpx.HTTPError, ExceptionGroup:
-            result = RetrievalResult(
-                RetrievalStatus.UNAVAILABLE,
-                request.url,
-                error_code="worker_unavailable",
+            result = (
+                ExtractedDocumentResult(
+                    SourceStatus.UNAVAILABLE, request.url, error_code="worker_unavailable"
+                )
+                if extracted
+                else RetrievalResult(
+                    RetrievalStatus.UNAVAILABLE, request.url, error_code="worker_unavailable"
+                )
             )
         finally:
             cleanup = asyncio.create_task(self._cleanup(name, token, creation_attempted))
@@ -521,14 +621,17 @@ class DockerPublicRetriever:
         if (
             receipt is not None
             and receipt.transferred_bytes == request.max_response_bytes
-            and result.status in {RetrievalStatus.UNAVAILABLE, RetrievalStatus.TIMEOUT}
+            and result.status.value in {"unavailable", "timeout"}
         ):
             result = replace(
                 result,
-                status=RetrievalStatus.BUDGET_EXHAUSTED,
+                status=SourceStatus.BUDGET_EXHAUSTED
+                if extracted
+                else RetrievalStatus.BUDGET_EXHAUSTED,
                 error_code="gateway_transport_allowance_exhausted",
             )
-        return replace(result, usage=self._settled_usage(request, receipt, token is not None))
+        usage = self._settled_usage(request, receipt, token is not None)
+        return replace(result, usage=replace(usage, extracted_bytes=result.usage.extracted_bytes))
 
     @staticmethod
     def _settled_usage(

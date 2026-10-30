@@ -6,6 +6,8 @@
 !app/infrastructure/web_gateway.py
 !app/infrastructure/web_network.py
 !app/infrastructure/web_reader.py
+!app/infrastructure/web_extraction.py
+!app/infrastructure/pdf_extractor.py
 !containers/
 !containers/gateway_guard.py
 !containers/trellis-gateway-init

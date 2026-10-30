@@ -11,8 +11,13 @@ import pytest
 
 from app.application.budgets import RunLimits
 from app.application.tool_context import ToolExecutionContext
-from app.domain.retrieval import RetrievalRequest, RetrievalStatus
-from app.domain.web import WebUsage
+from app.domain.retrieval import (
+    MAX_EXTRACTED_RESULT_BYTES,
+    ExtractedDocumentResult,
+    RetrievalRequest,
+    RetrievalStatus,
+)
+from app.domain.web import SourceStatus, WebUsage
 from app.infrastructure import retrieval_worker as worker
 
 DEPLOYMENT = worker.WorkerDeployment(
@@ -85,6 +90,21 @@ def result_payload(request: RetrievalRequest, **changes) -> bytes:
     return json.dumps(result).encode()
 
 
+def document_payload(request: RetrievalRequest, **changes) -> bytes:
+    result = asdict(
+        ExtractedDocumentResult(
+            SourceStatus.SUCCESS,
+            request.url,
+            request.url,
+            "text/html",
+            "Supporting text.",
+            WebUsage(page_attempts=1, network_requests=1, response_bytes=100, extracted_bytes=16),
+        )
+    )
+    result.update(changes)
+    return json.dumps(result).encode()
+
+
 @pytest.mark.parametrize("image", ["python:latest", "sha256:a", "x; touch /tmp/pwned"])
 def test_images_must_be_pinned(image):
     with pytest.raises(ValueError, match="pinned"):
@@ -149,7 +169,71 @@ def test_worker_result_has_measured_allowance_and_identity():
             worker._decode_result(result_payload(request, **change), request)
 
 
-def test_cancellation_revokes_lease_and_removes_worker(monkeypatch):
+def test_document_result_rejects_raw_bytes_wrong_identity_and_invalid_metadata():
+    request = RetrievalRequest("https://example.com")
+    decoded = worker._decode_document(document_payload(request), request)
+    assert decoded.text == "Supporting text."
+    assert not hasattr(decoded, "body")
+    for change in (
+        {"body": "aGVsbG8="},
+        {"requested_url": "https://other.test"},
+        {"status": "cleared"},
+        {"status": "blocked"},
+        {"text": "x" * (256 * 1024 + 1)},
+        {"title": "x" * 1001},
+        {"media_type": 42},
+        {"links": ["x"] * 33},
+        {"usage": asdict(WebUsage(page_attempts=1, extracted_bytes=17))},
+        {"usage": asdict(WebUsage(page_attempts=1, network_requests=7, extracted_bytes=16))},
+    ):
+        with pytest.raises(worker.WorkerBoundaryError):
+            worker._decode_document(document_payload(request, **change), request)
+    with pytest.raises(worker.WorkerBoundaryError):
+        worker._decode_document(b" " * (MAX_EXTRACTED_RESULT_BYTES + 1), request)
+
+
+def test_normal_document_path_requests_extraction_and_preserves_authoritative_usage(monkeypatch):
+    async def exercise():
+        request = RetrievalRequest("https://example.com")
+        control = AsyncMock()
+        control.issue.return_value = "lease-token"
+        control.revoke.return_value = worker.GatewayReceipt(2, 6000)
+        adapter = worker.DockerPublicRetriever(DEPLOYMENT, control)
+        adapter.is_ready = AsyncMock(return_value=True)
+        adapter._inspect = AsyncMock(return_value=inspection())
+
+        async def docker(args, **kwargs):
+            if args[0] == "start":
+                assert json.loads(kwargs["payload"])["operation"] == "extracted"
+                assert kwargs["limit"] == MAX_EXTRACTED_RESULT_BYTES
+                return 0, document_payload(request)
+            return 0, b""
+
+        monkeypatch.setattr(worker, "_run_docker", docker)
+        result = await adapter.read_document(request, context())
+        assert result.status is SourceStatus.SUCCESS
+        assert result.usage == WebUsage(
+            page_attempts=1, network_requests=2, response_bytes=6000, extracted_bytes=16
+        )
+
+    asyncio.run(exercise())
+
+
+def test_worker_readiness_requires_the_extraction_image_protocol(monkeypatch):
+    async def exercise():
+        adapter = worker.DockerPublicRetriever(DEPLOYMENT, AsyncMock())
+        adapter._inspect = AsyncMock(side_effect=AssertionError("Must reject before gateway"))
+        for images in ([], [{}], [{"Id": DEPLOYMENT.worker_image, "Os": "linux", "Config": {}}]):
+            monkeypatch.setattr(
+                worker, "_run_docker", AsyncMock(return_value=(0, json.dumps(images).encode()))
+            )
+            assert await adapter.is_ready() is False
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("operation", ["retrieve", "read_document"])
+def test_cancellation_revokes_lease_and_removes_worker(monkeypatch, operation):
     async def exercise():
         control = AsyncMock()
         control.issue.return_value = "lease-token"
@@ -170,7 +254,7 @@ def test_cancellation_revokes_lease_and_removes_worker(monkeypatch):
 
         monkeypatch.setattr(worker, "_run_docker", docker)
         task = asyncio.create_task(
-            adapter.retrieve(RetrievalRequest("https://example.com"), context())
+            getattr(adapter, operation)(RetrievalRequest("https://example.com"), context())
         )
         await started.wait()
         task.cancel()
