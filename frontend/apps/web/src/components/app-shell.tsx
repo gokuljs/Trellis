@@ -1115,8 +1115,8 @@ export function AppShell({
         ) {
           resetChatState(null)
           setError("This chat is unavailable.")
-          appliedPathRef.current = "/"
-          navigate("/", true)
+          appliedPathRef.current = "/app"
+          navigate("/app", true)
           return
         }
         if (bootstrapControllerRef.current)
@@ -1142,10 +1142,10 @@ export function AppShell({
     const synchronizeRoute = () => {
       const next = parseAppRoute(currentPath())
       if (next.kind === "unknown") {
-        navigate("/", true)
+        navigate("/app", true)
         return
       }
-      if (next.kind !== "home" && next.kind !== "chat") return
+      if (next.kind !== "workspace" && next.kind !== "chat") return
       if (next.path !== currentPath()) {
         navigate(next.path, true)
         return
@@ -1168,8 +1168,8 @@ export function AppShell({
 
   const handleNavigate = (view: WorkspaceView) => {
     if (view === "New session") {
-      if (currentPath() === "/") resetChatState(null)
-      else navigate("/")
+      if (currentPath() === "/app") resetChatState(null)
+      else navigate("/app")
       setSidebarCollapsed(false)
       return
     }

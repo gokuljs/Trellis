@@ -1,12 +1,27 @@
 import { parseAppRoute, type AppPath } from "./app-routes"
 
-type ReturnPathStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">
+export type ReturnPathStorage = Pick<
+  Storage,
+  "getItem" | "setItem" | "removeItem"
+>
 const returnPathKey = "trellis.auth-return-path"
 
 function validatedReturnPath(value: string | null): AppPath | null {
   if (value === null) return null
+  if (value === "/") return "/app"
   const route = parseAppRoute(value)
-  return route.kind === "chat" || route.kind === "home" ? route.path : null
+  return route.kind === "chat" || route.kind === "workspace" ? route.path : null
+}
+
+export function ensureAuthReturnPath(storage?: ReturnPathStorage): void {
+  try {
+    const target = storage ?? window.sessionStorage
+    if (!validatedReturnPath(target.getItem(returnPathKey))) {
+      target.setItem(returnPathKey, "/app")
+    }
+  } catch {
+    // Browsers may block session storage; sign-in can still continue.
+  }
 }
 
 export function rememberAuthReturnPath(
