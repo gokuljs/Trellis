@@ -29,6 +29,7 @@ type ComposerProps = {
   modelSaving: boolean
   onModelChange: (modelId: string) => void
   contextGauge?: ReactNode
+  clarification?: ReactNode
   runStatus?: string
   runMode?: RunMode
   onRunModeChange?: (mode: RunMode) => void
@@ -70,6 +71,7 @@ export function Composer({
   modelSaving,
   onModelChange,
   contextGauge,
+  clarification,
   runStatus,
   runMode = "chat",
   onRunModeChange,
@@ -105,6 +107,7 @@ export function Composer({
 
   return (
     <div className="composer-wrap">
+      {clarification}
       <div className="composer-box">
         <textarea
           aria-label="Message"
@@ -181,17 +184,19 @@ export function Composer({
           </div>
         </div>
       </div>
-      <div
-        className="composer-footnote"
-        role={runStatus ? "status" : undefined}
-      >
-        {runStatus ??
-          (runMode === "research"
-            ? budgetPreset === "longer"
-              ? "Research limits: 20 minutes, 600,000 tokens, $15 estimated model cost, 16 searches, 40 pages."
-              : "Research limits: 10 minutes, 300,000 tokens, $6 estimated model cost, 8 searches, 20 pages."
-            : "Trellis can make mistakes. Check important info.")}
-      </div>
+      {!answeringClarification ? (
+        <div
+          className="composer-footnote"
+          role={runStatus ? "status" : undefined}
+        >
+          {runStatus ??
+            (runMode === "research"
+              ? budgetPreset === "longer"
+                ? "Research limits: 20 minutes, 600,000 tokens, $15 estimated model cost, 16 searches, 40 pages."
+                : "Research limits: 10 minutes, 300,000 tokens, $6 estimated model cost, 8 searches, 20 pages."
+              : "Trellis can make mistakes. Check important info.")}
+        </div>
+      ) : null}
     </div>
   )
 }

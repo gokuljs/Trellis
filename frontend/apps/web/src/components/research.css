@@ -41,23 +41,22 @@
 }
 
 .research-clarification {
-  margin: var(--space-4) 0;
-  border: 1px solid var(--shell-line);
-  border-radius: 8px;
-  padding: var(--space-4);
-  background: var(--shell-card);
+  margin: 0 0 var(--space-3);
+  padding: 0 var(--space-4);
+  overflow-wrap: anywhere;
   font-size: 13px;
   line-height: 1.6;
 }
 
 .research-clarification h2 {
-  margin: 0 0 var(--space-2);
-  font-size: 13px;
+  margin: 0 0 var(--space-1);
+  color: var(--shell-text-muted);
+  font-size: 12px;
   font-weight: 500;
 }
 
 .research-clarification p {
-  margin: var(--space-2) 0 0;
+  margin: var(--space-1) 0 0;
 }
 
 .research-clarification-note {
