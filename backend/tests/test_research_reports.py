@@ -9,7 +9,12 @@ from app.application.budgets import BudgetExceeded
 from app.application.errors import ApplicationError
 from app.application.research import ResearchGeneration
 from app.application.research_ports import ResearchRepository
-from app.application.research_reports import ResearchReportService, parse_report, partial_report
+from app.application.research_reports import (
+    ResearchReportService,
+    parse_report,
+    parse_review,
+    partial_report,
+)
 from app.application.web_ports import WebRepository
 from app.domain.research import (
     ResearchPhase,
@@ -323,6 +328,121 @@ class ResearchReportTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(purposes, ["draft", "review", "repair", "recheck"])
         self.assertFalse(published[0][2])
+
+    async def test_structured_review_preserves_accepted_findings_after_failed_repair(self) -> None:
+        issue = {"claim_ids": ["price"], "issue": "Disclose the limited comparison scope."}
+        published, purposes, _ = await self.run_report(
+            [
+                report_json(),
+                json.dumps({"accepted_claim_ids": ["price"], "issues": [issue]}),
+                "invalid JSON",
+            ]
+        )
+        report, review, partial = published[0]
+        self.assertEqual(purposes, ["draft", "review", "repair"])
+        self.assertTrue(partial)
+        self.assertEqual(report.claims, parse_report(report_json()).claims)
+        self.assertEqual(review.accepted_claim_ids, ("price",))
+        self.assertEqual(review.report_hash, report.content_hash)
+        repair = json.loads(self.prompts["repair"].rsplit("\n", 1)[-1])
+        self.assertEqual(json.loads(repair["review"]["issues"][0]), issue)
+
+    async def test_structured_review_feedback_repairs_the_report(self) -> None:
+        issue = {"claim_id": "price", "issue": "The price is $10, not $999."}
+        published, purposes, _ = await self.run_report(
+            [
+                report_json("Product A costs $999."),
+                json.dumps({"accepted_claim_ids": [], "issues": [issue]}),
+                report_json(),
+                json.dumps({"accepted_claim_ids": ["price"], "issues": []}),
+            ]
+        )
+        self.assertEqual(purposes, ["draft", "review", "repair", "recheck"])
+        self.assertFalse(published[0][2])
+        self.assertNotIn("$999", published[0][0].markdown)
+        repair = json.loads(self.prompts["repair"].rsplit("\n", 1)[-1])
+        self.assertEqual(json.loads(repair["review"]["issues"][0]), issue)
+
+    async def test_review_receives_owned_source_provenance(self) -> None:
+        published, purposes, evidence = await self.run_report(
+            [report_json(), json.dumps({"accepted_claim_ids": ["price"], "issues": []})]
+        )
+        self.assertEqual(purposes, ["draft", "review"])
+        source = evidence.metadata()
+        reviewed = json.loads(self.prompts["review"].rsplit("\n", 1)[-1])["evidence"][0]
+        for field in (
+            "requested_url",
+            "final_url",
+            "canonical_url",
+            "title",
+            "publisher",
+            "published_at",
+            "fetched_at",
+        ):
+            self.assertEqual(reviewed[field], getattr(source, field))
+        self.assertEqual(reviewed["lines"], ["Product A costs $10."])
+        self.assertEqual(published[0][1].source_hashes, {SOURCE: source.content_hash})
+
+    async def test_malformed_review_feedback_is_sent_to_the_single_repair(self) -> None:
+        malformed = {"accepted_claim_ids": ["price"], "issues": [{"message": "Wrong shape."}]}
+        published, purposes, _ = await self.run_report(
+            [
+                report_json(),
+                json.dumps(malformed),
+                report_json(),
+                json.dumps({"accepted_claim_ids": ["price"], "issues": []}),
+            ]
+        )
+        self.assertEqual(purposes, ["draft", "review", "repair", "recheck"])
+        repair = json.loads(self.prompts["repair"].rsplit("\n", 1)[-1])
+        self.assertEqual(json.loads(repair["response"]), malformed)
+        self.assertEqual(
+            repair["report"], json.loads(json.dumps(asdict(parse_report(report_json()))))
+        )
+        self.assertIn("issue", repair["validation_issue"])
+        self.assertFalse(published[0][2])
+
+    def test_review_accepts_bounded_structured_issues_and_preserves_legacy_feedback(self) -> None:
+        report = parse_report(report_json())
+        hashes = {SOURCE: "a" * 64}
+        issues = [
+            "  Keep this legacy feedback unchanged.  ",
+            {"claim_ids": ["price"], "issue": "Check the comparison scope."},
+            {"claim_id": "price", "issue": "Add qualification."},
+            {"claim_ids": [], "issue": "The report needs a scope disclosure."},
+            {"issue": "Coverage remains incomplete."},
+        ]
+        review = parse_review(
+            json.dumps({"accepted_claim_ids": ["price"], "issues": issues}), report, hashes
+        )
+        self.assertEqual(review.report_hash, report.content_hash)
+        self.assertEqual(review.source_hashes, hashes)
+        self.assertEqual(review.accepted_claim_ids, ("price",))
+        self.assertEqual(review.issues[0], issues[0])
+        self.assertEqual([json.loads(value) for value in review.issues[1:]], issues[1:])
+
+    def test_review_rejects_invalid_or_unbounded_structured_issues(self) -> None:
+        report = parse_report(report_json())
+        invalid = [
+            [{"issue": ""}],
+            [{"issue": 5}],
+            [{"message": "Wrong field."}],
+            [{"issue": "Unknown field.", "severity": "low"}],
+            [{"claim_id": "missing", "issue": "Unknown claim."}],
+            [{"claim_ids": ["missing"], "issue": "Unknown claims."}],
+            [{"claim_ids": "price", "issue": "Wrong collection."}],
+            [{"claim_ids": [5], "issue": "Wrong claim type."}],
+            [{"claim_id": "price", "claim_ids": [], "issue": "Ambiguous target."}],
+            [{"issue": "x" * 8001}],
+            [{"issue": "One issue."}] * 101,
+        ]
+        for issues in invalid:
+            with self.subTest(issues=repr(issues)[:150]), self.assertRaises(ValueError):
+                parse_review(
+                    json.dumps({"accepted_claim_ids": [], "issues": issues}),
+                    report,
+                    {SOURCE: "a" * 64},
+                )
 
     async def test_output_limited_draft_is_repaired_with_reduced_scope(self) -> None:
         for content in ('{"markdown": "truncated', report_json()):
