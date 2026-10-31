@@ -29,7 +29,10 @@ _REPORT_SCHEMA = (
     "end_line}]}], covered_question_ids. Include markdown headings Summary, "
     "Findings, Conflicts, Limitations. Register every material external factual claim in "
     "claims and copy its exact text into markdown. Every claim requires supporting source "
-    "citations. Keep process status, missing-evidence disclosures, and limitations as "
+    "citations. Summary must synthesize the supported answer rather than merely announce "
+    "a report or reading list. When evidence supports a factual summary, register its "
+    "exact text as claim id summary with supporting citations and put it in Summary. "
+    "Keep process prefaces, missing-evidence disclosures, and limitations as "
     "narrative outside claims. Use claims:[] when there are no supported external facts. "
     "Use only root subquestion IDs in covered_question_ids; do not claim unanswered "
     "questions are covered. Cite exact recorded lines using [[source:UUID:L1-L3]] and "
@@ -275,18 +278,42 @@ def partial_report(
         if report
         else ()
     )
-    findings = (
-        "\n\n".join(
-            claim.text
-            + " "
-            + " ".join(
-                f"[[source:{ref.source_id}:L{ref.start_line}-L{ref.end_line}]]"
-                for ref in claim.citations
-            )
-            for claim in claims
+    original_summary = (
+        re.search(
+            r"^#{1,6}[ \t]+Summary[ \t]*\r?\n(.*?)(?=^#{1,6}[ \t]+|\Z)",
+            report.markdown,
+            flags=re.M | re.S | re.I,
         )
-        or "No reviewed findings are available."
+        if report
+        else None
     )
+    summary_claim = next(
+        (
+            claim
+            for claim in claims
+            if claim.id == "summary" and original_summary and claim.text in original_summary[1]
+        ),
+        None,
+    )
+    if summary_claim:
+        summary = _cited_claim(summary_claim) + "\n\nSome requested details remain unverified."
+    elif claims:
+        count = len(claims)
+        sources = len({reference.source_id for claim in claims for reference in claim.citations})
+        summary = (
+            f"This report includes {count} reviewed finding{'s' if count != 1 else ''} "
+            f"from {sources} source{'s' if sources != 1 else ''}. "
+            "Some requested details remain unverified."
+        )
+    else:
+        summary = "Research ended before any findings could be verified."
+    findings = "\n\n".join(_cited_claim(claim) for claim in claims if claim is not summary_claim)
+    if not findings:
+        findings = (
+            "No additional findings were verified."
+            if summary_claim
+            else "No findings could be verified within this run."
+        )
     missing = "\n".join(
         "- "
         + json.dumps(str(question.get("question", "Research question"))[:500], ensure_ascii=False)
@@ -295,14 +322,16 @@ def partial_report(
     if len(_questions(snapshot)) > 12:
         missing += f"\n- {len(_questions(snapshot)) - 12} further questions remain unverified."
     body = (
-        "## Summary\n\nThis research is incomplete.\n\n## Findings\n\n"
+        "## Summary\n\n"
+        + summary
+        + "\n\n## Findings\n\n"
         + findings
-        + _collected_sources(evidence or {})
-        + "\n\n## Conflicts\n\nConflict analysis is incomplete.\n\n## Limitations\n\n"
-        + f"Research stopped: {reason}."
+        + (_collected_sources(evidence or {}) if not claims else "")
+        + "\n\n## Conflicts\n\nConflicting claims were not fully assessed in this run."
+        + "\n\n## Limitations\n\n"
+        + _stopping_explanation(reason)
         + (f" {validation_issue}" if validation_issue else "")
-        + "\n\nQuestions requiring further verification:\n"
-        + missing
+        + ("\n\nRequested questions to revisit:\n" + missing if missing else "")
     )
     if len(body.encode("utf-8")) > 64 * 1024:
         return partial_report(
@@ -321,6 +350,38 @@ def partial_report(
     return partial, ResearchReview(
         partial.content_hash, hashes, tuple(claim.id for claim in claims), ()
     )
+
+
+def _cited_claim(claim: ResearchClaim) -> str:
+    return (
+        claim.text
+        + " "
+        + " ".join(
+            f"[[source:{ref.source_id}:L{ref.start_line}-L{ref.end_line}]]"
+            for ref in claim.citations
+        )
+    )
+
+
+def _stopping_explanation(reason: str) -> str:
+    messages = {
+        "report_support_incomplete": "The final review could not support every requested detail.",
+        "report_validation_failed": "The report could not be fully validated in this run.",
+        "research_finalization_limit": "The report reached its review limit.",
+        "research_finalization_reserve": "Collection ended to leave time for the report.",
+        "research_budget_exhausted": "Research reached its available budget.",
+        "cost_limit": "Research reached its cost limit.",
+        "token_limit": "Research reached its usage limit.",
+        "model_call_limit": "Research reached its model-call allowance.",
+        "tool_call_limit": "Research reached its tool-call allowance.",
+        "time_limit": "Research reached its time limit.",
+        "deadline_exceeded": "Research reached its time limit.",
+        "research_task_limit": "Research reached its assignment limit.",
+        "research_context_limit": "The evidence exceeded the space available for review.",
+        "context_budget_exceeded": "The evidence exceeded the space available for review.",
+        "context_too_large": "The evidence exceeded the space available for review.",
+    }
+    return messages.get(reason, "Research ended before a complete report could be verified.")
 
 
 def _markdown_label(value: str) -> str:

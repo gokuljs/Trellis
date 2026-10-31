@@ -738,6 +738,76 @@ class ResearchReportTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(verdict.report_hash, review.report_hash)
         self.assertEqual(asdict(verdict)["source_hashes"], {SOURCE: "a" * 64})
 
+    def summary_report(self) -> ResearchReport:
+        value = json.loads(report_json())
+        text = "Product A has a public price of $10."
+        value["markdown"] = value["markdown"].replace(
+            "Comparison.", text + f" [[source:{SOURCE}:L1-L1]]"
+        )
+        value["claims"].insert(
+            0,
+            {"id": "summary", "text": text, "citations": value["claims"][0]["citations"]},
+        )
+        return parse_report(json.dumps(value))
+
+    def test_partial_report_preserves_only_an_explicitly_reviewed_summary(self) -> None:
+        report = self.summary_report()
+        review = ResearchReview(report.content_hash, {SOURCE: "a" * 64}, ("summary", "price"), ())
+        partial, verdict = partial_report(snapshot(), "report_support_incomplete", report, review)
+        summary, findings = partial.markdown.split("## Findings", 1)
+        self.assertIn(report.claims[0].text, summary)
+        self.assertIn(f"[[source:{SOURCE}:L1-L1]]", summary)
+        self.assertNotIn(report.claims[0].text, findings)
+        self.assertEqual(partial.claims, report.claims)
+        self.assertEqual(verdict.report_hash, partial.content_hash)
+        self.assertEqual(verdict.source_hashes, review.source_hashes)
+
+    def test_rejected_or_stale_summary_is_never_presented_as_a_finding(self) -> None:
+        report = self.summary_report()
+        for digest, accepted in (
+            (report.content_hash, ("price",)),
+            ("b" * 64, ("summary", "price")),
+        ):
+            with self.subTest(accepted=accepted):
+                review = ResearchReview(digest, {SOURCE: "a" * 64}, accepted, ())
+                partial, _ = partial_report(snapshot(), "report_support_incomplete", report, review)
+                self.assertNotIn(report.claims[0].text, partial.markdown)
+
+    def test_summary_label_alone_cannot_move_a_finding_into_the_summary(self) -> None:
+        original = parse_report(report_json())
+        report = replace(original, claims=(replace(original.claims[0], id="summary"),))
+        review = ResearchReview(report.content_hash, {SOURCE: "a" * 64}, ("summary",), ())
+        partial, _ = partial_report(snapshot(), "report_support_incomplete", report, review)
+        self.assertNotIn(report.claims[0].text, partial.markdown.split("## Findings", 1)[0])
+        self.assertIn(report.claims[0].text, partial.markdown.split("## Findings", 1)[1])
+
+    def test_partial_findings_have_a_useful_summary_without_a_source_dump(self) -> None:
+        report = parse_report(report_json())
+        review = ResearchReview(report.content_hash, {SOURCE: "a" * 64}, ("price",), ())
+        evidence: dict[str, object] = {
+            "sources": [{"title": "Published pricing", "url": "https://example.com"}]
+        }
+        partial, _ = partial_report(
+            snapshot(), "report_support_incomplete", report, review, evidence=evidence
+        )
+        self.assertIn("1 reviewed finding from 1 source", partial.markdown)
+        self.assertNotIn("## Collected sources", partial.markdown)
+        self.assertNotIn("report_support_incomplete", partial.markdown)
+        self.assertEqual(partial.stop_reason, "report_support_incomplete")
+
+    def test_zero_reviewed_findings_keep_sources_and_unfinished_questions(self) -> None:
+        evidence: dict[str, object] = {
+            "sources": [{"title": "Published pricing", "url": "https://example.com"}]
+        }
+        partial, review = partial_report(snapshot(), "time_limit", evidence=evidence)
+        self.assertIn("before any findings could be verified", partial.markdown)
+        self.assertIn("## Collected sources", partial.markdown)
+        self.assertIn("Compare pricing", partial.markdown)
+        self.assertIn("time limit", partial.markdown)
+        self.assertNotIn("time_limit", partial.markdown)
+        self.assertEqual(partial.stop_reason, "time_limit")
+        self.assertEqual(review.accepted_claim_ids, ())
+
     def test_partial_report_cannot_reuse_a_review_for_another_revision(self) -> None:
         report = parse_report(report_json())
         review = ResearchReview("b" * 64, {SOURCE: "a" * 64}, ("price",), ())
