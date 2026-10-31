@@ -1,50 +1,12 @@
-import { useState, type ReactNode } from "react"
-import {
-  ArrowRight,
-  ArrowUpRight,
-  Code2,
-  Network,
-  Search,
-  type LucideIcon,
-} from "lucide-react"
+import type { ReactNode } from "react"
 
+import { GitHubIcon } from "@trellis/ui/icons/github-icon"
 import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 import { navigate, type AppPath } from "@/lib/app-routes"
 import { DitherLandscape } from "./dither-landscape"
 import "./home-page.css"
 
 const sourceUrl = "https://github.com/gokuljs/Trellis"
-
-type Capability = {
-  id: "coding" | "research" | "collaboration"
-  label: string
-  description: string
-  Icon: LucideIcon
-}
-
-const capabilities: readonly Capability[] = [
-  {
-    id: "coding",
-    label: "Coding",
-    description:
-      "Explore an idea, work through a problem, and build with a team of agents.",
-    Icon: Code2,
-  },
-  {
-    id: "research",
-    label: "Research",
-    description:
-      "Ask a bigger question. Follow the research and go straight to the sources.",
-    Icon: Search,
-  },
-  {
-    id: "collaboration",
-    label: "Collaboration",
-    description:
-      "Give your agents a direction and follow their work in one shared conversation.",
-    Icon: Network,
-  },
-]
 
 function HomeLink({
   href,
@@ -79,83 +41,54 @@ function HomeLink({
 }
 
 export function HomePage() {
-  const [activeCapability, setActiveCapability] =
-    useState<Capability["id"]>("coding")
-  const capability = capabilities.find((item) => item.id === activeCapability)!
-
   return (
     <div className="home-page">
       <header className="home-header">
-        <HomeLink href="/" className="home-brand">
-          <TrellisMark size={28} />
-          <span>Trellis</span>
-        </HomeLink>
-        <nav className="home-nav" aria-label="Main navigation">
-          <a href={sourceUrl} target="_blank" rel="noreferrer">
-            Source <ArrowUpRight size={14} aria-hidden="true" />
-          </a>
-          <HomeLink href="/login" className="home-sign-in">
-            Sign in
+        <div className="home-header-inner">
+          <HomeLink href="/" className="home-brand">
+            <TrellisMark size={20} />
+            <span>Trellis</span>
           </HomeLink>
-        </nav>
-      </header>
-
-      <main className="home-main">
-        <section className="home-content" aria-labelledby="home-heading">
-          <p className="home-eyebrow">Coding + research, together</p>
-          <h1 id="home-heading">
-            Think bigger.
-            <span>Build together.</span>
-          </h1>
-          <p className="home-description">
-            A team of agents for coding and research. Give them a direction.
-            Follow the work as it takes shape.
-          </p>
-          <div className="home-actions">
-            <HomeLink href="/app" className="home-primary-link">
-              Open Trellis <ArrowRight size={18} aria-hidden="true" />
-            </HomeLink>
+          <nav className="home-nav" aria-label="Main navigation">
+            <HomeLink href="/login">Sign in</HomeLink>
             <a
-              className="home-source-link"
               href={sourceUrl}
               target="_blank"
               rel="noreferrer"
+              aria-label="Trellis on GitHub"
+              title="Trellis on GitHub"
             >
-              View source <ArrowUpRight size={16} aria-hidden="true" />
+              <GitHubIcon size={17} />
             </a>
-          </div>
+          </nav>
+        </div>
+      </header>
 
-          <div className="home-capabilities">
-            <div
-              className="home-capability-options"
-              role="group"
-              aria-label="Explore Trellis"
-            >
-              {capabilities.map(({ id, label, Icon }) => (
-                <button
-                  type="button"
-                  key={id}
-                  aria-pressed={activeCapability === id}
-                  aria-controls="home-capability-description"
-                  onClick={() => setActiveCapability(id)}
-                >
-                  <Icon size={15} aria-hidden="true" />
-                  {label}
-                </button>
-              ))}
-            </div>
-            <p id="home-capability-description" aria-live="polite">
-              {capability.description}
+      <main className="home-main">
+        <div className="home-container">
+          <section className="home-content" aria-labelledby="home-heading">
+            <p className="home-eyebrow">Build with Trellis</p>
+            <h1 id="home-heading">
+              A team of agents
+              <br />
+              <span className="home-heading-muted">for coding</span>
+              <br />
+              <span className="home-heading-accent">and research</span>.
+            </h1>
+            <p className="home-description">
+              A team of agents for coding and research. Set the direction and
+              follow their work in one shared workspace.
             </p>
-          </div>
-        </section>
+          </section>
+        </div>
       </main>
 
       <footer className="home-footer">
-        <span>Your ideas. Your direction.</span>
-        <a href={sourceUrl} target="_blank" rel="noreferrer">
-          Built in the open <ArrowUpRight size={13} aria-hidden="true" />
-        </a>
+        <div className="home-footer-brand">
+          <TrellisMark size={20} />
+          <span>Trellis</span>
+        </div>
+        <span className="home-copyright">Trellis © 2026</span>
       </footer>
       <DitherLandscape />
     </div>
