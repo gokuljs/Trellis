@@ -18,8 +18,7 @@ MAX_RESEARCH_CONCURRENCY = 2
 REPORT_CALL_RESERVE = 4
 LEGACY_RESEARCH_POLICY = "bounded-research-v1"
 RESEARCH_POLICY_V2 = "bounded-research-v2"
-# Activation is a separate, verified rollout after collection and publication agree.
-CURRENT_RESEARCH_POLICY = LEGACY_RESEARCH_POLICY
+CURRENT_RESEARCH_POLICY = RESEARCH_POLICY_V2
 
 ResearchRole = Literal["lead", "worker", "writer", "reviewer"]
 
@@ -176,6 +175,10 @@ class ResearchTask:
     revision: int
     checkpoint: dict[str, object]
     result: dict[str, object] | None = None
+
+    @property
+    def notebook(self) -> dict[str, object]:
+        return {**self.checkpoint, **(self.result or {})}
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> Self:

@@ -63,6 +63,53 @@ class FollowupGuidanceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.execution = replace(make_run(), research_policy_version=RESEARCH_POLICY_V2)
 
+    def test_worker_local_finding_ids_cannot_hide_or_supply_sibling_coverage(self) -> None:
+        for first_depth, second_depth, missing in (
+            ("full_text", "listing", []),
+            ("abstract", "full_text", ["methods-text"]),
+        ):
+            with self.subTest(first_depth=first_depth, second_depth=second_depth):
+                first = {**finding(), "id": "f1", "evidence_depth": first_depth}
+                second = {
+                    **finding(),
+                    "id": "f1",
+                    "question_ids": ["other"],
+                    "requirement_ids": ["other-evidence"],
+                    "evidence_depth": second_depth,
+                }
+                other = {
+                    "id": "other",
+                    "question": "What does the other source establish?",
+                    "evidence_requirements": [
+                        {
+                            "id": "other-evidence",
+                            "description": "Other evidence",
+                            "depth": second_depth,
+                        }
+                    ],
+                }
+                workers = tuple(
+                    ResearchTask(
+                        str(uuid4()),
+                        self.execution.id,
+                        "Read assigned evidence",
+                        "worker",
+                        1,
+                        ResearchTaskStatus.COMPLETED,
+                        1,
+                        {"findings": [saved]},
+                    )
+                    for saved in (first, second)
+                )
+                state = replace(
+                    snapshot(self.execution, {"subquestions": [question(), other]}, workers),
+                    source_reads=(saved_read(first), saved_read(second)),
+                )
+                guidance = collection_guidance(state, self.execution)
+                self.assertEqual(
+                    [item["id"] for item in guidance["unresolved_requirements"]], missing
+                )
+
     def test_addressed_flag_without_evidence_still_needs_followup(self) -> None:
         state = snapshot(self.execution, {"subquestions": [question()]})
         guidance = collection_guidance(state, self.execution)

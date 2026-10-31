@@ -64,11 +64,7 @@ def _eligible_requirements(
     }
     notes: Iterable[dict[str, object]] = (
         snapshot.checkpoint,
-        *(
-            task.result or task.checkpoint
-            for task in snapshot.tasks
-            if task.role in {"lead", "worker"}
-        ),
+        *(task.notebook for task in snapshot.tasks if task.role in {"lead", "worker"}),
     )
     eligible: dict[str, set[str]] = {}
     for note in notes:

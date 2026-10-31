@@ -8,11 +8,13 @@ from urllib.parse import quote, urlsplit, urlunsplit
 from app.application.budgets import BudgetExceeded
 from app.application.errors import ApplicationError
 from app.application.research import ResearchGeneration
+from app.application.research_claim_binding import bind_emphasized_claim
 from app.application.research_evidence import collect_report_evidence
 from app.application.research_ports import ResearchRepository
 from app.application.research_report_coverage import complete_question_ids, review_question_coverage
 from app.application.web_ports import WebRepository
 from app.domain.research import (
+    LEGACY_RESEARCH_POLICY,
     RESEARCH_POLICY_V2,
     ResearchClaim,
     ResearchReport,
@@ -131,8 +133,14 @@ def _review_issues(value: object, report: ResearchReport) -> tuple[str, ...]:
         raise ValueError("invalid research review issues") from None
 
 
-def parse_report(text: str, *, default_stop_reason: str | None = None) -> ResearchReport:
+def parse_report(
+    text: str,
+    *,
+    default_stop_reason: str | None = None,
+    policy_version: str = LEGACY_RESEARCH_POLICY,
+) -> ResearchReport:
     value = _json_object(text)
+    markdown = value.get("markdown")
     raw_claims = value.get("claims")
     if not isinstance(raw_claims, list) or len(raw_claims) > 50:
         raise ValueError("invalid report claims")
@@ -153,8 +161,14 @@ def parse_report(text: str, *, default_stop_reason: str | None = None) -> Resear
         claim_id, claim_text = claim.get("id"), claim.get("text")
         if not isinstance(claim_id, str) or not isinstance(claim_text, str):
             raise ValueError("invalid report claim")
+        if (
+            policy_version == RESEARCH_POLICY_V2
+            and isinstance(markdown, str)
+            and claim_text not in markdown
+        ):
+            claim_text = bind_emphasized_claim(markdown, claim_text) or claim_text
         claims.append(ResearchClaim(claim_id, claim_text, tuple(citations)))
-    markdown, model_reason = value.get("markdown"), value.get("stop_reason")
+    model_reason = value.get("stop_reason")
     long_explanation = isinstance(model_reason, str) and len(model_reason) > 100
     reason = (
         default_stop_reason
@@ -221,12 +235,8 @@ def _writer_notes(snapshot: ResearchSnapshot, evidence: dict[str, object]) -> di
     if snapshot.policy_version != RESEARCH_POLICY_V2:
         return {
             "checkpoint": snapshot.checkpoint,
-            "lead": [
-                task.result or task.checkpoint for task in snapshot.tasks if task.role == "lead"
-            ],
-            "workers": [
-                task.result or task.checkpoint for task in snapshot.tasks if task.role == "worker"
-            ],
+            "lead": [task.notebook for task in snapshot.tasks if task.role == "lead"],
+            "workers": [task.notebook for task in snapshot.tasks if task.role == "worker"],
         }
     admitted = {
         (item.get("task_id"), item.get("finding_id"))
@@ -263,7 +273,7 @@ def _writer_notes(snapshot: ResearchSnapshot, evidence: dict[str, object]) -> di
         result = []
         by_id = {}
         for value in [
-            *(task.result or task.checkpoint for task in snapshot.tasks),
+            *(task.notebook for task in snapshot.tasks),
             snapshot.checkpoint,
         ]:
             for issue in cast(list[dict[str, object]], value.get(key, [])):
@@ -305,15 +315,9 @@ def _writer_notes(snapshot: ResearchSnapshot, evidence: dict[str, object]) -> di
         root["collection_decision"] = decision
     result = {
         "checkpoint": root,
-        "lead": [
-            note(task.result or task.checkpoint, task.id)
-            for task in snapshot.tasks
-            if task.role == "lead"
-        ],
+        "lead": [note(task.notebook, task.id) for task in snapshot.tasks if task.role == "lead"],
         "workers": [
-            note(task.result or task.checkpoint, task.id)
-            for task in snapshot.tasks
-            if task.role == "worker"
+            note(task.notebook, task.id) for task in snapshot.tasks if task.role == "worker"
         ],
     }
     result["omitted_note_count"] = omitted
@@ -704,7 +708,12 @@ class ResearchReportService:
                     if incomplete:
                         raise ValueError("research report reached its output limit")
                     report = disclose_missing_questions(
-                        parse_report(content, default_stop_reason=stopping_reason), snapshot
+                        parse_report(
+                            content,
+                            default_stop_reason=stopping_reason,
+                            policy_version=snapshot.policy_version,
+                        ),
+                        snapshot,
                     )
                     if writer_notes.get("scope_unavailable") and report.claims:
                         raise ValueError("complete research scope exceeds the bounded report input")

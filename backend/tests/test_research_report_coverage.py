@@ -1,10 +1,12 @@
 import json
 import unittest
 from dataclasses import replace
+from typing import cast
+from uuid import uuid4
 
 from app.application.research_report_coverage import review_question_coverage
 from app.application.research_reports import parse_report
-from app.domain.research import RESEARCH_POLICY_V2
+from app.domain.research import RESEARCH_POLICY_V2, ResearchTask, ResearchTaskStatus
 from tests.test_research_reports import SOURCE, report_json, snapshot
 
 
@@ -49,6 +51,34 @@ def research_state():
 
 
 class ResearchReportCoverageTests(unittest.TestCase):
+    def test_failed_worker_retains_saved_findings_for_writing_and_semantic_coverage(self):
+        from app.application.research_reports import _writer_notes
+
+        state = research_state()
+        question = dict(state.checkpoint["subquestions"][0])
+        question["evidence_requirements"] = question["evidence_requirements"][:1]
+        finding = state.checkpoint["findings"][0]
+        worker = ResearchTask(
+            str(uuid4()),
+            state.run_id,
+            "Find the published price",
+            "worker",
+            1,
+            ResearchTaskStatus.FAILED,
+            2,
+            {"findings": [finding]},
+            {"error_code": "research_checkpoint_required"},
+        )
+        state = replace(state, checkpoint={"subquestions": [question]}, tasks=(worker,))
+        notes = _writer_notes(
+            state, {"admitted_findings": [{"task_id": worker.id, "finding_id": finding["id"]}]}
+        )
+        workers = cast(list[dict[str, object]], notes["workers"])
+        self.assertEqual(workers[0]["findings"], [finding])
+        coverage, issues = self.review(state)
+        self.assertEqual(coverage[0].requirement_ids, ("price",))
+        self.assertEqual(issues, ())
+
     def test_writer_notes_keep_whole_contracts_within_their_byte_limit(self):
         from app.application.research_reports import _writer_notes
 

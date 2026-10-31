@@ -2253,6 +2253,11 @@ export function AppShell({
                       : undefined
               }
               budgetPreset={lockedBudgetPreset}
+              researchExecutionBudgetSeconds={
+                pending && researchQuery.data?.run_id === activeRunId
+                  ? researchQuery.data.execution_budget_seconds
+                  : undefined
+              }
               runMode={pending ? (activeMode ?? runMode) : runMode}
               onRunModeChange={setRunMode}
               researchAvailable={

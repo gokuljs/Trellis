@@ -41,8 +41,11 @@ from tests import test_research_postgres as database_tests
 
 
 class PostgresTransport:
-    def __init__(self, fixture: database_tests.ResearchPostgresTests) -> None:
+    def __init__(
+        self, fixture: database_tests.ResearchPostgresTests, *, pin_legacy_research: bool = False
+    ) -> None:
         self.fixture = fixture
+        self.pin_legacy_research = pin_legacy_research
         self.fail_delegate_results = False
         self.failed = False
         self.delegate_tools: set[str] = set()
@@ -123,8 +126,12 @@ class PostgresTransport:
             )
             return httpx.Response(400, json={"code": "22023", "message": message})
         decoded = json.loads(result.stdout.strip() or "null")
+        response_content = result.stdout.strip() or "null"
         if path == "rpc/mutate":
             action = payload.get("p_action")
+            if action == "create_run" and self.pin_legacy_research and isinstance(decoded, dict):
+                decoded = await asyncio.to_thread(self.fixture.pin_legacy_research, decoded)
+                response_content = json.dumps(decoded)
             if action == "begin_tool_execution" and isinstance(decoded, dict):
                 tool = decoded.get("tool_call", {})
                 if isinstance(tool, dict) and tool.get("name") == "delegate_research":
@@ -141,7 +148,7 @@ class PostgresTransport:
                 )
         return httpx.Response(
             200,
-            content=result.stdout.strip() or "null",
+            content=response_content,
             headers={"Content-Type": "application/json"},
         )
 
@@ -454,7 +461,7 @@ class ResearchExecutionPostgresTests(unittest.IsolatedAsyncioTestCase):
         self.tokens.record_verified("fixture-token", owner, datetime.now(UTC) + timedelta(hours=1))
         self.settings = settings
         self.installation_id = str(uuid4())
-        self.transport = PostgresTransport(self.fixture)
+        self.transport = PostgresTransport(self.fixture, pin_legacy_research=True)
         self.client = httpx.AsyncClient(transport=httpx.MockTransport(self.transport))
         self.repository = SupabaseRepository(settings, owner, self.tokens, self.client)
         run = await self.repository.get_run(self.fixture.run_id)
@@ -483,6 +490,12 @@ class ResearchExecutionPostgresTests(unittest.IsolatedAsyncioTestCase):
         self.fixture.run_id = created.id
         self.fixture.capability = self.repository._run_capability(created.id)
         self.execution_run = created
+        persisted = await self.repository.get_run(created.id)
+        assert persisted is not None
+        self.assertEqual(created.research_policy_version, database_tests.LEGACY_RESEARCH_POLICY)
+        self.assertEqual(created.research_policy_version, persisted.research_policy_version)
+        self.assertEqual(created.execution_budget_seconds, persisted.execution_budget_seconds)
+        self.assertEqual(created.deadline_at, persisted.deadline_at)
 
     def make_service(
         self, repository: SupabaseRepository

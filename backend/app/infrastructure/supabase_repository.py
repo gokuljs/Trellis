@@ -1059,7 +1059,8 @@ class SupabaseRepository(ResearchRepositoryMixin, WebRepositoryMixin):
                 "deadline_at,cancel_requested_at,lease_expires_at,recovery_count,stop_reason,"
                 "last_event_sequence,error_code,error_message,created_at,started_at,finished_at,"
                 "waiting_tool_call_id,recovery_contract,generation,retry_allowed,"
-                "recovery_reason,uncertain_tool_call_id,run_mode"
+                "recovery_reason,uncertain_tool_call_id,run_mode,"
+                "research_policy_version,execution_budget_seconds"
             ),
             filters={"user_id": f"eq.{self._user_id}", **filters},
         )

@@ -184,6 +184,28 @@ class V2ReviewBindingTests(unittest.TestCase):
 
 
 class V2ReportFinalizationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_emphasized_claim_reaches_review_and_publishes_without_repair(self):
+        fixture = report_fixtures.ResearchReportTests()
+        state = v2_state()
+        question = dict(state.checkpoint["subquestions"][0])
+        question["evidence_requirements"] = question["evidence_requirements"][:1]
+        state = replace(state, checkpoint={**state.checkpoint, "subquestions": [question]})
+        draft = json.loads(report_json())
+        draft["markdown"] = draft["markdown"].replace(
+            "Product A costs $10.", "Product A costs **$10**."
+        )
+        published, purposes, _ = await fixture.run_report(
+            [json.dumps(draft), price_review()], state=state
+        )
+        self.assertEqual(purposes, ["draft", "review"])
+        report, review, partial = published[0]
+        self.assertFalse(partial)
+        self.assertEqual(report.claims[0].text, "Product A costs **$10**.")
+        self.assertEqual(review.report_hash, report.content_hash)
+        self.assertEqual(review.source_hashes, {SOURCE: "a" * 64})
+        self.assertEqual(review.question_coverage[0].requirement_ids, ("price",))
+        self.assertIn("Product A costs **$10**.", fixture.prompts["review"])
+
     async def test_worker_gaps_and_conflicts_reach_both_writer_and_reviewer(self):
         state = v2_state()
         worker = ResearchTask(

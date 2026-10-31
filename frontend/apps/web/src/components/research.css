@@ -35,7 +35,19 @@
   font-size: 11px;
 }
 
-.research-workers summary {
+.research-evidence-summary {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: var(--space-3);
+  margin: var(--space-2) 0;
+}
+
+.research-scope p {
+  margin: var(--space-1) 0;
+}
+
+.research-workers summary,
+.research-scope summary {
   min-height: 32px;
   cursor: pointer;
 }
@@ -71,7 +83,8 @@
     gap: var(--space-1);
   }
 
-  .research-workers summary {
+  .research-workers summary,
+  .research-scope summary {
     min-height: 44px;
   }
 }

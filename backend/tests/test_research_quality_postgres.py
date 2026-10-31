@@ -158,6 +158,56 @@ class ResearchQualityPostgresTests(unittest.TestCase):
                 self.assertNotEqual(rejected.returncode, 0)
                 self.assert_no_publication()
 
+    def test_rejected_worker_response_keeps_checkpoint_findings_publishable(self) -> None:
+        task_id = self.db.tasks[1]
+        self.db.rpc(
+            "checkpoint",
+            {
+                "run_id": self.db.run_id,
+                "generation": 0,
+                "task_id": task_id,
+                "expected_revision": 0,
+                "operation_id": str(uuid4()),
+                "checkpoint": {"findings": self.checkpoint["findings"]},
+            },
+        )
+        self.checkpoint["findings"] = []
+        self.save_checkpoint()
+        call = self.db.rpc("reserve_call", self.db.reservation(task_id))["model_call"]
+        self.db.rpc(
+            "update_model_call", {"call_id": call["id"], "next_status": "streaming"}, research=False
+        )
+        self.db.rpc(
+            "reject_generation",
+            {
+                "run_id": self.db.run_id,
+                "generation": 0,
+                "task_id": task_id,
+                "call_id": call["id"],
+                "error_code": "research_checkpoint_required",
+                "completion": {
+                    "response_snapshot": {
+                        "content": "Finished without saving the latest read",
+                        "tool_calls": [],
+                        "continuation_items": [],
+                        "finish_kind": "final",
+                    },
+                    "finish_reason": "stop",
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "reasoning_tokens": 0,
+                    "estimated_cost": 0.001,
+                    "accounted_total_tokens": 120,
+                },
+            },
+        )
+        failed = next(task for task in self.snapshot()["tasks"] if task["id"] == task_id)
+        self.assertEqual(failed["result"], {"error_code": "research_checkpoint_required"})
+        self.assertEqual(len(failed["checkpoint"]["findings"]), 1)
+        published = self.db.rpc("publish", self.payload)
+        self.assertEqual(published["run"]["status"], "completed")
+        self.assertEqual(self.snapshot()["reviewed_coverage"][0]["requirement_ids"], ["price"])
+
     def test_supported_partial_report_can_publish_without_complete_question_coverage(self) -> None:
         questions = cast(list[dict[str, object]], self.checkpoint["subquestions"])
         requirements = cast(list[dict[str, object]], questions[0]["evidence_requirements"])

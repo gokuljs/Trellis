@@ -13,6 +13,7 @@ import { useTheme } from "@/components/theme-provider"
 import { ModelSelect } from "@/components/model-select"
 import type { ModelStatus, RunMode } from "@/lib/app-types"
 import { isModelSelectable } from "@/lib/model-choice"
+import { researchBudgetDescription } from "@/lib/research"
 
 type BudgetPreset = "conservative" | "longer"
 
@@ -35,6 +36,7 @@ type ComposerProps = {
   onRunModeChange?: (mode: RunMode) => void
   researchAvailable?: boolean
   researchUnavailableReason?: string | null
+  researchExecutionBudgetSeconds?: number | null
   answeringClarification?: boolean
   controlsDisabled?: boolean
 }
@@ -77,6 +79,7 @@ export function Composer({
   onRunModeChange,
   researchAvailable = false,
   researchUnavailableReason,
+  researchExecutionBudgetSeconds,
   answeringClarification = false,
   controlsDisabled = disabled,
 }: ComposerProps) {
@@ -150,6 +153,14 @@ export function Composer({
               className="composer-select"
               aria-label="Run budget"
               value={budgetPreset}
+              title={
+                runMode === "research"
+                  ? researchBudgetDescription(
+                      budgetPreset,
+                      researchExecutionBudgetSeconds
+                    )
+                  : undefined
+              }
               disabled={controlsDisabled}
               onChange={(event) =>
                 onBudgetChange(event.target.value as BudgetPreset)
@@ -191,9 +202,10 @@ export function Composer({
         >
           {runStatus ??
             (runMode === "research"
-              ? budgetPreset === "longer"
-                ? "Research limits: 20 minutes, 600,000 tokens, $15 estimated model cost, 16 searches, 40 pages."
-                : "Research limits: 10 minutes, 300,000 tokens, $6 estimated model cost, 8 searches, 20 pages."
+              ? researchBudgetDescription(
+                  budgetPreset,
+                  researchExecutionBudgetSeconds
+                )
               : "Trellis can make mistakes. Check important info.")}
         </div>
       ) : null}

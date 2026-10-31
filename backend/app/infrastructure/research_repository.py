@@ -6,6 +6,8 @@ from uuid import UUID
 
 from app.application.errors import ApplicationError
 from app.domain.research import (
+    CURRENT_RESEARCH_POLICY,
+    RESEARCH_POLICY_V2,
     ResearchReport,
     ResearchReservation,
     ResearchReview,
@@ -120,7 +122,12 @@ class ResearchRepositoryMixin:
             return (
                 isinstance(value, dict)
                 and type(value.get("schema_version")) is int
-                and value.get("schema_version") == 1
+                and value.get("schema_version")
+                == (2 if CURRENT_RESEARCH_POLICY == RESEARCH_POLICY_V2 else 1)
+                and (
+                    CURRENT_RESEARCH_POLICY != RESEARCH_POLICY_V2
+                    or value.get("policy_version") == RESEARCH_POLICY_V2
+                )
                 and value.get("ready") is True
             )
         except ApplicationError, RuntimeError, ValueError, TypeError:

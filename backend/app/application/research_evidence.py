@@ -41,9 +41,7 @@ class _FindingSupport:
 
 def _findings(snapshot: ResearchSnapshot) -> list[_FindingSupport]:
     checkpoints = [(None, snapshot.checkpoint)] + [
-        (task.id, {**task.checkpoint, **(task.result or {})})
-        for task in snapshot.tasks
-        if task.role in {"lead", "worker"}
+        (task.id, task.notebook) for task in snapshot.tasks if task.role in {"lead", "worker"}
     ]
     questions = []
     findings = []

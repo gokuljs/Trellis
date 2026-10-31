@@ -45,6 +45,7 @@ from app.application.ports import (
 )
 from app.application.research import (
     RESEARCH_CONTROL_NAMES,
+    RESEARCH_WEB_NAMES,
     ResearchCoordinator,
     ResearchGeneration,
     ResearchReportFinalizer,
@@ -483,7 +484,9 @@ class RunService:
                 or self._research_reports is None
                 or not model.supports_tools
                 or self._tool_registry is None
-                or not {"web_search", "web_read"}.issubset(
+                or not (
+                    research_web_names(CURRENT_RESEARCH_POLICY) - {"web_crawl", "web_source"}
+                ).issubset(
                     tool.name
                     for tool in self._tool_registry.specs(None, capabilities=self._capabilities)
                 )
@@ -524,6 +527,15 @@ class RunService:
                             item
                             for item in contract.tool_versions
                             if item[0] in research_web_names(CURRENT_RESEARCH_POLICY)
+                        ),
+                    )
+                elif "recovery_contract" in options:
+                    contract = options["recovery_contract"]
+                    research_only = research_web_names(RESEARCH_POLICY_V2) - RESEARCH_WEB_NAMES
+                    options["recovery_contract"] = replace(
+                        contract,
+                        tool_versions=tuple(
+                            item for item in contract.tool_versions if item[0] not in research_only
                         ),
                     )
                 run = await self._runs.create_run(
@@ -1678,6 +1690,9 @@ class RunService:
                 for tool in tools
                 if tool.name in research_web_names(run.research_policy_version)
             )
+        else:
+            research_only = research_web_names(RESEARCH_POLICY_V2) - RESEARCH_WEB_NAMES
+            tools = tuple(tool for tool in tools if tool.name not in research_only)
         return _ExecutionContext(
             model, provider, api_key or "", profile.id, workspace_root, guidance, tools, runtime
         )
@@ -2388,9 +2403,7 @@ class RunService:
                 }
                 if task.role == "lead":
                     state["worker_findings"] = [
-                        item.result or item.checkpoint
-                        for item in snapshot.tasks
-                        if item.role == "worker"
+                        item.notebook for item in snapshot.tasks if item.role == "worker"
                     ]
                 task_messages = await repository.read_research_task_messages(run.id, task.id)
                 checkpoint_only = False

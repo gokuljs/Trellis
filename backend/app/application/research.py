@@ -428,16 +428,31 @@ class ResearchCoordinator:
                 if policy_version == RESEARCH_POLICY_V2 and arguments.get("collection_decision"):
                     checkpoint["collection_decision_basis"] = collection_basis(
                         checkpoint,
-                        (item.checkpoint for item in snapshot.tasks if item.role == "worker"),
+                        (item.notebook for item in snapshot.tasks if item.role == "worker"),
                     )
-                saved = await self.repository.checkpoint_research(
-                    self.run.id,
-                    self.run.generation,
-                    task.id,
-                    current.revision,
-                    operation_id,
-                    checkpoint,
-                )
+                try:
+                    saved = await self.repository.checkpoint_research(
+                        self.run.id,
+                        self.run.generation,
+                        task.id,
+                        current.revision,
+                        operation_id,
+                        checkpoint,
+                    )
+                except ApplicationError as error:
+                    if (
+                        policy_version != RESEARCH_POLICY_V2
+                        or error.code != "research_source_changed"
+                    ):
+                        raise
+                    return {
+                        "status": "invalid_request",
+                        "reason": (
+                            "A citation refers to unavailable or changed source lines. "
+                            "Cite only available, owned, numbered lines. Record failed access "
+                            "as an uncited gap and include its source in examined_source_ids."
+                        ),
+                    }
                 return {"status": "saved", "revision": saved.revision}
             if task.role != "lead":
                 raise ValueError("only the lead may delegate or clarify")

@@ -8,6 +8,7 @@ import { MessageMarkdown } from "../components/message-markdown"
 import { RunActivity } from "../components/run-activity"
 import { RunActivityDisclosure } from "../components/run-activity-disclosure"
 import { SavedRunActivity } from "../components/saved-run-activity"
+import { ResearchProgress } from "../components/research-progress"
 import { describeActivity } from "./activity-status"
 import { threadMessages } from "./assistant-outputs"
 import {
@@ -20,7 +21,12 @@ import { webEvidenceKeys } from "./web-evidence-queries"
 import { groupRunEvents } from "./run-event-groups"
 import { runInfoFromEvent, turnFailureAction } from "./run-recovery"
 import { createApiClient } from "./api"
-import { researchQueryOptions } from "./research"
+import {
+  researchBudgetDescription,
+  researchEvidenceDepthLabel,
+  researchQueryOptions,
+  researchQuestionEvidenceLabel,
+} from "./research"
 import { runEventsQueryOptions } from "./server-queries"
 
 const sourceId = "29b96351-a37d-44b2-ae6e-1ccdbd210b4c"
@@ -58,6 +64,121 @@ const completedSummary = (mode = "research") => ({
   created_at: "2026-10-31T10:00:00Z",
   finished_at: "2026-10-31T10:05:17Z",
   stop_reason: "report_validation_failed",
+})
+
+test("evidence progress distinguishes recorded support from published review", () => {
+  const research = {
+    ...researchOutcome("researching"),
+    coverage: [
+      {
+        id: "q1",
+        status: "missing",
+        requirements: [
+          { id: "methods", status: "evidence_recorded", finding_ids: ["f1"] },
+          { id: "results", status: "missing", finding_ids: [] },
+        ],
+      },
+    ],
+  }
+  assert.equal(
+    researchQuestionEvidenceLabel(research, "q1", "addressed"),
+    "1/2 evidence areas recorded"
+  )
+  research.coverage[0].requirements[0].status = "reviewed"
+  assert.equal(
+    researchQuestionEvidenceLabel(research, "q1", "addressed"),
+    "1/2 evidence areas recorded · 1 reviewed"
+  )
+  research.coverage[0].requirements[1].status = "reviewed"
+  assert.equal(
+    researchQuestionEvidenceLabel(research, "q1", "addressed"),
+    "2/2 evidence areas reviewed"
+  )
+  assert.equal(
+    researchQuestionEvidenceLabel(researchOutcome(), "q1", "in_progress"),
+    "in progress"
+  )
+})
+
+test("research progress exposes scope and abstract-only evidence without percentages", () => {
+  const markup = renderToStaticMarkup(
+    createElement(ResearchProgress, {
+      research: {
+        ...researchOutcome("completed"),
+        sources_read: 2,
+        source_windows_read: 3,
+        evidence_depth: ["abstract"],
+        execution_budget_seconds: 600,
+        subquestions: [
+          { id: "q1", question: "What differs?", status: "addressed" },
+        ],
+        coverage: [
+          {
+            id: "q1",
+            status: "missing",
+            requirements: [
+              { id: "results", status: "missing", finding_ids: [] },
+            ],
+          },
+        ],
+        brief: {
+          scope: "Compare the two supplied abstracts",
+          comparison_dimensions: ["Approach"],
+          source_restrictions: ["Only the supplied pages"],
+          expected_output: "A comparison",
+        },
+      },
+    })
+  )
+  assert.match(markup, /2 sources read/)
+  assert.match(markup, /3 reading windows/)
+  assert.match(markup, /Abstract-only evidence/)
+  assert.match(markup, /Research scope/)
+  assert.match(markup, /Only the supplied pages/)
+  assert.match(markup, /1 evidence area missing/)
+  assert.doesNotMatch(markup, /%|evidence areas reviewed/)
+})
+
+test("paused research keeps its frozen allowance after Extended increases", () => {
+  const render = (seconds) =>
+    renderToStaticMarkup(
+      createElement(ResearchProgress, {
+        research: {
+          ...researchOutcome("waiting_for_input"),
+          remaining_seconds: 90,
+          execution_budget_seconds: seconds,
+          pending_clarification: {
+            id: "clarification",
+            question: "Which region?",
+          },
+        },
+      })
+    )
+  assert.match(render(1200), /20 min allowance/)
+  assert.doesNotMatch(render(1200), /45 min allowance/)
+  assert.match(render(2700), /45 min allowance/)
+  assert.match(render(1200), /Timer paused/)
+  assert.match(researchBudgetDescription("longer"), /45 minutes/)
+  assert.match(researchBudgetDescription("longer", 1200), /20 minutes/)
+  assert.match(researchBudgetDescription("conservative"), /10 minutes/)
+})
+
+test("legacy snapshots do not imply zero sources or reviewed evidence", () => {
+  const markup = renderToStaticMarkup(
+    createElement(ResearchProgress, {
+      research: {
+        ...researchOutcome(),
+        sources_read: null,
+        source_windows_read: null,
+      },
+    })
+  )
+  assert.doesNotMatch(
+    markup,
+    /sources read|reading windows|reviewed|Research scope/
+  )
+  assert.equal(researchEvidenceDepthLabel(["full_text"]), "Full-text excerpts")
+  assert.equal(researchEvidenceDepthLabel(["listing"]), "Job listings")
 })
 
 test("collapsed completed research shows the saved partial outcome", () => {

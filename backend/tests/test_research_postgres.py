@@ -7,7 +7,13 @@ import unittest
 from dataclasses import asdict
 from uuid import uuid4
 
-from app.domain.research import ResearchClaim, ResearchReport, ResearchReview, research_limits
+from app.domain.research import (
+    LEGACY_RESEARCH_POLICY,
+    ResearchClaim,
+    ResearchReport,
+    ResearchReview,
+    research_limits,
+)
 from app.domain.web import CitationReference
 
 
@@ -20,6 +26,7 @@ def literal(value: str) -> str:
 )
 class ResearchPostgresTests(unittest.TestCase):
     budget_preset = "conservative"
+    research_policy_version = LEGACY_RESEARCH_POLICY
 
     def sql(self, statement: str, *, authenticated: bool = True, check: bool = True):
         prefix = (
@@ -59,7 +66,43 @@ class ResearchPostgresTests(unittest.TestCase):
         )
         if not check:
             return result
-        return json.loads(result.stdout.strip())
+        value = json.loads(result.stdout.strip())
+        if action == "create_run" and not research:
+            return self.pin_legacy_research(value)
+        return value
+
+    def pin_legacy_research(self, created: dict) -> dict:
+        run = created.get("run")
+        if (
+            self.research_policy_version != LEGACY_RESEARCH_POLICY
+            or not isinstance(run, dict)
+            or run.get("run_mode") != "research"
+            or run.get("status") != "queued"
+            or run.get("research_policy_version") == LEGACY_RESEARCH_POLICY
+        ):
+            return created
+        seconds = research_limits(run["budget_preset"], LEGACY_RESEARCH_POLICY).seconds
+        result = self.sql(
+            "BEGIN; LOCK TABLE trellis.runs IN ACCESS EXCLUSIVE MODE; "
+            "ALTER TABLE trellis.runs DISABLE TRIGGER preserve_research_profile; "
+            "UPDATE trellis.runs r SET research_policy_version="
+            + literal(LEGACY_RESEARCH_POLICY)
+            + f", execution_budget_seconds={seconds}, "
+            f"deadline_at=r.deadline_at+make_interval(secs=>{seconds}-r.execution_budget_seconds) "
+            "WHERE r.id="
+            + literal(run["id"])
+            + " AND r.user_id="
+            + literal(self.owner)
+            + " AND r.status='queued' AND r.generation=0 "
+            "AND NOT EXISTS(SELECT 1 FROM trellis.model_calls c WHERE c.run_id=r.id) "
+            "AND NOT EXISTS(SELECT 1 FROM trellis.research_runs s WHERE s.run_id=r.id) "
+            "RETURNING jsonb_build_object('research_policy_version',r.research_policy_version,"
+            "'execution_budget_seconds',r.execution_budget_seconds,'deadline_at',r.deadline_at); "
+            "ALTER TABLE trellis.runs ENABLE TRIGGER preserve_research_profile; COMMIT;",
+            authenticated=False,
+        )
+        self.assertTrue(result.stdout.strip(), "Legacy fixture requires a new queued own run")
+        return {**created, "run": {**run, **json.loads(result.stdout)}}
 
     def setUp(self) -> None:
         self.owner = str(uuid4())
@@ -136,6 +179,19 @@ class ResearchPostgresTests(unittest.TestCase):
             "reserved_cost": 0.01,
             "finalization": False,
         }
+
+    def test_fixture_keeps_its_legacy_execution_profile(self) -> None:
+        profile = json.loads(
+            self.sql(
+                "SELECT jsonb_build_object('version',research_policy_version,'seconds',"
+                "execution_budget_seconds,'elapsed',extract(epoch FROM deadline_at-created_at)) "
+                "FROM trellis.runs WHERE id=" + literal(self.run_id) + ";"
+            ).stdout
+        )
+        expected = research_limits(self.budget_preset, LEGACY_RESEARCH_POLICY).seconds
+        self.assertEqual(profile["version"], LEGACY_RESEARCH_POLICY)
+        self.assertEqual(profile["seconds"], expected)
+        self.assertAlmostEqual(float(profile["elapsed"]), expected, delta=1)
 
     def test_parallel_reservations_cannot_spend_report_reserve(self) -> None:
         payloads = [

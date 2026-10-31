@@ -268,11 +268,10 @@ def collection_guidance(
     if observed_reads is not None and not observed_reads:
         observed_reads = parse_research_read_observations(snapshot.source_reads)
     worker_tasks = [item for item in snapshot.tasks if item.role == "worker"]
-    worker_notes = [item.checkpoint for item in worker_tasks]
+    worker_notes = [item.notebook for item in worker_tasks]
     checkpoints = [*worker_notes, snapshot.checkpoint]
     questions = _records(snapshot.checkpoint.get("subquestions"))
     findings = [item for note in checkpoints for item in _records(note.get("findings"))]
-    findings_by_id = _by_id(findings)
     gaps = _by_id(item for note in checkpoints for item in _records(note.get("gaps")))
     conflicts = _by_id(item for note in checkpoints for item in _records(note.get("conflicts")))
     open_gaps = [item for item in gaps.values() if item.get("status", "open") == "open"]
@@ -296,9 +295,10 @@ def collection_guidance(
             if requirement is None:
                 continue
             supporting = [
-                findings_by_id[str(identity)]
-                for identity in cast(list[str], facet.get("finding_ids", []))
-                if str(identity) in findings_by_id
+                finding
+                for finding in findings
+                if covered_question["id"] in cast(list[str], finding.get("question_ids", []))
+                and facet["id"] in cast(list[str], finding.get("requirement_ids", []))
             ]
             enough = any(
                 (
