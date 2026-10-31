@@ -306,7 +306,7 @@ def preflight_context(
         raise ApplicationError(
             "run_budget_exhausted", "The remaining run budget cannot fit the current input."
         )
-    nominal = min(request.max_output_tokens, 4096, profile.max_output_tokens or 0)
+    nominal = min(request.max_output_tokens, profile.max_output_tokens or 0)
     reserve = min(nominal, remaining_run_tokens - required_tokens)
     if reserve <= 0:
         raise ApplicationError("run_budget_exhausted", "The run has no output budget remaining.")

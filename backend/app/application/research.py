@@ -39,6 +39,7 @@ RESEARCH_WEB_NAMES = frozenset({"web_search", "web_read", "web_source", "web_cra
 class ResearchGeneration:
     call_id: str
     content: str
+    incomplete: bool = False
 
 
 ResearchGenerate = Callable[[str, str], Awaitable[ResearchGeneration]]

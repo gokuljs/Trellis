@@ -118,7 +118,7 @@ class Reports:
 class ResearchReportTests(unittest.IsolatedAsyncioTestCase):
     async def run_report(
         self,
-        responses: list[str | Exception],
+        responses: list[str | Exception | ResearchGeneration],
         *,
         evidence: Evidence | None = None,
         state: ResearchSnapshot | None = None,
@@ -135,6 +135,8 @@ class ResearchReportTests(unittest.IsolatedAsyncioTestCase):
             response = responses.pop(0)
             if isinstance(response, Exception):
                 raise response
+            if isinstance(response, ResearchGeneration):
+                return response
             return ResearchGeneration(CALL, response)
 
         run = cast(RunSnapshot, SimpleNamespace(id=RUN, session_id=SESSION, generation=0))
@@ -210,6 +212,116 @@ class ResearchReportTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(purposes, ["draft", "review", "repair", "recheck"])
         self.assertFalse(published[0][2])
+
+    async def test_output_limited_draft_is_repaired_with_reduced_scope(self) -> None:
+        for content in ('{"markdown": "truncated', report_json()):
+            with self.subTest(content=content):
+                published, purposes, _ = await self.run_report(
+                    [
+                        ResearchGeneration(CALL, content, incomplete=True),
+                        report_json(),
+                        json.dumps({"accepted_claim_ids": ["price"], "issues": []}),
+                    ]
+                )
+                self.assertEqual(purposes, ["draft", "repair", "recheck"])
+                self.assertFalse(published[0][2])
+                self.assertIn("output limit", self.prompts["repair"])
+                self.assertIn("number of claims", self.prompts["repair"])
+                self.assertIn("reduce report scope", self.prompts["repair"])
+
+    async def test_output_limited_review_cannot_accept_claims(self) -> None:
+        published, purposes, _ = await self.run_report(
+            [
+                report_json(),
+                ResearchGeneration(
+                    CALL,
+                    json.dumps({"accepted_claim_ids": ["price"], "issues": []}),
+                    incomplete=True,
+                ),
+                report_json(),
+                json.dumps({"accepted_claim_ids": ["price"], "issues": []}),
+            ]
+        )
+        self.assertEqual(purposes, ["draft", "review", "repair", "recheck"])
+        self.assertFalse(published[0][2])
+        self.assertIn("review response reached its output limit", self.prompts["repair"])
+
+    async def test_output_limited_repair_stops_without_another_candidate(self) -> None:
+        published, purposes, _ = await self.run_report(
+            ["invalid JSON", ResearchGeneration(CALL, report_json(), incomplete=True)]
+        )
+        report, review, partial = published[0]
+        self.assertEqual(purposes, ["draft", "repair"])
+        self.assertTrue(partial)
+        self.assertEqual(report.claims, ())
+        self.assertEqual(review.accepted_claim_ids, ())
+        self.assertIn("report response reached its output limit", report.markdown)
+        self.assertIn("https://example.com/pricing", report.markdown)
+
+    async def test_output_limited_repair_keeps_only_prior_reviewed_claims(self) -> None:
+        published, purposes, _ = await self.run_report(
+            [
+                report_json(),
+                json.dumps(
+                    {"accepted_claim_ids": ["price"], "issues": ["Disclose limited scope."]}
+                ),
+                ResearchGeneration(CALL, report_json("Product A costs $999."), incomplete=True),
+            ]
+        )
+        report, review, partial = published[0]
+        self.assertEqual(purposes, ["draft", "review", "repair"])
+        self.assertTrue(partial)
+        self.assertEqual(report.claims, parse_report(report_json()).claims)
+        self.assertNotIn("$999", report.markdown)
+        self.assertEqual(review.accepted_claim_ids, ("price",))
+        self.assertEqual(review.report_hash, report.content_hash)
+        self.assertEqual(review.source_hashes, {SOURCE: "a" * 64})
+
+    async def test_output_limited_recheck_keeps_the_prior_review(self) -> None:
+        published, purposes, _ = await self.run_report(
+            [
+                report_json(),
+                json.dumps(
+                    {"accepted_claim_ids": ["price"], "issues": ["Disclose limited scope."]}
+                ),
+                report_json("Product A costs $999."),
+                ResearchGeneration(
+                    CALL,
+                    json.dumps({"accepted_claim_ids": ["price"], "issues": []}),
+                    incomplete=True,
+                ),
+            ]
+        )
+        report, review, partial = published[0]
+        self.assertEqual(purposes, ["draft", "review", "repair", "recheck"])
+        self.assertTrue(partial)
+        self.assertEqual(report.claims, parse_report(report_json()).claims)
+        self.assertNotIn("$999", report.markdown)
+        self.assertIn("review response reached its output limit", report.markdown)
+        self.assertEqual(review.report_hash, report.content_hash)
+
+    async def test_output_limit_does_not_retry_after_unknown_repair_outcome(self) -> None:
+        with self.assertRaises(ApplicationError) as raised:
+            await self.run_report(
+                [
+                    ResearchGeneration(CALL, report_json(), incomplete=True),
+                    ApplicationError("model_outcome_unknown", "Unknown outcome."),
+                ]
+            )
+        self.assertEqual(raised.exception.code, "model_outcome_unknown")
+        self.assertEqual(set(self.prompts), {"draft", "repair"})
+
+    async def test_output_limit_does_not_retry_after_repair_budget_exhaustion(self) -> None:
+        published, purposes, _ = await self.run_report(
+            [
+                ResearchGeneration(CALL, report_json(), incomplete=True),
+                BudgetExceeded("research_finalization_limit"),
+            ]
+        )
+        self.assertEqual(purposes, ["draft", "repair"])
+        self.assertTrue(published[0][2])
+        self.assertEqual(published[0][0].stop_reason, "research_finalization_limit")
+        self.assertEqual(published[0][0].claims, ())
 
     async def test_failed_repair_preserves_saved_sources_without_unreviewed_claims(self) -> None:
         published, purposes, _ = await self.run_report(["invalid JSON", "invalid JSON"])

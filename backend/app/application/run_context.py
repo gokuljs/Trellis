@@ -568,6 +568,7 @@ class RunContext:
         messages: list[RunMessageRecord],
         tool_calls: list[ToolCallRecord],
         tools: tuple[ModelToolSpec, ...],
+        max_output_tokens: int = 4096,
     ) -> ContextPreflight:
         profile = profile_for_model(run.model_id)
         if profile is None:
@@ -586,7 +587,7 @@ class RunContext:
             run.adapter_kind,
             run.upstream_model_id,
             (ModelMessage("user", self.redactor.redact_text(prompt)), *context.messages),
-            4096,
+            max_output_tokens,
             context.system_instructions + "\n" + self.redactor.redact_text(instructions),
             tools,
         )

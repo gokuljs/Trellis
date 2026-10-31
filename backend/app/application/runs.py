@@ -104,6 +104,7 @@ from app.domain.workspaces import WorkspaceReviewState
 logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_TOKENS = 4096
+RESEARCH_REPORT_MAX_OUTPUT_TOKENS = 3 * MAX_OUTPUT_TOKENS
 DEFAULT_LEASE_RENEW_INTERVAL_SECONDS = 30.0
 MAX_MODEL_RESPONSE_BYTES = 256_000
 MAX_CONTINUATION_BYTES = 256_000
@@ -2081,6 +2082,28 @@ class RunService:
             run.id, RunEventType.PHASE, {"phase": "writing", "label": "Preparing the report"}
         )
 
+        async def saved_incomplete(task: ResearchTask) -> ResearchGeneration | None:
+            calls = await repository.read_research_task_calls(run.id, task.id)
+            if not calls:
+                return None
+            call = calls[-1]
+            response = call.response_snapshot
+            if (
+                call.run_id != run.id
+                or call.task_id != task.id
+                or call.status is not ModelCallStatus.COMPLETED
+                or call.error_code != "provider_response_incomplete"
+                or call.finish_reason not in {"max_output_tokens", "max_tokens"}
+                or call.accounted_total_tokens is None
+                or call.estimated_cost is None
+                or response is None
+                or response.get("finish_kind") != "incomplete"
+                or ("finish_reason" in response and response["finish_reason"] != call.finish_reason)
+                or not isinstance(response.get("content"), str)
+            ):
+                return None
+            return ResearchGeneration(call.id, cast(str, response["content"]), incomplete=True)
+
         async def generate(prompt: str, purpose: str) -> ResearchGeneration:
             role = "reviewer" if purpose in {"review", "recheck"} else "writer"
             task_id = str(uuid5(UUID(run.id), "report:" + purpose))
@@ -2091,6 +2114,10 @@ class RunService:
                 (ResearchTaskInput(task_id, "Research report " + purpose, role, 0),),
             )
             task = tasks[0]
+            if task.status is ResearchTaskStatus.FAILED:
+                incomplete = await saved_incomplete(task)
+                if incomplete is not None:
+                    return incomplete
             if task.status is ResearchTaskStatus.COMPLETED:
                 calls = await repository.read_research_task_calls(run.id, task.id)
                 if not calls or calls[-1].response_snapshot is None:
@@ -2113,6 +2140,13 @@ class RunService:
                     run, execution, coordinator, task, prompt=prompt, finalization=True
                 )
             except (ApplicationError, ProviderError) as error:
+                if (
+                    isinstance(error, ProviderError)
+                    and error.code == "provider_response_incomplete"
+                ):
+                    incomplete = await saved_incomplete(task)
+                    if incomplete is not None:
+                        return incomplete
                 if self._research_limit(error.code):
                     raise BudgetExceeded(error.code) from None
                 raise
@@ -2305,6 +2339,9 @@ class RunService:
                     messages=await repository.read_research_task_messages(run.id, task.id),
                     tool_calls=task_tools,
                     tools=available,
+                    max_output_tokens=RESEARCH_REPORT_MAX_OUTPUT_TOKENS
+                    if finalization
+                    else MAX_OUTPUT_TOKENS,
                 )
                 if plan.estimated_call_cost_usd is None:
                     raise ProviderError("pricing_unavailable", "Research requires model pricing.")

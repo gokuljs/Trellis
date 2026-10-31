@@ -225,6 +225,9 @@ class ScriptedResearcher:
         self.pages_per_worker: int | None = None
         self.use_saved_evidence = False
         self.checkpoint_stop_reason = False
+        self.incomplete_draft = False
+        self.draft_interrupted = False
+        self.report_output_limits: list[int] = []
 
     async def stream(
         self, request: ModelRequest, api_key: str, user_id: str
@@ -235,8 +238,12 @@ class ScriptedResearcher:
         exchanges = sum(message.role == "assistant" for message in request.messages)
         call: ModelToolCall | None = None
         text = "Internal research notes that must remain private."
+        incomplete = False
         if not request.tools:
+            self.report_output_limits.append(request.max_output_tokens)
             payload = json.loads(prompt.rsplit("\n", 1)[-1])
+            if "findings" in payload:
+                payload = payload["findings"]
             if "report" in payload:
                 text = json.dumps(
                     {
@@ -298,6 +305,10 @@ class ScriptedResearcher:
                         "stop_reason": "questions_addressed",
                     }
                 )
+                if self.incomplete_draft and not self.draft_interrupted:
+                    self.draft_interrupted = True
+                    text = '{"markdown":"unfinished'
+                    incomplete = True
         elif "delegate_research" in tool_names:
             if exchanges == 0:
                 call = ModelToolCall(
@@ -403,9 +414,17 @@ class ScriptedResearcher:
         if call is not None:
             yield ModelStreamEvent("tool_call", tool_call=call)
         yield ModelStreamEvent(
-            "usage", input_tokens=200, output_tokens=100, cached_tokens=0, cache_creation_tokens=0
+            "usage",
+            input_tokens=200,
+            output_tokens=4096 if incomplete else 100,
+            cached_tokens=0,
+            cache_creation_tokens=0,
         )
-        yield ModelStreamEvent("completed", finish_kind="tool" if call is not None else "final")
+        yield ModelStreamEvent(
+            "completed",
+            finish_kind="incomplete" if incomplete else "tool" if call is not None else "final",
+            finish_reason="max_output_tokens" if incomplete else None,
+        )
 
 
 @unittest.skipUnless(
@@ -544,6 +563,35 @@ class ResearchExecutionPostgresTests(unittest.IsolatedAsyncioTestCase):
             + ";",
         )
         self.assertEqual(int(outputs.stdout.strip()), 1)
+
+    async def test_incomplete_draft_retains_usage_and_repairs_before_publication(self) -> None:
+        self.provider.incomplete_draft = True
+        await self.service._execute_snapshot(self.execution_run)
+        saved = await self.repository.get_run(self.execution_run.id)
+        assert saved is not None
+        self.assertEqual(saved.status, RunStatus.COMPLETED, saved.error_message)
+        state = await self.repository.read_research(saved.id)
+        assert state is not None
+        calls = await self.repository.list_model_calls(saved.id)
+        interrupted = [call for call in calls if call.error_code == "provider_response_incomplete"]
+        self.assertEqual(len(interrupted), 1)
+        self.assertEqual(interrupted[0].status.value, "completed")
+        self.assertEqual(interrupted[0].accounted_total_tokens, 4296)
+        self.assertGreater(interrupted[0].estimated_cost or 0, 0)
+        self.assertEqual(self.provider.report_output_limits, [12288, 12288, 12288])
+        self.assertEqual(
+            [task.objective for task in state.tasks if task.role in {"writer", "reviewer"}],
+            ["Research report draft", "Research report repair", "Research report recheck"],
+        )
+        messages = await self.repository.list_messages(saved.session_id)
+        reports = [message.content for message in messages if message.role == "assistant"]
+        self.assertEqual(len(reports), 1)
+        self.assertIn("Current A price is $10.", reports[0])
+        self.assertNotIn("unfinished", reports[0])
+        citations = await self.repository.read_web_citations(
+            saved.session_id, state.report_model_call_id or ""
+        )
+        self.assertEqual(len(citations), 6)
 
     async def test_worker_stop_checkpoint_still_publishes_checked_findings(self) -> None:
         self.provider.checkpoint_stop_reason = True
