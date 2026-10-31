@@ -2148,7 +2148,12 @@ class RunService:
         return replace(run, deadline_at=(deadline - timedelta(seconds=reserved)).isoformat())
 
     async def _close_research_tools(
-        self, run: RunSnapshot, task: ResearchTask, *, timed_out_tool_id: str | None = None
+        self,
+        run: RunSnapshot,
+        task: ResearchTask,
+        *,
+        timed_out_tool_id: str | None = None,
+        reason: str = "research_finalization_reserve",
     ) -> None:
         for tool in await self._runs.list_tool_calls(run.id):
             if tool.task_id != task.id or tool.status not in {
@@ -2167,7 +2172,7 @@ class RunService:
                 ToolResult(
                     tool.provider_call_id,
                     tool.name,
-                    '{"status":"stopped","reason":"research_finalization_reserve"}',
+                    json.dumps({"status": "stopped", "reason": reason}, separators=(",", ":")),
                     True,
                 ),
                 status=status,
@@ -2185,6 +2190,17 @@ class RunService:
     ) -> ResearchGeneration | None:
         repository = self._research_repository
         assert repository is not None
+        task = next(item for item in (await coordinator.snapshot()).tasks if item.id == task.id)
+        if task.status not in {ResearchTaskStatus.QUEUED, ResearchTaskStatus.RUNNING}:
+            stopped_reason = task.checkpoint.get("stop_reason")
+            await self._close_research_tools(
+                run,
+                task,
+                reason=stopped_reason
+                if isinstance(stopped_reason, str) and stopped_reason
+                else "research_task_stopped",
+            )
+            return None
         scope = self._research_execution_scope(run, finalization=finalization)
         result: ResearchGeneration | None = None
         available = () if finalization else (*execution.tools, *control_specs(task.role))
@@ -2214,6 +2230,16 @@ class RunService:
             ):
                 return False
             task = next(item for item in (await coordinator.snapshot()).tasks if item.id == task.id)
+            if task.status not in {ResearchTaskStatus.QUEUED, ResearchTaskStatus.RUNNING}:
+                stopped_reason = task.checkpoint.get("stop_reason")
+                await self._close_research_tools(
+                    run,
+                    task,
+                    reason=stopped_reason
+                    if isinstance(stopped_reason, str) and stopped_reason
+                    else "research_task_stopped",
+                )
+                return False
             calls = await repository.read_research_task_calls(run.id, task.id)
             saved = next((item for item in calls if item.status is ModelCallStatus.PENDING), None)
             totals = await self._runs.list_model_calls(run.id)
@@ -2538,6 +2564,15 @@ class RunService:
             await self._record_tool_result(
                 run.id, stored, ToolResult(stored.provider_call_id, stored.name, content)
             )
+            stopped_reason = stored.arguments.get("stop_reason")
+            if (
+                stored.name == "research_checkpoint"
+                and response.get("status") == "saved"
+                and isinstance(stopped_reason, str)
+                and stopped_reason
+            ):
+                await self._close_research_tools(run, task, reason=stopped_reason)
+                return False
             if response.get("status") == "waiting_for_input":
                 assert self._research_repository is not None
                 _waiting, events = await self._research_repository.pause_research(

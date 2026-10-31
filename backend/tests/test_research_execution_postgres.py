@@ -224,6 +224,7 @@ class ScriptedResearcher:
         self.both_workers = asyncio.Event()
         self.pages_per_worker: int | None = None
         self.use_saved_evidence = False
+        self.checkpoint_stop_reason = False
 
     async def stream(
         self, request: ModelRequest, api_key: str, user_id: str
@@ -391,6 +392,11 @@ class ScriptedResearcher:
                     {
                         "findings": findings,
                         "examined_source_ids": [page["source_id"] for page in pages],
+                        **(
+                            {"stop_reason": "Collection is complete; use the saved findings."}
+                            if self.checkpoint_stop_reason
+                            else {}
+                        ),
                     },
                 )
         yield ModelStreamEvent("text_delta", text=text)
@@ -538,6 +544,29 @@ class ResearchExecutionPostgresTests(unittest.IsolatedAsyncioTestCase):
             + ";",
         )
         self.assertEqual(int(outputs.stdout.strip()), 1)
+
+    async def test_worker_stop_checkpoint_still_publishes_checked_findings(self) -> None:
+        self.provider.checkpoint_stop_reason = True
+        await self.service._execute_snapshot(self.execution_run)
+        saved = await self.repository.get_run(self.execution_run.id)
+        assert saved is not None
+        self.assertEqual(saved.status, RunStatus.COMPLETED, saved.error_message)
+        state = await self.repository.read_research(saved.id)
+        assert state is not None
+        workers = [task for task in state.tasks if task.role == "worker"]
+        self.assertEqual(len(workers), 2)
+        self.assertTrue(all(task.checkpoint.get("findings") for task in workers))
+        self.assertTrue(all(task.checkpoint.get("stop_reason") for task in workers))
+        self.assertEqual(len(self.pages.reads), 3)
+        messages = await self.repository.list_messages(saved.session_id)
+        reports = [message.content for message in messages if message.role == "assistant"]
+        self.assertEqual(len(reports), 1)
+        self.assertIn("Current A price is $10.", reports[0])
+        self.assertIn("B requires a sales quote.", reports[0])
+        citations = await self.repository.read_web_citations(
+            saved.session_id, state.report_model_call_id or ""
+        )
+        self.assertEqual(len(citations), 6)
 
     async def test_collection_cutoff_reports_saved_pages_without_worker_findings(self) -> None:
         self.provider.use_saved_evidence = True
