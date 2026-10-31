@@ -23,7 +23,10 @@ from app.application.budgets import (
 )
 from app.application.context_preview import preview_from_plan
 from app.application.errors import ApplicationError, ProviderError
-from app.application.execution_snapshots import generation_snapshot, restore_model_request
+from app.application.execution_snapshots import (
+    generation_snapshot,
+    restore_model_request,
+)
 from app.application.model_catalog import profile_for_model
 from app.application.ports import (
     ContextCheckpointRepository,
@@ -42,16 +45,21 @@ from app.application.ports import (
 )
 from app.application.research import (
     RESEARCH_CONTROL_NAMES,
-    RESEARCH_WEB_NAMES,
     ResearchCoordinator,
     ResearchGeneration,
     ResearchReportFinalizer,
     control_specs,
     research_instructions,
+    research_web_names,
     task_terminal_result,
     validate_task_recovery,
 )
 from app.application.research_ports import ResearchRepository
+from app.application.research_task_context import (
+    bounded_research_notebook,
+    checkpoint_disposes_reads,
+    project_research_task_context,
+)
 from app.application.run_capacity import RunCapacity
 from app.application.run_context import RunContext, billing_tier, usage_cost
 from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
@@ -75,7 +83,14 @@ from app.domain.recovery import (
     ToolRecoveryPolicy,
     resolve_recovery,
 )
-from app.domain.research import ResearchTask, ResearchTaskInput, ResearchTaskStatus, research_limits
+from app.domain.research import (
+    CURRENT_RESEARCH_POLICY,
+    RESEARCH_POLICY_V2,
+    ResearchTask,
+    ResearchTaskInput,
+    ResearchTaskStatus,
+    research_limits,
+)
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -107,6 +122,21 @@ RESEARCH_REPORT_MAX_OUTPUT_TOKENS = 3 * MAX_OUTPUT_TOKENS
 DEFAULT_LEASE_RENEW_INTERVAL_SECONDS = 30.0
 MAX_MODEL_RESPONSE_BYTES = 256_000
 MAX_CONTINUATION_BYTES = 256_000
+
+
+def _research_model_budget(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            {
+                "tokens": "model token count",
+                "collection_tokens_remaining": "remaining model token count",
+            }.get(key, key): _research_model_budget(item)
+            for key, item in value.items()
+            if isinstance(key, str)
+        }
+    if isinstance(value, list):
+        return [_research_model_budget(item) for item in value]
+    return value
 
 
 class _RunCreationOptions(TypedDict):
@@ -489,7 +519,9 @@ class RunService:
                         contract,
                         workspace=None,
                         tool_versions=tuple(
-                            item for item in contract.tool_versions if item[0] in RESEARCH_WEB_NAMES
+                            item
+                            for item in contract.tool_versions
+                            if item[0] in research_web_names(CURRENT_RESEARCH_POLICY)
                         ),
                     )
                 run = await self._runs.create_run(
@@ -1639,7 +1671,11 @@ class RunService:
         if run.run_mode == "research":
             workspace_root = None
             guidance = None
-            tools = tuple(tool for tool in tools if tool.name in RESEARCH_WEB_NAMES)
+            tools = tuple(
+                tool
+                for tool in tools
+                if tool.name in research_web_names(run.research_policy_version)
+            )
         return _ExecutionContext(
             model, provider, api_key or "", profile.id, workspace_root, guidance, tools, runtime
         )
@@ -2163,6 +2199,9 @@ class RunService:
             "research_finalization_limit",
             "research_task_limit",
             "research_context_limit",
+            "research_checkpoint_required",
+            "research_checkpoint_invalid",
+            "research_handoff_unavailable",
             "model_call_limit",
             "tool_call_limit",
             "token_limit",
@@ -2239,6 +2278,8 @@ class RunService:
             )
             return None
         scope = self._research_execution_scope(run, finalization=finalization)
+        notebook_enabled = run.research_policy_version == RESEARCH_POLICY_V2 and not finalization
+        stop_after_checkpoint = False
         result: ResearchGeneration | None = None
         available = (
             ()
@@ -2260,16 +2301,21 @@ class RunService:
         )
 
         async def advance() -> bool:
-            nonlocal result, task
+            nonlocal result, task, stop_after_checkpoint
             if not finalization and self._remaining_seconds(scope) <= 0:
                 await self._close_research_tools(run, task)
                 raise ProviderError(
                     "research_finalization_reserve", "Preparing the report from saved findings."
                 )
-            if not await self._execute_research_tools(
-                run, execution, coordinator, task, execution_scope=scope
-            ):
-                return False
+            try:
+                if not await self._execute_research_tools(
+                    run, execution, coordinator, task, execution_scope=scope
+                ):
+                    return False
+            except ProviderError as error:
+                if error.code != "research_handoff_unavailable" or not notebook_enabled:
+                    raise
+                stop_after_checkpoint = True
             task = next(item for item in (await coordinator.snapshot()).tasks if item.id == task.id)
             if task.status not in {ResearchTaskStatus.QUEUED, ResearchTaskStatus.RUNNING}:
                 stopped_reason = task.checkpoint.get("stop_reason")
@@ -2292,6 +2338,13 @@ class RunService:
                     not isinstance(metadata, dict)
                     or metadata.get("task_id") != task.id
                     or metadata.get("version") != run.research_policy_version
+                    or (
+                        notebook_enabled
+                        and (
+                            type(metadata.get("read_through_ordinal")) is not int
+                            or cast(int, metadata["read_through_ordinal"]) < 0
+                        )
+                    )
                 ):
                     raise ApplicationError(
                         "inconsistent_execution_records", "Research request identity changed."
@@ -2303,6 +2356,19 @@ class RunService:
                         "inconsistent_execution_records", "Research pricing context changed."
                     )
                 pricing_context = saved_pricing_context
+                if notebook_enabled:
+                    projection = project_research_task_context(
+                        run.id,
+                        task.id,
+                        await repository.read_research_task_messages(run.id, task.id),
+                        await self._runs.list_tool_calls(run.id),
+                        calls,
+                    )
+                    if metadata["read_through_ordinal"] != projection.read_through_ordinal:
+                        raise ProviderError(
+                            "inconsistent_execution_records",
+                            "The saved research read cursor changed.",
+                        )
             else:
                 snapshot = await coordinator.snapshot()
                 task_tools = [
@@ -2324,6 +2390,78 @@ class RunService:
                         for item in snapshot.tasks
                         if item.role == "worker"
                     ]
+                task_messages = await repository.read_research_task_messages(run.id, task.id)
+                checkpoint_only = False
+                projection = None
+                if notebook_enabled:
+                    projection = project_research_task_context(
+                        run.id, task.id, task_messages, task_tools, calls
+                    )
+                    failed_checkpoints = set()
+                    assistants = {
+                        message.id: message
+                        for message in task_messages
+                        if message.role == "assistant"
+                    }
+                    by_tool = {tool.id: tool for tool in task_tools}
+                    by_call = {call.id: call for call in calls}
+                    for message in task_messages:
+                        tool = by_tool.get(message.tool_call_id or "")
+                        if (
+                            message.role != "tool"
+                            or tool is None
+                            or tool.name != "research_checkpoint"
+                        ):
+                            continue
+                        assistant = assistants.get(tool.assistant_message_id)
+                        completed_call = (
+                            by_call.get(assistant.model_call_id or "") if assistant else None
+                        )
+                        metadata = (
+                            completed_call.request_snapshot.get("research")
+                            if completed_call
+                            else None
+                        )
+                        if (
+                            completed_call
+                            and completed_call.status is ModelCallStatus.COMPLETED
+                            and isinstance(metadata, dict)
+                            and metadata.get("checkpoint_only") is True
+                            and metadata.get("read_through_ordinal")
+                            == projection.read_through_ordinal
+                            and json.loads(message.content).get("status") == "invalid_request"
+                        ):
+                            failed_checkpoints.add(completed_call.id)
+                    if len(failed_checkpoints) >= 2:
+                        raise ProviderError(
+                            "research_checkpoint_invalid",
+                            "Research notes could not be saved after one retry.",
+                        )
+                    checkpoint_only = projection.checkpoint_required or stop_after_checkpoint
+                    shared_budget = await repository.research_budget_state(run.id, run.generation)
+                    remaining = shared_budget.get("collection_remaining")
+                    if isinstance(remaining, dict):
+                        shared_budget = {
+                            **shared_budget,
+                            "collection_calls_remaining": remaining.get("model_calls"),
+                            "collection_tokens_remaining": remaining.get("tokens"),
+                            "collection_cost_remaining": remaining.get("estimated_cost"),
+                            "collection_seconds_remaining": self._remaining_seconds(scope),
+                        }
+                    state["shared_budget"] = _research_model_budget(shared_budget)
+                    state["unprocessed_reads"] = [
+                        read.to_dict() for read in projection.unprocessed_reads
+                    ]
+                    state["read_through_ordinal"] = projection.read_through_ordinal
+                    state["checkpoint_required"] = checkpoint_only
+                    try:
+                        state = bounded_research_notebook(state)
+                    except ValueError as error:
+                        raise ProviderError(
+                            "research_context_limit",
+                            "The research notebook exceeds its active context.",
+                        ) from error
+                    task_messages = list(projection.messages)
                 task_prompt = (
                     prompt if prompt is not None else json.dumps(state, ensure_ascii=False)
                 )
@@ -2337,6 +2475,16 @@ class RunService:
                         "Return the requested JSON only. Do not introduce unsupported claims."
                     )
                 )
+                if checkpoint_only:
+                    instructions += (
+                        " This turn only saves research notes. Call research_checkpoint with "
+                        "sourced findings or explicit source-cited negative findings/gaps for "
+                        "each unprocessed read. Do not request more evidence or finish in text."
+                    )
+                if notebook_enabled:
+                    instructions += (
+                        " Budget counts report model tokens and shared held reservations."
+                    )
                 plan = await execution.runtime.prepare_task(
                     scope,
                     execution.provider,
@@ -2345,9 +2493,11 @@ class RunService:
                     task_id=task.id,
                     prompt=task_prompt,
                     instructions=instructions,
-                    messages=await repository.read_research_task_messages(run.id, task.id),
+                    messages=task_messages,
                     tool_calls=task_tools,
-                    tools=available,
+                    tools=tuple(tool for tool in available if tool.name == "research_checkpoint")
+                    if checkpoint_only
+                    else available,
                     max_output_tokens=RESEARCH_REPORT_MAX_OUTPUT_TOKENS
                     if finalization
                     else MAX_OUTPUT_TOKENS,
@@ -2355,23 +2505,61 @@ class RunService:
                 if plan.estimated_call_cost_usd is None:
                     raise ProviderError("pricing_unavailable", "Research requires model pricing.")
                 request = plan.request
+                handoff_capacity = None
+                if notebook_enabled and task.role == "worker" and not checkpoint_only:
+                    hold_tokens, hold_cost = execution.runtime.research_handoff_allowance(plan)
+                    try:
+                        await repository.set_research_handoff(
+                            run.id, run.generation, task.id, hold_tokens, hold_cost
+                        )
+                        handoff_capacity = {"tokens": hold_tokens, "estimated_cost": hold_cost}
+                    except ApplicationError as error:
+                        if not self._research_limit(error.code):
+                            raise
+                        if projection is None or not projection.unprocessed_reads:
+                            raise
+                        stop_after_checkpoint = True
+                        return True
                 snapshot_request = generation_snapshot(plan, redactor=self._redactor)
                 snapshot_request["research"] = {
                     "version": run.research_policy_version,
                     "task_id": task.id,
                     "role": task.role,
+                    **(
+                        {
+                            "read_through_ordinal": projection.read_through_ordinal,
+                            "checkpoint_only": checkpoint_only,
+                            "stop_after_checkpoint": stop_after_checkpoint,
+                            "handoff_capacity": handoff_capacity,
+                        }
+                        if projection is not None
+                        else {}
+                    ),
                 }
                 snapshot_request["pricing_context_tokens"] = plan.pricing_context_tokens
-                _reservation, call = await repository.reserve_research_call(
-                    run.id,
-                    run.generation,
-                    task.id,
-                    str(uuid4()),
-                    snapshot_request,
-                    plan.input_tokens + request.max_output_tokens,
-                    plan.estimated_call_cost_usd,
-                    finalization=finalization,
-                )
+                try:
+                    _reservation, call = await repository.reserve_research_call(
+                        run.id,
+                        run.generation,
+                        task.id,
+                        str(uuid4()),
+                        snapshot_request,
+                        plan.input_tokens + request.max_output_tokens,
+                        plan.estimated_call_cost_usd,
+                        finalization=finalization,
+                        **({"handoff": True} if checkpoint_only and task.role == "worker" else {}),
+                    )
+                except ApplicationError as error:
+                    if (
+                        notebook_enabled
+                        and not checkpoint_only
+                        and self._research_limit(error.code)
+                        and projection is not None
+                        and projection.unprocessed_reads
+                    ):
+                        stop_after_checkpoint = True
+                        return True
+                    raise
                 pricing_context = plan.pricing_context_tokens
             await self._renew_before_local_tool(run.id, expected_generation=run.generation)
             call = await self._runs.update_model_call(call.id, ModelCallStatus.STREAMING)
@@ -2424,6 +2612,16 @@ class RunService:
                     total_cost,
                     internal_tools=RESEARCH_CONTROL_NAMES,
                 )
+                if notebook_enabled and not step.tool_calls:
+                    messages = await repository.read_research_task_messages(run.id, task.id)
+                    projection = project_research_task_context(
+                        run.id, task.id, messages, all_tools, calls
+                    )
+                    if projection.unprocessed_reads:
+                        raise ProviderError(
+                            "research_checkpoint_required",
+                            "Research stopped before saving its notes.",
+                        )
                 assistant = (
                     ModelMessage(
                         "assistant",
@@ -2441,7 +2639,11 @@ class RunService:
                     call.id,
                     self._generation_completion(step, tokens, cost),
                     assistant_message=assistant,
-                    terminal_result=task_terminal_result(step.content, task.checkpoint)
+                    terminal_result=(
+                        {**task.checkpoint, "summary": step.content}
+                        if notebook_enabled
+                        else task_terminal_result(step.content, task.checkpoint)
+                    )
                     if assistant is None
                     else None,
                 )
@@ -2506,6 +2708,10 @@ class RunService:
                     str(uuid5(UUID(task.id), "stop:" + error.code)),
                     {**latest.checkpoint, "stop_reason": error.code},
                 )
+        finally:
+            if notebook_enabled and task.role == "worker":
+                with suppress(ApplicationError):
+                    await repository.release_research_handoff(run.id, run.generation, task.id)
         return result
 
     async def _execute_research_tools(
@@ -2518,6 +2724,9 @@ class RunService:
         execution_scope: RunSnapshot | None = None,
     ) -> bool:
         scope = execution_scope or run
+        notebook_enabled = run.research_policy_version == RESEARCH_POLICY_V2
+        repository = self._research_repository
+        assert repository is not None
         calls = [
             item for item in await self._runs.list_tool_calls(run.id) if item.task_id == task.id
         ]
@@ -2538,8 +2747,90 @@ class RunService:
                     reconciliation="checkpoint_resume",
                 )
             if stored.name not in RESEARCH_CONTROL_NAMES:
-                if stored.name not in RESEARCH_WEB_NAMES:
+                if stored.name not in research_web_names(run.research_policy_version):
                     raise ProviderError("unknown_tool", "Research can only use web tools.")
+                if notebook_enabled and stored.status is ToolCallStatus.PENDING:
+                    projection = project_research_task_context(
+                        run.id,
+                        task.id,
+                        await repository.read_research_task_messages(run.id, task.id),
+                        await self._runs.list_tool_calls(run.id),
+                        await repository.read_research_task_calls(run.id, task.id),
+                    )
+                    if projection.checkpoint_required:
+                        stored, event = await self._runs.begin_tool_execution(
+                            run.id,
+                            stored.id,
+                            dispatch_id=str(uuid4()),
+                            expected_attempt=stored.dispatch_attempt,
+                            recovery_policy=ToolRecoveryPolicy.CHECKPOINTED.value,
+                            input_snapshot={
+                                "arguments": stored.arguments,
+                                "decision": "checkpoint_required",
+                            },
+                        )
+                        await self._publish(event)
+                        await self._record_tool_result(
+                            run.id,
+                            stored,
+                            ToolResult(
+                                stored.provider_call_id,
+                                stored.name,
+                                json.dumps(
+                                    {
+                                        "status": "checkpoint_required",
+                                        "reason": "Save findings or gaps before more collection.",
+                                    }
+                                ),
+                                True,
+                            ),
+                        )
+                        continue
+                if notebook_enabled and task.role == "worker":
+                    messages = await repository.read_research_task_messages(run.id, task.id)
+                    parent = next(
+                        (item for item in messages if item.id == stored.assistant_message_id), None
+                    )
+                    model_calls = await repository.read_research_task_calls(run.id, task.id)
+                    parent_call = next(
+                        (
+                            item
+                            for item in model_calls
+                            if parent is not None and item.id == parent.model_call_id
+                        ),
+                        None,
+                    )
+                    metadata = parent_call.request_snapshot.get("research") if parent_call else None
+                    capacity = (
+                        metadata.get("handoff_capacity") if isinstance(metadata, dict) else None
+                    )
+                    if (
+                        not isinstance(capacity, dict)
+                        or type(capacity.get("tokens")) is not int
+                        or not isinstance(capacity.get("estimated_cost"), int | float)
+                    ):
+                        raise ProviderError(
+                            "inconsistent_execution_records",
+                            "Research handoff capacity is missing.",
+                        )
+                    try:
+                        await repository.set_research_handoff(
+                            run.id,
+                            run.generation,
+                            task.id,
+                            capacity["tokens"],
+                            capacity["estimated_cost"],
+                        )
+                    except ApplicationError as error:
+                        if not self._research_limit(error.code):
+                            raise
+                        await self._close_research_tools(
+                            run, task, reason="research_handoff_unavailable"
+                        )
+                        raise ProviderError(
+                            "research_handoff_unavailable",
+                            "Saving findings before further collection.",
+                        ) from error
                 try:
                     async with asyncio.timeout(self._remaining_seconds(scope)):
                         await self._execute_stored_tool(
@@ -2578,10 +2869,65 @@ class RunService:
                 for item in await self._runs.list_tool_calls(run.id)
                 if item.status in {ToolCallStatus.PENDING, ToolCallStatus.RUNNING}
             ]
+            checkpoint_arguments = stored.arguments
+            checkpoint_stop = False
+            disposition_missing = False
+            if notebook_enabled and stored.name == "research_checkpoint":
+                messages = await repository.read_research_task_messages(run.id, task.id)
+                model_calls = await repository.read_research_task_calls(run.id, task.id)
+                projection = project_research_task_context(
+                    run.id, task.id, messages, await self._runs.list_tool_calls(run.id), model_calls
+                )
+                parent = next(
+                    (item for item in messages if item.id == stored.assistant_message_id), None
+                )
+                parent_call = next(
+                    (
+                        item
+                        for item in model_calls
+                        if parent is not None and item.id == parent.model_call_id
+                    ),
+                    None,
+                )
+                metadata = parent_call.request_snapshot.get("research") if parent_call else None
+                through = (
+                    metadata.get("read_through_ordinal") if isinstance(metadata, dict) else None
+                )
+                if (
+                    type(through) is not int
+                    or through < 0
+                    or parent is None
+                    or through >= parent.ordinal
+                    or through
+                    not in {0, *(read.message_ordinal for read in projection.observed_reads)}
+                ):
+                    raise ProviderError(
+                        "inconsistent_execution_records", "Research read cursor is unavailable."
+                    )
+                reads = tuple(
+                    read for read in projection.unprocessed_reads if read.message_ordinal <= through
+                )
+                disposition_missing = not checkpoint_disposes_reads(stored.arguments, reads)
+                checkpoint_stop = (
+                    isinstance(metadata, dict) and metadata.get("stop_after_checkpoint") is True
+                )
+                if checkpoint_stop:
+                    checkpoint_arguments = {
+                        **stored.arguments,
+                        "stop_reason": "research_finalization_reserve",
+                    }
             if stored.name == "request_research_clarification" and len(pending) != 1:
                 response = {
                     "status": "invalid_request",
                     "reason": "Request clarification separately after other tools settle.",
+                }
+            elif disposition_missing:
+                response = {
+                    "status": "invalid_request",
+                    "reason": (
+                        "Save a sourced finding or an explicit source-cited gap "
+                        "for each unprocessed read."
+                    ),
                 }
             else:
                 try:
@@ -2592,7 +2938,7 @@ class RunService:
                     else:
                         async with asyncio.timeout(self._remaining_seconds(scope)):
                             response = await coordinator.control(
-                                task, stored.name, stored.arguments, operation_id
+                                task, stored.name, checkpoint_arguments, operation_id
                             )
                 except TimeoutError:
                     await self._close_research_tools(run, task, timed_out_tool_id=stored.id)
@@ -2614,10 +2960,15 @@ class RunService:
             if (
                 stored.name == "research_checkpoint"
                 and response.get("status") == "saved"
-                and isinstance(stopped_reason, str)
-                and stopped_reason
+                and (checkpoint_stop or (isinstance(stopped_reason, str) and stopped_reason))
             ):
-                await self._close_research_tools(run, task, reason=stopped_reason)
+                await self._close_research_tools(
+                    run,
+                    task,
+                    reason="research_finalization_reserve"
+                    if checkpoint_stop
+                    else cast(str, stopped_reason),
+                )
                 return False
             if response.get("status") == "waiting_for_input":
                 assert self._research_repository is not None

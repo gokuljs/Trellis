@@ -615,6 +615,28 @@ class RunContext:
             )
         return plan
 
+    @staticmethod
+    def research_handoff_allowance(plan: ContextPreflight) -> tuple[int, float]:
+        profile = profile_for_model(plan.request.model_id)
+        if profile is None:
+            raise ApplicationError("model_not_available", "Model metadata is unavailable.")
+        request = replace(
+            plan.request,
+            tools=tuple(tool for tool in plan.request.tools if tool.name == "research_checkpoint"),
+            messages=(
+                *plan.request.messages,
+                ModelMessage(
+                    "user", "Pending saved-source evidence: " + "x" * (2 * MAX_SOURCE_READ_BYTES)
+                ),
+            ),
+            max_output_tokens=4096,
+        )
+        count = estimate_input_tokens(request).tokens
+        cost = reserve_context_cost(profile, count, 4096, plan.pricing_context_tokens)
+        if cost is None:
+            raise ProviderError("pricing_unavailable", "Research requires model pricing.")
+        return count + 4096, cost
+
     def _restore_generation_plan(self, run: RunSnapshot, call: ModelCallRecord) -> ContextPreflight:
         try:
             plan = restore_context_plan(call.request_snapshot.get("generation_plan"), run)

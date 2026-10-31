@@ -206,6 +206,7 @@ class ResearchRepositoryMixin:
         reserved_cost: float,
         *,
         finalization: bool = False,
+        handoff: bool = False,
     ) -> tuple[ResearchReservation, ModelCallRecord]:
         research_identifier(task_id)
         research_identifier(operation_id)
@@ -228,6 +229,7 @@ class ResearchRepositoryMixin:
                     "reserved_tokens": reserved_tokens,
                     "reserved_cost": reserved_cost,
                     "finalization": finalization,
+                    **({"handoff": True} if handoff else {}),
                 },
             )
         )
@@ -247,6 +249,41 @@ class ResearchRepositoryMixin:
             raise RuntimeError("Supabase changed the research call reservation")
         self._model_call_runs[call.id] = run_id
         return reservation, call
+
+    async def set_research_handoff(
+        self, run_id: str, generation: int, task_id: str, reserved_tokens: int, reserved_cost: float
+    ) -> dict[str, object]:
+        research_identifier(task_id)
+        if (
+            type(reserved_tokens) is not int
+            or reserved_tokens < 1
+            or not math.isfinite(reserved_cost)
+            or reserved_cost < 0
+        ):
+            raise ValueError("invalid research handoff reservation")
+        return _object(
+            await self._research_call(
+                "set_handoff",
+                {
+                    "run_id": run_id,
+                    "generation": generation,
+                    "task_id": task_id,
+                    "reserved_tokens": reserved_tokens,
+                    "reserved_cost": reserved_cost,
+                },
+            )
+        )
+
+    async def release_research_handoff(self, run_id: str, generation: int, task_id: str) -> None:
+        research_identifier(task_id)
+        await self._research_call(
+            "release_handoff", {"run_id": run_id, "generation": generation, "task_id": task_id}
+        )
+
+    async def research_budget_state(self, run_id: str, generation: int) -> dict[str, object]:
+        return _object(
+            await self._research_call("budget_state", {"run_id": run_id, "generation": generation})
+        )
 
     async def commit_research_generation(
         self,

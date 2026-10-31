@@ -249,15 +249,19 @@ class ResearchSnapshot:
     citations: tuple[CitationReference, ...] = ()
     policy_version: str = LEGACY_RESEARCH_POLICY
     execution_budget_seconds: int | None = None
+    source_reads: tuple[dict[str, object], ...] = ()
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> Self:
         raw_tasks = value.get("tasks")
         raw_citations = value.get("citations", [])
+        raw_reads = value.get("source_reads", [])
         if not isinstance(raw_tasks, list) or len(raw_tasks) > 16:
             raise ValueError("invalid research task collection")
         if not isinstance(raw_citations, list) or len(raw_citations) > MAX_RESEARCH_CITATIONS:
             raise ValueError("invalid research citation collection")
+        if not isinstance(raw_reads, list) or len(raw_reads) > 384:
+            raise ValueError("invalid research read observations")
         tasks = tuple(ResearchTask.from_dict(research_object(item)) for item in raw_tasks)
         run_id = research_identifier(value.get("run_id"))
         if len({task.id for task in tasks}) != len(tasks) or any(
@@ -295,6 +299,7 @@ class ResearchSnapshot:
             tuple(citations),
             research_policy(value.get("policy_version", LEGACY_RESEARCH_POLICY)),
             research_execution_budget(value.get("execution_budget_seconds")),
+            tuple(research_object(item) for item in raw_reads),
         )
 
     def to_dict(self) -> dict[str, object]:

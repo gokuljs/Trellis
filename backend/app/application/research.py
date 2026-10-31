@@ -38,6 +38,21 @@ RESEARCH_CONTROL_NAMES = frozenset(
 RESEARCH_WEB_NAMES = frozenset({"web_search", "web_read", "web_source", "web_crawl"})
 
 
+def research_web_names(policy_version: str = LEGACY_RESEARCH_POLICY) -> frozenset[str]:
+    if policy_version == RESEARCH_POLICY_V2:
+        return frozenset(
+            {
+                "web_search",
+                "web_read",
+                "web_crawl",
+                "web_source_read",
+                "web_source_find",
+                "web_source_outline",
+            }
+        )
+    return RESEARCH_WEB_NAMES
+
+
 @dataclass(frozen=True, slots=True)
 class ResearchGeneration:
     call_id: str
@@ -397,10 +412,7 @@ def validate_task_recovery(
     unknown: list[str] = []
     for call in ordered:
         metadata = call.request_snapshot.get("research")
-        if (
-            not isinstance(metadata, dict)
-            or metadata.get("version") != RESEARCH_INSTRUCTIONS_VERSION
-        ):
+        if not isinstance(metadata, dict) or metadata.get("version") != run.research_policy_version:
             raise ApplicationError("inconsistent_execution_records", "Research request is invalid.")
         task_id = metadata.get("task_id")
         if (
