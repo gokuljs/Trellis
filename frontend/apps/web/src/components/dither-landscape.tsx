@@ -5,12 +5,17 @@ import { mountLandscape, type LandscapeStatus } from "@/lib/dither-landscape"
 
 export function DitherLandscape() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const posterRef = useRef<HTMLCanvasElement>(null)
   const controllerRef = useRef<ReturnType<typeof mountLandscape> | null>(null)
   const [status, setStatus] = useState<LandscapeStatus>("loading")
 
   useEffect(() => {
-    if (!canvasRef.current) return
-    const controller = mountLandscape(canvasRef.current, setStatus)
+    if (!canvasRef.current || !posterRef.current) return
+    const controller = mountLandscape(
+      canvasRef.current,
+      posterRef.current,
+      setStatus
+    )
     controllerRef.current = controller
     return () => {
       controller.dispose()
@@ -21,6 +26,7 @@ export function DitherLandscape() {
   return (
     <>
       <div className="home-art" aria-hidden="true">
+        <canvas ref={posterRef} className="home-landscape-poster" />
         <canvas ref={canvasRef} className="home-landscape" />
       </div>
       {status === "playing" || status === "paused" ? (

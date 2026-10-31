@@ -13,7 +13,8 @@ export function createLandscapeLoop(
   let frame: number | null = null
   let running = false
   let previous: number | null = null
-  let painted: number | null = null
+  let deadline: number | null = null
+  const interval = 1000 / 60
   let elapsed = 0
 
   const tick = (timestamp: number) => {
@@ -21,9 +22,14 @@ export function createLandscapeLoop(
     if (!running) return
     if (previous !== null) elapsed += Math.min(timestamp - previous, 100) / 1000
     previous = timestamp
-    if (painted === null || timestamp - painted >= 1000 / 30) {
+    if (deadline === null || timestamp >= deadline - 0.75) {
       draw(elapsed)
-      painted = timestamp
+      deadline =
+        deadline === null
+          ? timestamp + interval
+          : deadline +
+            Math.max(1, Math.floor((timestamp - deadline) / interval) + 1) *
+              interval
     }
     if (running) frame = scheduler.request(tick)
   }
@@ -39,7 +45,7 @@ export function createLandscapeLoop(
       if (frame !== null) scheduler.cancel(frame)
       frame = null
       previous = null
-      painted = null
+      deadline = null
     },
     drawStill() {
       draw(elapsed)

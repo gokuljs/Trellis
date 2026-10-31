@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "bun:test"
 
 import { createLandscapeLoop } from "./dither-landscape-loop"
-import { mountLandscape } from "./dither-landscape"
+import { arcGeometry, mountLandscape } from "./dither-landscape"
 
 function frameScheduler() {
   const frames = new Map()
@@ -33,8 +33,8 @@ test("landscape frames are capped and resume without advancing through a pause",
   loop.start()
   loop.start()
   assert.equal(scheduler.pending, 1)
-  for (let time = 0; time < 1000; time += 8) scheduler.tick(time)
-  assert.ok(times.length <= 30)
+  for (let time = 0; time < 1000; time += 1000 / 120) scheduler.tick(time)
+  assert.ok(times.length >= 59 && times.length <= 61)
   const beforePause = times.at(-1)
   loop.stop()
   assert.equal(scheduler.pending, 0)
@@ -44,12 +44,29 @@ test("landscape frames are capped and resume without advancing through a pause",
   loop.stop()
 })
 
+test("the frame deadline preserves sixty draws per second across display cadences", () => {
+  for (const refreshRate of [60, 120, 125]) {
+    const scheduler = frameScheduler()
+    let draws = 0
+    const loop = createLandscapeLoop(() => draws++, scheduler)
+    loop.start()
+    for (let frame = 0; frame < refreshRate * 3; frame++) {
+      scheduler.tick((frame * 1000) / refreshRate)
+    }
+    assert.ok(
+      draws >= 179 && draws <= 181,
+      `${refreshRate}Hz rendered ${draws} frames`
+    )
+    loop.stop()
+  }
+})
+
 function withLandscape(options, run) {
   const scheduler = frameScheduler()
   const media = Object.assign(new EventTarget(), { matches: !!options.reduced })
   const document = Object.assign(new EventTarget(), { hidden: false })
   const window = Object.assign(new EventTarget(), {
-    devicePixelRatio: 2,
+    devicePixelRatio: 1,
     matchMedia: () => media,
     requestAnimationFrame(callback) {
       assert.equal(this, window)
@@ -64,8 +81,9 @@ function withLandscape(options, run) {
     width: 0,
     height: 0,
     dataset: {},
-    getBoundingClientRect: () => ({ width: 1280, height: 720 }),
-    getContext: () => (options.noWebGL ? null : gl),
+    getBoundingClientRect: () =>
+      options.initialSize ?? { width: 320, height: 240 },
+    getContext: (kind) => (kind === "webgl2" && !options.noWebGL ? gl : null),
   })
   const counts = {
     draws: 0,
@@ -74,6 +92,12 @@ function withLandscape(options, run) {
     buffers: 0,
     deletedBuffers: 0,
     deletedShaders: 0,
+    vertexArrays: 0,
+    deletedVertexArrays: 0,
+    posters: 0,
+    particleDraws: 0,
+    compiledShaders: 0,
+    instances: 0,
   }
   const gl = {
     canvas,
@@ -94,11 +118,32 @@ function withLandscape(options, run) {
       return {}
     },
     createShader: () => ({}),
+    createVertexArray() {
+      counts.vertexArrays++
+      return {}
+    },
+    deleteVertexArray() {
+      counts.deletedVertexArrays++
+    },
+    bindVertexArray() {},
+    vertexAttribDivisor() {},
+    enable() {},
+    disable() {},
+    blendFunc() {},
+    drawArraysInstanced(_mode, _first, _vertices, instances) {
+      counts.particleDraws++
+      counts.draws++
+      counts.instances = instances
+    },
     shaderSource() {},
-    compileShader() {},
+    compileShader() {
+      counts.compiledShaders++
+    },
     attachShader() {},
     linkProgram() {},
-    getShaderParameter: () => !options.shaderFailure,
+    getShaderParameter: () =>
+      !options.shaderFailure &&
+      counts.compiledShaders !== options.shaderFailureAt,
     getProgramParameter: () => true,
     getAttribLocation: () => 0,
     getUniformLocation: () => ({}),
@@ -109,6 +154,7 @@ function withLandscape(options, run) {
     vertexAttribPointer() {},
     viewport() {},
     uniform2f() {},
+    uniform4f() {},
     uniform1f() {},
     drawArrays() {
       counts.draws++
@@ -122,6 +168,18 @@ function withLandscape(options, run) {
     deleteShader() {
       counts.deletedShaders++
     },
+  }
+  const poster = {
+    width: 0,
+    height: 0,
+    getContext: () => ({
+      createImageData: (width, height) => ({
+        data: new Uint8ClampedArray(width * height * 4),
+      }),
+      putImageData() {
+        counts.posters++
+      },
+    }),
   }
   const observers = {}
   const globals = {
@@ -158,10 +216,11 @@ function withLandscape(options, run) {
   const states = []
   let controller
   try {
-    controller = mountLandscape(canvas, (state) => states.push(state))
+    controller = mountLandscape(canvas, poster, (state) => states.push(state))
     run({
       controller,
       canvas,
+      poster,
       media,
       document,
       scheduler,
@@ -229,7 +288,7 @@ test("context loss shows fallback and restoration rebuilds the renderer", () => 
     assert.equal(states.at(-1), "unavailable")
     assert.equal(scheduler.pending, 0)
     canvas.dispatchEvent(new Event("webglcontextrestored"))
-    assert.equal(counts.programs, 2)
+    assert.equal(counts.programs, 6)
     assert.equal(canvas.dataset.ready, "true")
     assert.equal(states.at(-1), "playing")
     assert.equal(scheduler.pending, 1)
@@ -248,42 +307,117 @@ test("disposal releases GPU resources and ignores already queued observer callba
     assert.equal(states.length, updates)
     assert.equal(scheduler.pending, 0)
     assert.equal(counts.deletedBuffers, 1)
-    assert.equal(counts.deletedPrograms, 1)
-    assert.equal(counts.deletedShaders, 2)
+    assert.equal(counts.deletedPrograms, 3)
+    assert.equal(counts.deletedShaders, 6)
+    assert.equal(counts.deletedVertexArrays, 2)
   })
 })
 
-test("unsupported WebGL and shader or setup failures keep the CSS fallback", () => {
+test("unsupported WebGL2 and shader or setup failures keep the rendered poster", () => {
   for (const options of [
     { noWebGL: true },
     { shaderFailure: true },
+    { shaderFailureAt: 5 },
     { observerFailure: true },
   ]) {
     withLandscape(options, ({ canvas, scheduler, counts, states }) => {
       assert.equal(states.at(-1), "unavailable")
       assert.notEqual(canvas.dataset.ready, "true")
+      assert.equal(counts.posters, 1)
       assert.equal(scheduler.pending, 0)
       assert.equal(counts.deletedBuffers, counts.buffers)
       assert.equal(counts.deletedPrograms, counts.programs)
+      assert.equal(counts.deletedVertexArrays, counts.vertexArrays)
     })
   }
 })
 
+test("fallback resize bursts render one new poster and identical sizes keep the bitmap", () => {
+  withLandscape(
+    { noWebGL: true },
+    ({ canvas, scheduler, observers, counts }) => {
+      assert.equal(counts.posters, 1)
+      canvas.getBoundingClientRect = () => ({ width: 420, height: 240 })
+      observers.resize()
+      observers.resize()
+      observers.resize()
+      assert.equal(scheduler.pending, 1)
+      scheduler.tick(0)
+      assert.equal(counts.posters, 2)
+      observers.resize()
+      scheduler.tick(20)
+      assert.equal(counts.posters, 2)
+    }
+  )
+})
+
 test("effect cleanup and setup can reuse the canvas without losing its context", () => {
-  withLandscape({}, ({ controller, canvas, scheduler, counts }) => {
+  withLandscape({}, ({ controller, canvas, poster, scheduler, counts }) => {
     controller.dispose()
     const states = []
-    const replay = mountLandscape(canvas, (status) => states.push(status))
+    const replay = mountLandscape(canvas, poster, (status) =>
+      states.push(status)
+    )
     try {
       assert.equal(states.at(-1), "playing")
       assert.equal(canvas.dataset.ready, "true")
       assert.equal(scheduler.pending, 1)
-      assert.equal(counts.programs, 2)
+      assert.equal(counts.programs, 6)
     } finally {
       replay.dispose()
     }
-    assert.equal(counts.deletedPrograms, 2)
+    assert.equal(counts.deletedPrograms, 6)
     assert.equal(counts.deletedBuffers, 2)
     assert.equal(scheduler.pending, 0)
   })
+})
+
+test("arc geometry meets the viewport edges and places the colored region below the rim", () => {
+  const scene = arcGeometry(1280, 720)
+  const bottom = 0.4 * 1280 + 8 * scene.scale
+  assert.ok(
+    Math.abs(
+      Math.hypot(bottom - scene.centerX, 720 - scene.centerY) - scene.radius
+    ) < 0.001
+  )
+  assert.ok(
+    Math.abs(
+      Math.hypot(1280 - scene.centerX, 720 * 0.415 - scene.centerY) -
+        scene.radius
+    ) < 0.001
+  )
+  assert.ok(
+    Math.hypot(1280 - scene.centerX, 720 - scene.centerY) > scene.radius
+  )
+  assert.ok(Math.hypot(160 - scene.centerX, 160 - scene.centerY) < scene.radius)
+  assert.equal(scene.particleCount, 3446)
+})
+
+test("each frame draws the colored field, instanced particles and grain", () => {
+  withLandscape({}, ({ counts, scheduler }) => {
+    const draws = counts.draws
+    const particles = counts.particleDraws
+    scheduler.tick(0)
+    assert.equal(counts.draws - draws, 3)
+    assert.equal(counts.particleDraws - particles, 1)
+    assert.equal(counts.programs, 3)
+  })
+})
+
+test("a zero-size initial canvas recovers when layout supplies its dimensions", () => {
+  withLandscape(
+    { initialSize: { width: 0, height: 0 } },
+    ({ canvas, counts, observers, scheduler, states }) => {
+      assert.equal(counts.instances, 0)
+      assert.equal(states.at(-1), "playing")
+      canvas.getBoundingClientRect = () => ({ width: 320, height: 240 })
+      observers.resize()
+      scheduler.tick(0)
+      assert.ok(counts.instances > 0)
+      assert.equal(canvas.width, 320)
+      assert.equal(canvas.height, 240)
+      assert.equal(canvas.dataset.ready, "true")
+      assert.equal(counts.posters, 2)
+    }
+  )
 })
