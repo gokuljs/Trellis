@@ -11,7 +11,14 @@ from app.application.research import ResearchGeneration
 from app.application.research_ports import ResearchRepository
 from app.application.research_reports import ResearchReportService, parse_report, partial_report
 from app.application.web_ports import WebRepository
-from app.domain.research import ResearchPhase, ResearchReport, ResearchReview, ResearchSnapshot
+from app.domain.research import (
+    ResearchPhase,
+    ResearchReport,
+    ResearchReview,
+    ResearchSnapshot,
+    ResearchTask,
+    ResearchTaskStatus,
+)
 from app.domain.runtime import RunSnapshot
 from app.domain.web import SourceLines, SourceStatus, WebSource
 
@@ -21,6 +28,10 @@ RUN = str(uuid4())
 CALL = str(uuid4())
 OWNER = str(uuid4())
 TOOL = str(uuid4())
+LONG_STOP_REASON = (
+    "Bounded research collection completed; further searching was not pursued. Coverage is "
+    "selective, with practical-resource and publication-status verification remaining incomplete."
+)
 
 
 def report_json(claim: str = "Product A costs $10.") -> str:
@@ -156,6 +167,106 @@ class ResearchReportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(review.report_hash, report.content_hash)
         self.assertEqual(review.source_hashes, {SOURCE: "a" * 64})
         self.assertEqual(web.reads[-1], (SESSION, SOURCE, 1, 1))
+
+    async def test_narrative_stopping_reason_reaches_review_without_repair(self) -> None:
+        value = json.loads(report_json())
+        value["stop_reason"] = LONG_STOP_REASON
+        published, purposes, _ = await self.run_report(
+            [json.dumps(value), json.dumps({"accepted_claim_ids": ["price"], "issues": []})]
+        )
+        self.assertEqual(purposes, ["draft", "review"])
+        report, review, partial = published[0]
+        self.assertFalse(partial)
+        self.assertEqual(report.stop_reason, "collection_complete")
+        self.assertEqual(report.claims, parse_report(report_json()).claims)
+        self.assertEqual(report.markdown.count(LONG_STOP_REASON), 1)
+        self.assertIn(LONG_STOP_REASON, report.markdown.split("## Limitations", 1)[1])
+        reviewed = json.loads(self.prompts["review"].rsplit("\n", 1)[-1])["report"]
+        self.assertEqual(reviewed, json.loads(json.dumps(asdict(report))))
+        self.assertEqual(review.report_hash, report.content_hash)
+
+    async def test_report_uses_the_saved_runtime_stopping_reason(self) -> None:
+        lead = ResearchTask(
+            str(uuid4()),
+            RUN,
+            "Compare pricing",
+            "lead",
+            0,
+            ResearchTaskStatus.COMPLETED,
+            0,
+            {"stop_reason": "low_expected_value"},
+        )
+        base = replace(
+            snapshot(),
+            stop_reason="page_limit",
+            checkpoint={**snapshot().checkpoint, "stop_reason": "research_finalization_reserve"},
+            tasks=(lead,),
+        )
+        value = json.loads(report_json())
+        del value["stop_reason"]
+        for state, expected in (
+            (base, "page_limit"),
+            (replace(base, stop_reason=None), "research_finalization_reserve"),
+            (
+                replace(base, stop_reason=None, checkpoint=snapshot().checkpoint),
+                "low_expected_value",
+            ),
+        ):
+            with self.subTest(expected=expected):
+                published, purposes, _ = await self.run_report(
+                    [
+                        json.dumps(value),
+                        json.dumps({"accepted_claim_ids": ["price"], "issues": []}),
+                    ],
+                    state=state,
+                )
+                self.assertEqual(purposes, ["draft", "review"])
+                self.assertEqual(published[0][0].stop_reason, expected)
+
+    async def test_legacy_stopping_metadata_preserves_the_reviewed_revision(self) -> None:
+        value = json.loads(report_json())
+        value["stop_reason"] = "  coverage_sufficient  "
+        original = parse_report(json.dumps(value))
+        published, purposes, _ = await self.run_report(
+            [json.dumps(value), json.dumps({"accepted_claim_ids": ["price"], "issues": []})]
+        )
+        self.assertEqual(purposes, ["draft", "review"])
+        report, review, partial = published[0]
+        self.assertFalse(partial)
+        self.assertEqual(report, original)
+        self.assertEqual(report.stop_reason, "  coverage_sufficient  ")
+        self.assertEqual(review.report_hash, original.content_hash)
+
+    async def test_writer_can_omit_runtime_stopping_metadata(self) -> None:
+        value = json.loads(report_json())
+        del value["stop_reason"]
+        published, purposes, _ = await self.run_report(
+            [json.dumps(value), json.dumps({"accepted_claim_ids": ["price"], "issues": []})]
+        )
+        self.assertEqual(purposes, ["draft", "review"])
+        self.assertFalse(published[0][2])
+        self.assertEqual(published[0][0].stop_reason, "collection_complete")
+
+    async def test_stopping_explanation_still_requires_valid_size_and_citations(self) -> None:
+        for explanation in (
+            LONG_STOP_REASON + f" [[source:{uuid4()!s}:L1-L1]]",
+            "x" * (64 * 1024),
+        ):
+            with self.subTest(explanation_length=len(explanation)):
+                value = json.loads(report_json())
+                value["stop_reason"] = explanation
+                published, purposes, _ = await self.run_report(
+                    [json.dumps(value), json.dumps(value)]
+                )
+                self.assertEqual(purposes, ["draft", "repair"])
+                self.assertTrue(published[0][2])
+                self.assertEqual(published[0][0].claims, ())
+
+    def test_direct_report_parser_preserves_the_bounded_metadata_contract(self) -> None:
+        value = json.loads(report_json())
+        value["stop_reason"] = LONG_STOP_REASON
+        with self.assertRaises(ValueError):
+            parse_report(json.dumps(value))
 
     async def test_invalid_draft_uses_saved_evidence_and_the_repair_allowance(self) -> None:
         invalid = json.loads(report_json())

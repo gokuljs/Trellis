@@ -26,14 +26,15 @@ _CITATION = re.compile(r"\[\[source:([0-9a-f-]{36}):L([1-9][0-9]*)-L([1-9][0-9]*
 _SECTIONS = ("summary", "findings", "conflicts", "limitations")
 _REPORT_SCHEMA = (
     "Return JSON only with markdown, claims:[{id,text,citations:[{source_id,start_line,"
-    "end_line}]}], covered_question_ids, stop_reason. Include markdown headings Summary, "
+    "end_line}]}], covered_question_ids. Include markdown headings Summary, "
     "Findings, Conflicts, Limitations. Register every material external factual claim in "
     "claims and copy its exact text into markdown. Every claim requires supporting source "
     "citations. Keep process status, missing-evidence disclosures, and limitations as "
     "narrative outside claims. Use claims:[] when there are no supported external facts. "
     "Use only root subquestion IDs in covered_question_ids; do not claim unanswered "
     "questions are covered. Cite exact recorded lines using [[source:UUID:L1-L3]] and "
-    "matching claim citations. At most 50 citation bindings and 64 KiB markdown. "
+    "matching claim citations. Explain why research stopped in Limitations; stopping "
+    "metadata is supplied by the runtime. At most 50 citation bindings and 64 KiB markdown. "
 )
 
 
@@ -94,7 +95,7 @@ def _strings(value: object) -> tuple[str, ...]:
     return tuple(cast(list[str], value))
 
 
-def parse_report(text: str) -> ResearchReport:
+def parse_report(text: str, *, default_stop_reason: str | None = None) -> ResearchReport:
     value = _json_object(text)
     raw_claims = value.get("claims")
     if not isinstance(raw_claims, list) or len(raw_claims) > 50:
@@ -117,9 +118,24 @@ def parse_report(text: str) -> ResearchReport:
         if not isinstance(claim_id, str) or not isinstance(claim_text, str):
             raise ValueError("invalid report claim")
         claims.append(ResearchClaim(claim_id, claim_text, tuple(citations)))
-    markdown, reason = value.get("markdown"), value.get("stop_reason")
+    markdown, model_reason = value.get("markdown"), value.get("stop_reason")
+    long_explanation = isinstance(model_reason, str) and len(model_reason) > 100
+    reason = (
+        default_stop_reason
+        if default_stop_reason is not None and ("stop_reason" not in value or long_explanation)
+        else model_reason
+    )
     if not isinstance(markdown, str) or not isinstance(reason, str):
         raise ValueError("invalid report body")
+    if default_stop_reason is not None and long_explanation:
+        assert isinstance(model_reason, str)
+        markdown = re.sub(
+            r"(^#{1,6}\s+Limitations\s*$)",
+            lambda match: match[0] + "\n\n" + model_reason.strip(),
+            markdown,
+            count=1,
+            flags=re.M | re.I,
+        )
     report = ResearchReport(
         markdown, tuple(claims), _strings(value.get("covered_question_ids")), reason
     )
@@ -157,6 +173,18 @@ def _questions(snapshot: ResearchSnapshot) -> tuple[dict[str, object], ...]:
     if not isinstance(value, list):
         return ()
     return tuple(research_object(question) for question in value if isinstance(question, dict))
+
+
+def _stopping_reason(snapshot: ResearchSnapshot) -> str:
+    reasons = (
+        snapshot.stop_reason,
+        snapshot.checkpoint.get("stop_reason"),
+        *(task.checkpoint.get("stop_reason") for task in snapshot.tasks if task.role == "lead"),
+    )
+    for reason in reasons:
+        if isinstance(reason, str) and reason.strip() and len(reason) <= 100 and "\0" not in reason:
+            return reason
+    return "collection_complete"
 
 
 def disclose_missing_questions(
@@ -358,6 +386,7 @@ class ResearchReportService:
         accepted_review: ResearchReview | None = None
         anchor = snapshot.report_model_call_id
         expected = {question.get("id") for question in _questions(snapshot)}
+        stopping_reason = _stopping_reason(snapshot)
         saved_evidence = await collect_report_evidence(self._web, snapshot)
         findings = {
             "objective": snapshot.objective,
@@ -394,7 +423,9 @@ class ResearchReportService:
                 try:
                     if incomplete:
                         raise ValueError("research report reached its output limit")
-                    report = disclose_missing_questions(parse_report(content), snapshot)
+                    report = disclose_missing_questions(
+                        parse_report(content, default_stop_reason=stopping_reason), snapshot
+                    )
                     excerpts, hashes = await self._evidence(snapshot, report)
                     evidence_json = json.dumps(
                         {

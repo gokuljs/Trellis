@@ -228,6 +228,8 @@ class ScriptedResearcher:
         self.incomplete_draft = False
         self.draft_interrupted = False
         self.report_output_limits: list[int] = []
+        self.stopping_explanation: str | None = None
+        self.reviewed_reports: list[dict[str, object]] = []
 
     async def stream(
         self, request: ModelRequest, api_key: str, user_id: str
@@ -245,6 +247,7 @@ class ScriptedResearcher:
             if "findings" in payload:
                 payload = payload["findings"]
             if "report" in payload:
+                self.reviewed_reports.append(payload["report"])
                 text = json.dumps(
                     {
                         "accepted_claim_ids": [
@@ -302,7 +305,7 @@ class ScriptedResearcher:
                         "Independent reliability evidence was unavailable.",
                         "claims": claims,
                         "covered_question_ids": ["pricing", "strategy"],
-                        "stop_reason": "questions_addressed",
+                        "stop_reason": self.stopping_explanation or "questions_addressed",
                     }
                 )
                 if self.incomplete_draft and not self.draft_interrupted:
@@ -563,6 +566,42 @@ class ResearchExecutionPostgresTests(unittest.IsolatedAsyncioTestCase):
             + ";",
         )
         self.assertEqual(int(outputs.stdout.strip()), 1)
+
+    async def test_long_stopping_explanation_keeps_findings_in_the_reviewed_report(self) -> None:
+        explanation = (
+            "Bounded research collection completed; further searching was not pursued. "
+            "Coverage is selective, with practical-resource and publication-status "
+            "verification remaining incomplete."
+        )
+        self.provider.stopping_explanation = explanation
+        await self.service._execute_snapshot(self.execution_run)
+        saved = await self.repository.get_run(self.execution_run.id)
+        assert saved is not None
+        self.assertEqual(saved.status, RunStatus.COMPLETED, saved.error_message)
+        state = await self.repository.read_research(saved.id)
+        assert state is not None
+        self.assertEqual(state.phase.value, "completed")
+        self.assertEqual(len(self.provider.reviewed_reports), 1)
+        self.assertEqual(len(self.provider.report_output_limits), 2)
+        published = await asyncio.to_thread(
+            self.fixture.sql,
+            "SELECT report FROM trellis.research_runs WHERE run_id="
+            + database_tests.literal(saved.id)
+            + ";",
+            authenticated=False,
+        )
+        report = json.loads(published.stdout)
+        self.assertEqual(report, self.provider.reviewed_reports[0])
+        self.assertIn(explanation, report["markdown"])
+        self.assertIn("Current A price is $10.", report["markdown"])
+        self.assertLessEqual(len(report["stop_reason"]), 100)
+        messages = await self.repository.list_messages(saved.session_id)
+        reports = [message.content for message in messages if message.role == "assistant"]
+        self.assertEqual(reports, [report["markdown"]])
+        citations = await self.repository.read_web_citations(
+            saved.session_id, state.report_model_call_id or ""
+        )
+        self.assertEqual(len(citations), 6)
 
     async def test_incomplete_draft_retains_usage_and_repairs_before_publication(self) -> None:
         self.provider.incomplete_draft = True
