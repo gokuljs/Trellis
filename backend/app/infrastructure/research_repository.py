@@ -6,6 +6,8 @@ from uuid import UUID
 
 from app.application.errors import ApplicationError
 from app.domain.research import (
+    CURRENT_RESEARCH_POLICY,
+    RESEARCH_POLICY_V2,
     ResearchReport,
     ResearchReservation,
     ResearchReview,
@@ -13,7 +15,9 @@ from app.domain.research import (
     ResearchTask,
     ResearchTaskInput,
     research_identifier,
+    research_limits,
     research_object,
+    research_review_payload,
 )
 from app.domain.runtime import (
     ModelCallRecord,
@@ -24,6 +28,9 @@ from app.domain.runtime import (
     RunSnapshot,
     ToolCallRecord,
 )
+
+_MAX_TASK_CALLS = research_limits("longer").model_calls
+_MAX_TASK_MESSAGES = _MAX_TASK_CALLS + research_limits("longer").tool_calls
 
 
 def _object(value: object) -> dict[str, object]:
@@ -115,7 +122,12 @@ class ResearchRepositoryMixin:
             return (
                 isinstance(value, dict)
                 and type(value.get("schema_version")) is int
-                and value.get("schema_version") == 1
+                and value.get("schema_version")
+                == (2 if CURRENT_RESEARCH_POLICY == RESEARCH_POLICY_V2 else 1)
+                and (
+                    CURRENT_RESEARCH_POLICY != RESEARCH_POLICY_V2
+                    or value.get("policy_version") == RESEARCH_POLICY_V2
+                )
                 and value.get("ready") is True
             )
         except ApplicationError, RuntimeError, ValueError, TypeError:
@@ -202,6 +214,7 @@ class ResearchRepositoryMixin:
         reserved_cost: float,
         *,
         finalization: bool = False,
+        handoff: bool = False,
     ) -> tuple[ResearchReservation, ModelCallRecord]:
         research_identifier(task_id)
         research_identifier(operation_id)
@@ -224,6 +237,7 @@ class ResearchRepositoryMixin:
                     "reserved_tokens": reserved_tokens,
                     "reserved_cost": reserved_cost,
                     "finalization": finalization,
+                    **({"handoff": True} if handoff else {}),
                 },
             )
         )
@@ -243,6 +257,41 @@ class ResearchRepositoryMixin:
             raise RuntimeError("Supabase changed the research call reservation")
         self._model_call_runs[call.id] = run_id
         return reservation, call
+
+    async def set_research_handoff(
+        self, run_id: str, generation: int, task_id: str, reserved_tokens: int, reserved_cost: float
+    ) -> dict[str, object]:
+        research_identifier(task_id)
+        if (
+            type(reserved_tokens) is not int
+            or reserved_tokens < 1
+            or not math.isfinite(reserved_cost)
+            or reserved_cost < 0
+        ):
+            raise ValueError("invalid research handoff reservation")
+        return _object(
+            await self._research_call(
+                "set_handoff",
+                {
+                    "run_id": run_id,
+                    "generation": generation,
+                    "task_id": task_id,
+                    "reserved_tokens": reserved_tokens,
+                    "reserved_cost": reserved_cost,
+                },
+            )
+        )
+
+    async def release_research_handoff(self, run_id: str, generation: int, task_id: str) -> None:
+        research_identifier(task_id)
+        await self._research_call(
+            "release_handoff", {"run_id": run_id, "generation": generation, "task_id": task_id}
+        )
+
+    async def research_budget_state(self, run_id: str, generation: int) -> dict[str, object]:
+        return _object(
+            await self._research_call("budget_state", {"run_id": run_id, "generation": generation})
+        )
 
     async def commit_research_generation(
         self,
@@ -349,7 +398,7 @@ class ResearchRepositoryMixin:
     ) -> list[RunMessageRecord]:
         value = await self._research_task(run_id, task_id)
         messages = []
-        for row in _rows(value.get("messages"), 168):
+        for row in _rows(value.get("messages"), _MAX_TASK_MESSAGES):
             tools = tuple(
                 ModelToolCall(
                     cast(str, tool.get("id")),
@@ -367,7 +416,7 @@ class ResearchRepositoryMixin:
     async def read_research_task_calls(self, run_id: str, task_id: str) -> list[ModelCallRecord]:
         value = await self._research_task(run_id, task_id)
         calls = []
-        for row in _rows(value.get("calls"), 40):
+        for row in _rows(value.get("calls"), _MAX_TASK_CALLS):
             call = self._model_call(row)
             if call.run_id != run_id or row.get("task_id") != task_id:
                 raise RuntimeError("Supabase returned another task's model calls")
@@ -441,7 +490,7 @@ class ResearchRepositoryMixin:
                     "generation": generation,
                     "model_call_id": model_call_id,
                     "report": asdict(report),
-                    "review": asdict(review),
+                    "review": research_review_payload(review),
                     "report_hash": report.content_hash,
                     "partial": partial,
                 },

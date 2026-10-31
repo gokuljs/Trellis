@@ -136,6 +136,12 @@ function OwnedWebEvidenceScope({
                 <X size={15} aria-hidden="true" />
               </button>
             </div>
+            {selection ? (
+              <SourceExcerpt
+                key={`${selection.source_id}:${selection.start_line}:${selection.end_line}:${revision}`}
+                selection={selection}
+              />
+            ) : null}
             <div className="web-sources-clear">
               <button
                 type="button"
@@ -219,12 +225,6 @@ function OwnedWebEvidenceScope({
                   ? "Loading sources…"
                   : "Load more sources"}
               </button>
-            ) : null}
-            {selection ? (
-              <SourceExcerpt
-                key={`${selection.source_id}:${selection.start_line}:${selection.end_line}:${revision}`}
-                selection={selection}
-              />
             ) : null}
           </section>
         ) : null}

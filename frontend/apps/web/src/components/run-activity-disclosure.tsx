@@ -8,7 +8,7 @@ import { SavedRunActivity } from "@/components/saved-run-activity"
 import { RunActivity } from "@/components/run-activity"
 import { ResearchProgress } from "@/components/research-progress"
 import { researchQueryOptions } from "@/lib/research"
-import { describeActivity } from "@/lib/activity-status"
+import { describeActivity, researchOutcomeStatus } from "@/lib/activity-status"
 import { runSummariesQueryOptions } from "@/lib/server-queries"
 import { newestRunSummary } from "@/lib/activity-summary"
 import type {
@@ -67,12 +67,7 @@ export function RunActivityDisclosure({
   )
   const researchMode =
     activity.runInfo?.runMode === "research" || summary?.run_mode === "research"
-  const research = useQuery({
-    ...researchQueryOptions(sessionId ?? "", runId ?? ""),
-    enabled: Boolean(expanded && researchMode && sessionId && runId),
-    refetchInterval: expanded && pending && researchMode ? 2500 : false,
-  })
-  const status = describeActivity(
+  const activityStatus = describeActivity(
     activity.events,
     pending,
     now,
@@ -80,6 +75,22 @@ export function RunActivityDisclosure({
     summary,
     activity.runInfo?.status
   )
+  const terminalResearch = researchMode && activityStatus.terminal
+  const research = useQuery({
+    ...researchQueryOptions(sessionId ?? "", runId ?? ""),
+    enabled: Boolean(
+      (expanded || terminalResearch) && researchMode && sessionId && runId
+    ),
+    refetchInterval: expanded && pending && researchMode ? 2500 : false,
+  })
+  const refetchResearch = research.refetch
+  useEffect(() => {
+    if (terminalResearch && sessionId && runId)
+      void refetchResearch({ cancelRefetch: false })
+  }, [terminalResearch, sessionId, runId, refetchResearch])
+  const status = researchMode
+    ? researchOutcomeStatus(activityStatus, runId, research.data)
+    : activityStatus
   const available = Boolean(
     (sessionId && turnId) ||
     activity.events.length ||
@@ -264,6 +275,7 @@ export function RunActivityDisclosure({
                   events={activity.events}
                   runInfo={activity.runInfo}
                   summary={summary}
+                  research={research.data}
                   pending={pending}
                   summaryError={
                     summaries.error ? "Run totals could not be loaded." : null

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react"
 
-import type { RunSummary } from "@/lib/app-types"
-import { describeActivity } from "@/lib/activity-status"
+import type { ResearchSnapshot, RunSummary } from "@/lib/app-types"
+import { describeActivity, researchOutcomeStatus } from "@/lib/activity-status"
 import { activityTotals } from "@/lib/activity-summary"
 
 import type {
@@ -20,6 +20,7 @@ type RunActivityProps = {
   events: RuntimeRunEvent[]
   runInfo: RuntimeRunInfo | null
   summary?: RunSummary | null
+  research?: ResearchSnapshot | null
   summaryError?: string | null
   onRetrySummary?: () => void
   pending: boolean
@@ -107,6 +108,7 @@ export function RunActivity({
   events,
   runInfo,
   summary: savedSummary,
+  research,
   summaryError,
   onRetrySummary,
   pending,
@@ -117,7 +119,9 @@ export function RunActivity({
   const runId = runInfo?.runId ?? events.at(-1)?.runId ?? savedSummary?.run_id
   const summary = savedSummary?.run_id === runId ? savedSummary : null
   const [now, setNow] = useState(() => Date.now())
-  const status = describeActivity(
+  const researchMode =
+    runInfo?.runMode === "research" || summary?.run_mode === "research"
+  const activityStatus = describeActivity(
     events,
     pending,
     now,
@@ -125,6 +129,9 @@ export function RunActivity({
     summary ?? undefined,
     runInfo?.status
   )
+  const status = researchMode
+    ? researchOutcomeStatus(activityStatus, runId, research)
+    : activityStatus
   useEffect(() => {
     if (status.terminal) return
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
@@ -482,7 +489,7 @@ export function RunActivity({
                     title = "Stopping run"
                     break
                   case "run.completed":
-                    title = "Run completed"
+                    title = researchMode ? status.label : "Run completed"
                     break
                   case "run.cancelled":
                     title = "Run cancelled"

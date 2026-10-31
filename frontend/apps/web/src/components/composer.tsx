@@ -13,6 +13,7 @@ import { useTheme } from "@/components/theme-provider"
 import { ModelSelect } from "@/components/model-select"
 import type { ModelStatus, RunMode } from "@/lib/app-types"
 import { isModelSelectable } from "@/lib/model-choice"
+import { researchBudgetDescription } from "@/lib/research"
 
 type BudgetPreset = "conservative" | "longer"
 
@@ -29,11 +30,13 @@ type ComposerProps = {
   modelSaving: boolean
   onModelChange: (modelId: string) => void
   contextGauge?: ReactNode
+  clarification?: ReactNode
   runStatus?: string
   runMode?: RunMode
   onRunModeChange?: (mode: RunMode) => void
   researchAvailable?: boolean
   researchUnavailableReason?: string | null
+  researchExecutionBudgetSeconds?: number | null
   answeringClarification?: boolean
   controlsDisabled?: boolean
 }
@@ -70,11 +73,13 @@ export function Composer({
   modelSaving,
   onModelChange,
   contextGauge,
+  clarification,
   runStatus,
   runMode = "chat",
   onRunModeChange,
   researchAvailable = false,
   researchUnavailableReason,
+  researchExecutionBudgetSeconds,
   answeringClarification = false,
   controlsDisabled = disabled,
 }: ComposerProps) {
@@ -105,6 +110,7 @@ export function Composer({
 
   return (
     <div className="composer-wrap">
+      {clarification}
       <div className="composer-box">
         <textarea
           aria-label="Message"
@@ -147,6 +153,14 @@ export function Composer({
               className="composer-select"
               aria-label="Run budget"
               value={budgetPreset}
+              title={
+                runMode === "research"
+                  ? researchBudgetDescription(
+                      budgetPreset,
+                      researchExecutionBudgetSeconds
+                    )
+                  : undefined
+              }
               disabled={controlsDisabled}
               onChange={(event) =>
                 onBudgetChange(event.target.value as BudgetPreset)
@@ -181,17 +195,20 @@ export function Composer({
           </div>
         </div>
       </div>
-      <div
-        className="composer-footnote"
-        role={runStatus ? "status" : undefined}
-      >
-        {runStatus ??
-          (runMode === "research"
-            ? budgetPreset === "longer"
-              ? "Research limits: 20 minutes, $5 estimated model cost, 16 searches, 40 pages."
-              : "Research limits: 10 minutes, $2 estimated model cost, 8 searches, 20 pages."
-            : "Trellis can make mistakes. Check important info.")}
-      </div>
+      {!answeringClarification ? (
+        <div
+          className="composer-footnote"
+          role={runStatus ? "status" : undefined}
+        >
+          {runStatus ??
+            (runMode === "research"
+              ? researchBudgetDescription(
+                  budgetPreset,
+                  researchExecutionBudgetSeconds
+                )
+              : "Trellis can make mistakes. Check important info.")}
+        </div>
+      ) : null}
     </div>
   )
 }

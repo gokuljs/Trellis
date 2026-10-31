@@ -68,7 +68,11 @@ export function SavedTurnActivity({
             {summaries.map((summary) => (
               <option key={summary.run_id} value={summary.run_id}>
                 {new Date(summary.created_at).toLocaleString()} ·{" "}
-                {summary.status} · {summary.run_id.slice(0, 8)}
+                {summary.run_mode === "research" &&
+                summary.status === "completed"
+                  ? "research finished"
+                  : summary.status}{" "}
+                · {summary.run_id.slice(0, 8)}
               </option>
             ))}
           </select>

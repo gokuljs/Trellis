@@ -52,7 +52,18 @@ class ResearchRepository(Protocol):
         reserved_cost: float,
         *,
         finalization: bool = False,
+        handoff: bool = False,
     ) -> tuple[ResearchReservation, ModelCallRecord]: ...
+
+    async def set_research_handoff(
+        self, run_id: str, generation: int, task_id: str, reserved_tokens: int, reserved_cost: float
+    ) -> dict[str, object]: ...
+
+    async def release_research_handoff(
+        self, run_id: str, generation: int, task_id: str
+    ) -> None: ...
+
+    async def research_budget_state(self, run_id: str, generation: int) -> dict[str, object]: ...
 
     async def commit_research_generation(
         self,

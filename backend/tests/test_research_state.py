@@ -40,14 +40,32 @@ class ResearchStateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ResearchTaskInput(str(uuid4()), "Compare pricing", round_index=0)
 
-    def test_limits_keep_shared_time_cost_and_token_caps(self) -> None:
+    def test_research_usage_is_tripled_with_existing_collection_limits(self) -> None:
         standard = research_limits("conservative")
         extended = research_limits("longer")
         self.assertEqual(
-            (standard.seconds, standard.model_cost_usd, standard.total_tokens), (600, 2.0, 100_000)
+            (
+                standard.model_calls,
+                standard.tool_calls,
+                standard.total_tokens,
+                standard.model_cost_usd,
+            ),
+            (72, 192, 300_000, 6.0),
         )
         self.assertEqual(
-            (extended.seconds, extended.model_cost_usd, extended.total_tokens), (1200, 5.0, 200_000)
+            (
+                extended.model_calls,
+                extended.tool_calls,
+                extended.total_tokens,
+                extended.model_cost_usd,
+            ),
+            (120, 384, 600_000, 15.0),
+        )
+        self.assertEqual(
+            (standard.seconds, standard.search_calls, standard.page_attempts), (600, 8, 20)
+        )
+        self.assertEqual(
+            (extended.seconds, extended.search_calls, extended.page_attempts), (1200, 16, 40)
         )
         self.assertEqual((standard.worker_tasks, standard.collection_rounds), (4, 2))
         self.assertEqual((extended.worker_tasks, extended.collection_rounds), (8, 4))

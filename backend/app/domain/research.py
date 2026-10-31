@@ -16,8 +16,25 @@ MAX_RESEARCH_REPORT_BYTES = 64 * 1024
 MAX_RESEARCH_CITATIONS = 50
 MAX_RESEARCH_CONCURRENCY = 2
 REPORT_CALL_RESERVE = 4
+LEGACY_RESEARCH_POLICY = "bounded-research-v1"
+RESEARCH_POLICY_V2 = "bounded-research-v2"
+CURRENT_RESEARCH_POLICY = RESEARCH_POLICY_V2
 
 ResearchRole = Literal["lead", "worker", "writer", "reviewer"]
+
+
+def research_policy(value: object) -> str:
+    if value not in (LEGACY_RESEARCH_POLICY, RESEARCH_POLICY_V2):
+        raise ValueError("unknown research policy")
+    return cast(str, value)
+
+
+def research_execution_budget(value: object) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value not in (600, 1200, 2700):
+        raise ValueError("invalid research execution allowance")
+    return value
 
 
 def research_identifier(value: object) -> str:
@@ -111,16 +128,20 @@ class ResearchLimits:
 
 
 _RESEARCH_LIMITS = {
-    "conservative": ResearchLimits(24, 64, 100_000, 600, 2.0, 8, 20, 4, 2),
-    "longer": ResearchLimits(40, 128, 200_000, 1200, 5.0, 16, 40, 8, 4),
+    "conservative": ResearchLimits(72, 192, 300_000, 600, 6.0, 8, 20, 4, 2),
+    "longer": ResearchLimits(120, 384, 600_000, 1200, 15.0, 16, 40, 8, 4),
 }
 
 
-def research_limits(preset: str) -> ResearchLimits:
+def research_limits(preset: str, policy_version: str = LEGACY_RESEARCH_POLICY) -> ResearchLimits:
+    research_policy(policy_version)
     try:
-        return _RESEARCH_LIMITS[preset]
+        limits = _RESEARCH_LIMITS[preset]
     except KeyError:
         raise ValueError("unknown research budget") from None
+    if policy_version == RESEARCH_POLICY_V2 and preset == "longer":
+        return ResearchLimits(**{**asdict(limits), "seconds": 2700})
+    return limits
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +175,10 @@ class ResearchTask:
     revision: int
     checkpoint: dict[str, object]
     result: dict[str, object] | None = None
+
+    @property
+    def notebook(self) -> dict[str, object]:
+        return {**self.checkpoint, **(self.result or {})}
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> Self:
@@ -225,15 +250,25 @@ class ResearchSnapshot:
     stop_reason: str | None = None
     report_model_call_id: str | None = None
     citations: tuple[CitationReference, ...] = ()
+    policy_version: str = LEGACY_RESEARCH_POLICY
+    execution_budget_seconds: int | None = None
+    source_reads: tuple[dict[str, object], ...] = ()
+    reviewed_coverage: tuple[dict[str, object], ...] = ()
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> Self:
         raw_tasks = value.get("tasks")
         raw_citations = value.get("citations", [])
+        raw_coverage = value.get("reviewed_coverage", [])
+        raw_reads = value.get("source_reads", [])
         if not isinstance(raw_tasks, list) or len(raw_tasks) > 16:
             raise ValueError("invalid research task collection")
         if not isinstance(raw_citations, list) or len(raw_citations) > MAX_RESEARCH_CITATIONS:
             raise ValueError("invalid research citation collection")
+        if not isinstance(raw_coverage, list) or len(raw_coverage) > 12:
+            raise ValueError("invalid research question coverage")
+        if not isinstance(raw_reads, list) or len(raw_reads) > 384:
+            raise ValueError("invalid research read observations")
         tasks = tuple(ResearchTask.from_dict(research_object(item)) for item in raw_tasks)
         run_id = research_identifier(value.get("run_id"))
         if len({task.id for task in tasks}) != len(tasks) or any(
@@ -269,6 +304,10 @@ class ResearchSnapshot:
             if value.get("report_model_call_id") is not None
             else None,
             tuple(citations),
+            research_policy(value.get("policy_version", LEGACY_RESEARCH_POLICY)),
+            research_execution_budget(value.get("execution_budget_seconds")),
+            tuple(research_object(item) for item in raw_reads),
+            tuple(research_object(item) for item in raw_coverage),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -318,11 +357,29 @@ class ResearchReport:
 
 
 @dataclass(frozen=True, slots=True)
+class ResearchQuestionCoverage:
+    question_id: str
+    requirement_ids: tuple[str, ...]
+    claim_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for identity in (self.question_id, *self.requirement_ids, *self.claim_ids):
+            _text(identity, maximum=100)
+        if not self.requirement_ids or not self.claim_ids:
+            raise ValueError("research coverage requires evidence and accepted claims")
+        if len(set(self.requirement_ids)) != len(self.requirement_ids) or len(
+            set(self.claim_ids)
+        ) != len(self.claim_ids):
+            raise ValueError("research coverage contains duplicate identifiers")
+
+
+@dataclass(frozen=True, slots=True)
 class ResearchReview:
     report_hash: str
     source_hashes: dict[str, str]
     accepted_claim_ids: tuple[str, ...]
     issues: tuple[str, ...]
+    question_coverage: tuple[ResearchQuestionCoverage, ...] | None = None
 
     def __post_init__(self) -> None:
         for digest in (self.report_hash, *self.source_hashes.values()):
@@ -338,3 +395,20 @@ class ResearchReview:
             _text(claim, maximum=100)
         for issue in self.issues:
             _text(issue, maximum=8000)
+        if self.question_coverage is not None and (
+            len(self.question_coverage) > 12
+            or len({item.question_id for item in self.question_coverage})
+            != len(self.question_coverage)
+            or any(
+                not set(item.claim_ids).issubset(self.accepted_claim_ids)
+                for item in self.question_coverage
+            )
+        ):
+            raise ValueError("invalid research question coverage")
+
+
+def research_review_payload(review: ResearchReview) -> dict[str, object]:
+    value = asdict(review)
+    if review.question_coverage is None:
+        del value["question_coverage"]
+    return value

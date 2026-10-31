@@ -6,6 +6,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 
 import { MessageMarkdown } from "../components/message-markdown"
 import { RunActivity } from "../components/run-activity"
+import { RunActivityDisclosure } from "../components/run-activity-disclosure"
+import { SavedRunActivity } from "../components/saved-run-activity"
+import { ResearchProgress } from "../components/research-progress"
 import { describeActivity } from "./activity-status"
 import { threadMessages } from "./assistant-outputs"
 import {
@@ -18,6 +21,13 @@ import { webEvidenceKeys } from "./web-evidence-queries"
 import { groupRunEvents } from "./run-event-groups"
 import { runInfoFromEvent, turnFailureAction } from "./run-recovery"
 import { createApiClient } from "./api"
+import {
+  researchBudgetDescription,
+  researchEvidenceDepthLabel,
+  researchQueryOptions,
+  researchQuestionEvidenceLabel,
+} from "./research"
+import { runEventsQueryOptions } from "./server-queries"
 
 const sourceId = "29b96351-a37d-44b2-ae6e-1ccdbd210b4c"
 const marker = `[[source:${sourceId}:L12-L14]]`
@@ -28,6 +38,231 @@ const event = (sequence, eventType, data = {}) => ({
   eventVersion: 1,
   data,
   createdAt: "2026-10-31T10:00:00Z",
+})
+
+const researchOutcome = (phase = "partial") => ({
+  run_id: "research-run",
+  phase,
+  objective: "Compare opportunities",
+  subquestions: [],
+  tasks: [],
+  gaps: [],
+  conflicts: [],
+  pending_clarification: null,
+  remaining_seconds: null,
+  stop_reason:
+    phase === "partial" ? "report_validation_failed" : "coverage_sufficient",
+  citations: [],
+})
+
+const completedSummary = (mode = "research") => ({
+  run_id: "research-run",
+  turn_id: "research-turn",
+  status: "completed",
+  run_mode: mode,
+  last_sequence: 2,
+  created_at: "2026-10-31T10:00:00Z",
+  finished_at: "2026-10-31T10:05:17Z",
+  stop_reason: "report_validation_failed",
+})
+
+test("evidence progress distinguishes recorded support from published review", () => {
+  const research = {
+    ...researchOutcome("researching"),
+    coverage: [
+      {
+        id: "q1",
+        status: "missing",
+        requirements: [
+          { id: "methods", status: "evidence_recorded", finding_ids: ["f1"] },
+          { id: "results", status: "missing", finding_ids: [] },
+        ],
+      },
+    ],
+  }
+  assert.equal(
+    researchQuestionEvidenceLabel(research, "q1", "addressed"),
+    "1/2 evidence areas recorded"
+  )
+  research.coverage[0].requirements[0].status = "reviewed"
+  assert.equal(
+    researchQuestionEvidenceLabel(research, "q1", "addressed"),
+    "1/2 evidence areas recorded · 1 reviewed"
+  )
+  research.coverage[0].requirements[1].status = "reviewed"
+  assert.equal(
+    researchQuestionEvidenceLabel(research, "q1", "addressed"),
+    "2/2 evidence areas reviewed"
+  )
+  assert.equal(
+    researchQuestionEvidenceLabel(researchOutcome(), "q1", "in_progress"),
+    "in progress"
+  )
+})
+
+test("research progress exposes scope and abstract-only evidence without percentages", () => {
+  const markup = renderToStaticMarkup(
+    createElement(ResearchProgress, {
+      research: {
+        ...researchOutcome("completed"),
+        sources_read: 2,
+        source_windows_read: 3,
+        evidence_depth: ["abstract"],
+        execution_budget_seconds: 600,
+        subquestions: [
+          { id: "q1", question: "What differs?", status: "addressed" },
+        ],
+        coverage: [
+          {
+            id: "q1",
+            status: "missing",
+            requirements: [
+              { id: "results", status: "missing", finding_ids: [] },
+            ],
+          },
+        ],
+        brief: {
+          scope: "Compare the two supplied abstracts",
+          comparison_dimensions: ["Approach"],
+          source_restrictions: ["Only the supplied pages"],
+          expected_output: "A comparison",
+        },
+      },
+    })
+  )
+  assert.match(markup, /2 sources read/)
+  assert.match(markup, /3 reading windows/)
+  assert.match(markup, /Abstract-only evidence/)
+  assert.match(markup, /Research scope/)
+  assert.match(markup, /Only the supplied pages/)
+  assert.match(markup, /1 evidence area missing/)
+  assert.doesNotMatch(markup, /%|evidence areas reviewed/)
+})
+
+test("paused research keeps its frozen allowance after Extended increases", () => {
+  const render = (seconds) =>
+    renderToStaticMarkup(
+      createElement(ResearchProgress, {
+        research: {
+          ...researchOutcome("waiting_for_input"),
+          remaining_seconds: 90,
+          execution_budget_seconds: seconds,
+          pending_clarification: {
+            id: "clarification",
+            question: "Which region?",
+          },
+        },
+      })
+    )
+  assert.match(render(1200), /20 min allowance/)
+  assert.doesNotMatch(render(1200), /45 min allowance/)
+  assert.match(render(2700), /45 min allowance/)
+  assert.match(render(1200), /Timer paused/)
+  assert.match(researchBudgetDescription("longer"), /45 minutes/)
+  assert.match(researchBudgetDescription("longer", 1200), /20 minutes/)
+  assert.match(researchBudgetDescription("conservative"), /10 minutes/)
+})
+
+test("legacy snapshots do not imply zero sources or reviewed evidence", () => {
+  const markup = renderToStaticMarkup(
+    createElement(ResearchProgress, {
+      research: {
+        ...researchOutcome(),
+        sources_read: null,
+        source_windows_read: null,
+      },
+    })
+  )
+  assert.doesNotMatch(
+    markup,
+    /sources read|reading windows|reviewed|Research scope/
+  )
+  assert.equal(researchEvidenceDepthLabel(["full_text"]), "Full-text excerpts")
+  assert.equal(researchEvidenceDepthLabel(["listing"]), "Job listings")
+})
+
+test("collapsed completed research shows the saved partial outcome", () => {
+  const client = new QueryClient()
+  client.setQueryData(
+    researchQueryOptions("session", "research-run").queryKey,
+    researchOutcome()
+  )
+  const markup = renderToStaticMarkup(
+    createElement(
+      QueryClientProvider,
+      { client },
+      createElement(RunActivityDisclosure, {
+        sessionId: "session",
+        turnId: "research-turn",
+        activity: { events: [], summary: completedSummary() },
+        pending: false,
+        expanded: false,
+        onToggle: () => {},
+        onClose: () => {},
+        approvalPendingToolId: null,
+        approvalError: null,
+        onApprovalDecision: () => {},
+      })
+    )
+  )
+  assert.match(markup, /Research finished with gaps/)
+  assert.doesNotMatch(markup, />Completed</)
+})
+
+test("saved activity restores research outcome after history reload", () => {
+  const client = new QueryClient()
+  client.setQueryData(
+    researchQueryOptions("session", "research-run").queryKey,
+    researchOutcome()
+  )
+  client.setQueryData(
+    runEventsQueryOptions("session", "research-run").queryKey,
+    { pages: [{ items: [] }], pageParams: [0] }
+  )
+  const markup = renderToStaticMarkup(
+    createElement(
+      QueryClientProvider,
+      { client },
+      createElement(SavedRunActivity, {
+        sessionId: "session",
+        runId: "research-run",
+        runInfo: null,
+        summary: completedSummary(),
+      })
+    )
+  )
+  assert.match(markup, /Research finished with gaps/)
+  assert.doesNotMatch(markup, />Completed</)
+})
+
+test("live research completion labels distinguish accepted and partial reports", () => {
+  const render = (mode, research) =>
+    renderToStaticMarkup(
+      createElement(RunActivity, {
+        events: [event(1, "run.started"), event(2, "run.completed")],
+        runInfo: { runId: "research-run", runMode: mode, status: "completed" },
+        research,
+        pending: false,
+        approvalPendingToolId: null,
+        approvalError: null,
+        onApprovalDecision: () => {},
+      })
+    )
+  assert.match(
+    render("research", researchOutcome()),
+    /Research finished with gaps/
+  )
+  assert.doesNotMatch(render("research", researchOutcome()), /Run completed/)
+  assert.match(
+    render("research", researchOutcome("completed")),
+    /Research completed/
+  )
+  assert.match(render("chat"), />Completed</)
+  assert.match(render("chat"), /Run completed/)
+  assert.match(
+    render("research", { ...researchOutcome(), run_id: "other-run" }),
+    /Research finished</
+  )
 })
 
 test("unavailable research before admission lets the user change mode and retry", () => {
