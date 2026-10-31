@@ -1,14 +1,12 @@
-import { useEffect, type ReactNode } from "react"
+import { useEffect, useRef, type ReactNode } from "react"
 
 import { GitHubIcon } from "@trellis/ui/icons/github-icon"
 import { GoogleIcon } from "@trellis/ui/icons/google-icon"
 import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 import { useAuth } from "@/lib/use-auth"
 import { navigate, parseAppRoute, useAppPath } from "@/lib/app-routes"
-import {
-  consumeAuthReturnPath,
-  rememberAuthReturnPath,
-} from "@/lib/auth-return"
+import { ensureAuthReturnPath } from "@/lib/auth-return"
+import { authRedirect, hasAuthCallback } from "@/lib/auth-routing"
 import { SessionQueryProvider } from "@/components/session-query-provider"
 import "./auth-screen.css"
 
@@ -42,35 +40,38 @@ function AuthPageLink({
   )
 }
 
-export function AuthGate({ children }: { children: ReactNode }) {
+export function AuthGate({
+  children,
+  publicHome,
+}: {
+  children: ReactNode
+  publicHome: ReactNode
+}) {
+  const callbackPending = useRef(hasAuthCallback(window.location.href))
   const auth = useAuth()
   const path = useAppPath()
-  const authPage = path === "/login" || path === "/signup"
+  const route = parseAppRoute(path)
   const signedIn = auth.status === "signed-in" && auth.user !== null
   const signup = path === "/signup"
 
   useEffect(() => {
-    // Let session restoration consume OAuth callback parameters first.
-    if (auth.status === "loading") return
-    const route = parseAppRoute(path)
-    if (route.kind === "unknown") {
-      navigate("/", true)
-      return
-    }
-    if (route.path !== path) {
-      navigate(route.path, true)
-      return
-    }
-    if (signedIn && (authPage || route.kind === "home")) {
-      const target = consumeAuthReturnPath()
-      if (target || authPage) navigate(target ?? "/", true)
-    } else if (!signedIn && !authPage) {
-      if (route.kind === "chat") rememberAuthReturnPath(route.path)
-      navigate("/login", true)
-    }
-  }, [auth.status, authPage, signedIn, path])
+    const target = authRedirect(path, {
+      status: auth.status,
+      user: auth.user,
+      error: auth.error,
+      callbackPending: callbackPending.current,
+    })
+    if (auth.status !== "loading") callbackPending.current = false
+    if (target) navigate(target, true)
+  }, [auth.status, auth.user, auth.error, path])
 
-  if (signedIn && auth.user) {
+  if (route.kind === "home") return publicHome
+
+  if (
+    signedIn &&
+    auth.user &&
+    (route.kind === "workspace" || route.kind === "chat")
+  ) {
     return (
       <div
         className="authenticated-workspace"
@@ -136,6 +137,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
                       type="button"
                       disabled={auth.pendingProvider !== null}
                       onClick={() => {
+                        ensureAuthReturnPath()
                         void auth.signIn(provider)
                       }}
                     >

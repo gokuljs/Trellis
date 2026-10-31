@@ -1,8 +1,9 @@
 import { useSyncExternalStore } from "react"
 
-export type AppPath = "/" | "/login" | "/signup" | `/chats/${string}`
+export type AppPath = "/" | "/app" | "/login" | "/signup" | `/chats/${string}`
 export type AppRoute =
   | { kind: "home"; path: "/" }
+  | { kind: "workspace"; path: "/app" }
   | { kind: "login"; path: "/login" }
   | { kind: "signup"; path: "/signup" }
   | { kind: "chat"; chatId: string; path: `/chats/${string}` }
@@ -17,6 +18,7 @@ export function chatPath(chatId: string): `/chats/${string}` {
 
 export function parseAppRoute(pathname: string): AppRoute {
   if (pathname === "/") return { kind: "home", path: "/" }
+  if (pathname === "/app") return { kind: "workspace", path: "/app" }
   if (pathname === "/login") return { kind: "login", path: "/login" }
   if (pathname === "/signup") return { kind: "signup", path: "/signup" }
   const match = /^\/chats\/([^/]+)$/.exec(pathname)
