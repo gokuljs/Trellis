@@ -79,7 +79,7 @@ class ResearchPolicyTests(unittest.TestCase):
 
     def test_v1_checkpoint_schema_stays_unchanged(self) -> None:
         legacy = control_specs("worker", LEGACY_RESEARCH_POLICY)[0].input_schema
-        current = control_specs("worker", RESEARCH_POLICY_V2)[0].input_schema
+        current = control_specs("lead", RESEARCH_POLICY_V2)[0].input_schema
         self.assertNotIn("brief", cast(dict[str, object], legacy["properties"]))
         self.assertIn("brief", cast(dict[str, object], current["properties"]))
         self.assertEqual(

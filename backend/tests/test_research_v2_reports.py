@@ -184,6 +184,29 @@ class V2ReviewBindingTests(unittest.TestCase):
 
 
 class V2ReportFinalizationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_writer_and_reviewer_receive_the_same_evidence_omission_metadata(self):
+        fixture = report_fixtures.ResearchReportTests()
+        state = v2_state()
+        unavailable = {
+            **state.checkpoint["findings"][0],
+            "id": "unavailable-terms",
+            "requirement_ids": ["terms"],
+            "citations": [{"source_id": str(uuid4()), "start_line": 1, "end_line": 1}],
+        }
+        state = replace(
+            state,
+            checkpoint={
+                **state.checkpoint,
+                "findings": [*state.checkpoint["findings"], unavailable],
+            },
+        )
+        draft = json.loads(report_json())
+        draft["covered_question_ids"] = []
+        await fixture.run_report([json.dumps(draft), price_review()], state=state)
+        for purpose in ("draft", "review"):
+            self.assertIn('"omitted_finding_count": 1', fixture.prompts[purpose])
+            self.assertIn('"finding_id": "unavailable-terms"', fixture.prompts[purpose])
+
     async def test_emphasized_claim_reaches_review_and_publishes_without_repair(self):
         fixture = report_fixtures.ResearchReportTests()
         state = v2_state()

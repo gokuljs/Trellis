@@ -122,6 +122,7 @@ logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_TOKENS = 4096
 RESEARCH_REPORT_MAX_OUTPUT_TOKENS = 3 * MAX_OUTPUT_TOKENS
+RESEARCH_WORKER_MAX_COLLECTION_TURNS = 8
 DEFAULT_LEASE_RENEW_INTERVAL_SECONDS = 30.0
 MAX_MODEL_RESPONSE_BYTES = 256_000
 MAX_CONTINUATION_BYTES = 256_000
@@ -2219,6 +2220,7 @@ class RunService:
             "research_checkpoint_required",
             "research_checkpoint_invalid",
             "research_handoff_unavailable",
+            "research_worker_burst_complete",
             "model_call_limit",
             "tool_call_limit",
             "token_limit",
@@ -2297,6 +2299,7 @@ class RunService:
         scope = self._research_execution_scope(run, finalization=finalization)
         notebook_enabled = run.research_policy_version == RESEARCH_POLICY_V2 and not finalization
         stop_after_checkpoint = False
+        checkpoint_stop_reason = "research_finalization_reserve"
         result: ResearchGeneration | None = None
         available = (
             ()
@@ -2313,12 +2316,16 @@ class RunService:
                 if task.role == "lead"
                 else "reviewing",
                 "task_id": task.id,
-                "label": task.objective[:160],
+                "label": (
+                    task.objective.partition("\nQuestions: ")[0]
+                    if run.research_policy_version == RESEARCH_POLICY_V2
+                    else task.objective
+                )[:160],
             },
         )
 
         async def advance() -> bool:
-            nonlocal result, task, stop_after_checkpoint
+            nonlocal result, task, stop_after_checkpoint, checkpoint_stop_reason
             if not finalization and self._remaining_seconds(scope) <= 0:
                 await self._close_research_tools(run, task)
                 raise ProviderError(
@@ -2412,6 +2419,21 @@ class RunService:
                     projection = project_research_task_context(
                         run.id, task.id, task_messages, task_tools, calls
                     )
+                    if task.role == "worker":
+                        worker_turns = sum(
+                            call.status is ModelCallStatus.COMPLETED for call in calls
+                        )
+                        state["worker_turns_remaining"] = max(
+                            0, RESEARCH_WORKER_MAX_COLLECTION_TURNS - worker_turns
+                        )
+                        if worker_turns >= RESEARCH_WORKER_MAX_COLLECTION_TURNS:
+                            if not projection.unprocessed_reads:
+                                raise ProviderError(
+                                    "research_worker_burst_complete",
+                                    "Returning saved findings to the research lead.",
+                                )
+                            stop_after_checkpoint = True
+                            checkpoint_stop_reason = "research_worker_burst_complete"
                     failed_checkpoints = set()
                     assistants = {
                         message.id: message
@@ -2556,6 +2578,9 @@ class RunService:
                             "read_through_ordinal": projection.read_through_ordinal,
                             "checkpoint_only": checkpoint_only,
                             "stop_after_checkpoint": stop_after_checkpoint,
+                            "stop_reason": checkpoint_stop_reason
+                            if stop_after_checkpoint
+                            else None,
                             "handoff_capacity": handoff_capacity,
                         }
                         if projection is not None
@@ -2897,6 +2922,7 @@ class RunService:
             ]
             checkpoint_arguments = stored.arguments
             checkpoint_stop = False
+            checkpoint_stop_reason = "research_finalization_reserve"
             disposition_missing = False
             if notebook_enabled and stored.name == "research_checkpoint":
                 messages = await repository.read_research_task_messages(run.id, task.id)
@@ -2938,9 +2964,20 @@ class RunService:
                     isinstance(metadata, dict) and metadata.get("stop_after_checkpoint") is True
                 )
                 if checkpoint_stop:
+                    saved_reason = metadata.get("stop_reason")
+                    if saved_reason is not None and saved_reason not in {
+                        "research_finalization_reserve",
+                        "research_worker_burst_complete",
+                    }:
+                        raise ProviderError(
+                            "inconsistent_execution_records",
+                            "The saved research handoff reason changed.",
+                        )
+                    if isinstance(saved_reason, str):
+                        checkpoint_stop_reason = saved_reason
                     checkpoint_arguments = {
                         **stored.arguments,
-                        "stop_reason": "research_finalization_reserve",
+                        "stop_reason": checkpoint_stop_reason,
                     }
             if stored.name == "request_research_clarification" and len(pending) != 1:
                 response = {
@@ -2991,9 +3028,7 @@ class RunService:
                 await self._close_research_tools(
                     run,
                     task,
-                    reason="research_finalization_reserve"
-                    if checkpoint_stop
-                    else cast(str, stopped_reason),
+                    reason=checkpoint_stop_reason if checkpoint_stop else cast(str, stopped_reason),
                 )
                 return False
             if response.get("status") == "waiting_for_input":

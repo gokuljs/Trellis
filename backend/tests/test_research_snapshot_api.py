@@ -128,6 +128,20 @@ def fixtures():
 
 
 class ResearchSnapshotApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bounded_worker_handoff_has_a_human_status_and_objective(self):
+        run, state, account = fixtures()
+        worker = replace(
+            state.tasks[0],
+            status=ResearchTaskStatus.FAILED,
+            objective="Read the methods\nQuestions: q1\nPurpose: fill_gap",
+            checkpoint={"stop_reason": "research_worker_burst_complete"},
+        )
+        state = replace(state, tasks=(worker,))
+        account.database.read_research.return_value = state
+        result = await get_research(UUID(run.session_id), UUID(run.id), account)
+        self.assertEqual(result.tasks[0].status, "handed_off")
+        self.assertEqual(result.tasks[0].objective, "Read the methods")
+
     async def test_failed_worker_keeps_checkpoint_evidence_and_gaps_visible(self):
         run, state, account = fixtures()
         finding = state.checkpoint["findings"][0]

@@ -29,6 +29,7 @@ class _FindingSupport:
     finding_id: str
     question_ids: tuple[str, ...]
     references: tuple[CitationReference, ...]
+    requirement_ids: tuple[str, ...] = ()
 
     def record(self) -> dict[str, object]:
         return {
@@ -36,6 +37,7 @@ class _FindingSupport:
             "finding_id": self.finding_id,
             "question_ids": list(self.question_ids),
             "citations": [asdict(reference) for reference in self.references],
+            **({"requirement_ids": list(self.requirement_ids)} if self.requirement_ids else {}),
         }
 
 
@@ -44,6 +46,7 @@ def _findings(snapshot: ResearchSnapshot) -> list[_FindingSupport]:
         (task.id, task.notebook) for task in snapshot.tasks if task.role in {"lead", "worker"}
     ]
     questions = []
+    requirements: dict[str, tuple[str, ...]] = {}
     findings = []
     for task_id, checkpoint in checkpoints:
         values = checkpoint.get("subquestions", [])
@@ -53,6 +56,19 @@ def _findings(snapshot: ResearchSnapshot) -> list[_FindingSupport]:
                 for value in values
                 if isinstance(value, dict) and isinstance(value.get("id"), str)
             )
+            for question in values:
+                if not isinstance(question, dict) or not isinstance(question.get("id"), str):
+                    continue
+                required = question.get("evidence_requirements", [])
+                if isinstance(required, list):
+                    requirements.setdefault(
+                        question["id"],
+                        tuple(
+                            item["id"]
+                            for item in required
+                            if isinstance(item, dict) and isinstance(item.get("id"), str)
+                        ),
+                    )
         records = []
         for kind in ("findings", "conflicts", "gaps"):
             entries = checkpoint.get(kind, [])
@@ -68,6 +84,9 @@ def _findings(snapshot: ResearchSnapshot) -> list[_FindingSupport]:
             question_ids = value.get("question_ids", [])
             if not isinstance(question_ids, list):
                 question_ids = []
+            requirement_ids = value.get("requirement_ids", [])
+            if not isinstance(requirement_ids, list):
+                requirement_ids = []
             references = []
             citations = value.get("citations", [])
             if isinstance(citations, list) and len(citations) <= 10:
@@ -90,16 +109,34 @@ def _findings(snapshot: ResearchSnapshot) -> list[_FindingSupport]:
                     value["id"] if kind == "findings" else kind + ":" + value["id"],
                     tuple(identity for identity in question_ids[:12] if isinstance(identity, str)),
                     tuple(dict.fromkeys(references)),
+                    tuple(
+                        identity for identity in requirement_ids[:24] if isinstance(identity, str)
+                    ),
                 )
             )
     ordered = []
     remaining = list(findings)
     question_ids = tuple(dict.fromkeys(questions))
+    facets: list[tuple[str, str | None]] = []
+    width = max((len(requirements.get(identity, ())) for identity in question_ids), default=1)
+    for index in range(max(1, width)):
+        for question_id in question_ids:
+            required = requirements.get(question_id, ())
+            if index < len(required):
+                facets.append((question_id, required[index]))
+            elif index == 0 and not required:
+                facets.append((question_id, None))
     while remaining:
         selected = []
-        for question_id in question_ids:
+        for question_id, requirement_id in facets:
             match = next(
-                (finding for finding in remaining if question_id in finding.question_ids), None
+                (
+                    finding
+                    for finding in remaining
+                    if question_id in finding.question_ids
+                    and (requirement_id is None or requirement_id in finding.requirement_ids)
+                ),
+                None,
             )
             if match is not None:
                 selected.append(match)

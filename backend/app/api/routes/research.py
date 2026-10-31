@@ -277,8 +277,13 @@ async def get_research(session_id: UUID, run_id: UUID, account: AccountDep) -> R
         tasks=[
             ResearchTaskResponse(
                 id=task.id,
-                objective=task.objective,
-                status=closed_status
+                objective=task.objective.partition("\nQuestions: ")[0]
+                if state.policy_version == RESEARCH_POLICY_V2
+                else task.objective,
+                status="handed_off"
+                if state.policy_version == RESEARCH_POLICY_V2
+                and task.checkpoint.get("stop_reason") == "research_worker_burst_complete"
+                else closed_status
                 if is_terminal_run_status(run.status) and task.status.value in {"queued", "running"}
                 else task.status.value,
             )

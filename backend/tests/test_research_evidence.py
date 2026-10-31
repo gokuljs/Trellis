@@ -280,6 +280,42 @@ class ResearchEvidenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(item["excerpts"], [{"start_line": 1, "lines": list(lines)}])
         self.assertLessEqual(len(json.dumps(packet, ensure_ascii=False).encode()), 48 * 1024)
 
+    async def test_limited_packet_balances_subject_requirements_within_one_question(self) -> None:
+        lines = tuple("漢" * 1024 for _ in range(6))
+        pages = tuple((source(lines), lines) for _ in range(3))
+        checkpoint = {
+            "subquestions": [
+                {
+                    "id": "architecture",
+                    "question": "Compare both systems",
+                    "evidence_requirements": [
+                        {"id": "system-a", "description": "A architecture"},
+                        {"id": "system-b", "description": "B architecture"},
+                    ],
+                }
+            ],
+            "findings": [
+                {
+                    "id": identity,
+                    "text": "A supported architecture detail.",
+                    "question_ids": ["architecture"],
+                    "requirement_ids": [requirement],
+                    "citations": [{"source_id": metadata.id, "start_line": 1, "end_line": 6}],
+                }
+                for identity, requirement, (metadata, _) in zip(
+                    ("a-first", "a-extra", "b-first"),
+                    ("system-a", "system-a", "system-b"),
+                    pages,
+                    strict=True,
+                )
+            ],
+        }
+        packet = await self.collect(Evidence(pages), checkpoint)
+        self.assertEqual(
+            {item["finding_id"] for item in packet["admitted_findings"]}, {"a-first", "b-first"}
+        )
+        self.assertEqual(packet["omitted_findings"][0]["finding_id"], "a-extra")
+
     async def test_worker_checkpoint_findings_survive_a_summary_only_result(self) -> None:
         from app.application.research_evidence import collect_report_evidence
 

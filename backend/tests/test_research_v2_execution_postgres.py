@@ -146,7 +146,32 @@ class DurableResearcher:
         else:
             state = json.loads(prompt)
             notes = state["checkpoint"]
-            if any(tool.name == "delegate_research" for tool in request.tools):
+            if state.get("checkpoint_required"):
+                calls = [
+                    ModelToolCall(
+                        str(uuid4()),
+                        "research_checkpoint",
+                        {
+                            "findings": [
+                                {
+                                    "id": read["source_id"],
+                                    "text": FACT,
+                                    "question_ids": ["comparison"],
+                                    "requirement_ids": ["behavior"],
+                                    "citations": [
+                                        {
+                                            "source_id": read["source_id"],
+                                            "start_line": 1,
+                                            "end_line": 1,
+                                        }
+                                    ],
+                                }
+                                for read in state["unprocessed_reads"]
+                            ]
+                        },
+                    )
+                ]
+            elif any(tool.name == "delegate_research" for tool in request.tools):
                 if not notes.get("subquestions") and not state.get("research_brief", {}).get(
                     "subquestions"
                 ):
@@ -184,31 +209,22 @@ class DurableResearcher:
                             },
                         )
                     ]
-            elif state.get("checkpoint_required"):
-                calls = [
-                    ModelToolCall(
-                        str(uuid4()),
-                        "research_checkpoint",
-                        {
-                            "findings": [
-                                {
-                                    "id": read["source_id"],
-                                    "text": FACT,
-                                    "question_ids": ["comparison"],
-                                    "requirement_ids": ["behavior"],
-                                    "citations": [
-                                        {
-                                            "source_id": read["source_id"],
-                                            "start_line": 1,
-                                            "end_line": 1,
-                                        }
-                                    ],
-                                }
-                                for read in state["unprocessed_reads"]
-                            ]
-                        },
+                else:
+                    notebooks = [notes, *state["worker_findings"]]
+                    covered = {
+                        finding["id"]
+                        for notebook in notebooks
+                        for finding in notebook.get("findings", [])
+                    }
+                    sources = dict.fromkeys(
+                        source
+                        for notebook in notebooks
+                        for source in notebook.get("examined_source_ids", [])
                     )
-                ]
+                    calls = [
+                        ModelToolCall(str(uuid4()), "web_source_read", {"source_id": source})
+                        for source in list(sources.keys() - covered)[:2]
+                    ]
             elif not notes.get("examined_source_ids"):
                 discovered = [
                     page["source_id"]
@@ -431,7 +447,18 @@ class ResearchV2ExecutionPostgresTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(pages.urls, [])
                 self.assertEqual(len(state.source_reads), 10)
                 worker = next(task for task in state.tasks if task.role == "worker")
-                self.assertEqual(len(cast(list, worker.checkpoint["findings"])), 10)
+                self.assertEqual(worker.checkpoint["stop_reason"], "research_worker_burst_complete")
+                self.assertEqual(len(cast(list, worker.checkpoint["findings"])), 6)
+                lead = next(task for task in state.tasks if task.role == "lead")
+                self.assertEqual(len(cast(list, lead.checkpoint["findings"])), 4)
+                self.assertEqual(
+                    sum(
+                        len(cast(list, task.checkpoint.get("findings", [])))
+                        for task in state.tasks
+                        if task.role in {"lead", "worker"}
+                    ),
+                    10,
+                )
                 messages = await repository.read_research_task_messages(saved.id, worker.id)
                 task_calls = await repository.read_research_task_calls(saved.id, worker.id)
                 projection = project_research_task_context(

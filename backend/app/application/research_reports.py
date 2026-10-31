@@ -736,6 +736,15 @@ class ResearchReportService:
                                 {
                                     "observed_source_reads": _review_observations(snapshot, report),
                                     "research_notes": writer_notes,
+                                    "evidence_omissions": {
+                                        key: saved_evidence.get(key)
+                                        for key in (
+                                            "omitted_findings",
+                                            "omitted_finding_count",
+                                            "omitted_findings_truncated",
+                                            "omissions",
+                                        )
+                                    },
                                 }
                                 if snapshot.policy_version == RESEARCH_POLICY_V2
                                 else {}
@@ -755,6 +764,9 @@ class ResearchReportService:
                         "covered question. "
                         "Accept reported experimental results only with appropriate attribution "
                         "and caveats about incompatible evaluation conditions. "
+                        "Evidence-packet omissions and omitted notebook records are separate "
+                        "runtime counts. Use the supplied evidence_omissions metadata to check "
+                        "omission disclosures; these process facts need no external citation. "
                         if snapshot.policy_version == RESEARCH_POLICY_V2
                         else ""
                     )

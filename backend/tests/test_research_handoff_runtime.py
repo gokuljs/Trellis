@@ -50,6 +50,7 @@ class HandoffMemory(MemoryResearch):
         self.handoff_calls = []
         self.fail_body_receipt = False
         self.deny_holds = False
+        self.previous_tasks = ()
 
     async def read_research(self, run_id):
         return ResearchSnapshot(
@@ -60,7 +61,7 @@ class HandoffMemory(MemoryResearch):
             "Compare documented product behavior",
             0,
             {"subquestions": [QUESTION]},
-            (self.task,),
+            (*self.previous_tasks, self.task),
             None,
             600,
             policy_version=RESEARCH_POLICY_V2,
@@ -297,11 +298,28 @@ class HandoffRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await service._run_research_task(run, execution, coordinator, records.task)
         self.assertEqual(len(pages.fetches), 10)
         self.assertEqual(len(set(pages.fetches)), 10)
+        worker = records.task
+        self.assertEqual(worker.checkpoint["stop_reason"], "research_worker_burst_complete")
+        self.assertEqual(len(worker.checkpoint["findings"]), 6)
+        records.previous_tasks = (worker,)
+        records.task = replace(
+            worker,
+            id=str(uuid4()),
+            role="lead",
+            round_index=0,
+            status=ResearchTaskStatus.QUEUED,
+            revision=0,
+            checkpoint={
+                key: value for key, value in worker.checkpoint.items() if key != "stop_reason"
+            },
+        )
+        await service._run_research_task(run, execution, coordinator, records.task)
+        self.assertEqual(len(pages.fetches), 10)
         self.assertEqual(len(pages.body_reads), 10)
         self.assertEqual(len(records.task.checkpoint["findings"]), 10)
         self.assertEqual(records.task.status, ResearchTaskStatus.COMPLETED)
         self.assertEqual(records.holds, {})
-        self.assertEqual(len(records.handoff_calls), 5)
+        self.assertEqual(len(records.handoff_calls), 3)
         for request in provider.requests:
             state = json.loads(request.messages[0].content)
             if state.get("checkpoint_required"):
@@ -310,7 +328,7 @@ class HandoffRuntimeTests(unittest.IsolatedAsyncioTestCase):
         last = provider.requests[-1]
         self.assertLess(len(last.messages), len(records.messages))
         self.assertEqual(
-            validate_task_recovery(run, (records.task,), records.calls, records.tools), ()
+            validate_task_recovery(run, (worker, records.task), records.calls, records.tools), ()
         )
 
     async def test_a_batched_third_read_is_recorded_without_dispatch(self):
@@ -325,8 +343,9 @@ class HandoffRuntimeTests(unittest.IsolatedAsyncioTestCase):
             and json.loads(message.content).get("status") == "checkpoint_required"
         ]
         self.assertTrue(blocked)
-        self.assertEqual(len(pages.body_reads), 10)
-        self.assertEqual(len(set(pages.body_reads)), 10)
+        self.assertEqual(len(pages.body_reads), 6)
+        self.assertEqual(len(set(pages.body_reads)), 6)
+        self.assertEqual(records.task.checkpoint["stop_reason"], "research_worker_burst_complete")
         projection = project_research_task_context(
             run.id, records.task.id, records.messages, records.tools, records.calls
         )

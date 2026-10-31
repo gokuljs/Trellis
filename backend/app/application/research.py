@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from app.application.errors import ApplicationError, ProviderError
 from app.application.research_notebook import (
     ResearchCheckpointV2,
+    WorkerCheckpointV2,
     collection_basis,
     collection_guidance,
     merge_notebook,
@@ -159,9 +160,20 @@ def control_specs(
 ) -> tuple[ModelToolSpec, ...]:
     overrides: dict[str, type[BaseModel]] = {}
     if policy_version == RESEARCH_POLICY_V2:
-        overrides = {"research_checkpoint": ResearchCheckpointV2, "delegate_research": _DelegateV2}
+        overrides = {
+            "research_checkpoint": ResearchCheckpointV2 if role == "lead" else WorkerCheckpointV2,
+            "delegate_research": _DelegateV2,
+        }
     return tuple(
-        ModelToolSpec(name, description, overrides.get(name, model).model_json_schema())
+        ModelToolSpec(
+            name,
+            "Save sourced findings, examined sources, gaps and conflicts for the assigned "
+            "evidence requirements. Updates merge by finding/issue ID. Save discoveries "
+            "before further searching."
+            if policy_version == RESEARCH_POLICY_V2 and role != "lead"
+            else description,
+            overrides.get(name, model).model_json_schema(),
+        )
         for name, description, model in _CONTROLS
         if role == "lead" or name == "research_checkpoint"
     )
@@ -186,13 +198,17 @@ def research_instructions(task: ResearchTask, policy_version: str = LEGACY_RESEA
     if policy_version == RESEARCH_POLICY_V2:
         shared = shared.replace(RESEARCH_INSTRUCTIONS_VERSION, policy_version) + (
             " Follow the frozen conversation context to understand follow-up requests; never "
-            "include private context in public queries. Save a brief describing scope, "
+            "include private context in public queries. The lead owns the brief describing scope, "
             "comparison dimensions, source restrictions, and expected output. Each important "
             "question needs explicit evidence_requirements with unique IDs. For comparisons "
             "of papers, investigate methods, evaluation conditions, results, and limitations "
             "in full text when the scope permits. For jobs, verify current employer listings "
             "and application links. Respect abstract-only and other explicit source restrictions. "
             "Link every finding to question_ids, requirement_ids and exact cited source lines. "
+            "Cite minimal complete evidence passages that support each finding, rather than "
+            "the whole read window for a single fact. Keep necessary conditions and caveats. "
+            "Split compound findings into independently supported facts; record comparisons "
+            "separately from individual-source facts. "
             "Distinguish author_reported results, corroborated facts, and inference. "
             "Record evidence_depth honestly; source access alone does not prove sufficient depth. "
             "Track gaps and conflicts by stable ID; resolve existing IDs when evidence answers "
@@ -208,6 +224,11 @@ def research_instructions(task: ResearchTask, policy_version: str = LEGACY_RESEA
             "target missing requirements and open conflicts; preserve source restrictions. "
             "Delegated assignments require explicit question/requirement or conflict IDs, "
             "a purpose, and expected_value. Corroboration needs a concrete remaining uncertainty. "
+            "Prioritize unassigned requested entities and evidence requirements before deepening "
+            "covered ones. Cover every initial unresolved requirement in the first worker batch "
+            "when at most 24 fit across two assignments of at most 12 requirements each. Group "
+            "related entities or dimensions when there are more than two. Use later rounds for "
+            "methods, results, limitations, and specific remaining gaps or conflicts. "
             "When further collection has low expected value, save collection_decision with "
             "the reason and explanation. This stops collection, not the final evidence review."
         )
@@ -221,7 +242,15 @@ def research_instructions(task: ResearchTask, policy_version: str = LEGACY_RESEA
             "Finish when enough evidence is available; a separate bounded report pass will "
             "write and check the report from saved findings."
         )
-    return shared + " You are a focused worker. Do not delegate or broaden the assignment."
+    return shared + (
+        " You are a focused worker. Do not delegate or broaden the assignment."
+        + (
+            " Establish evidence for every assigned entity or requirement before repeatedly "
+            "deepening one. Save specific remaining gaps when handing work back to the lead."
+            if policy_version == RESEARCH_POLICY_V2
+            else ""
+        )
+    )
 
 
 def merge_checkpoint(
@@ -290,6 +319,7 @@ def _focused_objectives(
         for item in cast(list[dict[str, object]], question.get("evidence_requirements", []))
     }
     unresolved = {str(item["id"]) for item in guidance["unresolved_requirements"]}
+    unassigned = set(guidance["unassigned_requirement_ids"])
     conflicts = {str(item["id"]): item for item in guidance["open_conflicts"]}
     covered = {
         str(item["id"])
@@ -300,6 +330,68 @@ def _focused_objectives(
     brief = snapshot.checkpoint.get("brief", {})
     brief = brief if isinstance(brief, dict) else {}
     restrictions = cast(list[str], brief.get("source_restrictions", []))
+    batch_requirements = {
+        identity for assignment in request.assignments for identity in assignment.requirement_ids
+    }
+    initial_wave = not any(item.role == "worker" for item in snapshot.tasks)
+    common_size = sum(
+        len(item) + 1
+        for item in (
+            max((item.objective for item in request.assignments), key=len),
+            f"Questions: {', '.join(questions)}",
+            "Purpose: fill_gap",
+            "Expected value: "
+            + max((item.expected_value for item in request.assignments), key=len),
+            "Evidence required:",
+            "Conflicts to investigate:",
+            "Source restrictions (do not broaden):",
+            *(f"- {item}" for item in restrictions),
+            "Saved source IDs (reuse existing evidence before fetching again): "
+            + ", ".join(guidance["examined_source_ids"]),
+            "Use the authoritative brief and exact saved lines. Return sourced findings or "
+            "specific negative gaps for the stated evidence IDs.",
+        )
+    )
+    bins = [(common_size, 0), (common_size, 0)]
+    initial_fits = len(unresolved) <= 24
+    sizes = sorted(
+        (
+            len(
+                f"- {identity} (Question: {requirements[identity]['question_id']}; "
+                f"Depth: {requirements[identity]['depth']}): "
+                f"{requirements[identity]['description']}"
+            )
+            + 1
+            for identity in unresolved
+        ),
+        reverse=True,
+    )
+    for size in sizes:
+        candidates = [
+            index for index, (used, count) in enumerate(bins) if count < 12 and used + size <= 16000
+        ]
+        if not candidates:
+            initial_fits = False
+            break
+        target = min(candidates, key=lambda index: bins[index][0])
+        used, count = bins[target]
+        bins[target] = used + size, count + 1
+    if initial_wave and initial_fits and not unresolved <= batch_requirements:
+        missing = ", ".join(
+            str(item["id"])
+            for item in guidance["unresolved_requirements"]
+            if item["id"] not in batch_requirements
+        )
+        raise ValueError(
+            "the first worker batch must cover all requested evidence requirements; missing: "
+            + missing
+        )
+    if (
+        unassigned
+        and not unassigned.intersection(batch_requirements)
+        and not any(assignment.purpose == "check_conflict" for assignment in request.assignments)
+    ):
+        raise ValueError("target unassigned evidence requirements before deepening assigned work")
     claimed: set[str] = set()
     objectives = []
     for assignment in request.assignments:
@@ -408,15 +500,13 @@ class ResearchCoordinator:
                 policy_version = getattr(
                     self.run, "research_policy_version", LEGACY_RESEARCH_POLICY
                 )
-                if (
-                    policy_version == RESEARCH_POLICY_V2
-                    and task.role != "lead"
-                    and any(
-                        arguments.get(key)
-                        for key in ("brief", "scope", "subquestions", "collection_decision")
-                    )
-                ):
-                    raise ValueError("only the lead may change research scope or questions")
+                if policy_version == RESEARCH_POLICY_V2 and task.role != "lead":
+                    lead_fields = {"brief", "scope", "subquestions", "collection_decision"}
+                    if any(arguments.get(key) for key in lead_fields):
+                        raise ValueError("only the lead may change research scope or questions")
+                    arguments = WorkerCheckpointV2.model_validate(
+                        {key: value for key, value in arguments.items() if key not in lead_fields}
+                    ).model_dump()
                 checkpoint = merge_checkpoint(
                     {**current.checkpoint, **snapshot.checkpoint}
                     if policy_version == RESEARCH_POLICY_V2 and task.role == "lead"

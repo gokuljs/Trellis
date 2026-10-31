@@ -3,7 +3,12 @@ from dataclasses import replace
 from typing import cast
 from uuid import uuid4
 
-from app.application.research import ResearchCoordinator, collection_guidance, control_specs
+from app.application.research import (
+    ResearchCoordinator,
+    collection_guidance,
+    control_specs,
+    research_instructions,
+)
 from app.application.research_notebook import collection_basis, merge_notebook
 from app.application.research_ports import ResearchRepository
 from app.application.research_task_context import ResearchReadObservation, ResearchReadRange
@@ -341,6 +346,17 @@ class MemoryFollowups:
     async def read_research(self, run_id):
         return self.state
 
+    async def checkpoint_research(
+        self, run_id, generation, task_id, revision, operation_id, checkpoint
+    ):
+        task = next(item for item in self.state.tasks if item.id == task_id)
+        saved = replace(task, revision=revision + 1, checkpoint=checkpoint)
+        self.state = replace(
+            self.state,
+            tasks=tuple(saved if item.id == task_id else item for item in self.state.tasks),
+        )
+        return saved
+
     async def create_research_tasks(self, run_id, generation, operation_id, tasks):
         self.created.extend(tasks)
         created = tuple(
@@ -462,6 +478,144 @@ class FocusedDelegationTests(unittest.IsolatedAsyncioTestCase):
     async def test_duplicate_batch_work_is_rejected(self) -> None:
         result = await self.delegate([assignment(), assignment()])
         self.assertEqual(result["status"], "invalid_request")
+
+    async def test_initial_wave_covers_all_frameworks_with_shared_question_ids(self) -> None:
+        requested = question()
+        requested["evidence_requirements"] = [
+            {"id": name, "description": f"Read {name} methods", "depth": "full_text"}
+            for name in ("autogen", "metagpt", "chatdev")
+        ]
+        self.repository.state = replace(
+            self.repository.state, checkpoint={"subquestions": [requested]}
+        )
+        result = await self.delegate(
+            [assignment(requirement_ids=["autogen"]), assignment(requirement_ids=["metagpt"])]
+        )
+        self.assertEqual(result["status"], "invalid_request")
+        self.assertIn("chatdev", result["reason"])
+        self.assertEqual(self.repository.created, [])
+        result = await self.delegate(
+            [
+                assignment(requirement_ids=["autogen"]),
+                assignment(requirement_ids=["metagpt", "chatdev"]),
+            ]
+        )
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(len(self.repository.created), 2)
+        self.assertIn("chatdev", self.repository.created[1].objective)
+
+    async def test_later_wave_prioritizes_never_assigned_requirements(self) -> None:
+        await self.delegate([assignment()])
+        requested = question()
+        requested["evidence_requirements"].append(
+            {"id": "chatdev", "description": "Read ChatDev methods", "depth": "full_text"}
+        )
+        self.repository.state = replace(
+            self.repository.state, checkpoint={"subquestions": [requested]}
+        )
+        guidance = collection_guidance(self.repository.state, self.execution)
+        self.assertEqual(guidance["unassigned_requirement_ids"], ["chatdev"])
+        self.assertEqual(guidance["unresolved_requirements"][0]["id"], "chatdev")
+        result = await self.delegate([assignment()], round_index=2)
+        self.assertEqual(result["status"], "invalid_request")
+        result = await self.delegate([assignment(requirement_ids=["chatdev"])], round_index=2)
+        self.assertEqual(result["status"], "complete")
+
+    async def test_more_than_twenty_four_initial_requirements_remain_bounded(self) -> None:
+        questions = [
+            {
+                "id": f"q{group}",
+                "question": f"Compare dimension {group}",
+                "evidence_requirements": [
+                    {
+                        "id": f"q{group}-r{index}",
+                        "description": "Read the original source",
+                        "depth": "full_text",
+                    }
+                    for index in range(9)
+                ],
+            }
+            for group in range(3)
+        ]
+        self.repository.state = replace(
+            self.repository.state, checkpoint={"subquestions": questions}
+        )
+        result = await self.delegate([assignment(question_ids=["q0"], requirement_ids=["q0-r0"])])
+        self.assertEqual(result["status"], "complete")
+        guidance = result["collection_guidance"]
+        self.assertEqual(len(guidance["unassigned_requirement_ids"]), 26)
+        self.assertEqual(guidance["unassigned_question_ids"], ["q1", "q2"])
+
+    async def test_large_complete_requirement_text_can_use_later_waves(self) -> None:
+        questions = [
+            {
+                "id": f"q{group}",
+                "question": f"Compare dimension {group}",
+                "evidence_requirements": [
+                    {
+                        "id": f"q{group}-r{index}",
+                        "description": "Evidence details " + "x" * 1980,
+                        "depth": "full_text",
+                    }
+                    for index in range(9)
+                ],
+            }
+            for group in range(2)
+        ]
+        self.repository.state = replace(
+            self.repository.state, checkpoint={"subquestions": questions}
+        )
+        result = await self.delegate([assignment(question_ids=["q0"], requirement_ids=["q0-r0"])])
+        self.assertEqual(result["status"], "complete")
+        self.assertLessEqual(len(self.repository.created[0].objective), 16000)
+        self.assertEqual(len(result["collection_guidance"]["unassigned_requirement_ids"]), 17)
+
+    async def test_worker_schema_only_advertises_valid_notebook_fields(self) -> None:
+        worker = next(
+            item
+            for item in control_specs("worker", RESEARCH_POLICY_V2)
+            if item.name == "research_checkpoint"
+        )
+        lead = next(
+            item
+            for item in control_specs("lead", RESEARCH_POLICY_V2)
+            if item.name == "research_checkpoint"
+        )
+        self.assertEqual(
+            set(cast(dict[str, object], worker.input_schema["properties"])),
+            {"phase", "findings", "examined_source_ids", "gaps", "conflicts", "stop_reason"},
+        )
+        definitions = cast(dict[str, object], worker.input_schema.get("$defs", {}))
+        self.assertNotIn("ResearchBrief", definitions)
+        self.assertNotIn("ResearchQuestion", definitions)
+        self.assertNotIn("scope", worker.description)
+        self.assertIn("brief", cast(dict[str, object], lead.input_schema["properties"]))
+        legacy = next(
+            item for item in control_specs("worker") if item.name == "research_checkpoint"
+        )
+        self.assertIn("scope", cast(dict[str, object], legacy.input_schema["properties"]))
+
+    async def test_worker_preserves_pending_v2_empty_scope_defaults(self) -> None:
+        worker = replace(self.lead, role="worker")
+        self.repository.state = replace(self.repository.state, tasks=(worker,))
+
+        result = await self.coordinator.control(
+            worker,
+            "research_checkpoint",
+            {"scope": "", "brief": None, "subquestions": [], "collection_decision": None},
+            str(uuid4()),
+        )
+        self.assertEqual(result["status"], "saved")
+        result = await self.coordinator.control(
+            worker, "research_checkpoint", {"scope": "Broaden the scope"}, str(uuid4())
+        )
+        self.assertEqual(result["status"], "invalid_request")
+
+    async def test_v2_instructions_request_complete_minimal_citations(self) -> None:
+        instructions = research_instructions(self.lead, RESEARCH_POLICY_V2)
+        self.assertIn("minimal complete", instructions)
+        self.assertIn("Split compound findings", instructions)
+        self.assertIn("unassigned", instructions)
 
     async def test_replay_retains_original_assignment_when_source_inventory_changes(self) -> None:
         operation_id = str(uuid4())

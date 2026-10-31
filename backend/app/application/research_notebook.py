@@ -20,6 +20,8 @@ BriefEntry = Annotated[str, Field(min_length=1, max_length=2000)]
 class ResearchCollectionGuidance(TypedDict):
     coverage: list[dict[str, object]]
     unresolved_requirements: list[dict[str, object]]
+    unassigned_requirement_ids: list[str]
+    unassigned_question_ids: list[str]
     unavailable_requirements: list[dict[str, object]]
     open_gaps: list[dict[str, object]]
     open_conflicts: list[dict[str, object]]
@@ -87,16 +89,19 @@ class ResearchCollectionDecision(NotebookArguments):
     explanation: str = Field(min_length=1, max_length=2000)
 
 
-class ResearchCheckpointV2(NotebookArguments):
+class WorkerCheckpointV2(NotebookArguments):
     phase: Literal["scoping", "researching", "checking_conflict"] = "researching"
-    scope: str = Field(default="", max_length=8000)
-    brief: ResearchBrief | None = None
-    subquestions: list[ResearchQuestion] = Field(default_factory=list, max_length=12)
     findings: list[SourcedFinding] = Field(default_factory=list, max_length=50)
     examined_source_ids: list[str] = Field(default_factory=list, max_length=40)
     gaps: list[ResearchIssue] = Field(default_factory=list, max_length=50)
     conflicts: list[ResearchIssue] = Field(default_factory=list, max_length=50)
     stop_reason: str | None = Field(default=None, max_length=100)
+
+
+class ResearchCheckpointV2(WorkerCheckpointV2):
+    scope: str = Field(default="", max_length=8000)
+    brief: ResearchBrief | None = None
+    subquestions: list[ResearchQuestion] = Field(default_factory=list, max_length=12)
     collection_decision: ResearchCollectionDecision | None = None
 
 
@@ -288,6 +293,25 @@ def collection_guidance(
         for question in questions
         for requirement in _records(question.get("evidence_requirements"))
     }
+    assigned_requirements = {
+        str(identity)
+        for note in worker_notes
+        for key in ("findings", "gaps", "conflicts")
+        for item in _records(note.get(key))
+        for identity in cast(list[str], item.get("requirement_ids", []))
+    }
+    for task in worker_tasks:
+        _, marker, evidence = task.objective.rpartition("\nEvidence required:\n")
+        if not marker:
+            continue
+        evidence = "\n" + evidence.partition("\nConflicts to investigate:")[0] + "\n"
+        for identity, requirement in requirements.items():
+            entry = (
+                f"\n- {identity} (Question: {requirement['question_id']}; "
+                f"Depth: {requirement['depth']}): {requirement['description']}\n"
+            )
+            if entry in evidence:
+                assigned_requirements.add(identity)
     unresolved, unavailable = [], []
     for covered_question in coverage:
         for facet in _records(covered_question.get("requirements")):
@@ -324,6 +348,29 @@ def collection_guidance(
             if facets and all(item["status"] == "evidence_recorded" for item in facets)
             else "missing"
         )
+    assigned_questions = {
+        str(requirement["question_id"])
+        for identity, requirement in requirements.items()
+        if identity in assigned_requirements
+    }
+    unresolved.sort(
+        key=lambda requirement: (
+            str(requirement["question_id"]) in assigned_questions,
+            str(requirement["id"]) in assigned_requirements,
+        )
+    )
+    unassigned_requirements = [
+        str(requirement["id"])
+        for requirement in unresolved
+        if str(requirement["id"]) not in assigned_requirements
+    ]
+    unassigned_questions = list(
+        dict.fromkeys(
+            str(requirement["question_id"])
+            for requirement in unresolved
+            if str(requirement["question_id"]) not in assigned_questions
+        )
+    )
     limits = research_limits(run.budget_preset, run.research_policy_version)
     remaining_rounds = max(
         0, limits.collection_rounds - max((item.round_index for item in worker_tasks), default=0)
@@ -387,6 +434,8 @@ def collection_guidance(
     return {
         "coverage": coverage,
         "unresolved_requirements": unresolved,
+        "unassigned_requirement_ids": unassigned_requirements,
+        "unassigned_question_ids": unassigned_questions,
         "unavailable_requirements": unavailable,
         "open_gaps": open_gaps,
         "open_conflicts": open_conflicts,
