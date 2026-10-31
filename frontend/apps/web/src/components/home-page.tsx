@@ -10,6 +10,7 @@ import {
 
 import { TrellisMark } from "@trellis/ui/icons/trellis-mark"
 import { navigate, type AppPath } from "@/lib/app-routes"
+import { DitherLandscape } from "./dither-landscape"
 import "./home-page.css"
 
 const sourceUrl = "https://github.com/gokuljs/Trellis"
@@ -84,7 +85,6 @@ export function HomePage() {
 
   return (
     <div className="home-page">
-      <div className="home-art" aria-hidden="true" />
       <header className="home-header">
         <HomeLink href="/" className="home-brand">
           <TrellisMark size={28} />
@@ -157,6 +157,7 @@ export function HomePage() {
           Built in the open <ArrowUpRight size={13} aria-hidden="true" />
         </a>
       </footer>
+      <DitherLandscape />
     </div>
   )
 }
