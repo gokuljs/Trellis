@@ -2186,40 +2186,43 @@ export function AppShell({
 
         {activeView !== "Settings" ? (
           <>
-            {awaitingClarification ? (
-              <section
-                className="research-clarification"
-                aria-label="Research clarification"
-              >
-                <h2>Clarification needed</h2>
-                {pendingClarification ? (
-                  <p>{pendingClarification.question}</p>
-                ) : (
-                  <p role="status">
-                    {researchQuery.error
-                      ? "The saved question could not be loaded."
-                      : "Loading the research question…"}
-                    {researchQuery.error ? (
-                      <button
-                        type="button"
-                        onClick={() => void researchQuery.refetch()}
-                      >
-                        Retry
-                      </button>
-                    ) : null}
-                  </p>
-                )}
-                <p className="research-clarification-note">
-                  Reply below to continue this research. The execution timer is
-                  paused.
-                </p>
-              </section>
-            ) : null}
             <Composer
+              clarification={
+                awaitingClarification ? (
+                  <section
+                    className="research-clarification"
+                    aria-label="Research clarification"
+                  >
+                    <h2>One quick question</h2>
+                    {pendingClarification ? (
+                      <p>{pendingClarification.question}</p>
+                    ) : (
+                      <p role="status">
+                        {researchQuery.error
+                          ? "The saved question could not be loaded."
+                          : "Loading the research question…"}
+                        {researchQuery.error ? (
+                          <button
+                            type="button"
+                            onClick={() => void researchQuery.refetch()}
+                          >
+                            Retry
+                          </button>
+                        ) : null}
+                      </p>
+                    )}
+                    <p className="research-clarification-note" role="status">
+                      {clarificationSubmitting
+                        ? "Saving your reply…"
+                        : "Research paused. Reply to continue."}
+                    </p>
+                  </section>
+                ) : null
+              }
               value={composerValue}
               placeholder={
                 awaitingClarification
-                  ? "Clarify the research question"
+                  ? "Your reply"
                   : activeView === "New session"
                     ? "What are we building?"
                     : "Adjust or continue"
@@ -2238,9 +2241,7 @@ export function AppShell({
                 sessionLoading
                   ? "Checking current run…"
                   : awaitingClarification
-                    ? clarificationSubmitting
-                      ? "Saving clarification…"
-                      : "Waiting for your reply. Research time and remaining budget are preserved."
+                    ? undefined
                     : pending
                       ? cancellingRun
                         ? "Stopping…"
@@ -2252,6 +2253,11 @@ export function AppShell({
                       : undefined
               }
               budgetPreset={lockedBudgetPreset}
+              researchExecutionBudgetSeconds={
+                pending && researchQuery.data?.run_id === activeRunId
+                  ? researchQuery.data.execution_budget_seconds
+                  : undefined
+              }
               runMode={pending ? (activeMode ?? runMode) : runMode}
               onRunModeChange={setRunMode}
               researchAvailable={

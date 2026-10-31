@@ -35,6 +35,7 @@ from app.application.ports import (
 from app.application.profile import ProfileService
 from app.application.recovery_contracts import RecoveryContracts
 from app.application.recovery_discovery import RecoveryDiscovery
+from app.application.research import research_web_names
 from app.application.research_ports import ResearchRepository
 from app.application.research_reports import ResearchReportService
 from app.application.run_capacity import RunCapacity
@@ -50,6 +51,7 @@ from app.application.web_tools import WebToolService
 from app.core.config import Settings
 from app.domain.capabilities import RuntimeCapabilities, RuntimeCapability
 from app.domain.models import ProviderName
+from app.domain.research import CURRENT_RESEARCH_POLICY
 from app.domain.runtime import RunEventType
 from app.infrastructure.brave_search import BraveSearchProvider
 from app.infrastructure.command_tools import LocalCommandToolExecutor
@@ -339,6 +341,7 @@ class AccountRegistry:
             read_ready=retriever is not None and self._capabilities.allows("web_read"),
             render_ready=renderer is not None,
             crawl_ready=crawler is not None,
+            research_ready=await database.research_ready(),
             source_capability=source_capability,
         )
 
@@ -518,7 +521,10 @@ class AccountRegistry:
                                 secret_store,
                                 capabilities=self._capabilities,
                                 research_available=await database.research_ready()
-                                and {"web_search", "web_read"}.issubset(
+                                and (
+                                    research_web_names(CURRENT_RESEARCH_POLICY)
+                                    - {"web_crawl", "web_source"}
+                                ).issubset(
                                     {
                                         tool.name
                                         for tool in tools.specs(

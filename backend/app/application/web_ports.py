@@ -46,6 +46,10 @@ class WebRepository(Protocol):
         self, session_id: str, offset: int = 0, limit: int = 20
     ) -> SourcePage: ...
 
+    async def list_run_web_sources(
+        self, session_id: str, run_id: str, limit: int = 40
+    ) -> tuple[WebSource, ...]: ...
+
     async def read_web_source(
         self, session_id: str, source_id: str, start_line: int = 1, max_lines: int = 100
     ) -> SourceLines | None: ...

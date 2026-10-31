@@ -259,4 +259,26 @@ export type ResearchSnapshot = {
   stop_reason: string | null
   citations: SourceCitation[]
   report_model_call_id?: string | null
+  policy_version?: string | null
+  execution_budget_seconds?: number | null
+  brief?: {
+    scope: string
+    comparison_dimensions: string[]
+    source_restrictions: string[]
+    expected_output: string
+  } | null
+  coverage?: {
+    id: string
+    status: string
+    requirements: {
+      id: string
+      status: string
+      finding_ids: string[]
+      description?: string
+      depth?: string
+    }[]
+  }[]
+  evidence_depth?: string[]
+  sources_read?: number | null
+  source_windows_read?: number | null
 }

@@ -24,11 +24,13 @@ from app.application.ports import (
     WorkspaceBindingPort,
     WorkspaceExecutionPort,
 )
+from app.application.research import RESEARCH_WEB_NAMES, research_web_names
 from app.application.secret_redaction import COMMON_SECRET_REDACTOR, SecretRedactor
 from app.application.settings import is_selectable
 from app.application.tools import ToolRegistry
 from app.domain.capabilities import RuntimeCapabilities
 from app.domain.context import ContextPreflight
+from app.domain.research import RESEARCH_POLICY_V2
 from app.domain.runtime import ModelMessage, ModelRequest
 
 ContextStatus = Literal["ready", "compaction_required", "compacting", "unavailable"]
@@ -164,6 +166,8 @@ class ContextPreviewService:
             if model.supports_tools and self._tool_registry is not None
             else ()
         )
+        research_only = research_web_names(RESEARCH_POLICY_V2) - RESEARCH_WEB_NAMES
+        tools = tuple(tool for tool in tools if tool.name not in research_only)
         context = build_model_context(
             window.messages if window else (),
             (),

@@ -27,6 +27,12 @@ from app.domain.web import (
     WebUsage,
 )
 
+_SOURCE_METADATA_COLUMNS = (
+    "id,user_id,session_id,run_id,tool_call_id,evidence_epoch,requested_url,final_url,"
+    "canonical_url,title,publisher,published_at,fetched_at,extractor_version,content_hash,"
+    "line_count,byte_count,status,error_code,created_at"
+)
+
 
 def _object(value: object) -> dict[str, object]:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
@@ -344,6 +350,38 @@ class WebRepositoryMixin:
         ):
             raise RuntimeError("Supabase returned an invalid source line range")
         return result
+
+    async def list_run_web_sources(
+        self, session_id: str, run_id: str, limit: int = 40
+    ) -> tuple[WebSource, ...]:
+        if (
+            str(UUID(session_id)) != session_id
+            or str(UUID(run_id)) != run_id
+            or type(limit) is not int
+            or not 1 <= limit <= 40
+        ):
+            raise ValueError("invalid research source inventory")
+        rows = _rows(
+            await self._request(
+                "GET",
+                "web_sources",
+                params={
+                    "select": _SOURCE_METADATA_COLUMNS,
+                    "user_id": f"eq.{self._user_id}",
+                    "session_id": f"eq.{session_id}",
+                    "run_id": f"eq.{run_id}",
+                    "order": "created_at.asc,id.asc",
+                    "limit": str(limit),
+                },
+            ),
+            limit,
+        )
+        sources = tuple(self._source(row, session_id) for row in rows)
+        if any(source.run_id != run_id for source in sources) or len(
+            {source.id for source in sources}
+        ) != len(sources):
+            raise RuntimeError("Supabase returned another run's source inventory")
+        return sources
 
     async def clear_web_sources(self, session_id: str) -> ClearSourcesResult:
         row = _object(await self._web_call("clear_sources", {"session_id": session_id}))

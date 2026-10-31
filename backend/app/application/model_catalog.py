@@ -132,7 +132,7 @@ def context_budget(profile: ModelProfile, *, output_reserve: int = 4096) -> Cont
         )
     ):
         return None
-    reserve = min(output_reserve, 4096, maximum_output)
+    reserve = min(output_reserve, maximum_output)
     margin = max(2048, (context + 49) // 50)
     input_cap = min(context - reserve, profile.max_input_tokens or context)
     usable = input_cap - margin

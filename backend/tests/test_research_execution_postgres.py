@@ -5,7 +5,8 @@ import re
 import unittest
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
-from typing import cast
+from typing import TypedDict, cast
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import httpx
@@ -17,6 +18,7 @@ from app.application.ports import (
 )
 from app.application.recovery_contracts import RecoveryContracts
 from app.application.research_reports import ResearchReportService
+from app.application.run_context import RunContext
 from app.application.runs import RunService
 from app.application.tool_context import ToolExecutionContext
 from app.application.tools import ToolRegistry
@@ -39,8 +41,11 @@ from tests import test_research_postgres as database_tests
 
 
 class PostgresTransport:
-    def __init__(self, fixture: database_tests.ResearchPostgresTests) -> None:
+    def __init__(
+        self, fixture: database_tests.ResearchPostgresTests, *, pin_legacy_research: bool = False
+    ) -> None:
         self.fixture = fixture
+        self.pin_legacy_research = pin_legacy_research
         self.fail_delegate_results = False
         self.failed = False
         self.delegate_tools: set[str] = set()
@@ -80,6 +85,7 @@ class PostgresTransport:
                 "models",
                 "profiles",
                 "chats",
+                "web_sources",
             }:
                 raise AssertionError("Unexpected table " + path)
             columns = request.url.params["select"]
@@ -120,8 +126,12 @@ class PostgresTransport:
             )
             return httpx.Response(400, json={"code": "22023", "message": message})
         decoded = json.loads(result.stdout.strip() or "null")
+        response_content = result.stdout.strip() or "null"
         if path == "rpc/mutate":
             action = payload.get("p_action")
+            if action == "create_run" and self.pin_legacy_research and isinstance(decoded, dict):
+                decoded = await asyncio.to_thread(self.fixture.pin_legacy_research, decoded)
+                response_content = json.dumps(decoded)
             if action == "begin_tool_execution" and isinstance(decoded, dict):
                 tool = decoded.get("tool_call", {})
                 if isinstance(tool, dict) and tool.get("name") == "delegate_research":
@@ -138,7 +148,7 @@ class PostgresTransport:
                 )
         return httpx.Response(
             200,
-            content=result.stdout.strip() or "null",
+            content=response_content,
             headers={"Content-Type": "application/json"},
         )
 
@@ -202,12 +212,31 @@ class FixtureSearch:
         )
 
 
+class FixtureCitation(TypedDict):
+    source_id: str
+    start_line: int
+    end_line: int
+
+
+class FixtureClaim(TypedDict):
+    id: str
+    text: str
+    citations: list[FixtureCitation]
+
+
 class ScriptedResearcher:
     def __init__(self) -> None:
         self.calls = 0
         self.workers_started: set[str] = set()
         self.both_workers = asyncio.Event()
         self.pages_per_worker: int | None = None
+        self.use_saved_evidence = False
+        self.checkpoint_stop_reason = False
+        self.incomplete_draft = False
+        self.draft_interrupted = False
+        self.report_output_limits: list[int] = []
+        self.stopping_explanation: str | None = None
+        self.reviewed_reports: list[dict[str, object]] = []
 
     async def stream(
         self, request: ModelRequest, api_key: str, user_id: str
@@ -218,9 +247,14 @@ class ScriptedResearcher:
         exchanges = sum(message.role == "assistant" for message in request.messages)
         call: ModelToolCall | None = None
         text = "Internal research notes that must remain private."
+        incomplete = False
         if not request.tools:
+            self.report_output_limits.append(request.max_output_tokens)
             payload = json.loads(prompt.rsplit("\n", 1)[-1])
+            if "findings" in payload:
+                payload = payload["findings"]
             if "report" in payload:
+                self.reviewed_reports.append(payload["report"])
                 text = json.dumps(
                     {
                         "accepted_claim_ids": [
@@ -230,18 +264,35 @@ class ScriptedResearcher:
                     }
                 )
             else:
-                findings = [
+                report_findings: list[FixtureClaim] = [
                     finding
                     for worker in payload["workers"]
                     for finding in worker.get("findings", [])
                 ]
-                claims = [
+                if self.use_saved_evidence:
+                    report_findings = [
+                        {
+                            "id": f"saved-{source['source_id']}-{excerpt['start_line'] + index}",
+                            "text": line,
+                            "citations": [
+                                {
+                                    "source_id": source["source_id"],
+                                    "start_line": excerpt["start_line"] + index,
+                                    "end_line": excerpt["start_line"] + index,
+                                }
+                            ],
+                        }
+                        for source in payload.get("saved_evidence", {}).get("sources", [])
+                        for excerpt in source["excerpts"]
+                        for index, line in enumerate(excerpt["lines"])
+                    ]
+                claims: list[FixtureClaim] = [
                     {
                         "id": finding["id"],
                         "text": finding["text"],
                         "citations": finding["citations"],
                     }
-                    for finding in findings
+                    for finding in report_findings
                 ]
                 lines = [
                     claim["text"]
@@ -261,9 +312,13 @@ class ScriptedResearcher:
                         "Independent reliability evidence was unavailable.",
                         "claims": claims,
                         "covered_question_ids": ["pricing", "strategy"],
-                        "stop_reason": "questions_addressed",
+                        "stop_reason": self.stopping_explanation or "questions_addressed",
                     }
                 )
+                if self.incomplete_draft and not self.draft_interrupted:
+                    self.draft_interrupted = True
+                    text = '{"markdown":"unfinished'
+                    incomplete = True
         elif "delegate_research" in tool_names:
             if exchanges == 0:
                 call = ModelToolCall(
@@ -358,15 +413,28 @@ class ScriptedResearcher:
                     {
                         "findings": findings,
                         "examined_source_ids": [page["source_id"] for page in pages],
+                        **(
+                            {"stop_reason": "Collection is complete; use the saved findings."}
+                            if self.checkpoint_stop_reason
+                            else {}
+                        ),
                     },
                 )
         yield ModelStreamEvent("text_delta", text=text)
         if call is not None:
             yield ModelStreamEvent("tool_call", tool_call=call)
         yield ModelStreamEvent(
-            "usage", input_tokens=200, output_tokens=100, cached_tokens=0, cache_creation_tokens=0
+            "usage",
+            input_tokens=200,
+            output_tokens=4096 if incomplete else 100,
+            cached_tokens=0,
+            cache_creation_tokens=0,
         )
-        yield ModelStreamEvent("completed", finish_kind="tool" if call is not None else "final")
+        yield ModelStreamEvent(
+            "completed",
+            finish_kind="incomplete" if incomplete else "tool" if call is not None else "final",
+            finish_reason="max_output_tokens" if incomplete else None,
+        )
 
 
 @unittest.skipUnless(
@@ -393,7 +461,7 @@ class ResearchExecutionPostgresTests(unittest.IsolatedAsyncioTestCase):
         self.tokens.record_verified("fixture-token", owner, datetime.now(UTC) + timedelta(hours=1))
         self.settings = settings
         self.installation_id = str(uuid4())
-        self.transport = PostgresTransport(self.fixture)
+        self.transport = PostgresTransport(self.fixture, pin_legacy_research=True)
         self.client = httpx.AsyncClient(transport=httpx.MockTransport(self.transport))
         self.repository = SupabaseRepository(settings, owner, self.tokens, self.client)
         run = await self.repository.get_run(self.fixture.run_id)
@@ -422,6 +490,12 @@ class ResearchExecutionPostgresTests(unittest.IsolatedAsyncioTestCase):
         self.fixture.run_id = created.id
         self.fixture.capability = self.repository._run_capability(created.id)
         self.execution_run = created
+        persisted = await self.repository.get_run(created.id)
+        assert persisted is not None
+        self.assertEqual(created.research_policy_version, database_tests.LEGACY_RESEARCH_POLICY)
+        self.assertEqual(created.research_policy_version, persisted.research_policy_version)
+        self.assertEqual(created.execution_budget_seconds, persisted.execution_budget_seconds)
+        self.assertEqual(created.deadline_at, persisted.deadline_at)
 
     def make_service(
         self, repository: SupabaseRepository
@@ -505,6 +579,140 @@ class ResearchExecutionPostgresTests(unittest.IsolatedAsyncioTestCase):
             + ";",
         )
         self.assertEqual(int(outputs.stdout.strip()), 1)
+
+    async def test_long_stopping_explanation_keeps_findings_in_the_reviewed_report(self) -> None:
+        explanation = (
+            "Bounded research collection completed; further searching was not pursued. "
+            "Coverage is selective, with practical-resource and publication-status "
+            "verification remaining incomplete."
+        )
+        self.provider.stopping_explanation = explanation
+        await self.service._execute_snapshot(self.execution_run)
+        saved = await self.repository.get_run(self.execution_run.id)
+        assert saved is not None
+        self.assertEqual(saved.status, RunStatus.COMPLETED, saved.error_message)
+        state = await self.repository.read_research(saved.id)
+        assert state is not None
+        self.assertEqual(state.phase.value, "completed")
+        self.assertEqual(len(self.provider.reviewed_reports), 1)
+        self.assertEqual(len(self.provider.report_output_limits), 2)
+        published = await asyncio.to_thread(
+            self.fixture.sql,
+            "SELECT report FROM trellis.research_runs WHERE run_id="
+            + database_tests.literal(saved.id)
+            + ";",
+            authenticated=False,
+        )
+        report = json.loads(published.stdout)
+        self.assertEqual(report, self.provider.reviewed_reports[0])
+        self.assertIn(explanation, report["markdown"])
+        self.assertIn("Current A price is $10.", report["markdown"])
+        self.assertLessEqual(len(report["stop_reason"]), 100)
+        messages = await self.repository.list_messages(saved.session_id)
+        reports = [message.content for message in messages if message.role == "assistant"]
+        self.assertEqual(reports, [report["markdown"]])
+        citations = await self.repository.read_web_citations(
+            saved.session_id, state.report_model_call_id or ""
+        )
+        self.assertEqual(len(citations), 6)
+
+    async def test_incomplete_draft_retains_usage_and_repairs_before_publication(self) -> None:
+        self.provider.incomplete_draft = True
+        await self.service._execute_snapshot(self.execution_run)
+        saved = await self.repository.get_run(self.execution_run.id)
+        assert saved is not None
+        self.assertEqual(saved.status, RunStatus.COMPLETED, saved.error_message)
+        state = await self.repository.read_research(saved.id)
+        assert state is not None
+        calls = await self.repository.list_model_calls(saved.id)
+        interrupted = [call for call in calls if call.error_code == "provider_response_incomplete"]
+        self.assertEqual(len(interrupted), 1)
+        self.assertEqual(interrupted[0].status.value, "completed")
+        self.assertEqual(interrupted[0].accounted_total_tokens, 4296)
+        self.assertGreater(interrupted[0].estimated_cost or 0, 0)
+        self.assertEqual(self.provider.report_output_limits, [12288, 12288, 12288])
+        self.assertEqual(
+            [task.objective for task in state.tasks if task.role in {"writer", "reviewer"}],
+            ["Research report draft", "Research report repair", "Research report recheck"],
+        )
+        messages = await self.repository.list_messages(saved.session_id)
+        reports = [message.content for message in messages if message.role == "assistant"]
+        self.assertEqual(len(reports), 1)
+        self.assertIn("Current A price is $10.", reports[0])
+        self.assertNotIn("unfinished", reports[0])
+        citations = await self.repository.read_web_citations(
+            saved.session_id, state.report_model_call_id or ""
+        )
+        self.assertEqual(len(citations), 6)
+
+    async def test_worker_stop_checkpoint_still_publishes_checked_findings(self) -> None:
+        self.provider.checkpoint_stop_reason = True
+        await self.service._execute_snapshot(self.execution_run)
+        saved = await self.repository.get_run(self.execution_run.id)
+        assert saved is not None
+        self.assertEqual(saved.status, RunStatus.COMPLETED, saved.error_message)
+        state = await self.repository.read_research(saved.id)
+        assert state is not None
+        workers = [task for task in state.tasks if task.role == "worker"]
+        self.assertEqual(len(workers), 2)
+        self.assertTrue(all(task.checkpoint.get("findings") for task in workers))
+        self.assertTrue(all(task.checkpoint.get("stop_reason") for task in workers))
+        self.assertEqual(len(self.pages.reads), 3)
+        messages = await self.repository.list_messages(saved.session_id)
+        reports = [message.content for message in messages if message.role == "assistant"]
+        self.assertEqual(len(reports), 1)
+        self.assertIn("Current A price is $10.", reports[0])
+        self.assertIn("B requires a sales quote.", reports[0])
+        citations = await self.repository.read_web_citations(
+            saved.session_id, state.report_model_call_id or ""
+        )
+        self.assertEqual(len(citations), 6)
+
+    async def test_collection_cutoff_reports_saved_pages_without_worker_findings(self) -> None:
+        self.provider.use_saved_evidence = True
+        prepare = RunContext.prepare_task
+
+        async def stop_collection(runtime, *args, **kwargs):
+            if (
+                kwargs["tools"]
+                and sum(message.role == "assistant" for message in kwargs["messages"]) >= 2
+            ):
+                raise ApplicationError(
+                    "research_finalization_reserve", "Preparing the report from saved pages."
+                )
+            return await prepare(runtime, *args, **kwargs)
+
+        with patch.object(RunContext, "prepare_task", stop_collection):
+            await self.service._execute_snapshot(self.execution_run)
+
+        saved = await self.repository.get_run(self.execution_run.id)
+        assert saved is not None
+        self.assertEqual(saved.status, RunStatus.COMPLETED, saved.error_message)
+        state = await self.repository.read_research(self.execution_run.id)
+        assert state is not None
+        workers = [task for task in state.tasks if task.role == "worker"]
+        self.assertEqual(len(workers), 2)
+        self.assertTrue(all(task.result is None for task in workers))
+        self.assertTrue(all(not task.checkpoint.get("findings") for task in workers))
+        self.assertTrue(
+            all(
+                task.checkpoint.get("stop_reason") == "research_finalization_reserve"
+                for task in workers
+            )
+        )
+        self.assertEqual(len(self.pages.reads), 3)
+        messages = await self.repository.list_messages(self.execution_run.session_id)
+        reports = [message.content for message in messages if message.role == "assistant"]
+        self.assertEqual(len(reports), 1)
+        self.assertIn("Current A price is $10.", reports[0])
+        self.assertIn("Archived A price is $8.", reports[0])
+        self.assertIn("B requires a sales quote.", reports[0])
+        self.assertNotIn("Internal research notes", reports[0])
+        citations = await self.repository.read_web_citations(
+            self.execution_run.session_id, state.report_model_call_id or ""
+        )
+        self.assertEqual(len(citations), 6)
+        self.assertLessEqual(self.provider.calls, self.execution_run.max_model_calls)
 
     async def test_recovery_after_ten_pages_keeps_original_budget_and_does_not_refetch(
         self,

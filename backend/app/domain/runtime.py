@@ -384,6 +384,8 @@ class RunSnapshot:
     recovery_reason: str | None = None
     uncertain_tool_call_id: str | None = None
     run_mode: RunMode = "chat"
+    research_policy_version: str = "bounded-research-v1"
+    execution_budget_seconds: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
