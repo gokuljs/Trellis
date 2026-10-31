@@ -19,6 +19,7 @@ from app.domain.research import (
     LEGACY_RESEARCH_POLICY,
     RESEARCH_POLICY_V2,
     ResearchClaim,
+    ResearchQuestionCoverage,
     ResearchReport,
     ResearchReview,
     ResearchSnapshot,
@@ -525,14 +526,6 @@ def partial_report(
             if summary_claim
             else "No findings could be verified within this run."
         )
-    missing = "\n".join(
-        "- "
-        + json.dumps(str(question.get("question", "Research question"))[:500], ensure_ascii=False)
-        for question in _questions(snapshot)[:12]
-        if question.get("id") not in covered
-    )
-    if len(_questions(snapshot)) > 12:
-        missing += f"\n- {len(_questions(snapshot)) - 12} further questions remain unverified."
     body = (
         "## Summary\n\n"
         + summary
@@ -543,8 +536,23 @@ def partial_report(
         + "\n\n## Limitations\n\n"
         + _stopping_explanation(reason)
         + (f" {validation_issue}" if validation_issue else "")
-        + ("\n\nRequested questions to revisit:\n" + missing if missing else "")
     )
+    if snapshot.policy_version == RESEARCH_POLICY_V2:
+        body += _partial_requirement_disclosure(
+            snapshot, coverage or (), covered, min(8 * 1024, max(0, 64 * 1024 - len(body.encode())))
+        )
+    else:
+        missing = "\n".join(
+            "- "
+            + json.dumps(
+                str(question.get("question", "Research question"))[:500], ensure_ascii=False
+            )
+            for question in _questions(snapshot)[:12]
+            if question.get("id") not in covered
+        )
+        if len(_questions(snapshot)) > 12:
+            missing += f"\n- {len(_questions(snapshot)) - 12} further questions remain unverified."
+        body += "\n\nRequested questions to revisit:\n" + missing if missing else ""
     if len(body.encode("utf-8")) > 64 * 1024:
         return partial_report(
             snapshot, reason, evidence=evidence, validation_issue=validation_issue
@@ -566,6 +574,73 @@ def partial_report(
         (),
         coverage if snapshot.policy_version == RESEARCH_POLICY_V2 else None,
     )
+
+
+def _partial_requirement_disclosure(
+    snapshot: ResearchSnapshot,
+    coverage: tuple[ResearchQuestionCoverage, ...],
+    covered: set[str],
+    max_bytes: int,
+) -> str:
+    reviewed = {item.question_id: set(item.requirement_ids) for item in coverage}
+    entries = []
+    specific = False
+    for question in _questions(snapshot):
+        if question.get("id") in covered:
+            continue
+        requirements = question.get("evidence_requirements")
+        if not isinstance(requirements, list) or not requirements:
+            entries.append(
+                (
+                    "",
+                    "- "
+                    + json.dumps(
+                        str(question.get("question", "Research question"))[:500], ensure_ascii=False
+                    ),
+                )
+            )
+            continue
+        specific = True
+        label = str(question.get("question", "Research question"))
+        label = _markdown_label(label[:200] + ("…" if len(label) > 200 else ""))
+        for requirement in requirements:
+            if not isinstance(requirement, dict) or requirement.get("id") in reviewed.get(
+                str(question.get("id")), set()
+            ):
+                continue
+            description = str(
+                requirement.get("description") or requirement.get("id", "Evidence requirement")
+            )
+            entries.append((label, f"- {_markdown_label(description)}"))
+    if not entries:
+        return ""
+    heading = (
+        "\n\nUnverified evidence areas:\n" if specific else "\n\nRequested questions to revisit:\n"
+    )
+    selected = []
+    previous_label = ""
+    for label, description in entries:
+        entry = (
+            f"\n**{label}**\n\n{description}" if label and label != previous_label else description
+        )
+        omitted = len(entries) - len(selected) - 1
+        notice = (
+            f"\n- {omitted} further evidence areas omitted from this list remain unverified."
+            if omitted
+            else ""
+        )
+        candidate = heading + "\n".join([*selected, entry]) + notice
+        if len(candidate.encode()) <= max_bytes:
+            selected.append(entry)
+            previous_label = label
+    omitted = len(entries) - len(selected)
+    notice = (
+        f"\n- {omitted} further evidence areas omitted from this list remain unverified."
+        if omitted
+        else ""
+    )
+    result = heading + "\n".join(selected) + notice
+    return result if len(result.encode()) <= max_bytes else ""
 
 
 def _cited_claim(claim: ResearchClaim) -> str:
