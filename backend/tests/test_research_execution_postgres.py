@@ -5,7 +5,8 @@ import re
 import unittest
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
-from typing import cast
+from typing import TypedDict, cast
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import httpx
@@ -17,6 +18,7 @@ from app.application.ports import (
 )
 from app.application.recovery_contracts import RecoveryContracts
 from app.application.research_reports import ResearchReportService
+from app.application.run_context import RunContext
 from app.application.runs import RunService
 from app.application.tool_context import ToolExecutionContext
 from app.application.tools import ToolRegistry
@@ -80,6 +82,7 @@ class PostgresTransport:
                 "models",
                 "profiles",
                 "chats",
+                "web_sources",
             }:
                 raise AssertionError("Unexpected table " + path)
             columns = request.url.params["select"]
@@ -202,12 +205,25 @@ class FixtureSearch:
         )
 
 
+class FixtureCitation(TypedDict):
+    source_id: str
+    start_line: int
+    end_line: int
+
+
+class FixtureClaim(TypedDict):
+    id: str
+    text: str
+    citations: list[FixtureCitation]
+
+
 class ScriptedResearcher:
     def __init__(self) -> None:
         self.calls = 0
         self.workers_started: set[str] = set()
         self.both_workers = asyncio.Event()
         self.pages_per_worker: int | None = None
+        self.use_saved_evidence = False
 
     async def stream(
         self, request: ModelRequest, api_key: str, user_id: str
@@ -230,18 +246,35 @@ class ScriptedResearcher:
                     }
                 )
             else:
-                findings = [
+                report_findings: list[FixtureClaim] = [
                     finding
                     for worker in payload["workers"]
                     for finding in worker.get("findings", [])
                 ]
-                claims = [
+                if self.use_saved_evidence:
+                    report_findings = [
+                        {
+                            "id": f"saved-{source['source_id']}-{excerpt['start_line'] + index}",
+                            "text": line,
+                            "citations": [
+                                {
+                                    "source_id": source["source_id"],
+                                    "start_line": excerpt["start_line"] + index,
+                                    "end_line": excerpt["start_line"] + index,
+                                }
+                            ],
+                        }
+                        for source in payload.get("saved_evidence", {}).get("sources", [])
+                        for excerpt in source["excerpts"]
+                        for index, line in enumerate(excerpt["lines"])
+                    ]
+                claims: list[FixtureClaim] = [
                     {
                         "id": finding["id"],
                         "text": finding["text"],
                         "citations": finding["citations"],
                     }
-                    for finding in findings
+                    for finding in report_findings
                 ]
                 lines = [
                     claim["text"]
@@ -505,6 +538,52 @@ class ResearchExecutionPostgresTests(unittest.IsolatedAsyncioTestCase):
             + ";",
         )
         self.assertEqual(int(outputs.stdout.strip()), 1)
+
+    async def test_collection_cutoff_reports_saved_pages_without_worker_findings(self) -> None:
+        self.provider.use_saved_evidence = True
+        prepare = RunContext.prepare_task
+
+        async def stop_collection(runtime, *args, **kwargs):
+            if (
+                kwargs["tools"]
+                and sum(message.role == "assistant" for message in kwargs["messages"]) >= 2
+            ):
+                raise ApplicationError(
+                    "research_finalization_reserve", "Preparing the report from saved pages."
+                )
+            return await prepare(runtime, *args, **kwargs)
+
+        with patch.object(RunContext, "prepare_task", stop_collection):
+            await self.service._execute_snapshot(self.execution_run)
+
+        saved = await self.repository.get_run(self.execution_run.id)
+        assert saved is not None
+        self.assertEqual(saved.status, RunStatus.COMPLETED, saved.error_message)
+        state = await self.repository.read_research(self.execution_run.id)
+        assert state is not None
+        workers = [task for task in state.tasks if task.role == "worker"]
+        self.assertEqual(len(workers), 2)
+        self.assertTrue(all(task.result is None for task in workers))
+        self.assertTrue(all(not task.checkpoint.get("findings") for task in workers))
+        self.assertTrue(
+            all(
+                task.checkpoint.get("stop_reason") == "research_finalization_reserve"
+                for task in workers
+            )
+        )
+        self.assertEqual(len(self.pages.reads), 3)
+        messages = await self.repository.list_messages(self.execution_run.session_id)
+        reports = [message.content for message in messages if message.role == "assistant"]
+        self.assertEqual(len(reports), 1)
+        self.assertIn("Current A price is $10.", reports[0])
+        self.assertIn("Archived A price is $8.", reports[0])
+        self.assertIn("B requires a sales quote.", reports[0])
+        self.assertNotIn("Internal research notes", reports[0])
+        citations = await self.repository.read_web_citations(
+            self.execution_run.session_id, state.report_model_call_id or ""
+        )
+        self.assertEqual(len(citations), 6)
+        self.assertLessEqual(self.provider.calls, self.execution_run.max_model_calls)
 
     async def test_recovery_after_ten_pages_keeps_original_budget_and_does_not_refetch(
         self,
