@@ -1,0 +1,444 @@
+import unittest
+from dataclasses import replace
+from typing import cast
+from uuid import uuid4
+
+from app.application.research import ResearchCoordinator, collection_guidance, control_specs
+from app.application.research_notebook import collection_basis, merge_notebook
+from app.application.research_ports import ResearchRepository
+from app.application.research_task_context import ResearchReadObservation, ResearchReadRange
+from app.domain.research import (
+    RESEARCH_POLICY_V2,
+    ResearchPhase,
+    ResearchSnapshot,
+    ResearchTask,
+    ResearchTaskStatus,
+)
+from tests.test_research_agent_loop import make_run
+from tests.test_research_policy import finding, question
+
+
+def snapshot(run, checkpoint: dict, tasks: tuple = ()) -> ResearchSnapshot:
+    return ResearchSnapshot(
+        run.id,
+        run.session_id,
+        str(uuid4()),
+        ResearchPhase.RESEARCHING,
+        "Compare methods",
+        1,
+        checkpoint,
+        tasks,
+        None,
+        500,
+        policy_version=RESEARCH_POLICY_V2,
+        execution_budget_seconds=600,
+    )
+
+
+def assignment(**updates) -> dict:
+    return {
+        "objective": "Read the methods section and compare workflow design",
+        "question_ids": ["methods"],
+        "requirement_ids": ["methods-text"],
+        "conflict_ids": [],
+        "purpose": "fill_gap",
+        "expected_value": "The methods are still missing from the comparison.",
+        **updates,
+    }
+
+
+def saved_read(saved_finding: dict) -> dict[str, object]:
+    citation = saved_finding["citations"][0]
+    return ResearchReadObservation(
+        str(uuid4()),
+        10,
+        citation["source_id"],
+        "a" * 64,
+        "source_lines",
+        (ResearchReadRange(citation["start_line"], citation["end_line"]),),
+    ).to_dict()
+
+
+class FollowupGuidanceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.execution = replace(make_run(), research_policy_version=RESEARCH_POLICY_V2)
+
+    def test_addressed_flag_without_evidence_still_needs_followup(self) -> None:
+        state = snapshot(self.execution, {"subquestions": [question()]})
+        guidance = collection_guidance(state, self.execution)
+        self.assertEqual(guidance["next_action"], "research")
+        self.assertEqual(guidance["unresolved_requirements"][0]["id"], "methods-text")
+
+    def test_unavailable_facet_does_not_block_other_required_evidence(self) -> None:
+        requested = question()
+        requested["evidence_requirements"].append(
+            {"id": "results", "description": "Read evaluation results", "depth": "full_text"}
+        )
+        state = snapshot(
+            self.execution,
+            {
+                "subquestions": [requested],
+                "gaps": [
+                    {
+                        "id": "methods-blocked",
+                        "text": "Methods are inaccessible",
+                        "question_ids": ["methods"],
+                        "requirement_ids": ["methods-text"],
+                        "status": "unavailable",
+                        "citations": [],
+                    }
+                ],
+            },
+        )
+        guidance = collection_guidance(state, self.execution)
+        self.assertEqual(guidance["next_action"], "research")
+        self.assertEqual([item["id"] for item in guidance["unresolved_requirements"]], ["results"])
+        self.assertEqual(guidance["unavailable_requirements"][0]["id"], "methods-text")
+
+    def test_resolved_root_issue_does_not_reappear_from_old_worker_notes(self) -> None:
+        issue = {
+            "id": "methods-gap",
+            "text": "Missing methods",
+            "question_ids": ["methods"],
+            "status": "open",
+        }
+        worker = ResearchTask(
+            str(uuid4()),
+            self.execution.id,
+            "Read methods",
+            "worker",
+            1,
+            ResearchTaskStatus.COMPLETED,
+            1,
+            {"gaps": [issue]},
+        )
+        state = snapshot(
+            self.execution,
+            {"subquestions": [question()], "gaps": [{**issue, "status": "resolved"}]},
+            (worker,),
+        )
+        self.assertEqual(collection_guidance(state, self.execution)["open_gaps"], [])
+
+    def test_finalization_and_round_limits_stop_additional_collection(self) -> None:
+        state = snapshot(self.execution, {"subquestions": [question()]})
+        for budget in ({"collection_calls_remaining": 0}, {"budget_unknown": True}):
+            with self.subTest(budget=budget):
+                self.assertEqual(
+                    collection_guidance(state, self.execution, shared_budget=budget)["next_action"],
+                    "stop",
+                )
+        worker = ResearchTask(
+            str(uuid4()),
+            self.execution.id,
+            "Last allowed round",
+            "worker",
+            2,
+            ResearchTaskStatus.COMPLETED,
+            1,
+            {},
+        )
+        self.assertEqual(
+            collection_guidance(replace(state, tasks=(worker,)), self.execution)["reason"],
+            "collection_round_limit",
+        )
+
+    def test_low_value_decision_is_invalidated_by_new_evidence_or_clarification(self) -> None:
+        checkpoint: dict[str, object] = {
+            "subquestions": [question()],
+            "collection_decision": {
+                "reason": "low_expected_value",
+                "explanation": "Repeated official-source searches found no methods.",
+            },
+        }
+        checkpoint["collection_decision_basis"] = collection_basis(checkpoint)
+        state = snapshot(self.execution, checkpoint)
+        self.assertEqual(collection_guidance(state, self.execution)["reason"], "low_expected_value")
+        changed = {**checkpoint, "clarifications": [{"text": "Include the full paper"}]}
+        self.assertEqual(
+            collection_guidance(replace(state, checkpoint=changed), self.execution)["next_action"],
+            "research",
+        )
+        worker = ResearchTask(
+            str(uuid4()),
+            self.execution.id,
+            "New evidence",
+            "worker",
+            1,
+            ResearchTaskStatus.COMPLETED,
+            1,
+            {"findings": [finding()]},
+        )
+        self.assertNotEqual(
+            collection_guidance(replace(state, tasks=(worker,)), self.execution)["reason"],
+            "low_expected_value",
+        )
+
+    def test_evidence_records_do_not_claim_semantic_review(self) -> None:
+        state = snapshot(self.execution, {"subquestions": [question()], "findings": [finding()]})
+        guidance = collection_guidance(state, self.execution, observed_reads=None)
+        self.assertEqual(guidance["reason"], "coverage_recorded")
+        self.assertIs(guidance["requires_report_review"], True)
+
+    def test_issue_links_cannot_invent_requirements(self) -> None:
+        with self.assertRaises(ValueError):
+            merge_notebook(
+                {"subquestions": [question()]},
+                {
+                    "gaps": [
+                        {
+                            "id": "fake",
+                            "text": "No source",
+                            "question_ids": ["methods"],
+                            "requirement_ids": ["invented"],
+                            "status": "unavailable",
+                        }
+                    ]
+                },
+            )
+
+    def test_cited_evidence_must_have_been_presented_in_complete_ranges(self) -> None:
+        saved_finding = finding()
+        source = saved_finding["citations"][0]["source_id"]
+        state = snapshot(
+            self.execution, {"subquestions": [question()], "findings": [saved_finding]}
+        )
+        read = ResearchReadObservation(
+            str(uuid4()),
+            10,
+            source,
+            "a" * 64,
+            "source_lines",
+            (ResearchReadRange(500, 504), ResearchReadRange(506, 510)),
+        )
+        incomplete = collection_guidance(state, self.execution, observed_reads=[read])
+        self.assertEqual(incomplete["unresolved_requirements"][0]["status"], "read_needed")
+        self.assertEqual(incomplete["coverage"][0]["status"], "missing")
+        complete = replace(read, presented_ranges=(ResearchReadRange(500, 510),))
+        self.assertEqual(
+            collection_guidance(state, self.execution, observed_reads=[complete])["reason"],
+            "coverage_recorded",
+        )
+
+    def test_abstract_claim_does_not_satisfy_a_full_text_requirement(self) -> None:
+        saved_finding = {**finding(), "evidence_depth": "abstract"}
+        state = snapshot(
+            self.execution, {"subquestions": [question()], "findings": [saved_finding]}
+        )
+        self.assertEqual(
+            collection_guidance(state, self.execution)["unresolved_requirements"][0]["status"],
+            "read_needed",
+        )
+
+    def test_production_guidance_requires_saved_read_provenance(self) -> None:
+        saved_finding = finding()
+        state = snapshot(
+            self.execution, {"subquestions": [question()], "findings": [saved_finding]}
+        )
+        self.assertEqual(collection_guidance(state, self.execution)["next_action"], "research")
+        observed = replace(state, source_reads=(saved_read(saved_finding),))
+        guidance = collection_guidance(observed, self.execution)
+        self.assertEqual(guidance["reason"], "coverage_recorded")
+        self.assertIn(saved_finding["citations"][0]["source_id"], guidance["examined_source_ids"])
+
+    def test_all_explicitly_unavailable_requirements_stop_with_disclosure(self) -> None:
+        state = snapshot(
+            self.execution,
+            {
+                "subquestions": [question()],
+                "gaps": [
+                    {
+                        "id": "methods-blocked",
+                        "text": "No in-scope full text is available",
+                        "question_ids": ["methods"],
+                        "requirement_ids": ["methods-text"],
+                        "status": "unavailable",
+                        "citations": [],
+                    }
+                ],
+            },
+        )
+        guidance = collection_guidance(state, self.execution)
+        self.assertEqual(guidance["reason"], "evidence_unavailable")
+        self.assertEqual(guidance["unavailable_requirements"][0]["id"], "methods-text")
+
+    def test_brief_entries_and_merged_question_count_remain_bounded(self) -> None:
+        with self.assertRaises(ValueError):
+            merge_notebook(
+                {}, {"brief": {"scope": "Compare papers", "source_restrictions": ["X" * 2001]}}
+            )
+        previous: dict[str, object] = {
+            "subquestions": [
+                {
+                    **question(),
+                    "id": f"q{index}",
+                    "evidence_requirements": [
+                        {
+                            "id": f"r{index}",
+                            "description": "Read evidence",
+                            "depth": "source_excerpt",
+                        }
+                    ],
+                }
+                for index in range(12)
+            ]
+        }
+        with self.assertRaises(ValueError):
+            merge_notebook(previous, {"subquestions": [question()]})
+
+
+class MemoryFollowups:
+    def __init__(self, state: ResearchSnapshot) -> None:
+        self.state = state
+        self.created = []
+
+    async def read_research(self, run_id):
+        return self.state
+
+    async def create_research_tasks(self, run_id, generation, operation_id, tasks):
+        self.created.extend(tasks)
+        created = tuple(
+            ResearchTask(
+                item.id,
+                run_id,
+                item.objective,
+                item.role,
+                item.round_index,
+                ResearchTaskStatus.COMPLETED,
+                0,
+                {},
+            )
+            for item in tasks
+        )
+        self.state = replace(self.state, tasks=(*self.state.tasks, *created))
+        return created
+
+
+class FocusedDelegationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.execution = replace(make_run(), research_policy_version=RESEARCH_POLICY_V2)
+        self.lead = ResearchTask(
+            str(uuid4()),
+            self.execution.id,
+            "Compare methods",
+            "lead",
+            0,
+            ResearchTaskStatus.RUNNING,
+            0,
+            {},
+        )
+        self.repository = MemoryFollowups(snapshot(self.execution, {"subquestions": [question()]}))
+
+        async def unused(task):
+            raise AssertionError("The memory repository returns completed tasks")
+
+        self.coordinator = ResearchCoordinator(
+            cast(ResearchRepository, self.repository), self.execution, unused
+        )
+
+    async def delegate(self, items: list[dict], *, round_index: int = 1, operation_id=None):
+        return await self.coordinator.control(
+            self.lead,
+            "delegate_research",
+            {
+                "round_index": round_index,
+                "assignments": items,
+            },
+            operation_id or str(uuid4()),
+        )
+
+    async def test_focused_assignment_contains_evidence_and_scope_without_forcing_fulltext(
+        self,
+    ) -> None:
+        requested = question()
+        requested["evidence_requirements"][0]["depth"] = "abstract"
+        self.repository.state = replace(
+            self.repository.state,
+            checkpoint={
+                "subquestions": [requested],
+                "brief": {
+                    "scope": "Compare abstracts",
+                    "source_restrictions": ["Only the two supplied arXiv abstract pages"],
+                },
+                "examined_source_ids": [str(uuid4())],
+            },
+        )
+        result = await self.delegate([assignment()])
+        self.assertEqual(result["status"], "complete")
+        objective = self.repository.created[0].objective
+        self.assertIn("methods-text", objective)
+        self.assertIn("Depth: abstract", objective)
+        self.assertIn("Only the two supplied arXiv abstract pages", objective)
+        self.assertNotIn("Depth: full_text", objective)
+        self.assertIn("unresolved_requirements", result["collection_guidance"])
+
+    async def test_later_round_rejects_broad_unlinked_or_already_covered_assignment(self) -> None:
+        previous = ResearchTask(
+            str(uuid4()),
+            self.execution.id,
+            "First round",
+            "worker",
+            1,
+            ResearchTaskStatus.COMPLETED,
+            1,
+            {},
+        )
+        supported = finding()
+        self.repository.state = replace(
+            self.repository.state,
+            tasks=(previous,),
+            checkpoint={"subquestions": [question()], "findings": [supported]},
+            source_reads=(saved_read(supported),),
+        )
+        result = await self.delegate([assignment()], round_index=2)
+        self.assertEqual(result["status"], "invalid_request")
+        result = await self.delegate([assignment(requirement_ids=[])], round_index=2)
+        self.assertEqual(result["status"], "invalid_request")
+        self.assertEqual(self.repository.created, [])
+
+    async def test_corroboration_is_allowed_with_specific_evidence_and_expected_value(self) -> None:
+        supported = finding()
+        self.repository.state = replace(
+            self.repository.state,
+            checkpoint={"subquestions": [question()], "findings": [supported]},
+            source_reads=(saved_read(supported),),
+        )
+        result = await self.delegate(
+            [
+                assignment(
+                    purpose="corroborate",
+                    expected_value="An independent original source can test the author's claim.",
+                )
+            ]
+        )
+        self.assertEqual(result["status"], "complete")
+
+    async def test_duplicate_batch_work_is_rejected(self) -> None:
+        result = await self.delegate([assignment(), assignment()])
+        self.assertEqual(result["status"], "invalid_request")
+
+    async def test_replay_retains_original_assignment_when_source_inventory_changes(self) -> None:
+        operation_id = str(uuid4())
+        first = await self.delegate([assignment()], operation_id=operation_id)
+        original = self.repository.created[0].objective
+        self.repository.state = replace(
+            self.repository.state,
+            checkpoint={
+                **self.repository.state.checkpoint,
+                "examined_source_ids": [str(uuid4())],
+            },
+        )
+        replay = await self.delegate([assignment()], operation_id=operation_id)
+        self.assertEqual(first["status"], replay["status"])
+        self.assertEqual(len(self.repository.created), 1)
+        self.assertEqual(self.repository.created[0].objective, original)
+
+    async def test_legacy_delegation_schema_is_unchanged(self) -> None:
+        legacy = next(item for item in control_specs("lead") if item.name == "delegate_research")
+        current = next(
+            item
+            for item in control_specs("lead", RESEARCH_POLICY_V2)
+            if item.name == "delegate_research"
+        )
+        self.assertIn("objectives", cast(dict[str, object], legacy.input_schema["properties"]))
+        self.assertNotIn("assignments", cast(dict[str, object], legacy.input_schema["properties"]))
+        self.assertIn("assignments", cast(dict[str, object], current.input_schema["properties"]))

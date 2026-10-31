@@ -54,10 +54,12 @@ from app.application.research import (
     task_terminal_result,
     validate_task_recovery,
 )
+from app.application.research_notebook import collection_guidance
 from app.application.research_ports import ResearchRepository
 from app.application.research_task_context import (
     bounded_research_notebook,
     checkpoint_disposes_reads,
+    parse_research_read_observations,
     project_research_task_context,
 )
 from app.application.run_capacity import RunCapacity
@@ -2449,6 +2451,17 @@ class RunService:
                             "collection_seconds_remaining": self._remaining_seconds(scope),
                         }
                     state["shared_budget"] = _research_model_budget(shared_budget)
+                    state["collection_guidance"] = _research_model_budget(
+                        collection_guidance(
+                            snapshot,
+                            run,
+                            shared_budget=shared_budget,
+                            observed_reads=(
+                                *parse_research_read_observations(snapshot.source_reads),
+                                *projection.observed_reads,
+                            ),
+                        )
+                    )
                     state["unprocessed_reads"] = [
                         read.to_dict() for read in projection.unprocessed_reads
                     ]

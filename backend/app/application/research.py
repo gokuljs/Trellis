@@ -10,7 +10,12 @@ from uuid import UUID, uuid5
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.application.errors import ApplicationError, ProviderError
-from app.application.research_notebook import ResearchCheckpointV2, merge_notebook
+from app.application.research_notebook import (
+    ResearchCheckpointV2,
+    collection_basis,
+    collection_guidance,
+    merge_notebook,
+)
 from app.application.research_ports import ResearchRepository
 from app.domain.research import (
     LEGACY_RESEARCH_POLICY,
@@ -109,6 +114,20 @@ class _Delegate(_Arguments):
     objectives: list[str] = Field(min_length=1, max_length=2)
 
 
+class _FocusedAssignment(_Arguments):
+    objective: str = Field(min_length=1, max_length=4000)
+    question_ids: list[str] = Field(min_length=1, max_length=12)
+    requirement_ids: list[str] = Field(default_factory=list, max_length=12)
+    conflict_ids: list[str] = Field(default_factory=list, max_length=12)
+    purpose: Literal["fill_gap", "check_conflict", "corroborate"]
+    expected_value: str = Field(min_length=1, max_length=1000)
+
+
+class _DelegateV2(_Arguments):
+    round_index: int = Field(ge=1, le=4)
+    assignments: list[_FocusedAssignment] = Field(min_length=1, max_length=2)
+
+
 class _Clarify(_Arguments):
     question: str = Field(min_length=1, max_length=4000)
 
@@ -138,16 +157,11 @@ _CONTROLS: tuple[tuple[str, str, type[_Arguments]], ...] = (
 def control_specs(
     role: str, policy_version: str = LEGACY_RESEARCH_POLICY
 ) -> tuple[ModelToolSpec, ...]:
+    overrides: dict[str, type[BaseModel]] = {}
+    if policy_version == RESEARCH_POLICY_V2:
+        overrides = {"research_checkpoint": ResearchCheckpointV2, "delegate_research": _DelegateV2}
     return tuple(
-        ModelToolSpec(
-            name,
-            description,
-            (
-                ResearchCheckpointV2
-                if policy_version == RESEARCH_POLICY_V2 and name == "research_checkpoint"
-                else model
-            ).model_json_schema(),
-        )
+        ModelToolSpec(name, description, overrides.get(name, model).model_json_schema())
         for name, description, model in _CONTROLS
         if role == "lead" or name == "research_checkpoint"
     )
@@ -183,6 +197,19 @@ def research_instructions(task: ResearchTask, policy_version: str = LEGACY_RESEA
             "Record evidence_depth honestly; source access alone does not prove sufficient depth. "
             "Track gaps and conflicts by stable ID; resolve existing IDs when evidence answers "
             "them instead of appending stale gaps. A question status never proves coverage."
+            " Mark a requirement unavailable only when useful in-scope alternatives are exhausted; "
+            "a single blocked URL does not make its information unavailable."
+            " Use web_source_outline and web_source_find to locate relevant sections, then "
+            "web_source_read to actually read complete saved lines. Search snippets, previews, "
+            "and outlines are discovery aids. After at most two substantive source reads, "
+            "checkpoint findings or source-cited negative gaps before more collection. A "
+            "checkpoint-only request may offer only research_checkpoint. Finish only after "
+            "all presented evidence has a saved disposition. Follow collection_guidance: "
+            "target missing requirements and open conflicts; preserve source restrictions. "
+            "Delegated assignments require explicit question/requirement or conflict IDs, "
+            "a purpose, and expected_value. Corroboration needs a concrete remaining uncertainty. "
+            "When further collection has low expected value, save collection_decision with "
+            "the reason and explanation. This stops collection, not the final evidence review."
         )
     if task.role == "lead":
         return shared + (
@@ -238,6 +265,105 @@ def merge_checkpoint(
     return research_object(merged)
 
 
+def _focused_objectives(
+    request: _DelegateV2, snapshot: ResearchSnapshot, run: RunSnapshot
+) -> list[str]:
+    guidance = collection_guidance(snapshot, run)
+    if guidance["reason"] in {
+        "brief_required",
+        "finalization_reserve",
+        "usage_unknown",
+        "worker_task_limit",
+        "collection_round_limit",
+        "low_expected_value",
+    }:
+        raise ValueError(f"collection should stop or establish scope: {guidance['reason']}")
+    if len(request.assignments) > guidance["remaining_worker_tasks"]:
+        raise ValueError("not enough worker assignments remain")
+    questions = {
+        str(item["id"]): item
+        for item in cast(list[dict[str, object]], snapshot.checkpoint.get("subquestions", []))
+    }
+    requirements = {
+        str(item["id"]): {**item, "question_id": question["id"]}
+        for question in questions.values()
+        for item in cast(list[dict[str, object]], question.get("evidence_requirements", []))
+    }
+    unresolved = {str(item["id"]) for item in guidance["unresolved_requirements"]}
+    conflicts = {str(item["id"]): item for item in guidance["open_conflicts"]}
+    covered = {
+        str(item["id"])
+        for row in guidance["coverage"]
+        for item in cast(list[dict[str, object]], row["requirements"])
+        if item["status"] == "evidence_recorded"
+    }
+    brief = snapshot.checkpoint.get("brief", {})
+    brief = brief if isinstance(brief, dict) else {}
+    restrictions = cast(list[str], brief.get("source_restrictions", []))
+    claimed: set[str] = set()
+    objectives = []
+    for assignment in request.assignments:
+        question_ids = set(assignment.question_ids)
+        requirement_ids = set(assignment.requirement_ids)
+        conflict_ids = set(assignment.conflict_ids)
+        if not question_ids <= questions.keys() or any(
+            requirements.get(identity, {}).get("question_id") not in question_ids
+            for identity in requirement_ids
+        ):
+            raise ValueError("assignment refers to an unknown question or evidence requirement")
+        if not requirement_ids and not conflict_ids:
+            raise ValueError("assignment must name evidence requirements or conflicts")
+        if not conflict_ids <= conflicts.keys() or any(
+            not question_ids.intersection(cast(list[str], conflicts[identity]["question_ids"]))
+            for identity in conflict_ids
+        ):
+            raise ValueError("assignment must target an open conflict for its questions")
+        if assignment.purpose == "fill_gap":
+            if not requirement_ids or not requirement_ids <= unresolved:
+                raise ValueError("gap assignments must target unresolved evidence requirements")
+            if claimed.intersection(requirement_ids):
+                raise ValueError("parallel assignments must not duplicate the same evidence gap")
+            claimed.update(requirement_ids)
+        elif assignment.purpose == "check_conflict" and not conflict_ids:
+            raise ValueError("conflict checking requires an open conflict ID")
+        elif assignment.purpose == "corroborate" and not requirement_ids.intersection(covered):
+            raise ValueError("corroboration requires an existing evidence-backed finding")
+        evidence = [
+            f"- {identity} (Question: {requirements[identity]['question_id']}; "
+            f"Depth: {requirements[identity]['depth']}): {requirements[identity]['description']}"
+            for identity in assignment.requirement_ids
+        ]
+        conflict_text = [
+            f"- {identity}: {conflicts[identity]['text']}" for identity in assignment.conflict_ids
+        ]
+        objective = "\n".join(
+            [
+                assignment.objective,
+                f"Questions: {', '.join(assignment.question_ids)}",
+                f"Purpose: {assignment.purpose}",
+                f"Expected value: {assignment.expected_value}",
+                "Evidence required:",
+                *evidence,
+                "Conflicts to investigate:",
+                *conflict_text,
+                "Source restrictions (do not broaden):",
+                *(f"- {item}" for item in restrictions),
+                "Saved source IDs (reuse existing evidence before fetching again): "
+                + ", ".join(guidance["examined_source_ids"]),
+                "Use the authoritative brief and exact saved lines. Return sourced findings or "
+                "specific negative gaps for the stated evidence IDs.",
+            ]
+        )
+        if len(objective) > 16000:
+            raise ValueError(
+                "assignment is too large; target fewer requirements without cutting restrictions"
+            )
+        objectives.append(objective)
+    if len(set(objectives)) != len(objectives):
+        raise ValueError("parallel assignments must investigate different evidence")
+    return objectives
+
+
 class ResearchCoordinator:
     def __init__(
         self,
@@ -285,17 +411,25 @@ class ResearchCoordinator:
                 if (
                     policy_version == RESEARCH_POLICY_V2
                     and task.role != "lead"
-                    and any(arguments.get(key) for key in ("brief", "scope", "subquestions"))
+                    and any(
+                        arguments.get(key)
+                        for key in ("brief", "scope", "subquestions", "collection_decision")
+                    )
                 ):
                     raise ValueError("only the lead may change research scope or questions")
                 checkpoint = merge_checkpoint(
-                    {**snapshot.checkpoint, **current.checkpoint}
+                    {**current.checkpoint, **snapshot.checkpoint}
                     if policy_version == RESEARCH_POLICY_V2 and task.role == "lead"
                     else current.checkpoint,
                     arguments,
                     policy_version=policy_version,
                     known_questions=snapshot.checkpoint.get("subquestions"),
                 )
+                if policy_version == RESEARCH_POLICY_V2 and arguments.get("collection_decision"):
+                    checkpoint["collection_decision_basis"] = collection_basis(
+                        checkpoint,
+                        (item.checkpoint for item in snapshot.tasks if item.role == "worker"),
+                    )
                 saved = await self.repository.checkpoint_research(
                     self.run.id,
                     self.run.generation,
@@ -308,31 +442,50 @@ class ResearchCoordinator:
             if task.role != "lead":
                 raise ValueError("only the lead may delegate or clarify")
             if name == "delegate_research":
-                request = _Delegate.model_validate(arguments)
+                policy_version = getattr(
+                    self.run, "research_policy_version", LEGACY_RESEARCH_POLICY
+                )
+                focused = policy_version == RESEARCH_POLICY_V2
+                request = (
+                    _DelegateV2.model_validate(arguments)
+                    if focused
+                    else _Delegate.model_validate(arguments)
+                )
                 limits = research_limits(self.run.budget_preset)
                 if request.round_index > limits.collection_rounds:
                     return {"status": "budget_exhausted", "reason": "collection_round_limit"}
                 snapshot = await self.snapshot()
-                identities = tuple(
-                    str(uuid5(UUID(operation_id), f"worker-{index}"))
-                    for index in range(len(request.objectives))
+                count = (
+                    len(request.assignments)
+                    if isinstance(request, _DelegateV2)
+                    else len(request.objectives)
                 )
-                if not all(
-                    any(item.id == identity for item in snapshot.tasks) for identity in identities
-                ):
+                identities = tuple(
+                    str(uuid5(UUID(operation_id), f"worker-{index}")) for index in range(count)
+                )
+                existing = {item.id: item for item in snapshot.tasks if item.id in identities}
+                if len(existing) != len(identities):
                     maximum_round = max(
                         (item.round_index for item in snapshot.tasks if item.role == "worker"),
                         default=0,
                     )
                     if request.round_index != maximum_round + 1:
                         raise ValueError("collection rounds must advance in order")
-                inputs = tuple(
-                    ResearchTaskInput(identity, objective, "worker", request.round_index)
-                    for identity, objective in zip(identities, request.objectives, strict=True)
-                )
-                tasks = await self.repository.create_research_tasks(
-                    self.run.id, self.run.generation, operation_id, inputs
-                )
+                if focused and len(existing) == len(identities):
+                    tasks = tuple(existing[identity] for identity in identities)
+                else:
+                    objectives = (
+                        _focused_objectives(request, snapshot, self.run)
+                        if isinstance(request, _DelegateV2)
+                        else request.objectives
+                    )
+                    inputs = tuple(
+                        ResearchTaskInput(identity, objective, "worker", request.round_index)
+                        for identity, objective in zip(identities, objectives, strict=True)
+                    )
+                    tasks = await self.repository.create_research_tasks(
+                        self.run.id, self.run.generation, operation_id, inputs
+                    )
 
                 async def run_worker(worker: ResearchTask) -> None:
                     await self.run_task(worker)
@@ -357,10 +510,13 @@ class ResearchCoordinator:
                         "research_worker_failed", "A research worker failed."
                     ) from error
                 completed = await self.snapshot()
-                return {
+                result: dict[str, object] = {
                     "status": "complete",
                     "tasks": [item.to_dict() for item in completed.tasks if item.id in identities],
                 }
+                if focused:
+                    result["collection_guidance"] = collection_guidance(completed, self.run)
+                return result
             if name == "request_research_clarification":
                 request = _Clarify.model_validate(arguments)
                 return {
