@@ -22,6 +22,7 @@ class ResearchCollectionGuidance(TypedDict):
     unresolved_requirements: list[dict[str, object]]
     unassigned_requirement_ids: list[str]
     unassigned_question_ids: list[str]
+    unanswered_question_ids: list[str]
     unavailable_requirements: list[dict[str, object]]
     open_gaps: list[dict[str, object]]
     open_conflicts: list[dict[str, object]]
@@ -313,6 +314,7 @@ def collection_guidance(
             if entry in evidence:
                 assigned_requirements.add(identity)
     unresolved, unavailable = [], []
+    evidenced_questions: set[str] = set()
     for covered_question in coverage:
         for facet in _records(covered_question.get("requirements")):
             requirement = requirements.get(str(facet["id"]))
@@ -333,6 +335,7 @@ def collection_guidance(
                 for item in supporting
             )
             if enough:
+                evidenced_questions.add(str(covered_question["id"]))
                 continue
             if facet["id"] in unavailable_ids:
                 facet["status"] = "unavailable"
@@ -355,6 +358,7 @@ def collection_guidance(
     }
     unresolved.sort(
         key=lambda requirement: (
+            str(requirement["question_id"]) in evidenced_questions,
             str(requirement["question_id"]) in assigned_questions,
             str(requirement["id"]) in assigned_requirements,
         )
@@ -369,6 +373,13 @@ def collection_guidance(
             str(requirement["question_id"])
             for requirement in unresolved
             if str(requirement["question_id"]) not in assigned_questions
+        )
+    )
+    unanswered_questions = list(
+        dict.fromkeys(
+            str(requirement["question_id"])
+            for requirement in unresolved
+            if str(requirement["question_id"]) not in evidenced_questions
         )
     )
     limits = research_limits(run.budget_preset, run.research_policy_version)
@@ -436,6 +447,7 @@ def collection_guidance(
         "unresolved_requirements": unresolved,
         "unassigned_requirement_ids": unassigned_requirements,
         "unassigned_question_ids": unassigned_questions,
+        "unanswered_question_ids": unanswered_questions,
         "unavailable_requirements": unavailable,
         "open_gaps": open_gaps,
         "open_conflicts": open_conflicts,

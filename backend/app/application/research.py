@@ -229,6 +229,12 @@ def research_instructions(task: ResearchTask, policy_version: str = LEGACY_RESEA
             "when at most 24 fit across two assignments of at most 12 requirements each. Group "
             "related entities or dimensions when there are more than two. Use later rounds for "
             "methods, results, limitations, and specific remaining gaps or conflicts. "
+            "An assignment is not evidence. After each batch, first investigate the first "
+            "unanswered_question_id, which has no findings supported by observed source lines. "
+            "Give it a focused assignment or read its saved sources yourself before deepening "
+            "questions that already have findings. Within a shared assignment, establish and "
+            "checkpoint at least one supported finding for each requested entity before "
+            "returning to deeper details for an entity already covered. "
             "When further collection has low expected value, save collection_decision with "
             "the reason and explanation. This stops collection, not the final evidence review."
         )
@@ -386,10 +392,26 @@ def _focused_objectives(
             "the first worker batch must cover all requested evidence requirements; missing: "
             + missing
         )
+    unanswered = guidance["unanswered_question_ids"]
+    if not initial_wave and unanswered:
+        priority = {
+            str(item["id"])
+            for item in guidance["unresolved_requirements"]
+            if item["question_id"] == unanswered[0]
+        }
+        if not priority.intersection(batch_requirements) and not all(
+            assignment.purpose == "check_conflict" for assignment in request.assignments
+        ):
+            raise ValueError(
+                "first investigate unanswered question "
+                + unanswered[0]
+                + "; target its evidence requirements: "
+                + ", ".join(sorted(priority))
+            )
     if (
         unassigned
         and not unassigned.intersection(batch_requirements)
-        and not any(assignment.purpose == "check_conflict" for assignment in request.assignments)
+        and not all(assignment.purpose == "check_conflict" for assignment in request.assignments)
     ):
         raise ValueError("target unassigned evidence requirements before deepening assigned work")
     claimed: set[str] = set()

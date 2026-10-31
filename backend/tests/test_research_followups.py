@@ -521,6 +521,77 @@ class FocusedDelegationTests(unittest.IsolatedAsyncioTestCase):
         result = await self.delegate([assignment(requirement_ids=["chatdev"])], round_index=2)
         self.assertEqual(result["status"], "complete")
 
+    async def assigned_question_without_findings(self) -> None:
+        requested = question()
+        requested["evidence_requirements"].append(
+            {"id": "results", "description": "Read results", "depth": "full_text"}
+        )
+        other = {
+            "id": "other",
+            "question": "What does the other framework do?",
+            "evidence_requirements": [
+                {"id": "other-methods", "description": "Read other methods", "depth": "full_text"}
+            ],
+        }
+        self.repository.state = replace(
+            self.repository.state, checkpoint={"subquestions": [requested, other]}
+        )
+        initial = await self.delegate(
+            [
+                assignment(requirement_ids=["methods-text", "results"]),
+                assignment(question_ids=["other"], requirement_ids=["other-methods"]),
+            ]
+        )
+        self.assertEqual(initial["status"], "complete")
+        supported = finding()
+        self.repository.state = replace(
+            self.repository.state,
+            checkpoint={"subquestions": [requested, other], "findings": [supported]},
+            source_reads=(saved_read(supported),),
+        )
+
+    async def test_assignment_without_findings_does_not_hide_an_unanswered_question(self) -> None:
+        await self.assigned_question_without_findings()
+        guidance = collection_guidance(self.repository.state, self.execution)
+        self.assertEqual(guidance["unassigned_requirement_ids"], [])
+        self.assertEqual(guidance["unresolved_requirements"][0]["id"], "other-methods")
+        self.assertEqual(guidance["unanswered_question_ids"], ["other"])
+        rejected = await self.delegate([assignment(requirement_ids=["results"])], round_index=2)
+        self.assertEqual(rejected["status"], "invalid_request")
+        self.assertIn("other", rejected["reason"])
+        accepted = await self.delegate(
+            [assignment(question_ids=["other"], requirement_ids=["other-methods"])], round_index=2
+        )
+        self.assertEqual(accepted["status"], "complete")
+
+    async def test_conflict_assignment_cannot_exempt_other_workers_from_unanswered_priority(self):
+        await self.assigned_question_without_findings()
+        self.repository.state = replace(
+            self.repository.state,
+            checkpoint={
+                **self.repository.state.checkpoint,
+                "conflicts": [
+                    {
+                        "id": "method-conflict",
+                        "text": "Two methods disagree",
+                        "question_ids": ["methods"],
+                        "requirement_ids": ["methods-text"],
+                        "status": "open",
+                    }
+                ],
+            },
+        )
+        conflict = assignment(
+            requirement_ids=[], conflict_ids=["method-conflict"], purpose="check_conflict"
+        )
+        mixed = await self.delegate(
+            [assignment(requirement_ids=["results"]), conflict], round_index=2
+        )
+        self.assertEqual(mixed["status"], "invalid_request")
+        self.assertIn("other", mixed["reason"])
+        pure = await self.delegate([conflict], round_index=2)
+        self.assertEqual(pure["status"], "complete")
+
     async def test_more_than_twenty_four_initial_requirements_remain_bounded(self) -> None:
         questions = [
             {
