@@ -128,6 +128,19 @@ MAX_MODEL_RESPONSE_BYTES = 256_000
 MAX_CONTINUATION_BYTES = 256_000
 
 
+def _research_review_identity(prompt: str) -> object:
+    start = prompt.rfind('{"report":')
+    if start >= 0:
+        try:
+            payload = json.loads(prompt[start:])
+        except ValueError:
+            pass
+        else:
+            if isinstance(payload, dict) and "evidence" in payload:
+                return payload["report"], payload["evidence"]
+    return prompt
+
+
 def _research_model_budget(value: object) -> object:
     if isinstance(value, dict):
         return {
@@ -2167,6 +2180,21 @@ class RunService:
                 (ResearchTaskInput(task_id, "Research report " + purpose, role, 0),),
             )
             task = tasks[0]
+            if run.research_policy_version == RESEARCH_POLICY_V2 and role == "reviewer":
+                for saved_call in await repository.read_research_task_calls(run.id, task.id):
+                    saved_request = restore_model_request(saved_call.request_snapshot, run)
+                    if (
+                        saved_call.run_id != run.id
+                        or saved_call.task_id != task.id
+                        or not saved_request.messages
+                        or saved_request.messages[0].role != "user"
+                        or _research_review_identity(saved_request.messages[0].content)
+                        != _research_review_identity(self._redactor.redact_text(prompt))
+                    ):
+                        raise ApplicationError(
+                            "inconsistent_execution_records",
+                            "The saved research review input changed.",
+                        )
             if task.status is ResearchTaskStatus.FAILED:
                 incomplete = await saved_incomplete(task)
                 if incomplete is not None:

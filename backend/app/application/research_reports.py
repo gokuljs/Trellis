@@ -1,9 +1,11 @@
 import json
 import re
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, replace
 from typing import cast
 from urllib.parse import quote, urlsplit, urlunsplit
+from uuid import UUID
 
 from app.application.budgets import BudgetExceeded
 from app.application.errors import ApplicationError
@@ -45,7 +47,15 @@ _REPORT_SCHEMA = (
 )
 
 
+class _ReportClaimError(ValueError):
+    def __init__(self, issues: list[dict[str, object]]) -> None:
+        self.issues = issues[:50]
+        super().__init__("Some report claims have invalid citation records.")
+
+
 def _validation_issue(error: ValueError) -> str:
+    if isinstance(error, _ReportClaimError):
+        return str(error)
     if isinstance(error, json.JSONDecodeError):
         return "The report response was not valid JSON."
     messages = {
@@ -145,29 +155,14 @@ def parse_report(
     if not isinstance(raw_claims, list) or len(raw_claims) > 50:
         raise ValueError("invalid report claims")
     claims = []
+    issues: list[dict[str, object]] = []
     for raw in raw_claims:
-        claim = research_object(raw)
-        references = claim.get("citations")
-        if not isinstance(references, list):
-            raise ValueError("invalid claim citations")
-        citations = []
-        for raw_reference in references:
-            reference = research_object(raw_reference)
-            start, end = reference.get("start_line"), reference.get("end_line")
-            source = reference.get("source_id")
-            if not isinstance(source, str) or type(start) is not int or type(end) is not int:
-                raise ValueError("invalid claim citation")
-            citations.append(CitationReference(source, start, end))
-        claim_id, claim_text = claim.get("id"), claim.get("text")
-        if not isinstance(claim_id, str) or not isinstance(claim_text, str):
-            raise ValueError("invalid report claim")
-        if (
-            policy_version == RESEARCH_POLICY_V2
-            and isinstance(markdown, str)
-            and claim_text not in markdown
-        ):
-            claim_text = bind_emphasized_claim(markdown, claim_text) or claim_text
-        claims.append(ResearchClaim(claim_id, claim_text, tuple(citations)))
+        try:
+            claims.append(_parse_report_claim(raw, markdown, policy_version))
+        except _ReportClaimError as error:
+            issues.extend(error.issues[: 50 - len(issues)])
+    if issues:
+        raise _ReportClaimError(issues)
     model_reason = value.get("stop_reason")
     long_explanation = isinstance(model_reason, str) and len(model_reason) > 100
     reason = (
@@ -191,6 +186,60 @@ def parse_report(
     )
     validate_report_structure(report)
     return report
+
+
+def _parse_report_claim(raw: object, markdown: object, policy_version: str) -> ResearchClaim:
+    claim = research_object(raw)
+    references = claim.get("citations")
+    if not isinstance(references, list):
+        raise ValueError("invalid claim citations")
+    citations = []
+    issues: list[dict[str, object]] = []
+    for index, raw_reference in enumerate(references):
+        try:
+            reference = research_object(raw_reference)
+            start, end = reference.get("start_line"), reference.get("end_line")
+            source = reference.get("source_id")
+            if not isinstance(source, str) or type(start) is not int or type(end) is not int:
+                raise ValueError("invalid claim citation")
+            if policy_version == RESEARCH_POLICY_V2 and str(UUID(source)) != source:
+                raise ValueError("invalid citation source_id")
+            citations.append(CitationReference(source, start, end))
+        except ValueError:
+            if policy_version != RESEARCH_POLICY_V2:
+                raise
+            record = raw_reference if isinstance(raw_reference, dict) else {}
+            source = record.get("source_id")
+            try:
+                valid_source = isinstance(source, str) and str(UUID(source)) == source
+            except ValueError:
+                valid_source = False
+            issues.append(
+                {
+                    "claim_id": str(claim.get("id", ""))[:100],
+                    "citation_index": index,
+                    "source_id": str(source)[:100],
+                    "issue": (
+                        "source_id must exactly match a saved source UUID; do not invent or "
+                        "repair UUIDs. Remove this claim if its actual source is unavailable."
+                        if not valid_source
+                        else "start_line/end_line must be ordered positive source lines with "
+                        "at most 200 lines per citation."
+                    ),
+                }
+            )
+    if issues:
+        raise _ReportClaimError(issues)
+    claim_id, claim_text = claim.get("id"), claim.get("text")
+    if not isinstance(claim_id, str) or not isinstance(claim_text, str):
+        raise ValueError("invalid report claim")
+    if (
+        policy_version == RESEARCH_POLICY_V2
+        and isinstance(markdown, str)
+        and claim_text not in markdown
+    ):
+        claim_text = bind_emphasized_claim(markdown, claim_text) or claim_text
+    return ResearchClaim(claim_id, claim_text, tuple(citations))
 
 
 def validate_report_structure(report: ResearchReport) -> None:
@@ -520,14 +569,61 @@ def partial_report(
 
 
 def _cited_claim(claim: ResearchClaim) -> str:
-    return (
-        claim.text
-        + " "
-        + " ".join(
-            f"[[source:{ref.source_id}:L{ref.start_line}-L{ref.end_line}]]"
-            for ref in claim.citations
-        )
+    markers = dict.fromkeys(
+        f"[[source:{ref.source_id}:L{ref.start_line}-L{ref.end_line}]]" for ref in claim.citations
     )
+    return " ".join([claim.text, *(marker for marker in markers if marker not in claim.text)])
+
+
+def _claim_subset_report(text: str, stop_reason: str) -> ResearchReport | None:
+    value = _json_object(text)
+    markdown, raw_claims = value.get("markdown"), value.get("claims")
+    if not isinstance(markdown, str) or not isinstance(raw_claims, list) or len(raw_claims) > 50:
+        return None
+    identities = Counter(
+        raw.get("id")
+        for raw in raw_claims
+        if isinstance(raw, dict) and isinstance(raw.get("id"), str)
+    )
+    selected: list[ResearchClaim] = []
+    citation_count = 0
+
+    def build(claims: list[ResearchClaim]) -> ResearchReport:
+        summary = next((claim for claim in claims if claim.id == "summary"), None)
+        body = (
+            "## Summary\n\n"
+            + (
+                _cited_claim(summary)
+                if summary is not None
+                else "Some report entries were omitted because their citation records "
+                "could not be validated."
+            )
+            + "\n\n## Findings\n\n"
+            + "\n\n".join(_cited_claim(claim) for claim in claims if claim is not summary)
+            + "\n\n## Conflicts\n\nConflicts require evidence review."
+            "\n\n## Limitations\n\nInvalid entries were omitted without correcting their "
+            "source identifiers. Requested question coverage remains unverified."
+        )
+        report = ResearchReport(body, tuple(claims), (), stop_reason)
+        validate_report_structure(report)
+        return report
+
+    for raw in raw_claims:
+        try:
+            claim = _parse_report_claim(raw, markdown, RESEARCH_POLICY_V2)
+            if (
+                identities[claim.id] != 1
+                or claim.text not in markdown
+                or citation_count + len(claim.citations) > 50
+            ):
+                continue
+            build([claim])
+            build([*selected, claim])
+        except ValueError:
+            continue
+        selected.append(claim)
+        citation_count += len(claim.citations)
+    return build(selected) if selected else None
 
 
 def _stopping_explanation(reason: str) -> str:
@@ -704,17 +800,26 @@ class ResearchReportService:
                 repair_context: dict[str, object]
                 checked: ResearchGeneration | None = None
                 report: ResearchReport | None = None
+                subset_candidate = False
                 try:
                     if incomplete:
                         raise ValueError("research report reached its output limit")
-                    report = disclose_missing_questions(
-                        parse_report(
+                    try:
+                        candidate = parse_report(
                             content,
                             default_stop_reason=stopping_reason,
                             policy_version=snapshot.policy_version,
-                        ),
-                        snapshot,
-                    )
+                        )
+                    except ValueError:
+                        candidate = (
+                            _claim_subset_report(content, stopping_reason)
+                            if attempt == 1 and snapshot.policy_version == RESEARCH_POLICY_V2
+                            else None
+                        )
+                        if candidate is None:
+                            raise
+                        subset_candidate = True
+                    report = disclose_missing_questions(candidate, snapshot)
                     if writer_notes.get("scope_unavailable") and report.claims:
                         raise ValueError("complete research scope exceeds the bounded report input")
                     excerpts, hashes = await self._evidence(snapshot, report)
@@ -797,19 +902,34 @@ class ResearchReportService:
                     if not review.issues and set(review.accepted_claim_ids) == {
                         claim.id for claim in report.claims
                     }:
+                        if subset_candidate:
+                            report, review = partial_report(
+                                snapshot,
+                                "report_validation_failed",
+                                report,
+                                review,
+                                validation_issue=(
+                                    "Report entries with invalid citation records were omitted."
+                                ),
+                            )
                         await self._research.publish_research_report(
                             run.id,
                             run.generation,
                             anchor,
                             report,
                             review,
-                            partial=not report.claims
+                            partial=subset_candidate
+                            or not report.claims
                             or set(report.covered_question_ids) != expected
                             or (snapshot.policy_version == RESEARCH_POLICY_V2 and not expected),
                         )
                         return
                     reason = "report_support_incomplete"
-                    validation_issue = None
+                    validation_issue = (
+                        "Report entries with invalid citation records were omitted."
+                        if subset_candidate
+                        else None
+                    )
                     repair_context = {"report": asdict(report), "review": asdict(review)}
                 except ValueError as error:
                     reason = "report_validation_failed"
@@ -818,6 +938,8 @@ class ResearchReportService:
                         "response": checked.content if checked is not None else content,
                         "validation_issue": validation_issue,
                     }
+                    if isinstance(error, _ReportClaimError):
+                        repair_context["validation_issues"] = error.issues
                     if checked is not None and report is not None:
                         repair_context["report"] = asdict(report)
                 if attempt:
