@@ -147,7 +147,15 @@ async function effectiveEnvironment(component) {
       ),
       ...supplied,
     }
-  } catch {
+  } catch (error) {
+    if (
+      component.name === "frontend" &&
+      ["MODULE_NOT_FOUND", "ERR_MODULE_NOT_FOUND"].includes(error?.code)
+    ) {
+      throw new SetupError(
+        "Frontend development dependencies are missing or incomplete. Run cd frontend && bun install --frozen-lockfile, then run make dev again."
+      )
+    }
     throw new SetupError(
       `Unable to load ${component.name} development configuration. Check its environment files and installed dependencies.`
     )
