@@ -1,6 +1,6 @@
 import type { OrbState } from "thinking-orbs"
 
-import type { RunSummary } from "@/lib/app-types"
+import type { ResearchSnapshot, RunSummary } from "@/lib/app-types"
 import type { RuntimeRunEvent } from "@/lib/runtime-client"
 
 export type ActivityStatus = {
@@ -11,6 +11,25 @@ export type ActivityStatus = {
 }
 
 type StatusCopy = Pick<ActivityStatus, "label" | "orb">
+
+export function researchOutcomeStatus(
+  status: ActivityStatus,
+  runId: string | undefined,
+  research: ResearchSnapshot | null | undefined
+): ActivityStatus {
+  if (!status.terminal || status.label !== "Completed") return status
+  const phase =
+    research && research.run_id === runId ? research.phase : undefined
+  return {
+    ...status,
+    label:
+      phase === "partial"
+        ? "Research finished with gaps"
+        : phase === "completed"
+          ? "Research completed"
+          : "Research finished",
+  }
+}
 
 const phaseStates = new Map<string, StatusCopy>([
   ["answering", { label: "Answering", orb: "composing" }],

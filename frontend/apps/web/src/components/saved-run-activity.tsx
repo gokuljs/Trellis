@@ -1,10 +1,15 @@
-import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query"
+import {
+  useInfiniteQuery,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query"
 
 import { RunActivity } from "@/components/run-activity"
 import { eventsFromPages } from "@/lib/activity-history"
 import { runEventsQueryOptions } from "@/lib/server-queries"
 import type { RuntimeRunInfo } from "@/lib/runtime-client"
 import type { RunSummary } from "@/lib/app-types"
+import { researchQueryOptions } from "@/lib/research"
 
 export function SavedRunActivity({
   sessionId,
@@ -22,6 +27,11 @@ export function SavedRunActivity({
   const client = useQueryClient()
   const options = runEventsQueryOptions(sessionId, runId)
   const history = useInfiniteQuery(options)
+  const research = useQuery({
+    ...researchQueryOptions(sessionId, runId),
+    enabled:
+      runInfo?.runMode === "research" || summary?.run_mode === "research",
+  })
   const events = eventsFromPages(history.data?.pages ?? [], runId)
   const firstCursor = history.data?.pageParams[0]
   const earlierEvicted = typeof firstCursor === "number" && firstCursor > 0
@@ -38,6 +48,7 @@ export function SavedRunActivity({
           events={events}
           runInfo={runInfo}
           summary={summary}
+          research={research.data}
           pending={false}
           approvalPendingToolId={null}
           approvalError={null}
