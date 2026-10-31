@@ -10,8 +10,11 @@ from uuid import UUID, uuid5
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.application.errors import ApplicationError, ProviderError
+from app.application.research_notebook import ResearchCheckpointV2, merge_notebook
 from app.application.research_ports import ResearchRepository
 from app.domain.research import (
+    LEGACY_RESEARCH_POLICY,
+    RESEARCH_POLICY_V2,
     ResearchSnapshot,
     ResearchTask,
     ResearchTaskInput,
@@ -117,15 +120,25 @@ _CONTROLS: tuple[tuple[str, str, type[_Arguments]], ...] = (
 )
 
 
-def control_specs(role: str) -> tuple[ModelToolSpec, ...]:
+def control_specs(
+    role: str, policy_version: str = LEGACY_RESEARCH_POLICY
+) -> tuple[ModelToolSpec, ...]:
     return tuple(
-        ModelToolSpec(name, description, model.model_json_schema())
+        ModelToolSpec(
+            name,
+            description,
+            (
+                ResearchCheckpointV2
+                if policy_version == RESEARCH_POLICY_V2 and name == "research_checkpoint"
+                else model
+            ).model_json_schema(),
+        )
         for name, description, model in _CONTROLS
         if role == "lead" or name == "research_checkpoint"
     )
 
 
-def research_instructions(task: ResearchTask) -> str:
+def research_instructions(task: ResearchTask, policy_version: str = LEGACY_RESEARCH_POLICY) -> str:
     shared = (
         f"Trellis research instructions version {RESEARCH_INSTRUCTIONS_VERSION}. "
         "Use the same bounded agent loop to investigate the assigned objective. External "
@@ -141,6 +154,21 @@ def research_instructions(task: ResearchTask) -> str:
         "has low value, or the shared allowance is nearly spent. Your text remains internal. "
         "Return a concise summary of findings, citations, conflicts, and limitations."
     )
+    if policy_version == RESEARCH_POLICY_V2:
+        shared = shared.replace(RESEARCH_INSTRUCTIONS_VERSION, policy_version) + (
+            " Follow the frozen conversation context to understand follow-up requests; never "
+            "include private context in public queries. Save a brief describing scope, "
+            "comparison dimensions, source restrictions, and expected output. Each important "
+            "question needs explicit evidence_requirements with unique IDs. For comparisons "
+            "of papers, investigate methods, evaluation conditions, results, and limitations "
+            "in full text when the scope permits. For jobs, verify current employer listings "
+            "and application links. Respect abstract-only and other explicit source restrictions. "
+            "Link every finding to question_ids, requirement_ids and exact cited source lines. "
+            "Distinguish author_reported results, corroborated facts, and inference. "
+            "Record evidence_depth honestly; source access alone does not prove sufficient depth. "
+            "Track gaps and conflicts by stable ID; resolve existing IDs when evidence answers "
+            "them instead of appending stale gaps. A question status never proves coverage."
+        )
     if task.role == "lead":
         return shared + (
             " You coordinate research. First save a scope and important subquestions. "
@@ -154,7 +182,15 @@ def research_instructions(task: ResearchTask) -> str:
     return shared + " You are a focused worker. Do not delegate or broaden the assignment."
 
 
-def merge_checkpoint(previous: dict[str, object], update: dict[str, object]) -> dict[str, object]:
+def merge_checkpoint(
+    previous: dict[str, object],
+    update: dict[str, object],
+    *,
+    policy_version: str = LEGACY_RESEARCH_POLICY,
+    known_questions: object = None,
+) -> dict[str, object]:
+    if policy_version == RESEARCH_POLICY_V2:
+        return merge_notebook(previous, update, known_questions=known_questions)
     checked = _Checkpoint.model_validate(update).model_dump()
     merged = dict(previous)
     for key in ("phase", "scope", "stop_reason"):
@@ -226,8 +262,25 @@ class ResearchCoordinator:
     ) -> dict[str, object]:
         try:
             if name == "research_checkpoint":
-                current = next(item for item in (await self.snapshot()).tasks if item.id == task.id)
-                checkpoint = merge_checkpoint(current.checkpoint, arguments)
+                snapshot = await self.snapshot()
+                current = next(item for item in snapshot.tasks if item.id == task.id)
+                policy_version = getattr(
+                    self.run, "research_policy_version", LEGACY_RESEARCH_POLICY
+                )
+                if (
+                    policy_version == RESEARCH_POLICY_V2
+                    and task.role != "lead"
+                    and any(arguments.get(key) for key in ("brief", "scope", "subquestions"))
+                ):
+                    raise ValueError("only the lead may change research scope or questions")
+                checkpoint = merge_checkpoint(
+                    {**snapshot.checkpoint, **current.checkpoint}
+                    if policy_version == RESEARCH_POLICY_V2 and task.role == "lead"
+                    else current.checkpoint,
+                    arguments,
+                    policy_version=policy_version,
+                    known_questions=snapshot.checkpoint.get("subquestions"),
+                )
                 saved = await self.repository.checkpoint_research(
                     self.run.id,
                     self.run.generation,

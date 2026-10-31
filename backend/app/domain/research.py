@@ -16,8 +16,26 @@ MAX_RESEARCH_REPORT_BYTES = 64 * 1024
 MAX_RESEARCH_CITATIONS = 50
 MAX_RESEARCH_CONCURRENCY = 2
 REPORT_CALL_RESERVE = 4
+LEGACY_RESEARCH_POLICY = "bounded-research-v1"
+RESEARCH_POLICY_V2 = "bounded-research-v2"
+# Activation is a separate, verified rollout after collection and publication agree.
+CURRENT_RESEARCH_POLICY = LEGACY_RESEARCH_POLICY
 
 ResearchRole = Literal["lead", "worker", "writer", "reviewer"]
+
+
+def research_policy(value: object) -> str:
+    if value not in (LEGACY_RESEARCH_POLICY, RESEARCH_POLICY_V2):
+        raise ValueError("unknown research policy")
+    return cast(str, value)
+
+
+def research_execution_budget(value: object) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value not in (600, 1200, 2700):
+        raise ValueError("invalid research execution allowance")
+    return value
 
 
 def research_identifier(value: object) -> str:
@@ -116,11 +134,15 @@ _RESEARCH_LIMITS = {
 }
 
 
-def research_limits(preset: str) -> ResearchLimits:
+def research_limits(preset: str, policy_version: str = LEGACY_RESEARCH_POLICY) -> ResearchLimits:
+    research_policy(policy_version)
     try:
-        return _RESEARCH_LIMITS[preset]
+        limits = _RESEARCH_LIMITS[preset]
     except KeyError:
         raise ValueError("unknown research budget") from None
+    if policy_version == RESEARCH_POLICY_V2 and preset == "longer":
+        return ResearchLimits(**{**asdict(limits), "seconds": 2700})
+    return limits
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +247,8 @@ class ResearchSnapshot:
     stop_reason: str | None = None
     report_model_call_id: str | None = None
     citations: tuple[CitationReference, ...] = ()
+    policy_version: str = LEGACY_RESEARCH_POLICY
+    execution_budget_seconds: int | None = None
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> Self:
@@ -269,6 +293,8 @@ class ResearchSnapshot:
             if value.get("report_model_call_id") is not None
             else None,
             tuple(citations),
+            research_policy(value.get("policy_version", LEGACY_RESEARCH_POLICY)),
+            research_execution_budget(value.get("execution_budget_seconds")),
         )
 
     def to_dict(self) -> dict[str, object]:

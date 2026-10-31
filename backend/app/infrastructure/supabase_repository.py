@@ -45,6 +45,12 @@ from app.domain.models import (
 )
 from app.domain.outputs import AssistantOutput, validate_assistant_batch
 from app.domain.recovery import RecoveryContract, RecoveryResolution, RecoverySnapshot
+from app.domain.research import (
+    CURRENT_RESEARCH_POLICY,
+    research_execution_budget,
+    research_limits,
+    research_policy,
+)
 from app.domain.runtime import (
     ModelCallRecord,
     ModelCallStatus,
@@ -992,6 +998,10 @@ class SupabaseRepository(ResearchRepositoryMixin, WebRepositoryMixin):
             recovery_reason=_nullable_text(row, "recovery_reason"),
             uncertain_tool_call_id=_nullable_text(row, "uncertain_tool_call_id"),
             run_mode=cast(RunMode, row.get("run_mode", "chat")),
+            research_policy_version=research_policy(
+                row.get("research_policy_version") or "bounded-research-v1"
+            ),
+            execution_budget_seconds=research_execution_budget(row.get("execution_budget_seconds")),
         )
 
     def _event(self, row: dict[str, object]) -> RunEvent:
@@ -1328,7 +1338,12 @@ class SupabaseRepository(ResearchRepositoryMixin, WebRepositoryMixin):
             raise ValueError("run input cannot be empty")
         if not client_request_id or len(client_request_id) > 200:
             raise ValueError("client request ID must contain 1 to 200 characters")
-        if not self._token_source.valid_for(limits_for_preset(budget_preset).max_seconds + 30):
+        execution_seconds = (
+            research_limits(budget_preset, CURRENT_RESEARCH_POLICY).seconds
+            if run_mode == "research"
+            else limits_for_preset(budget_preset).max_seconds
+        )
+        if not self._token_source.valid_for(execution_seconds + 30):
             raise ApplicationError(
                 "run_token_too_short",
                 "Your sign-in expires too soon for this run. Refresh your sign-in and try again.",
