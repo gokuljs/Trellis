@@ -94,6 +94,7 @@ class DurableTransport(PostgresTransport):
 class DurableResearcher:
     def __init__(self):
         self.requests = []
+        self.retry_saved_urls = False
 
     async def stream(self, request: ModelRequest, api_key, user_id):
         self.requests.append(request)
@@ -146,7 +147,23 @@ class DurableResearcher:
         else:
             state = json.loads(prompt)
             notes = state["checkpoint"]
-            if state.get("checkpoint_required"):
+            if self.retry_saved_urls and not any(
+                tool.name == "delegate_research" for tool in request.tools
+            ):
+                self.retry_saved_urls = False
+                calls = [
+                    ModelToolCall(
+                        str(uuid4()),
+                        "web_read",
+                        {
+                            "urls": [
+                                f"https://example.com/{index}" for index in range(start, start + 5)
+                            ]
+                        },
+                    )
+                    for start in (0, 5)
+                ]
+            elif state.get("checkpoint_required"):
                 calls = [
                     ModelToolCall(
                         str(uuid4()),
@@ -402,6 +419,15 @@ class ResearchV2ExecutionPostgresTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             len((await self.repository.list_web_sources(saved.session_id, 0, 20)).items), 10
         )
+        original_sources = {
+            source.id: (source.content_hash, source.fetched_at)
+            for source in (await self.repository.list_web_sources(saved.session_id, 0, 20)).items
+        }
+        original_reads = {
+            call.id
+            for call in await self.repository.list_tool_calls(saved.id)
+            if call.name == "web_read"
+        }
         self.assertEqual(
             sum(
                 message.role == "assistant"
@@ -417,6 +443,7 @@ class ResearchV2ExecutionPostgresTests(unittest.IsolatedAsyncioTestCase):
                 self.settings, UUID(self.fixture.owner), self.tokens, client
             )
             service, provider, pages, _contracts = self.make_service(repository)
+            provider.retry_saved_urls = True
             try:
                 claimed, reason = await repository.claim_recovery(saved, self.installation_id)
                 self.assertIsNone(reason)
@@ -445,6 +472,40 @@ class ResearchV2ExecutionPostgresTests(unittest.IsolatedAsyncioTestCase):
                 assert state is not None
                 self.assertEqual(state.phase.value, "completed")
                 self.assertEqual(pages.urls, [])
+                self.assertEqual(
+                    {
+                        source.id: (source.content_hash, source.fetched_at)
+                        for source in (
+                            await repository.list_web_sources(saved.session_id, 0, 20)
+                        ).items
+                    },
+                    original_sources,
+                )
+                repeated_reads = [
+                    call
+                    for call in await repository.list_tool_calls(saved.id)
+                    if call.name == "web_read" and call.id not in original_reads
+                ]
+                self.assertEqual(len(repeated_reads), 2)
+                repeated_ids = {call.id for call in repeated_reads}
+                reused = [
+                    page
+                    for task_id in dict.fromkeys(call.task_id for call in repeated_reads)
+                    if task_id is not None
+                    for message in await repository.read_research_task_messages(saved.id, task_id)
+                    if message.tool_call_id in repeated_ids
+                    for page in json.loads(message.content).get("pages", [])
+                ]
+                self.assertEqual(len(reused), 10)
+                self.assertEqual({page["source_id"] for page in reused}, set(original_sources))
+                self.assertTrue(all(page.get("reused_run_source") is True for page in reused))
+                usage = await asyncio.to_thread(
+                    self.fixture.sql,
+                    "SELECT usage->>'page_attempts',usage->>'network_requests' "
+                    "FROM trellis.web_runs WHERE run_id=" + database_tests.literal(saved.id) + ";",
+                    authenticated=False,
+                )
+                self.assertEqual(usage.stdout.strip(), "10|10")
                 self.assertEqual(len(state.source_reads), 10)
                 worker = next(task for task in state.tasks if task.role == "worker")
                 self.assertEqual(worker.checkpoint["stop_reason"], "research_worker_burst_complete")
