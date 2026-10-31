@@ -15,6 +15,7 @@ from app.domain.research import (
     research_identifier,
     research_limits,
     research_object,
+    research_review_payload,
 )
 from app.domain.runtime import (
     ModelCallRecord,
@@ -482,7 +483,7 @@ class ResearchRepositoryMixin:
                     "generation": generation,
                     "model_call_id": model_call_id,
                     "report": asdict(report),
-                    "review": asdict(review),
+                    "review": research_review_payload(review),
                     "report_hash": report.content_hash,
                     "partial": partial,
                 },

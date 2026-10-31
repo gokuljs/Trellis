@@ -250,16 +250,20 @@ class ResearchSnapshot:
     policy_version: str = LEGACY_RESEARCH_POLICY
     execution_budget_seconds: int | None = None
     source_reads: tuple[dict[str, object], ...] = ()
+    reviewed_coverage: tuple[dict[str, object], ...] = ()
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> Self:
         raw_tasks = value.get("tasks")
         raw_citations = value.get("citations", [])
+        raw_coverage = value.get("reviewed_coverage", [])
         raw_reads = value.get("source_reads", [])
         if not isinstance(raw_tasks, list) or len(raw_tasks) > 16:
             raise ValueError("invalid research task collection")
         if not isinstance(raw_citations, list) or len(raw_citations) > MAX_RESEARCH_CITATIONS:
             raise ValueError("invalid research citation collection")
+        if not isinstance(raw_coverage, list) or len(raw_coverage) > 12:
+            raise ValueError("invalid research question coverage")
         if not isinstance(raw_reads, list) or len(raw_reads) > 384:
             raise ValueError("invalid research read observations")
         tasks = tuple(ResearchTask.from_dict(research_object(item)) for item in raw_tasks)
@@ -300,6 +304,7 @@ class ResearchSnapshot:
             research_policy(value.get("policy_version", LEGACY_RESEARCH_POLICY)),
             research_execution_budget(value.get("execution_budget_seconds")),
             tuple(research_object(item) for item in raw_reads),
+            tuple(research_object(item) for item in raw_coverage),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -349,11 +354,29 @@ class ResearchReport:
 
 
 @dataclass(frozen=True, slots=True)
+class ResearchQuestionCoverage:
+    question_id: str
+    requirement_ids: tuple[str, ...]
+    claim_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for identity in (self.question_id, *self.requirement_ids, *self.claim_ids):
+            _text(identity, maximum=100)
+        if not self.requirement_ids or not self.claim_ids:
+            raise ValueError("research coverage requires evidence and accepted claims")
+        if len(set(self.requirement_ids)) != len(self.requirement_ids) or len(
+            set(self.claim_ids)
+        ) != len(self.claim_ids):
+            raise ValueError("research coverage contains duplicate identifiers")
+
+
+@dataclass(frozen=True, slots=True)
 class ResearchReview:
     report_hash: str
     source_hashes: dict[str, str]
     accepted_claim_ids: tuple[str, ...]
     issues: tuple[str, ...]
+    question_coverage: tuple[ResearchQuestionCoverage, ...] | None = None
 
     def __post_init__(self) -> None:
         for digest in (self.report_hash, *self.source_hashes.values()):
@@ -369,3 +392,20 @@ class ResearchReview:
             _text(claim, maximum=100)
         for issue in self.issues:
             _text(issue, maximum=8000)
+        if self.question_coverage is not None and (
+            len(self.question_coverage) > 12
+            or len({item.question_id for item in self.question_coverage})
+            != len(self.question_coverage)
+            or any(
+                not set(item.claim_ids).issubset(self.accepted_claim_ids)
+                for item in self.question_coverage
+            )
+        ):
+            raise ValueError("invalid research question coverage")
+
+
+def research_review_payload(review: ResearchReview) -> dict[str, object]:
+    value = asdict(review)
+    if review.question_coverage is None:
+        del value["question_coverage"]
+    return value
