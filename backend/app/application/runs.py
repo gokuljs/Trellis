@@ -59,9 +59,10 @@ from app.application.research_notebook import collection_guidance
 from app.application.research_ports import ResearchRepository
 from app.application.research_task_context import (
     bounded_research_notebook,
-    checkpoint_disposes_reads,
+    checkpoint_read_feedback,
     parse_research_read_observations,
     project_research_task_context,
+    undisposed_checkpoint_reads,
 )
 from app.application.run_capacity import RunCapacity
 from app.application.run_context import RunContext, billing_tier, usage_cost
@@ -2951,7 +2952,7 @@ class RunService:
             checkpoint_arguments = stored.arguments
             checkpoint_stop = False
             checkpoint_stop_reason = "research_finalization_reserve"
-            disposition_missing = False
+            checkpoint_feedback: dict[str, object] | None = None
             if notebook_enabled and stored.name == "research_checkpoint":
                 messages = await repository.read_research_task_messages(run.id, task.id)
                 model_calls = await repository.read_research_task_calls(run.id, task.id)
@@ -2987,7 +2988,9 @@ class RunService:
                 reads = tuple(
                     read for read in projection.unprocessed_reads if read.message_ordinal <= through
                 )
-                disposition_missing = not checkpoint_disposes_reads(stored.arguments, reads)
+                missing_reads = undisposed_checkpoint_reads(stored.arguments, reads)
+                if missing_reads:
+                    checkpoint_feedback = checkpoint_read_feedback(missing_reads)
                 checkpoint_stop = (
                     isinstance(metadata, dict) and metadata.get("stop_after_checkpoint") is True
                 )
@@ -3012,14 +3015,8 @@ class RunService:
                     "status": "invalid_request",
                     "reason": "Request clarification separately after other tools settle.",
                 }
-            elif disposition_missing:
-                response = {
-                    "status": "invalid_request",
-                    "reason": (
-                        "Save a sourced finding or an explicit source-cited gap "
-                        "for each unprocessed read."
-                    ),
-                }
+            elif checkpoint_feedback is not None:
+                response = checkpoint_feedback
             else:
                 try:
                     if stored.name == "delegate_research":

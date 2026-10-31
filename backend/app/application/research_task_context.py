@@ -124,6 +124,12 @@ def parse_research_read_observations(
 def checkpoint_disposes_reads(
     arguments: Mapping[str, object], observations: Sequence[ResearchReadObservation]
 ) -> bool:
+    return not undisposed_checkpoint_reads(arguments, observations)
+
+
+def undisposed_checkpoint_reads(
+    arguments: Mapping[str, object], observations: Sequence[ResearchReadObservation]
+) -> tuple[ResearchReadObservation, ...]:
     references = []
     for key in ("findings", "gaps", "conflicts"):
         records = arguments.get(key)
@@ -140,8 +146,10 @@ def checkpoint_disposes_reads(
                 start, end = citation.get("start_line"), citation.get("end_line")
                 if type(start) is int and type(end) is int and 1 <= start <= end:
                     references.append((citation.get("source_id"), start, end))
-    return all(
-        any(
+    return tuple(
+        observation
+        for observation in observations
+        if not any(
             source_id == observation.source_id
             and any(
                 start <= window.end_line and end >= window.start_line
@@ -149,8 +157,43 @@ def checkpoint_disposes_reads(
             )
             for source_id, start, end in references
         )
-        for observation in observations
     )
+
+
+def checkpoint_read_feedback(
+    observations: Sequence[ResearchReadObservation], *, max_bytes: int = 27_000
+) -> dict[str, object]:
+    details: list[dict[str, object]] = []
+    response: dict[str, object] = {
+        "status": "invalid_request",
+        "reason": (
+            "Keep dispositions for other unprocessed reads. Add a sourced finding or "
+            "source-cited gap for every read listed below, citing its presented source lines."
+        ),
+        "undisposed_read_count": len(observations),
+        "undisposed_reads": details,
+        "undisposed_reads_omitted": len(observations),
+    }
+    for observation in observations:
+        details.append(
+            {
+                "source_id": observation.source_id,
+                "content_hash": observation.content_hash,
+                "presented_ranges": [
+                    {"start_line": window.start_line, "end_line": window.end_line}
+                    for window in observation.presented_ranges
+                ],
+            }
+        )
+        response["undisposed_reads_omitted"] = len(observations) - len(details)
+        if (
+            len(json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode())
+            > max_bytes
+        ):
+            details.pop()
+            response["undisposed_reads_omitted"] = len(observations) - len(details)
+            break
+    return response
 
 
 def bounded_research_notebook(
