@@ -3324,6 +3324,8 @@ class RunService:
             if self._tool_registry.requires_workspace(stored_call.name)
             else None,
             _assert_run_active=assert_run_active,
+            run_mode=run.run_mode,
+            research_policy_version=run.research_policy_version,
         )
         async with asyncio.timeout(remaining_seconds):
             return await self._tool_registry.execute(

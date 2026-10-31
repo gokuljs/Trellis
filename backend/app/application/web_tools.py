@@ -3,8 +3,9 @@
 import asyncio
 import json
 import re
-from collections.abc import Awaitable, Callable
-from dataclasses import replace
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID, uuid5
@@ -24,6 +25,7 @@ from app.application.web_source_safety import accepted_source
 from app.application.web_source_summary import bound_source_summaries, source_summary
 from app.domain.capabilities import RuntimeCapability
 from app.domain.recovery import ToolRecoveryPolicy
+from app.domain.research import RESEARCH_POLICY_V2
 from app.domain.retrieval import (
     MAX_RENDER_SECONDS,
     MAX_RETRIEVAL_SECONDS,
@@ -39,12 +41,19 @@ from app.domain.web import (
     SourceLines,
     SourceStatus,
     WebScope,
+    WebSource,
     WebUsage,
 )
 
 READ_TRANSPORT_BYTES = 18 * 1024 * 1024
 _JSON_LIMIT = MAX_RESULT_BYTES - 1
 ProgressPublisher = Callable[[ToolExecutionContext, dict[str, object]], Awaitable[None]]
+
+
+@dataclass(slots=True)
+class _SourceReadLock:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
 
 
 class _Arguments(BaseModel):
@@ -160,6 +169,7 @@ class WebToolService:
         self._monthly_limit = monthly_search_limit
         self._redactor = redactor
         self._publish_progress = publish_progress
+        self._source_read_locks: dict[tuple[str, str, str, str], _SourceReadLock] = {}
         self._crawler = WebCrawlService(
             evidence.repository, crawler, redactor, publish_progress=publish_progress
         )
@@ -392,42 +402,18 @@ class WebToolService:
     ) -> dict[str, object]:
         pages: list[dict[str, object]] = []
         for index, url in enumerate(arguments.urls):
-            page: dict[str, object]
-            source_id = _operation_id(context, f"source:{index}")
-            existing = await self._repository.read_web_source(context.session_id, source_id, 1, 3)
-            await context.assert_active()
-            if existing is not None:
-                if (
-                    existing.source.run_id != context.run_id
-                    or existing.source.tool_call_id != context.tool_call_id
-                    or existing.source.requested_url != self._accepted_metadata(url, 4096)
-                ):
-                    raise ApplicationError(
-                        "web_scope_invalid", WEB_ERROR_MESSAGES["web_scope_invalid"]
+            reuse = (
+                context.run_mode == "research"
+                and context.research_policy_version == RESEARCH_POLICY_V2
+            )
+            if reuse and context.dispatch_attempt == 1:
+                async with self._source_read_lock(url, context):
+                    page = await self._read_single_page(
+                        url, index, arguments, scope, context, reuse=True
                     )
-                page = await source_summary(self._repository, existing, self._redactor)
-                page["reused"] = True
-            elif context.dispatch_attempt > 1:
-                page = {
-                    "status": "interrupted",
-                    "error_code": "read_not_replayed",
-                    "not_attempted": True,
-                }
-            elif arguments.render and self._renderer is None:
-                page = {
-                    "status": "unavailable",
-                    "error_code": "renderer_not_configured",
-                    "not_attempted": True,
-                }
-            elif not arguments.render and self._retriever is None:
-                page = {
-                    "status": "unavailable",
-                    "error_code": "reader_not_configured",
-                    "not_attempted": True,
-                }
             else:
-                page = await self._read_page(
-                    url, index, source_id, scope, context, render=arguments.render
+                page = await self._read_single_page(
+                    url, index, arguments, scope, context, reuse=False
                 )
             page["input_index"] = index
             pages.append(page)
@@ -437,6 +423,127 @@ class WebToolService:
             "pages": pages,
         }
         return bound_source_summaries(value, pages, self._redactor)
+
+    @asynccontextmanager
+    async def _source_read_lock(
+        self, url: str, context: ToolExecutionContext
+    ) -> AsyncIterator[None]:
+        key = context.user_id, context.session_id, context.run_id, url
+        entry = self._source_read_locks.setdefault(key, _SourceReadLock())
+        entry.users += 1
+        try:
+            async with asyncio.timeout(context.remaining_seconds), entry.lock:
+                await context.assert_active()
+                yield
+        finally:
+            entry.users -= 1
+            if entry.users == 0:
+                self._source_read_locks.pop(key, None)
+
+    async def _saved_run_source(
+        self, url: str, scope: WebScope, context: ToolExecutionContext, *, render: bool
+    ) -> dict[str, object] | None:
+        await context.assert_active()
+        async with asyncio.timeout(min(10.0, context.remaining_seconds)):
+            sources = await self._repository.list_run_web_sources(
+                context.session_id, context.run_id, 40
+            )
+            await context.assert_active()
+            for source in sources:
+                if (
+                    source.user_id != context.user_id
+                    or source.session_id != context.session_id
+                    or source.run_id != context.run_id
+                ):
+                    raise ApplicationError(
+                        "web_scope_invalid", WEB_ERROR_MESSAGES["web_scope_invalid"]
+                    )
+                if not source.status.citable:
+                    continue
+                if source.evidence_epoch != scope.evidence_epoch:
+                    raise ApplicationError(
+                        "web_scope_invalid", WEB_ERROR_MESSAGES["web_scope_invalid"]
+                    )
+                if url not in {source.requested_url, source.final_url}:
+                    continue
+                if render and not (source.extractor_version or "").startswith("trellis-render-"):
+                    continue
+                if not self._reusable_source(source):
+                    raise ApplicationError(
+                        "web_scope_invalid", WEB_ERROR_MESSAGES["web_scope_invalid"]
+                    )
+                result = await self._repository.read_web_source(context.session_id, source.id, 1, 3)
+                await context.assert_active()
+                if result is None:
+                    raise ApplicationError(
+                        "source_not_found", WEB_ERROR_MESSAGES["source_not_found"]
+                    )
+                if result.source != source or result.start_line != 1 or not result.lines:
+                    raise ApplicationError(
+                        "web_scope_invalid", WEB_ERROR_MESSAGES["web_scope_invalid"]
+                    )
+                page = await source_summary(self._repository, result, self._redactor)
+                await context.assert_active()
+                page.update({"reused": True, "reused_run_source": True})
+                return page
+        return None
+
+    @staticmethod
+    def _reusable_source(source: WebSource) -> bool:
+        return (
+            source.content_hash is not None
+            and re.fullmatch(r"[0-9a-f]{64}", source.content_hash) is not None
+            and source.line_count > 0
+            and source.byte_count > 0
+            and source.fetched_at is not None
+        )
+
+    async def _read_single_page(
+        self,
+        url: str,
+        index: int,
+        arguments: WebRenderArguments,
+        scope: WebScope,
+        context: ToolExecutionContext,
+        *,
+        reuse: bool,
+    ) -> dict[str, object]:
+        source_id = _operation_id(context, f"source:{index}")
+        existing = await self._repository.read_web_source(context.session_id, source_id, 1, 3)
+        await context.assert_active()
+        if existing is not None:
+            if (
+                existing.source.run_id != context.run_id
+                or existing.source.tool_call_id != context.tool_call_id
+                or existing.source.requested_url != self._accepted_metadata(url, 4096)
+            ):
+                raise ApplicationError("web_scope_invalid", WEB_ERROR_MESSAGES["web_scope_invalid"])
+            page = await source_summary(self._repository, existing, self._redactor)
+            page["reused"] = True
+            return page
+        if context.dispatch_attempt > 1:
+            return {
+                "status": "interrupted",
+                "error_code": "read_not_replayed",
+                "not_attempted": True,
+            }
+        if reuse:
+            page = await self._saved_run_source(url, scope, context, render=arguments.render)
+            if page is not None:
+                return page
+        if arguments.render and self._renderer is None:
+            return {
+                "status": "unavailable",
+                "error_code": "renderer_not_configured",
+                "not_attempted": True,
+            }
+        if not arguments.render and self._retriever is None:
+            return {
+                "status": "unavailable",
+                "error_code": "reader_not_configured",
+                "not_attempted": True,
+            }
+        return await self._read_page(url, index, source_id, scope, context, render=arguments.render)
 
     async def _read_page(
         self,
