@@ -188,8 +188,8 @@ export function Composer({
         {runStatus ??
           (runMode === "research"
             ? budgetPreset === "longer"
-              ? "Research limits: 20 minutes, $5 estimated model cost, 16 searches, 40 pages."
-              : "Research limits: 10 minutes, $2 estimated model cost, 8 searches, 20 pages."
+              ? "Research limits: 20 minutes, 600,000 tokens, $15 estimated model cost, 16 searches, 40 pages."
+              : "Research limits: 10 minutes, 300,000 tokens, $6 estimated model cost, 8 searches, 20 pages."
             : "Trellis can make mistakes. Check important info.")}
       </div>
     </div>

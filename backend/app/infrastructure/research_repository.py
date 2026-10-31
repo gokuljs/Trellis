@@ -13,6 +13,7 @@ from app.domain.research import (
     ResearchTask,
     ResearchTaskInput,
     research_identifier,
+    research_limits,
     research_object,
 )
 from app.domain.runtime import (
@@ -24,6 +25,9 @@ from app.domain.runtime import (
     RunSnapshot,
     ToolCallRecord,
 )
+
+_MAX_TASK_CALLS = research_limits("longer").model_calls
+_MAX_TASK_MESSAGES = _MAX_TASK_CALLS + research_limits("longer").tool_calls
 
 
 def _object(value: object) -> dict[str, object]:
@@ -349,7 +353,7 @@ class ResearchRepositoryMixin:
     ) -> list[RunMessageRecord]:
         value = await self._research_task(run_id, task_id)
         messages = []
-        for row in _rows(value.get("messages"), 168):
+        for row in _rows(value.get("messages"), _MAX_TASK_MESSAGES):
             tools = tuple(
                 ModelToolCall(
                     cast(str, tool.get("id")),
@@ -367,7 +371,7 @@ class ResearchRepositoryMixin:
     async def read_research_task_calls(self, run_id: str, task_id: str) -> list[ModelCallRecord]:
         value = await self._research_task(run_id, task_id)
         calls = []
-        for row in _rows(value.get("calls"), 40):
+        for row in _rows(value.get("calls"), _MAX_TASK_CALLS):
             call = self._model_call(row)
             if call.run_id != run_id or row.get("task_id") != task_id:
                 raise RuntimeError("Supabase returned another task's model calls")

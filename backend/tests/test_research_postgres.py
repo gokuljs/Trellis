@@ -7,7 +7,7 @@ import unittest
 from dataclasses import asdict
 from uuid import uuid4
 
-from app.domain.research import ResearchClaim, ResearchReport, ResearchReview
+from app.domain.research import ResearchClaim, ResearchReport, ResearchReview, research_limits
 from app.domain.web import CitationReference
 
 
@@ -88,8 +88,9 @@ class ResearchPostgresTests(unittest.TestCase):
         )
         self.run_id = created["run"]["id"]
         self.session_id = session["id"]
+        self.max_total_tokens = created["run"]["max_total_tokens"]
         self.assertEqual(
-            created["run"]["max_model_calls"], 40 if self.budget_preset == "longer" else 24
+            created["run"]["max_model_calls"], research_limits(self.budget_preset).model_calls
         )
         self.rpc(
             "transition_run_record",
@@ -137,7 +138,9 @@ class ResearchPostgresTests(unittest.TestCase):
         }
 
     def test_parallel_reservations_cannot_spend_report_reserve(self) -> None:
-        payloads = [self.reservation(task, tokens=40_000) for task in self.tasks]
+        payloads = [
+            self.reservation(task, tokens=self.max_total_tokens * 2 // 5) for task in self.tasks
+        ]
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             results = list(
                 executor.map(
@@ -382,7 +385,9 @@ class ResearchPostgresTests(unittest.TestCase):
         self.assertEqual(answered["run"]["deadline_at"], replayed["run"]["deadline_at"])
         self.assertEqual(answered["run"]["generation"], 1)
         self.assertEqual(replayed["run"]["recovery_count"], 0)
-        self.assertEqual(replayed["run"]["max_model_calls"], 24)
+        self.assertEqual(
+            replayed["run"]["max_model_calls"], research_limits(self.budget_preset).model_calls
+        )
         resumed = json.loads(
             self.sql(f"SELECT trellis.read_research({literal(self.run_id)});").stdout
         )

@@ -111,8 +111,8 @@ class ResearchLimits:
 
 
 _RESEARCH_LIMITS = {
-    "conservative": ResearchLimits(24, 64, 100_000, 600, 2.0, 8, 20, 4, 2),
-    "longer": ResearchLimits(40, 128, 200_000, 1200, 5.0, 16, 40, 8, 4),
+    "conservative": ResearchLimits(72, 192, 300_000, 600, 6.0, 8, 20, 4, 2),
+    "longer": ResearchLimits(120, 384, 600_000, 1200, 15.0, 16, 40, 8, 4),
 }
 
 
