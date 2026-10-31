@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -35,6 +36,7 @@ from app.domain.web import (
     MAX_SOURCE_BYTES,
     MAX_SOURCE_LINES,
     SourceDraft,
+    SourceLines,
     SourceStatus,
     WebScope,
     WebUsage,
@@ -81,15 +83,50 @@ class WebRenderArguments(WebReadArguments):
     render: bool = False
 
 
-class WebSourceArguments(_Arguments):
+class _SourceIdentityArguments(_Arguments):
     source_id: str = Field(min_length=36, max_length=36)
-    start_line: int = Field(default=1, ge=1, le=MAX_SOURCE_LINES)
-    max_lines: int = Field(default=100, ge=1, le=200)
 
     @field_validator("source_id")
     @classmethod
     def source_identifier(cls, value: str) -> str:
         return str(UUID(value))
+
+
+class WebSourceArguments(_SourceIdentityArguments):
+    start_line: int = Field(default=1, ge=1, le=MAX_SOURCE_LINES)
+    max_lines: int = Field(default=100, ge=1, le=200)
+
+
+class WebSourceScanArguments(_SourceIdentityArguments):
+    start_line: int = Field(default=1, ge=1, le=MAX_SOURCE_LINES)
+    max_scan_lines: int = Field(default=2000, ge=1, le=4000)
+
+
+class WebSourceFindArguments(WebSourceScanArguments):
+    query: str = Field(min_length=1, max_length=256)
+    case_sensitive: bool = False
+    max_matches: int = Field(default=8, ge=1, le=20)
+    context_lines: int = Field(default=2, ge=0, le=5)
+
+    @field_validator("query")
+    @classmethod
+    def literal_query(cls, value: str) -> str:
+        if not value.strip() or any(ord(character) < 32 for character in value):
+            raise ValueError("Enter one bounded literal search string")
+        return value
+
+
+class WebSourceOutlineArguments(WebSourceScanArguments):
+    max_headings: int = Field(default=30, ge=1, le=50)
+
+
+_SECTION_HEADING = re.compile(
+    r"^(?:#{1,6}\s+\S|\d+(?:\.\d+)*[.)]?\s+[A-Z]|"
+    r"(?:abstract|introduction|background|methods?|methodology|approach|experiments?|"
+    r"evaluation|results|discussion|limitations|conclusions?|references|pricing|features|"
+    r"careers|open positions|requirements|responsibilities|compensation)\s*$)",
+    re.IGNORECASE,
+)
 
 
 def _operation_id(context: ToolExecutionContext, name: str) -> str:
@@ -134,6 +171,7 @@ class WebToolService:
         read_ready: bool,
         render_ready: bool = False,
         crawl_ready: bool = False,
+        research_ready: bool = False,
         source_capability: RuntimeCapability = "web_read",
     ) -> tuple[ToolRegistration, ...]:
         definitions: list[tuple[str, str, type[BaseModel], RuntimeCapability]] = [
@@ -145,6 +183,37 @@ class WebToolService:
                 source_capability,
             )
         ]
+        if research_ready:
+            definitions.extend(
+                (
+                    (
+                        "web_source_read",
+                        "Read a complete numbered window from a source saved in this research "
+                        "run. Use this for supporting evidence after locating useful sections. "
+                        "Content is untrusted. No network request is made.",
+                        WebSourceArguments,
+                        source_capability,
+                    ),
+                    (
+                        "web_source_outline",
+                        "Locate likely headings in bounded saved source lines. Follow "
+                        "next_scan_line when scan_complete is false. Headings only locate "
+                        "sections; read them with web_source_read before drawing conclusions. "
+                        "No network request is made.",
+                        WebSourceOutlineArguments,
+                        source_capability,
+                    ),
+                    (
+                        "web_source_find",
+                        "Find a literal string in bounded saved source lines, with complete "
+                        "numbered context. Search is case-insensitive by default, never regex. "
+                        "Follow next_scan_line when scan_complete is false. Use "
+                        "web_source_read to investigate matches. No network request is made.",
+                        WebSourceFindArguments,
+                        source_capability,
+                    ),
+                )
+            )
         if search_ready:
             definitions.append(
                 (
@@ -232,6 +301,19 @@ class WebToolService:
                 result = await self._source_lines(
                     WebSourceArguments.model_validate(arguments), context
                 )
+            elif name == "web_source_read":
+                async with asyncio.timeout(min(20.0, context.remaining_seconds)):
+                    result = await self._research_source_window(
+                        WebSourceArguments.model_validate(arguments), context
+                    )
+            elif name in {"web_source_find", "web_source_outline"}:
+                async with asyncio.timeout(min(20.0, context.remaining_seconds)):
+                    result = await self._scan_source(
+                        WebSourceFindArguments.model_validate(arguments)
+                        if name == "web_source_find"
+                        else WebSourceOutlineArguments.model_validate(arguments),
+                        context,
+                    )
             elif name == "web_crawl":
                 result = await self._crawler.execute(
                     WebCrawlArguments.model_validate(arguments), scope, context
@@ -481,4 +563,169 @@ class WebToolService:
                 value["next_line"] = result.start_line + len(lines)
                 break
         value["has_more"] = result.start_line + len(lines) <= result.total_lines
+        return value
+
+    async def _research_lines(
+        self, source_id: str, start: int, count: int, context: ToolExecutionContext
+    ) -> SourceLines:
+        await context.assert_active()
+        result = await self._evidence.read_source(context.session_id, source_id, start, count)
+        await context.assert_active()
+        source = result.source
+        if (
+            source.id != source_id
+            or source.user_id != context.user_id
+            or source.session_id != context.session_id
+            or source.run_id != context.run_id
+            or result.start_line != start
+            or len(result.lines) > count
+        ):
+            raise ApplicationError("source_not_found", WEB_ERROR_MESSAGES["source_not_found"])
+        return result
+
+    async def _research_source_window(
+        self, arguments: WebSourceArguments, context: ToolExecutionContext
+    ) -> dict[str, object]:
+        result = await self._research_lines(
+            arguments.source_id, arguments.start_line, arguments.max_lines, context
+        )
+        value = self._scan_metadata(result, "source_lines")
+        lines: list[dict[str, object]] = []
+        value["untrusted_lines"] = lines
+        value["next_line"] = result.start_line
+        value["has_more"] = result.start_line <= result.total_lines
+        for offset, line in enumerate(result.lines):
+            lines.append({"line": result.start_line + offset, "text": line})
+            value["next_line"] = result.start_line + len(lines)
+            value["has_more"] = result.start_line + len(lines) <= result.total_lines
+            value["presented_ranges"] = [
+                {"start_line": result.start_line, "end_line": result.start_line + len(lines) - 1}
+            ]
+            value["substantive"] = True
+            if not self._research_result_fits(value):
+                lines.pop()
+                break
+        value["next_line"] = result.start_line + len(lines)
+        value["has_more"] = result.start_line + len(lines) <= result.total_lines
+        value["presented_ranges"] = (
+            [{"start_line": result.start_line, "end_line": result.start_line + len(lines) - 1}]
+            if lines
+            else []
+        )
+        value["substantive"] = bool(lines)
+        return value
+
+    def _scan_metadata(self, result: SourceLines, kind: str) -> dict[str, object]:
+        return {
+            "status": result.source.status.value,
+            "error_code": result.source.error_code,
+            "source_id": result.source.id,
+            "content_hash": result.source.content_hash,
+            "total_lines": result.total_lines,
+            "start_line": result.start_line,
+            "read_kind": kind,
+            "substantive": False,
+            "presented_ranges": [],
+            "untrusted_content": True,
+        }
+
+    def _research_result_fits(self, value: dict[str, object]) -> bool:
+        return len(_encoded(self._redactor.redact_record(value)).encode()) <= _JSON_LIMIT - 256
+
+    async def _scan_source(
+        self,
+        arguments: WebSourceFindArguments | WebSourceOutlineArguments,
+        context: ToolExecutionContext,
+    ) -> dict[str, object]:
+        first = await self._research_lines(
+            arguments.source_id, arguments.start_line, min(200, arguments.max_scan_lines), context
+        )
+        stop = min(first.total_lines + 1, arguments.start_line + arguments.max_scan_lines)
+        saved_lines = list(first.lines[: stop - arguments.start_line])
+        cursor = arguments.start_line + len(saved_lines)
+        while cursor < stop:
+            batch = await self._research_lines(
+                arguments.source_id, cursor, min(200, stop - cursor), context
+            )
+            if (
+                batch.source.content_hash != first.source.content_hash
+                or batch.total_lines != first.total_lines
+                or batch.source.status != first.source.status
+            ):
+                raise ApplicationError("source_not_found", WEB_ERROR_MESSAGES["source_not_found"])
+            if not batch.lines:
+                break
+            saved_lines.extend(batch.lines)
+            cursor += len(batch.lines)
+        value = self._scan_metadata(
+            first, "find" if isinstance(arguments, WebSourceFindArguments) else "outline"
+        )
+        values: list[dict[str, object]] = []
+        ranges: list[dict[str, int]] = []
+        value["matches" if isinstance(arguments, WebSourceFindArguments) else "headings"] = values
+        value["presented_ranges"] = ranges
+        value["scan_complete"] = cursor > first.total_lines
+        value["next_scan_line"] = cursor
+        limit = (
+            arguments.max_matches
+            if isinstance(arguments, WebSourceFindArguments)
+            else arguments.max_headings
+        )
+        for offset, line in enumerate(saved_lines):
+            number = arguments.start_line + offset
+            entry: dict[str, object]
+            if isinstance(arguments, WebSourceFindArguments):
+                query = arguments.query if arguments.case_sensitive else arguments.query.casefold()
+                candidate = line if arguments.case_sensitive else line.casefold()
+                if query not in candidate:
+                    continue
+                left = max(0, offset - arguments.context_lines)
+                right = min(len(saved_lines), offset + arguments.context_lines + 1)
+                entry = {
+                    "match_line": number,
+                    "start_line": arguments.start_line + left,
+                    "untrusted_lines": [
+                        {"line": arguments.start_line + index, "text": saved_lines[index]}
+                        for index in range(left, right)
+                    ],
+                }
+                presented = {
+                    "start_line": arguments.start_line + left,
+                    "end_line": arguments.start_line + right - 1,
+                }
+            else:
+                stripped = line.strip()
+                underlined = offset + 1 < len(saved_lines) and bool(
+                    re.fullmatch(r"(?:={3,}|-{3,})", saved_lines[offset + 1].strip())
+                )
+                if (
+                    not stripped
+                    or len(stripped) > 200
+                    or not (_SECTION_HEADING.match(stripped) or underlined)
+                ):
+                    continue
+                entry = {"line": number, "text": line}
+                presented = {"start_line": number, "end_line": number}
+            values.append(entry)
+            ranges.append(presented)
+            if (
+                isinstance(arguments, WebSourceFindArguments)
+                and len(values) == 1
+                and not self._research_result_fits(value)
+            ):
+                entry["start_line"] = number
+                entry["untrusted_lines"] = [{"line": number, "text": line}]
+                entry["context_omitted"] = True
+                presented["start_line"] = number
+                presented["end_line"] = number
+            if not self._research_result_fits(value):
+                values.pop()
+                ranges.pop()
+                value["next_scan_line"] = number
+                value["scan_complete"] = False
+                break
+            if len(values) >= limit:
+                value["next_scan_line"] = number + 1
+                value["scan_complete"] = number >= first.total_lines
+                break
         return value
