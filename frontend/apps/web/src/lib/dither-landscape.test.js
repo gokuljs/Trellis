@@ -213,10 +213,9 @@ function withLandscape(options, run) {
       writable: true,
       value,
     })
-  const states = []
   let controller
   try {
-    controller = mountLandscape(canvas, poster, (state) => states.push(state))
+    controller = mountLandscape(canvas, poster)
     run({
       controller,
       canvas,
@@ -226,7 +225,6 @@ function withLandscape(options, run) {
       scheduler,
       observers,
       counts,
-      states,
     })
   } finally {
     controller?.dispose()
@@ -238,73 +236,57 @@ function withLandscape(options, run) {
 }
 
 test("reduced motion renders a still frame and responds to preference changes", () => {
-  withLandscape(
-    { reduced: true },
-    ({ canvas, media, scheduler, counts, states }) => {
-      assert.equal(states.at(-1), "reduced")
-      assert.ok(counts.draws > 0)
-      assert.equal(canvas.dataset.ready, "true")
-      assert.equal(scheduler.pending, 0)
-      media.matches = false
-      media.dispatchEvent(new Event("change"))
-      assert.equal(states.at(-1), "playing")
-      assert.equal(scheduler.pending, 1)
-      media.matches = true
-      media.dispatchEvent(new Event("change"))
-      assert.equal(scheduler.pending, 0)
-    }
-  )
+  withLandscape({ reduced: true }, ({ canvas, media, scheduler, counts }) => {
+    assert.ok(counts.draws > 0)
+    assert.equal(canvas.dataset.ready, "true")
+    assert.equal(scheduler.pending, 0)
+    media.matches = false
+    media.dispatchEvent(new Event("change"))
+    assert.equal(scheduler.pending, 1)
+    media.matches = true
+    media.dispatchEvent(new Event("change"))
+    assert.equal(scheduler.pending, 0)
+  })
 })
 
-test("pause, page visibility and intersection suspend rendering", () => {
-  withLandscape(
-    {},
-    ({ controller, document, scheduler, observers, states }) => {
-      controller.togglePaused()
-      assert.equal(states.at(-1), "paused")
-      assert.equal(scheduler.pending, 0)
-      controller.togglePaused()
-      assert.equal(scheduler.pending, 1)
-      document.hidden = true
-      document.dispatchEvent(new Event("visibilitychange"))
-      assert.equal(scheduler.pending, 0)
-      document.hidden = false
-      document.dispatchEvent(new Event("visibilitychange"))
-      assert.equal(scheduler.pending, 1)
-      observers.intersection([{ isIntersecting: false }])
-      assert.equal(scheduler.pending, 0)
-      observers.intersection([{ isIntersecting: true }])
-      assert.equal(scheduler.pending, 1)
-    }
-  )
+test("page visibility and intersection suspend rendering", () => {
+  withLandscape({}, ({ document, scheduler, observers }) => {
+    assert.equal(scheduler.pending, 1)
+    document.hidden = true
+    document.dispatchEvent(new Event("visibilitychange"))
+    assert.equal(scheduler.pending, 0)
+    document.hidden = false
+    document.dispatchEvent(new Event("visibilitychange"))
+    assert.equal(scheduler.pending, 1)
+    observers.intersection([{ isIntersecting: false }])
+    assert.equal(scheduler.pending, 0)
+    observers.intersection([{ isIntersecting: true }])
+    assert.equal(scheduler.pending, 1)
+  })
 })
 
 test("context loss shows fallback and restoration rebuilds the renderer", () => {
-  withLandscape({}, ({ canvas, scheduler, counts, states }) => {
+  withLandscape({}, ({ canvas, scheduler, counts }) => {
     const lost = new Event("webglcontextlost", { cancelable: true })
     canvas.dispatchEvent(lost)
     assert.equal(lost.defaultPrevented, true)
     assert.equal(canvas.dataset.ready, "false")
-    assert.equal(states.at(-1), "unavailable")
     assert.equal(scheduler.pending, 0)
     canvas.dispatchEvent(new Event("webglcontextrestored"))
     assert.equal(counts.programs, 6)
     assert.equal(canvas.dataset.ready, "true")
-    assert.equal(states.at(-1), "playing")
     assert.equal(scheduler.pending, 1)
   })
 })
 
 test("disposal releases GPU resources and ignores already queued observer callbacks", () => {
-  withLandscape({}, ({ controller, scheduler, observers, counts, states }) => {
+  withLandscape({}, ({ controller, scheduler, observers, counts }) => {
     controller.dispose()
     const draws = counts.draws
-    const updates = states.length
     observers.resize()
     observers.intersection([{ isIntersecting: true }])
     scheduler.tick(1000)
     assert.equal(counts.draws, draws)
-    assert.equal(states.length, updates)
     assert.equal(scheduler.pending, 0)
     assert.equal(counts.deletedBuffers, 1)
     assert.equal(counts.deletedPrograms, 3)
@@ -320,8 +302,7 @@ test("unsupported WebGL2 and shader or setup failures keep the rendered poster",
     { shaderFailureAt: 5 },
     { observerFailure: true },
   ]) {
-    withLandscape(options, ({ canvas, scheduler, counts, states }) => {
-      assert.equal(states.at(-1), "unavailable")
+    withLandscape(options, ({ canvas, scheduler, counts }) => {
       assert.notEqual(canvas.dataset.ready, "true")
       assert.equal(counts.posters, 1)
       assert.equal(scheduler.pending, 0)
@@ -354,12 +335,8 @@ test("fallback resize bursts render one new poster and identical sizes keep the 
 test("effect cleanup and setup can reuse the canvas without losing its context", () => {
   withLandscape({}, ({ controller, canvas, poster, scheduler, counts }) => {
     controller.dispose()
-    const states = []
-    const replay = mountLandscape(canvas, poster, (status) =>
-      states.push(status)
-    )
+    const replay = mountLandscape(canvas, poster)
     try {
-      assert.equal(states.at(-1), "playing")
       assert.equal(canvas.dataset.ready, "true")
       assert.equal(scheduler.pending, 1)
       assert.equal(counts.programs, 6)
@@ -407,9 +384,9 @@ test("each frame draws the colored field, instanced particles and grain", () => 
 test("a zero-size initial canvas recovers when layout supplies its dimensions", () => {
   withLandscape(
     { initialSize: { width: 0, height: 0 } },
-    ({ canvas, counts, observers, scheduler, states }) => {
+    ({ canvas, counts, observers, scheduler }) => {
       assert.equal(counts.instances, 0)
-      assert.equal(states.at(-1), "playing")
+      assert.equal(scheduler.pending, 1)
       canvas.getBoundingClientRect = () => ({ width: 320, height: 240 })
       observers.resize()
       scheduler.tick(0)
