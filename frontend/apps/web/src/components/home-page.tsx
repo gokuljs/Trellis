@@ -88,7 +88,6 @@ export function HomePage() {
           <TrellisMark size={20} />
           <span>Trellis</span>
         </div>
-        <span className="home-copyright">Trellis © 2026</span>
       </footer>
       <DitherLandscape />
     </div>

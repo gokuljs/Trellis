@@ -438,13 +438,9 @@ function createRenderer(gl: WebGL2RenderingContext) {
   }
 }
 
-export type LandscapeStatus =
-  "loading" | "playing" | "paused" | "reduced" | "unavailable"
-
 export function mountLandscape(
   canvas: HTMLCanvasElement,
-  poster: HTMLCanvasElement,
-  onStatus: (status: LandscapeStatus) => void
+  poster: HTMLCanvasElement
 ) {
   let gl: WebGL2RenderingContext | null = null
   try {
@@ -464,11 +460,9 @@ export function mountLandscape(
   let intersectionObserver: IntersectionObserver | null = null
   let scene: ArcGeometry | null = null
   let seeds: Float32Array = new Float32Array()
-  let paused = false
   let disposed = false
   let inView = true
   let resizeFrame: number | null = null
-  let lastStatus: LandscapeStatus = "loading"
   const loop = createLandscapeLoop((time) => {
     if (!renderer) return
     renderer.draw(time)
@@ -476,23 +470,11 @@ export function mountLandscape(
   })
   const synchronize = () => {
     if (disposed) return
-    const status = !renderer
-      ? "unavailable"
-      : media?.matches
-        ? "reduced"
-        : paused
-          ? "paused"
-          : "playing"
-    if (status !== lastStatus) {
-      lastStatus = status
-      onStatus(status)
-    }
     if (renderer && !document.hidden && inView) {
-      if (status === "playing") loop.start()
-      else {
+      if (media?.matches) {
         loop.stop()
         loop.drawStill()
-      }
+      } else loop.start()
     } else loop.stop()
   }
   const resize = () => {
@@ -575,14 +557,6 @@ export function mountLandscape(
     synchronize()
   } catch {
     dispose()
-    onStatus("unavailable")
-    return { togglePaused() {}, dispose() {} }
   }
-  return {
-    togglePaused() {
-      paused = !paused
-      synchronize()
-    },
-    dispose,
-  }
+  return { dispose }
 }
